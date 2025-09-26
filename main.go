@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -15,12 +16,15 @@ import (
 	"sync"
 )
 
-const (
-	CacheDir   = "/var/cache/hokuto"
-	SourcesDir = CacheDir + "/sources"
-	BinDir     = CacheDir + "/bin"
-	CacheStore = SourcesDir + "/_cache"
-	Installed  = "/var/db/hokuto/installed"
+var (
+	rootDir    string
+	CacheDir   string
+	SourcesDir string
+	BinDir     string
+	CacheStore string
+	Installed  string
+	repoPaths  string
+	tmpDir     string
 	ConfigFile = "/etc/hokuto.conf"
 )
 
@@ -80,27 +84,77 @@ func mergeEnvOverrides(cfg *Config) {
 	}
 }
 
-// List installed packages with version
-func listPackages(pkgName string) error {
-	var pkgs []string
-	if pkgName != "" {
-		if _, err := os.Stat(filepath.Join(Installed, pkgName)); err == nil {
-			pkgs = []string{pkgName}
-		} else {
-			return fmt.Errorf("package not found: %s", pkgName)
+func initConfig(cfg *Config) {
+	rootDir = cfg.Values["HOKUTO_ROOT"]
+	if rootDir == "" {
+		rootDir = "/"
+	}
+
+	repoPaths = cfg.Values["HOKUTO_PATH"]
+	if repoPaths == "" {
+		log.Fatalf("Critical error: HOKUTO_PATH is not set in the configuration.")
+	}
+
+	tmpDir = cfg.Values["TMPDIR"]
+	if tmpDir == "" {
+		tmpDir = "/tmp"
+	}
+
+	CacheDir = "/var/cache/hokuto"
+	SourcesDir = CacheDir + "/sources"
+	BinDir = CacheDir + "/bin"
+	CacheStore = SourcesDir + "/_cache"
+	Installed = rootDir + "/var/db/hokuto/installed"
+
+}
+
+// List installed packages with version, supporting partial matches.
+func listPackages(searchTerm string) error {
+	// Step 1: Always get the full list of installed package directories first.
+	entries, err := os.ReadDir(Installed)
+	if err != nil {
+		// Handle cases where the 'Installed' directory might not exist yet
+		if os.IsNotExist(err) {
+			fmt.Println("No packages installed.")
+			return nil
 		}
-	} else {
-		entries, err := os.ReadDir(Installed)
-		if err != nil {
-			return err
-		}
-		for _, e := range entries {
-			if e.IsDir() {
-				pkgs = append(pkgs, e.Name())
-			}
+		return err
+	}
+
+	var allPkgs []string
+	for _, e := range entries {
+		if e.IsDir() {
+			allPkgs = append(allPkgs, e.Name())
 		}
 	}
-	for _, p := range pkgs {
+
+	// Step 2: Filter the list if a search term was provided.
+	var pkgsToShow []string
+	if searchTerm != "" {
+		// This is the new logic for partial matching
+		for _, pkg := range allPkgs {
+			if strings.Contains(pkg, searchTerm) {
+				pkgsToShow = append(pkgsToShow, pkg)
+			}
+		}
+	} else {
+		// If no search term, we'll show everything
+		pkgsToShow = allPkgs
+	}
+
+	// Step 3: Handle the case where no packages were found after filtering.
+	if len(pkgsToShow) == 0 {
+		if searchTerm != "" {
+			return fmt.Errorf("no packages found matching: %s", searchTerm)
+		}
+		// This handles the case where there are no packages installed at all.
+		fmt.Println("No packages installed.")
+		return nil
+	}
+
+	// Step 4: Print the information for the final list of packages.
+	// This part remains the same as your original code.
+	for _, p := range pkgsToShow {
 		versionFile := filepath.Join(Installed, p, "version")
 		version := "unknown"
 		if data, err := os.ReadFile(versionFile); err == nil {
@@ -108,6 +162,7 @@ func listPackages(pkgName string) error {
 		}
 		fmt.Printf("%s %s\n", p, version)
 	}
+
 	return nil
 }
 
@@ -415,10 +470,6 @@ func verifyOrCreateChecksums(pkgName, pkgDir string) error {
 
 // checksum command
 func hokutoChecksum(pkgName string, cfg *Config) error {
-	repoPaths := cfg.Values["HOKUTO_PATH"]
-	if repoPaths == "" {
-		return fmt.Errorf("HOKUTO_PATH is not set")
-	}
 
 	paths := strings.Split(repoPaths, ":")
 	var pkgDir string
@@ -448,28 +499,15 @@ func hokutoChecksum(pkgName string, cfg *Config) error {
 // build package
 func buildEntry(pkgName string, cfg *Config) error {
 	// set tmpdir
-	tmpDir := cfg.Values["TMPDIR"]
 	pkgTmpDir := filepath.Join(tmpDir, pkgName)
 	buildDir := filepath.Join(pkgTmpDir, "build")
 	outputDir := filepath.Join(pkgTmpDir, "output")
-
-	// Prepare root dir for installations (used by pkgInstall, depends, etc.)
-	rootDir := cfg.Values["HOKUTO_ROOT"]
-	if rootDir == "" {
-		rootDir = "/"
-	}
 
 	// Create build/output dirs (non-root, inside TMPDIR)
 	for _, dir := range []string{buildDir, outputDir} {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return fmt.Errorf("failed to create dir %s: %v", dir, err)
 		}
-	}
-
-	// Use HOKUTO_PATH from config to find package dir
-	repoPaths := cfg.Values["HOKUTO_PATH"]
-	if repoPaths == "" {
-		return fmt.Errorf("HOKUTO_PATH is not set")
 	}
 
 	paths := strings.Split(repoPaths, ":")
@@ -595,6 +633,24 @@ func buildEntry(pkgName string, cfg *Config) error {
 	cpCmd := exec.Command("cp", "--remove-destination", versionSrc, versionDst)
 	if err := runAsRoot(cpCmd); err != nil {
 		return fmt.Errorf("failed to copy version file: %v", err)
+	}
+
+	// Copy post-install file from pkgDir if it exists
+	postinstallSrc := filepath.Join(pkgDir, "post-install")
+	postinstallDst := filepath.Join(installedDir, "post-install")
+
+	if fi, err := os.Stat(postinstallSrc); err == nil && !fi.IsDir() {
+		// ensure installedDir exists
+		if err := os.MkdirAll(filepath.Dir(postinstallDst), 0o755); err != nil {
+			return fmt.Errorf("failed to create installed dir: %v", err)
+		}
+
+		cpCmd := exec.Command("cp", "--remove-destination", postinstallSrc, postinstallDst)
+		if err := runAsRoot(cpCmd); err != nil {
+			return fmt.Errorf("failed to copy post-install file: %v", err)
+		}
+	} else if err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("failed to stat post-install file: %v", err)
 	}
 
 	// Generate manifest
@@ -1157,9 +1213,6 @@ func createPackageTarball(pkgName, pkgVer, outputDir string, runAsRoot func(*exe
 }
 
 func getModifiedFiles(pkgName, rootDir string) ([]string, error) {
-	if rootDir == "" {
-		rootDir = "/"
-	}
 
 	installedDir := filepath.Join(rootDir, "var", "db", "hokuto", "installed", pkgName)
 	manifestFile := filepath.Join(installedDir, "manifest")
@@ -1405,23 +1458,61 @@ func runAsRoot(cmd *exec.Cmd) error {
 	return sudoCmd.Run()
 }
 
-func pkgInstall(tarballPath, pkgName string, cfg *Config) error {
-	tmpDir := cfg.Values["TMPDIR"]
-	if tmpDir == "" {
-		tmpDir = "/tmp"
+// executePostInstall runs the post-install script for pkgName if present.
+// If rootDir != "/" it attempts to run the same absolute path via chroot.
+// If chroot fails the function prints a warning and returns nil.
+func executePostInstall(pkgName, rootDir string, runAsRoot func(*exec.Cmd) error) error {
+
+	// absolute path inside the system (and inside the chroot)
+	const relScript = "/var/db/hokuto/installed"
+	scriptPath := filepath.Join(relScript, pkgName, "post-install")
+	hostScript := filepath.Join(rootDir, scriptPath)
+
+	// nothing to do if the file doesn't exist on host
+	if fi, err := os.Stat(hostScript); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("failed to stat post-install script %s: %v", hostScript, err)
+	} else if fi.IsDir() {
+		return fmt.Errorf("post-install path %s is a directory", hostScript)
 	}
+
+	var cmd *exec.Cmd
+	if rootDir == "/" {
+		cmd = exec.Command(hostScript)
+	} else {
+		// run the same absolute path inside the chroot
+		cmd = exec.Command("chroot", rootDir, scriptPath)
+	}
+
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	// If chroot is used and fails, print a warning and continue (non-fatal).
+	if rootDir != "/" {
+		if err := runAsRoot(cmd); err != nil {
+			fmt.Printf("warning: chroot to %s failed or post-install could not run: %v\n", rootDir, err)
+			return nil
+		}
+		return nil
+	}
+
+	if err := runAsRoot(cmd); err != nil {
+		return fmt.Errorf("post-install script %s failed: %v", hostScript, err)
+	}
+	return nil
+}
+
+func pkgInstall(tarballPath, pkgName string, cfg *Config) error {
+
 	stagingDir := filepath.Join(tmpDir, "staging", pkgName)
 
 	// Clean staging dir
 	os.RemoveAll(stagingDir)
 	if err := os.MkdirAll(stagingDir, 0o755); err != nil {
 		return fmt.Errorf("failed to create staging dir: %v", err)
-	}
-
-	// Prepare root dir
-	rootDir := cfg.Values["HOKUTO_ROOT"]
-	if rootDir == "" {
-		rootDir = "/"
 	}
 
 	// 1. Unpack tarball into staging
@@ -1550,10 +1641,15 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config) error {
 			}
 		}
 	}
-	// Generate updated manifest in staging
-	stagingManifest := filepath.Join(stagingDir, "var", "db", "hokuto", "installed", pkgName)
-	if err := generateManifest(stagingDir, stagingManifest, runAsRoot); err != nil {
+	// Generate updated manifest of staging
+	stagingManifest := stagingDir + "/var/db/hokuto/installed/" + pkgName + "/manifest"
+	stagingManifest2dir := tmpDir + "/staging-manifest-" + pkgName
+	stagingManifest2file := filepath.Join(stagingManifest2dir, "/manifest")
+	if err := generateManifest(stagingDir, stagingManifest2dir, runAsRoot); err != nil {
 		return fmt.Errorf("failed to generate manifest: %v", err)
+	}
+	if err := updateManifestWithNewFiles(stagingManifest, stagingManifest2file); err != nil {
+		fmt.Fprintf(os.Stderr, "Manifest update failed: %v\n", err)
 	}
 	// 4. Determine obsolete files (compare manifests)
 	filesToDelete, err := removeObsoleteFiles(pkgName, stagingDir, rootDir, runAsRoot)
@@ -1575,8 +1671,186 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config) error {
 			fmt.Printf("Removed obsolete file: %s\n", p)
 		}
 	}
-
+	// 7. Run package post-install script (non-fatal on chroot failure)
+	if err := executePostInstall(pkgName, rootDir, runAsRoot); err != nil {
+		// executePostInstall will already treat chroot failures as non-fatal,
+		// but handle any unexpected errors here.
+		fmt.Printf("warning: post-install for %s returned error: %v\n", pkgName, err)
+	}
 	return nil
+}
+
+// ManifestEntry represents a single line in the manifest file.
+type ManifestEntry struct {
+	Path     string
+	Checksum string
+}
+
+// parseManifest reads a manifest file and returns a map of file paths to their entries.
+// The map key is the file Path.
+// parseManifest reads a manifest file and returns a map of file paths to their entries.
+// It specifically skips entries that represent directories (end with '/').
+func parseManifest(filePath string) (map[string]ManifestEntry, error) {
+	entries := make(map[string]ManifestEntry)
+
+	file, err := os.Open(filePath)
+	if err != nil {
+		// Treat non-existent base manifest as an empty manifest.
+		if os.IsNotExist(err) {
+			return entries, nil
+		}
+		return nil, fmt.Errorf("failed to open manifest file %s: %w", filePath, err)
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue // Skip empty lines and comments
+		}
+
+		// Check if the line represents a directory.
+		// We look for a line that starts with '/' and ends with '/', and has no other fields.
+		if strings.HasSuffix(line, "/") {
+			// Check if the line contains ONLY the directory path.
+			// If there's any whitespace, it might be a malformed file entry,
+			// but for a pure directory line like "/etc/", this will be false.
+			if len(strings.Fields(line)) == 1 {
+				continue // Skip directories
+			}
+		}
+
+		fields := strings.Fields(line)
+
+		// Now, we expect exactly two fields (Path and Checksum) for a file.
+		// If we get fewer, we return an error indicating a malformed file entry.
+		if len(fields) < 2 {
+			// The user's error message comes from here when processing a directory line.
+			// Since we've pre-filtered pure directory lines, this catches real malformed file lines.
+			return nil, fmt.Errorf("invalid manifest line format: %s", line)
+		}
+
+		path := fields[0]
+		checksum := fields[1]
+
+		entries[path] = ManifestEntry{Path: path, Checksum: checksum}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("error reading manifest file %s: %w", filePath, err)
+	}
+
+	return entries, nil
+}
+
+// updateManifestWithNewFiles compares stagingManifest2 with stagingManifest.
+// Any file path in stagingManifest2 that is NOT in stagingManifest is appended
+// to stagingManifest with a zeroed checksum ("000000").
+func updateManifestWithNewFiles(stagingManifest, stagingManifest2 string) error {
+	// 1. Parse the base manifest (currently tracked files)
+	baseEntries, err := parseManifest(stagingManifest)
+	if err != nil {
+		return fmt.Errorf("error parsing base manifest (%s): %w", stagingManifest, err)
+	}
+
+	// 2. Parse the new manifest (newly staged files)
+	newEntries, err := parseManifest(stagingManifest2)
+	if err != nil {
+		return fmt.Errorf("error parsing new manifest (%s): %w", stagingManifest2, err)
+	}
+
+	// 3. Determine new files to add
+	newFilesToTrack := make([]ManifestEntry, 0)
+	const zeroChecksum = "000000" // The required replacement checksum
+
+	for path, newEntry := range newEntries {
+		// Check if the file path exists in the original base manifest
+		if _, exists := baseEntries[path]; !exists {
+			// This is a new file! Add it to the list to be appended,
+			// but with the zero checksum.
+
+			// Create a copy to modify the checksum
+			entryToAdd := newEntry
+			entryToAdd.Checksum = zeroChecksum
+			newFilesToTrack = append(newFilesToTrack, entryToAdd)
+		}
+	}
+
+	// If no new files were found, we are done.
+	if len(newFilesToTrack) == 0 {
+		return nil
+	}
+
+	// 4. Append the new entries to stagingManifest
+	// Use os.OpenFile with os.O_APPEND to add new lines without rewriting the whole file.
+	outputFile, err := os.OpenFile(stagingManifest, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return fmt.Errorf("failed to open manifest file for appending (%s): %w", stagingManifest, err)
+	}
+	defer outputFile.Close()
+
+	writer := bufio.NewWriter(outputFile)
+	for _, entry := range newFilesToTrack {
+		// Append new entries in the specified format: path<space><space>checksum<newline>
+		_, err := writer.WriteString(fmt.Sprintf("%s  %s\n", entry.Path, entry.Checksum))
+		if err != nil {
+			return fmt.Errorf("failed to write to manifest file: %w", err)
+		}
+	}
+
+	return writer.Flush()
+}
+
+// getRepoVersion reads pkgname/version from repoPaths and returns the version string.
+// The version file format is: "<version> <revision>", e.g. "1.0 1".
+// We only care about the first field (the version).
+func getRepoVersion(pkgName string) (string, error) {
+	// 1. Split the repoPaths string by the colon (':') separator.
+	paths := strings.Split(repoPaths, ":")
+
+	var lastErr error
+
+	// 2. Iterate over all individual repository paths.
+	for _, repoPath := range paths {
+		// Trim any potential whitespace from the path
+		repoPath = strings.TrimSpace(repoPath)
+		if repoPath == "" {
+			continue // Skip empty paths
+		}
+
+		// 3. Construct the full path to the version file.
+		// filepath.Join handles the correct path separators (e.g., '/' or '\')
+		versionFile := filepath.Join(repoPath, pkgName, "version")
+
+		// 4. Attempt to read the file.
+		data, err := os.ReadFile(versionFile)
+		if err == nil {
+			// File found and read successfully. Process the content.
+			fields := strings.Fields(string(data))
+			if len(fields) == 0 {
+				// If the file is empty, this path is considered invalid but we can stop here.
+				return "", fmt.Errorf("invalid version file format (empty file) for %s in path %s", pkgName, repoPath)
+			}
+
+			// Successfully found the version. Return it immediately.
+			return fields[0], nil
+		} else if !os.IsNotExist(err) {
+			// If we hit an error other than "file not found," it's a serious issue
+			// (e.g., permission denied) so we'll record it and continue trying other paths
+			// but keep the error to return if no file is found anywhere.
+			lastErr = fmt.Errorf("could not read version file for %s in path %s: %w", pkgName, repoPath, err)
+		}
+		// If os.IsNotExist(err) is true, we just continue to the next path.
+	}
+
+	// 5. If the loop completes without finding a valid version file,
+	// return the last non-FileNotFound error if one occurred, otherwise
+	// return a generic "not found" error.
+	if lastErr != nil {
+		return "", lastErr
+	}
+	return "", fmt.Errorf("version file for %s not found in any of the specified paths", pkgName)
 }
 
 // Entry point
@@ -1586,8 +1860,12 @@ func main() {
 		return
 	}
 
-	cfg, _ := loadConfig(ConfigFile)
+	cfg, err := loadConfig(ConfigFile)
+	if err != nil {
+		// handle error
+	}
 	mergeEnvOverrides(cfg)
+	initConfig(cfg)
 
 	switch os.Args[1] {
 	case "version":
@@ -1623,14 +1901,33 @@ func main() {
 		}
 	case "install":
 		if len(os.Args) < 3 {
-			fmt.Println("Usage: hokuto install <tarball>")
+			fmt.Println("Usage: hokuto install <tarball|pkgname>")
 			os.Exit(1)
 		}
-		tarballPath := os.Args[2]
 
-		// infer pkgName from tarball name (pkgname-pkgver.tar.zst)
-		base := filepath.Base(tarballPath)
-		pkgName := strings.SplitN(base, "-", 2)[0]
+		arg := os.Args[2]
+		var tarballPath, pkgName string
+
+		if strings.HasSuffix(arg, ".tar.zst") {
+			// Direct tarball path
+			tarballPath = arg
+			base := filepath.Base(tarballPath)
+			pkgName = strings.SplitN(base, "-", 2)[0]
+		} else {
+			// Package name
+			pkgName = arg
+			version, err := getRepoVersion(pkgName)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+				os.Exit(1)
+			}
+
+			tarballPath = filepath.Join(BinDir, fmt.Sprintf("%s-%s.tar.zst", pkgName, version))
+			if _, err := os.Stat(tarballPath); err != nil {
+				fmt.Fprintf(os.Stderr, "Tarball not found: %s\n", tarballPath)
+				os.Exit(1)
+			}
+		}
 
 		if err := pkgInstall(tarballPath, pkgName, cfg); err != nil {
 			fmt.Fprintf(os.Stderr, "Error installing package %s: %v\n", pkgName, err)
