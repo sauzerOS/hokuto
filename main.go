@@ -137,27 +137,41 @@ func NewExecutor(ctx context.Context /* other params */) *Executor {
 	return &Executor{Context: ctx}
 }
 
-// ensureSudo prompts once and primes the sudo timestamp cache.
+// ensureSudo only prompts for a password if sudo really needs one.
+// 1. If we’re root or root‐mode isn’t required, do nothing.
+// 2. If we've already primed, try “sudo -v” (interactive on expiry).
+// 3. Otherwise, run “sudo -n -v” (noninteractive); if it succeeds, no password is needed.
+// 4. If that fails, open /dev/tty, read the password, then run “sudo -S -v” to prime.
 func (e *Executor) ensureSudo() error {
-	// if we’re already root or we never need sudo, nothing to do
+	// no elevation needed if we’re already root or ShouldRunAsRoot is false
 	if os.Geteuid() == 0 || !e.ShouldRunAsRoot {
 		return nil
 	}
-	// if we’ve already primed, just refresh timestamp
+
+	// if we’ve primed before, refresh the timestamp (may re‐prompt if expired)
 	if e.sudoPrimed {
-		cmd := exec.CommandContext(e.Context, "sudo", "-v")
-		cmd.Stdin = os.Stdin
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-		if err := cmd.Run(); err != nil {
-			// force a re-prompt next time
-			e.sudoPrimed = false
-			return fmt.Errorf("sudo timestamp refresh failed: %w", err)
+		refresh := exec.CommandContext(e.Context, "sudo", "-v")
+		refresh.Stdin = os.Stdin
+		refresh.Stdout = os.Stdout
+		refresh.Stderr = os.Stderr
+		if err := refresh.Run(); err == nil {
+			return nil
 		}
-		return nil
+		// expired or error: clear flag and fall through to interactive prompt
+		e.sudoPrimed = false
+	} else {
+		// try noninteractive validation: succeeds if nopasswd or timestamp still valid
+		check := exec.CommandContext(e.Context, "sudo", "-n", "-v")
+		check.Stdout = io.Discard
+		check.Stderr = io.Discard
+		if err := check.Run(); err == nil {
+			e.sudoPrimed = true
+			return nil
+		}
+		// noninteractive check failed: sudo needs a password
 	}
 
-	// first-time ask on /dev/tty
+	// interactive password prompt via the real tty
 	tty, err := os.Open("/dev/tty")
 	if err != nil {
 		return fmt.Errorf("cannot open /dev/tty: %w", err)
@@ -171,7 +185,7 @@ func (e *Executor) ensureSudo() error {
 		return fmt.Errorf("reading sudo password: %w", err)
 	}
 
-	// prime the timestamp cache with -S (read from our pipe) and -v
+	// prime sudo’s timestamp cache
 	prime := exec.CommandContext(e.Context, "sudo", "-S", "-v")
 	prime.Stdin = strings.NewReader(string(pass) + "\n")
 	prime.Stdout = os.Stdout
@@ -184,10 +198,11 @@ func (e *Executor) ensureSudo() error {
 	return nil
 }
 
-// Run executes cmd, elevating with sudo -E if needed.
-// Password is only asked/cached in ensureSudo(), never during the main exec.
+// Run executes the given command, elevating via sudo -E only when needed.
+// It wires up stdio, isolates the child in its own process group for cleanup,
+// and calls ensureSudo() to avoid unnecessary password prompts.
 func (e *Executor) Run(cmd *exec.Cmd) error {
-	// Phase 0: wire up stdio
+	// --- Phase 0: wire up stdio ---
 	if cmd.Stdin == nil {
 		cmd.Stdin = os.Stdin
 	}
@@ -198,22 +213,22 @@ func (e *Executor) Run(cmd *exec.Cmd) error {
 		cmd.Stderr = os.Stderr
 	}
 
-	// Phase 1: prompt/refresh sudo timestamp
+	// --- Phase 1: maybe prime sudo ---
 	if err := e.ensureSudo(); err != nil {
 		return err
 	}
 
-	// Phase 2: build the actual invocation
+	// --- Phase 2: build the final command ---
 	var finalCmd *exec.Cmd
 	if e.ShouldRunAsRoot && os.Geteuid() != 0 {
-		// use -E only—no -S, so sudo reads its own tty
+		// use -E only so sudo reads its own tty and uses our cached ticket
 		args := append([]string{"-E", cmd.Path}, cmd.Args[1:]...)
 		finalCmd = exec.CommandContext(e.Context, "sudo", args...)
 	} else {
 		finalCmd = exec.CommandContext(e.Context, cmd.Path, cmd.Args[1:]...)
 	}
 
-	// inherit or copy environment
+	// preserve or inherit the environment
 	if len(cmd.Env) > 0 {
 		finalCmd.Env = cmd.Env
 	} else {
@@ -226,10 +241,10 @@ func (e *Executor) Run(cmd *exec.Cmd) error {
 	finalCmd.Stdout = cmd.Stdout
 	finalCmd.Stderr = cmd.Stderr
 
-	// Phase 3: isolate process-group so we can clean up on cancel
+	// --- Phase 3: isolate process group for context‐based cleanup ---
 	finalCmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
-	// Phase 4: start, cancel watcher, wait
+	// --- Phase 4: start and watch for cancel ---
 	if err := finalCmd.Start(); err != nil {
 		return fmt.Errorf("failed to start command: %w", err)
 	}
@@ -245,6 +260,7 @@ func (e *Executor) Run(cmd *exec.Cmd) error {
 		}
 	}()
 
+	// --- Phase 5: wait and return ---
 	if waitErr := finalCmd.Wait(); waitErr != nil {
 		if e.Context.Err() != nil {
 			time.Sleep(100 * time.Millisecond)
