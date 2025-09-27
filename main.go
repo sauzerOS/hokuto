@@ -7,6 +7,7 @@ import (
 	"io"
 	"io/fs"
 	"log"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -14,6 +15,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 )
 
 var (
@@ -26,6 +28,10 @@ var (
 	repoPaths  string
 	tmpDir     string
 	ConfigFile = "/etc/hokuto.conf"
+	// Executor for general user actions (always runs commands as the invoking user)
+	UserExec = &Executor{ShouldRunAsRoot: false}
+	// Executor for system-wide final actions (always forces privilege elevation if needed)
+	RootExec = &Executor{ShouldRunAsRoot: true}
 )
 
 // Config struct
@@ -106,6 +112,73 @@ func initConfig(cfg *Config) {
 	CacheStore = SourcesDir + "/_cache"
 	Installed = rootDir + "/var/db/hokuto/installed"
 
+}
+
+// Executor provides a consistent interface for executing commands,
+// abstracting away the privilege escalation (sudo) logic.
+type Executor struct {
+	// ShouldRunAsRoot specifies whether the command MUST be executed with root privileges.
+	ShouldRunAsRoot bool
+}
+
+// Run executes the given command, handling privilege escalation as necessary.
+func (e *Executor) Run(cmd *exec.Cmd) error {
+	// 1. Standardize Stdio for all execution paths
+	if cmd.Stdin == nil {
+		cmd.Stdin = os.Stdin
+	}
+	if cmd.Stdout == nil {
+		cmd.Stdout = os.Stdout
+	}
+	if cmd.Stderr == nil {
+		cmd.Stderr = os.Stderr
+	}
+
+	// Determine if we need to escalate privileges (or if we are already root and need to run a root task).
+	isCurrentlyRoot := os.Geteuid() == 0
+
+	if e.ShouldRunAsRoot && !isCurrentlyRoot {
+		// --- Privilege Escalation via SUDO is Required ---
+
+		// 1. Prepare the arguments for sudo: sudo -E <binary> <args...>
+		// The -E flag is crucial: it preserves the user's environment (CFLAGS, MAKEFLAGS, etc.)
+		args := append([]string{"-E", cmd.Path}, cmd.Args[1:]...)
+		sudoCmd := exec.Command("sudo", args...)
+
+		// 2. Transfer execution context properties
+		sudoCmd.Stdin = cmd.Stdin
+		sudoCmd.Stdout = cmd.Stdout
+		sudoCmd.Stderr = cmd.Stderr
+		sudoCmd.Dir = cmd.Dir
+
+		// 3. Ensure the environment is passed to sudo
+		// This makes sure variables are available for sudo's -E flag to use.
+		// We use the current process environment (os.Environ()) for the sudo wrapper.
+		// If cmd.Env was explicitly set, we respect that for the sudo wrapper.
+		if len(cmd.Env) > 0 {
+			sudoCmd.Env = cmd.Env
+		} else {
+			sudoCmd.Env = os.Environ()
+		}
+
+		return sudoCmd.Run()
+	}
+
+	// --- Direct Execution is Sufficient (either non-root task, or already root) ---
+
+	// Ensure the command inherits the environment if not explicitly set.
+	if len(cmd.Env) == 0 {
+		cmd.Env = os.Environ()
+	}
+
+	// We explicitly clear the process group ID to avoid issues with signals
+	// when running commands that may spawn children.
+	if cmd.SysProcAttr == nil {
+		cmd.SysProcAttr = &syscall.SysProcAttr{}
+	}
+	cmd.SysProcAttr.Setpgid = true
+
+	return cmd.Run()
 }
 
 // List installed packages with version, supporting partial matches.
@@ -496,177 +569,125 @@ func hokutoChecksum(pkgName string, cfg *Config) error {
 	return nil
 }
 
-// build package
-func buildEntry(pkgName string, cfg *Config) error {
-	// set tmpdir
-	pkgTmpDir := filepath.Join(tmpDir, pkgName)
-	buildDir := filepath.Join(pkgTmpDir, "build")
-	outputDir := filepath.Join(pkgTmpDir, "output")
-
-	// Create build/output dirs (non-root, inside TMPDIR)
-	for _, dir := range []string{buildDir, outputDir} {
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			return fmt.Errorf("failed to create dir %s: %v", dir, err)
-		}
+// prepareSources copies and extracts sources into the build directory
+func prepareSources(pkgName, pkgDir, buildDir string, execCtx *Executor) error {
+	srcDir := filepath.Join(CacheDir, "sources", pkgName)
+	if _, err := os.Stat(srcDir); os.IsNotExist(err) {
+		return fmt.Errorf("source directory %s does not exist; run hokuto checksum first", srcDir)
 	}
 
-	paths := strings.Split(repoPaths, ":")
-	var pkgDir string
-	found := false
-	for _, repo := range paths {
-		tryPath := filepath.Join(repo, pkgName)
-		if info, err := os.Stat(tryPath); err == nil && info.IsDir() {
-			pkgDir = tryPath
-			found = true
-			break
-		}
-	}
-	if !found {
-		return fmt.Errorf("package %s not found in HOKUTO_PATH", pkgName)
+	// Clear buildDir
+	rmCmd := exec.Command("rm", "-rf", "buildDir/*")
+	if err := execCtx.Run(rmCmd); err != nil {
+		return fmt.Errorf("failed to clear build dir %s: %v", buildDir, err)
 	}
 
-	// Prepare sources in build directory
-	if err := prepareSources(pkgName, pkgDir, buildDir, runAsRoot); err != nil {
-		return fmt.Errorf("failed to prepare sources: %v", err)
-	}
-
-	// Read version
-	versionFile := filepath.Join(pkgDir, "version")
-	versionData, err := os.ReadFile(versionFile)
+	// Read sources list
+	sourcesFile := filepath.Join(pkgDir, "sources")
+	sourcesData, err := os.ReadFile(sourcesFile)
 	if err != nil {
-		return fmt.Errorf("failed to read version file: %v", err)
-	}
-	version := strings.Fields(string(versionData))[0]
-
-	// Build script
-	buildScript := filepath.Join(pkgDir, "build")
-	if _, err := os.Stat(buildScript); err != nil {
-		return fmt.Errorf("build script not found: %v", err)
+		return fmt.Errorf("failed to read sources file: %v", err)
 	}
 
-	// Check RUN_BUILD_AS_ROOT
-	runBuildAsRoot := false
-	asRootFile := filepath.Join(pkgDir, "asroot")
-	if _, err := os.Stat(asRootFile); err == nil {
-		runBuildAsRoot = true
-	}
-
-	// Build environment
-	env := os.Environ()
-	defaults := map[string]string{
-		"AR":          "gcc-ar",
-		"CC":          "cc",
-		"CXX":         "c++",
-		"NM":          "gcc-nm",
-		"RANLIB":      "gcc-ranlib",
-		"CFLAGS":      "-O2 -march=x86-64 -mtune=generic -pipe -fPIC",
-		"CXXFLAGS":    "",
-		"LDFLAGS":     "",
-		"MAKEFLAGS":   fmt.Sprintf("-j%d", runtime.NumCPU()),
-		"RUSTFLAGS":   fmt.Sprintf("--remap-path-prefix=%s=.", buildDir),
-		"GOFLAGS":     "-trimpath -modcacherw",
-		"GOPATH":      filepath.Join(buildDir, "go"),
-		"HOKUTO_ROOT": cfg.Values["HOKUTO_ROOT"],
-		"TMPDIR":      tmpDir,
-	}
-
-	for k, def := range defaults {
-		val := cfg.Values[k]
-		if val == "" {
-			val = def
+	for _, line := range strings.Split(string(sourcesData), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
 		}
-		if k == "CXXFLAGS" && val == "" {
-			val = cfg.Values["CFLAGS"]
-			if val == "" {
-				val = defaults["CFLAGS"]
+
+		parts := strings.SplitN(line, " ", 2)
+		relPath := parts[0]
+		targetSubdir := ""
+		if len(parts) == 2 {
+			targetSubdir = parts[1]
+		}
+
+		var srcPath string
+		switch {
+		case strings.HasPrefix(relPath, "files/"):
+			srcPath = filepath.Join(pkgDir, relPath)
+		case strings.HasPrefix(relPath, "patches/"):
+			srcPath = filepath.Join(pkgDir, relPath)
+		// >>> NEW LOGIC: If it's a URL, use the Base() of the path for lookup <<<
+		case strings.HasPrefix(relPath, "http://"), strings.HasPrefix(relPath, "https://"), strings.HasPrefix(relPath, "ftp://"):
+			// Assume the downloader saved the file using the filename part of the URL.
+			// You may need to refine this if your downloader renames the file.
+			// Here, we grab the filename from the URL path.
+			urlPath, err := url.Parse(relPath)
+			if err != nil {
+				return fmt.Errorf("invalid URL in sources file: %v", err)
+			}
+			// Use the basename of the URL path as the actual filename on disk
+			filenameOnDisk := filepath.Base(urlPath.Path)
+			srcPath = filepath.Join(srcDir, filenameOnDisk)
+		// >>> END NEW LOGIC <<<
+		default:
+			// This is for local files, which should be rare outside of "files/"
+			srcPath = filepath.Join(srcDir, relPath)
+		}
+
+		info, err := os.Stat(srcPath)
+		if err != nil {
+			// Updated error message to show what path we actually searched
+			return fmt.Errorf("source %s listed but missing: stat %s: %v", relPath, srcPath, err)
+		}
+
+		targetDir := buildDir
+		if targetSubdir != "" {
+			targetDir = filepath.Join(buildDir, targetSubdir)
+			if err := os.MkdirAll(targetDir, 0o755); err != nil {
+				return fmt.Errorf("failed to create target subdir %s: %v", targetDir, err)
 			}
 		}
-		env = append(env, fmt.Sprintf("%s=%s", k, val))
-	}
 
-	// Run build script
-	fmt.Printf("Building %s (version %s) in %s, install to %s (root=%v)\n",
-		pkgName, version, buildDir, outputDir, runBuildAsRoot)
+		destPath := filepath.Join(targetDir, filepath.Base(relPath))
 
-	cmd := exec.Command(buildScript, outputDir, version)
-	cmd.Dir = buildDir
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	cmd.Env = env
-	if runBuildAsRoot {
-		if err := runAsRoot(cmd); err != nil {
-			return fmt.Errorf("build failed: %v", err)
-		}
-	} else {
-		if err := cmd.Run(); err != nil {
-			return fmt.Errorf("build failed: %v", err)
-		}
-	}
-
-	// Create /var/db/hokuto/installed/<pkgName> inside the staging outputDir
-	installedDir := filepath.Join(outputDir, "var", "db", "hokuto", "installed", pkgName)
-	fmt.Printf("Creating metadata directory: %s\n", installedDir)
-	mkdirCmd := exec.Command("mkdir", "-p", installedDir)
-	if err := runAsRoot(mkdirCmd); err != nil {
-		return fmt.Errorf("failed to create installed dir: %v", err)
-	}
-
-	// Generate libdeps
-	libdepsFile := filepath.Join(installedDir, "libdeps")
-	if err := generateLibDeps(outputDir, libdepsFile, runAsRoot); err != nil {
-		fmt.Printf("Warning: failed to generate libdeps: %v\n", err)
-	} else {
-		fmt.Printf("Library dependencies written to %s\n", libdepsFile)
-	}
-
-	// Generate depends
-	if err := generateDepends(pkgName, pkgDir, outputDir, rootDir, runAsRoot); err != nil {
-		return fmt.Errorf("failed to generate depends: %v", err)
-	}
-	fmt.Printf("Depends written to %s\n", filepath.Join(installedDir, "depends"))
-
-	fmt.Printf("%s built successfully, output in %s\n", pkgName, outputDir)
-
-	// Copy version file from pkgDir
-	versionSrc := filepath.Join(pkgDir, "version")
-	versionDst := filepath.Join(installedDir, "version")
-	cpCmd := exec.Command("cp", "--remove-destination", versionSrc, versionDst)
-	if err := runAsRoot(cpCmd); err != nil {
-		return fmt.Errorf("failed to copy version file: %v", err)
-	}
-
-	// Copy post-install file from pkgDir if it exists
-	postinstallSrc := filepath.Join(pkgDir, "post-install")
-	postinstallDst := filepath.Join(installedDir, "post-install")
-
-	if fi, err := os.Stat(postinstallSrc); err == nil && !fi.IsDir() {
-		// ensure installedDir exists
-		if err := os.MkdirAll(filepath.Dir(postinstallDst), 0o755); err != nil {
-			return fmt.Errorf("failed to create installed dir: %v", err)
+		if info.IsDir() {
+			// Copy directory recursively
+			if err := copyDir(srcPath, destPath); err != nil {
+				return fmt.Errorf("failed to copy directory %s: %v", relPath, err)
+			}
+			continue
 		}
 
-		cpCmd := exec.Command("cp", "--remove-destination", postinstallSrc, postinstallDst)
-		if err := runAsRoot(cpCmd); err != nil {
-			return fmt.Errorf("failed to copy post-install file: %v", err)
+		// Resolve symlinks
+		realPath, err := filepath.EvalSymlinks(srcPath)
+		if err != nil {
+			return fmt.Errorf("failed to resolve symlink %s: %v", relPath, err)
 		}
-	} else if err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("failed to stat post-install file: %v", err)
+
+		// Extract archives or copy file
+		switch {
+		case strings.HasSuffix(realPath, ".tar.gz"),
+			strings.HasSuffix(realPath, ".tar.xz"),
+			strings.HasSuffix(realPath, ".tar.bz2"),
+			strings.HasSuffix(realPath, ".tar"):
+			if err := extractTar(realPath, targetDir); err != nil {
+				return fmt.Errorf("failed to extract tar %s: %v", relPath, err)
+			}
+		case strings.HasSuffix(realPath, ".zip"):
+			cmd := exec.Command("unzip", "-q", "-o", realPath, "-d", targetDir)
+			cmd.Stdout = os.Stdout
+			cmd.Stderr = os.Stderr
+			if err := cmd.Run(); err != nil {
+				return fmt.Errorf("failed to unzip %s: %v", relPath, err)
+			}
+		default:
+			// Copy file
+			if err := os.MkdirAll(filepath.Dir(destPath), 0o755); err != nil {
+				return fmt.Errorf("failed to create parent dir for %s: %v", destPath, err)
+			}
+			if err := copyFile(realPath, destPath); err != nil {
+				return fmt.Errorf("failed to copy file %s: %v", relPath, err)
+			}
+		}
 	}
 
-	// Generate manifest
-	if err := generateManifest(outputDir, installedDir, runAsRoot); err != nil {
-		return fmt.Errorf("failed to generate manifest: %v", err)
-	}
-
-	// Generate package archive
-	if err := createPackageTarball(pkgName, version, outputDir, runAsRoot, runBuildAsRoot); err != nil {
-		return fmt.Errorf("failed to package tarball: %v", err)
-	}
 	return nil
 }
 
 // generateLibDeps scans ELF files in outputDir and writes their shared library dependencies to libdepsFile
-func generateLibDeps(outputDir, libdepsFile string, runAsRoot func(*exec.Cmd) error) error {
+func generateLibDeps(outputDir, libdepsFile string, execCtx *Executor) error {
 	ignorePatterns := []string{
 		"ld-*", "libc.so*", "libm.so*", "libpthread.so*", "libdl.so*",
 		"libgcc_s.so*", "libstdc++.so*", "libcrypt.so*", "libc++.so*",
@@ -709,22 +730,37 @@ func generateLibDeps(outputDir, libdepsFile string, runAsRoot func(*exec.Cmd) er
 	worker := func() {
 		defer wg.Done()
 		for file := range fileCh {
-			// Check if file is an ELF binary
-			cmd := exec.Command("file", "--brief", "--mime-type", file)
-			out, err := cmd.Output()
-			if err != nil || !(strings.Contains(string(out), "application/x-executable") ||
-				strings.Contains(string(out), "application/x-sharedlib")) {
+			var fileOut, lddOut bytes.Buffer
+
+			// 1. Check if file is an ELF binary (using the package's determined execution context)
+			cmdFile := exec.Command("file", "--brief", "--mime-type", file)
+			cmdFile.Stdout = &fileOut
+			cmdFile.Stderr = os.Stderr // pipe errors to our stderr
+
+			if err := execCtx.Run(cmdFile); err != nil {
+				// If 'file' fails (e.g., access denied, not found), skip this file
 				continue
 			}
 
+			if !(strings.Contains(fileOut.String(), "application/x-executable") ||
+				strings.Contains(fileOut.String(), "application/x-sharedlib")) {
+				continue
+			}
+
+			// 2. Run ldd to find dependencies (using the package's determined execution context)
 			lddCmd := exec.Command("ldd", file)
-			out, err = lddCmd.Output()
-			if err != nil {
+			lddCmd.Stdout = &lddOut
+			lddCmd.Stderr = os.Stderr // pipe errors to our stderr
+
+			if err := execCtx.Run(lddCmd); err != nil {
+				// If ldd fails (e.g., cannot find dependencies), skip this file
 				continue
 			}
 
 			var libs []string
-			scanner := bufio.NewScanner(bytes.NewReader(out))
+			scanner := bufio.NewScanner(bytes.NewReader(lddOut.Bytes()))
+			// ... (rest of the ldd output parsing logic remains the same) ...
+
 			for scanner.Scan() {
 				line := scanner.Text()
 				parts := strings.Fields(line)
@@ -737,6 +773,7 @@ func generateLibDeps(outputDir, libdepsFile string, runAsRoot func(*exec.Cmd) er
 					}
 				}
 			}
+
 			if len(libs) > 0 {
 				resultCh <- result{libs: libs}
 			}
@@ -775,23 +812,32 @@ func generateLibDeps(outputDir, libdepsFile string, runAsRoot func(*exec.Cmd) er
 	}
 	f.Close()
 
-	// ensure ownership is root:root
-	chownCmd := exec.Command("chown", "0:0", tmpFile)
-	if err := runAsRoot(chownCmd); err != nil {
-		return fmt.Errorf("failed to chown temp libdeps: %v", err)
+	// 1. Determine if this step is necessary (i.e., if we ran as root)
+	if execCtx.ShouldRunAsRoot {
+		// This step is mandatory IF we ran as root (because the build output files are now root-owned)
+		chownCmd := exec.Command("chown", "0:0", tmpFile)
+
+		// The command is expected to succeed here, so we treat failure as a fatal issue.
+		if err := execCtx.Run(chownCmd); err != nil {
+			return fmt.Errorf("failed to chown temp libdeps (via Executor): %v", err)
+		}
+	} else {
+		// If the Executor is unprivileged, the files are already user-owned (not root),
+		// and attempting to chown 0:0 would fail, so we skip it entirely.
+		// This is the correct behavior for unprivileged builds.
 	}
 
-	// move into place as root
+	// move into place
 	mvCmd := exec.Command("mv", "--force", tmpFile, libdepsFile)
-	if err := runAsRoot(mvCmd); err != nil {
-		return fmt.Errorf("failed to move libdeps into place: %v", err)
+	if err := execCtx.Run(mvCmd); err != nil {
+		return fmt.Errorf("failed to move libdeps into place (via Executor): %v", err)
 	}
 
 	fmt.Printf("Library dependencies written to %s (%d deps)\n", libdepsFile, len(seen))
 	return nil
 }
 
-func generateDepends(pkgName, pkgDir, outputDir, rootDir string, runAsRoot func(*exec.Cmd) error) error {
+func generateDepends(pkgName, pkgDir, outputDir, rootDir string, execCtx *Executor) error {
 	installedDir := filepath.Join(outputDir, "var", "db", "hokuto", "installed", pkgName)
 	libdepsFile := filepath.Join(installedDir, "libdeps")
 	dependsFile := filepath.Join(installedDir, "depends")
@@ -860,10 +906,10 @@ func generateDepends(pkgName, pkgDir, outputDir, rootDir string, runAsRoot func(
 	sort.Strings(deps)
 	content := strings.Join(deps, "\n")
 
-	// Write depends file using runAsRoot if necessary
+	// Write depends file
 	writeCmd := exec.Command("sh", "-c", fmt.Sprintf("echo %s > %s", shellEscape(content), shellEscape(dependsFile)))
-	if err := runAsRoot(writeCmd); err != nil {
-		return fmt.Errorf("failed to write depends via runAsRoot: %v", err)
+	if err := execCtx.Run(writeCmd); err != nil {
+		return fmt.Errorf("failed to write depends: %v", err)
 	}
 
 	return nil
@@ -875,14 +921,14 @@ func shellEscape(s string) string {
 }
 
 // listOutputFiles generates a list of all files and directories in outputDir.
-func listOutputFiles(outputDir string, runAsRoot func(*exec.Cmd) error) ([]string, error) {
+func listOutputFiles(outputDir string, execCtx *Executor) ([]string, error) {
 	var entries []string
 
 	// Use find via sudo to safely list all files and directories
 	cmd := exec.Command("find", outputDir)
 	var out bytes.Buffer
 	cmd.Stdout = &out
-	if err := runAsRoot(cmd); err != nil {
+	if err := execCtx.Run(cmd); err != nil {
 		return nil, fmt.Errorf("failed to list output files via find: %v", err)
 	}
 
@@ -928,18 +974,18 @@ func listOutputFiles(outputDir string, runAsRoot func(*exec.Cmd) error) ([]strin
 // generateManifest scans outputDir and writes a manifest file
 // installedDir is the directory where the manifest file will be placed
 // outputDir is the dir scanned for files
-func generateManifest(outputDir, installedDir string, runAsRoot func(*exec.Cmd) error) error {
+func generateManifest(outputDir, installedDir string, execCtx *Executor) error {
 	manifestFile := filepath.Join(installedDir, "manifest")
 	tmpManifest := filepath.Join(os.TempDir(), filepath.Base(manifestFile)+".tmp")
 
 	// Ensure installedDir exists as root
 	mkdirCmd := exec.Command("mkdir", "-p", installedDir)
-	if err := runAsRoot(mkdirCmd); err != nil {
+	if err := execCtx.Run(mkdirCmd); err != nil {
 		return fmt.Errorf("failed to create installedDir: %v", err)
 	}
 
 	// List all output files
-	entries, err := listOutputFiles(outputDir, runAsRoot)
+	entries, err := listOutputFiles(outputDir, execCtx)
 	if err != nil {
 		return fmt.Errorf("failed to list output files: %v", err)
 	}
@@ -980,31 +1026,28 @@ func generateManifest(outputDir, installedDir string, runAsRoot func(*exec.Cmd) 
 			continue
 		}
 
-		// Compute checksum with b3sum via runAsRoot
-		b3sumCmd := exec.Command("b3sum", absPath)
-		var out bytes.Buffer
-		b3sumCmd.Stdout = &out
-		b3sumCmd.Stderr = os.Stderr // optional: see warnings
-		if err := runAsRoot(b3sumCmd); err != nil {
+		// Compute checksum with b3sum helper
+		checksum, err := b3sum(absPath, execCtx)
+		if err != nil {
 			return fmt.Errorf("b3sum failed for %s: %v", absPath, err)
 		}
 
-		fields := strings.Fields(out.String())
-		if len(fields) < 1 {
-			return fmt.Errorf("unexpected b3sum output for %s: %s", absPath, out.String())
-		}
-		checksum := fields[0]
+		// The output parsing and error checking is now handled inside the b3sum function,
+		// but we still check the overall function error.
+		// Note: The rest of the logic remains the same, as the b3sum function now returns
+		// the computed checksum string directly.
 
 		if _, err := fmt.Fprintf(f, "%s  %s\n", entry, checksum); err != nil {
 			return fmt.Errorf("failed to write manifest entry: %v", err)
 		}
+
 	}
 
 	f.Close() // close before moving
 
 	// Move temp manifest into installedDir as root
 	cpCmd := exec.Command("cp", "--remove-destination", tmpManifest, manifestFile)
-	if err := runAsRoot(cpCmd); err != nil {
+	if err := execCtx.Run(cpCmd); err != nil {
 		return fmt.Errorf("failed to copy temporary manifest into place: %v", err)
 	}
 
@@ -1012,108 +1055,6 @@ func generateManifest(outputDir, installedDir string, runAsRoot func(*exec.Cmd) 
 	os.Remove(tmpManifest)
 
 	fmt.Printf("Manifest written to %s (%d entries)\n", manifestFile, len(filtered))
-	return nil
-}
-
-// prepareSources copies and extracts sources into the build directory
-func prepareSources(pkgName, pkgDir, buildDir string, runAsRoot func(*exec.Cmd) error) error {
-	srcDir := filepath.Join(CacheDir, "sources", pkgName)
-	if _, err := os.Stat(srcDir); os.IsNotExist(err) {
-		return fmt.Errorf("source directory %s does not exist; run hokuto checksum first", srcDir)
-	}
-
-	// Clear buildDir via runAsRoot
-	rmCmd := exec.Command("rm", "-rf", buildDir)
-	if err := runAsRoot(rmCmd); err != nil {
-		return fmt.Errorf("failed to clear build dir %s: %v", buildDir, err)
-	}
-
-	// Read sources list
-	sourcesFile := filepath.Join(pkgDir, "sources")
-	sourcesData, err := os.ReadFile(sourcesFile)
-	if err != nil {
-		return fmt.Errorf("failed to read sources file: %v", err)
-	}
-
-	for _, line := range strings.Split(string(sourcesData), "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-
-		parts := strings.SplitN(line, " ", 2)
-		relPath := parts[0]
-		targetSubdir := ""
-		if len(parts) == 2 {
-			targetSubdir = parts[1]
-		}
-
-		var srcPath string
-		switch {
-		case strings.HasPrefix(relPath, "files/"):
-			srcPath = filepath.Join(pkgDir, relPath)
-		case strings.HasPrefix(relPath, "patches/"):
-			srcPath = filepath.Join(pkgDir, relPath)
-		default:
-			srcPath = filepath.Join(srcDir, relPath)
-		}
-
-		info, err := os.Stat(srcPath)
-		if err != nil {
-			return fmt.Errorf("source %s listed but missing: %v", relPath, err)
-		}
-
-		targetDir := buildDir
-		if targetSubdir != "" {
-			targetDir = filepath.Join(buildDir, targetSubdir)
-			if err := os.MkdirAll(targetDir, 0o755); err != nil {
-				return fmt.Errorf("failed to create target subdir %s: %v", targetDir, err)
-			}
-		}
-
-		destPath := filepath.Join(targetDir, filepath.Base(relPath))
-
-		if info.IsDir() {
-			// Copy directory recursively
-			if err := copyDir(srcPath, destPath); err != nil {
-				return fmt.Errorf("failed to copy directory %s: %v", relPath, err)
-			}
-			continue
-		}
-
-		// Resolve symlinks
-		realPath, err := filepath.EvalSymlinks(srcPath)
-		if err != nil {
-			return fmt.Errorf("failed to resolve symlink %s: %v", relPath, err)
-		}
-
-		// Extract archives or copy file
-		switch {
-		case strings.HasSuffix(realPath, ".tar.gz"),
-			strings.HasSuffix(realPath, ".tar.xz"),
-			strings.HasSuffix(realPath, ".tar.bz2"),
-			strings.HasSuffix(realPath, ".tar"):
-			if err := extractTar(realPath, targetDir); err != nil {
-				return fmt.Errorf("failed to extract tar %s: %v", relPath, err)
-			}
-		case strings.HasSuffix(realPath, ".zip"):
-			cmd := exec.Command("unzip", "-q", "-o", realPath, "-d", targetDir)
-			cmd.Stdout = os.Stdout
-			cmd.Stderr = os.Stderr
-			if err := cmd.Run(); err != nil {
-				return fmt.Errorf("failed to unzip %s: %v", relPath, err)
-			}
-		default:
-			// Copy file
-			if err := os.MkdirAll(filepath.Dir(destPath), 0o755); err != nil {
-				return fmt.Errorf("failed to create parent dir for %s: %v", destPath, err)
-			}
-			if err := copyFile(realPath, destPath); err != nil {
-				return fmt.Errorf("failed to copy file %s: %v", relPath, err)
-			}
-		}
-	}
-
 	return nil
 }
 
@@ -1183,7 +1124,7 @@ func extractTar(archive, dest string) error {
 	return nil
 }
 
-func createPackageTarball(pkgName, pkgVer, outputDir string, runAsRoot func(*exec.Cmd) error, runBuildAsRoot bool) error {
+func createPackageTarball(pkgName, pkgVer, outputDir string, execCtx *Executor) error {
 	// Ensure BinDir exists
 	if err := os.MkdirAll(BinDir, 0o755); err != nil {
 		return fmt.Errorf("failed to create BinDir: %v", err)
@@ -1194,17 +1135,19 @@ func createPackageTarball(pkgName, pkgVer, outputDir string, runAsRoot func(*exe
 	args := []string{"-cf", tarballPath, "-C", outputDir, "."}
 	args = append([]string{"--zstd"}, args...) // always compress
 
-	if !runBuildAsRoot {
+	// Check if the build phase ran as an unprivileged user.
+	// If ShouldRunAsRoot is FALSE, the build ran as the user, and we must override ownership inside the tarball.
+	if !execCtx.ShouldRunAsRoot {
 		// Force numeric root ownership for user builds
-		args = append([]string{"--owner=0", "--group=0", "--numeric-owner"}, args...)
+		// This ensures the files inside the tarball are always 0:0 regardless of the builder's UID.
+		args = append(args, "--owner=0", "--group=0", "--numeric-owner")
 	}
 
-	cmd := exec.Command("tar", args...)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+	// Create the final tar command
+	tarCmd := exec.Command("tar", args...)
 
 	fmt.Printf("Creating package tarball: %s\n", tarballPath)
-	if err := runAsRoot(cmd); err != nil {
+	if err := execCtx.Run(tarCmd); err != nil {
 		return fmt.Errorf("failed to create tarball: %v", err)
 	}
 
@@ -1212,7 +1155,7 @@ func createPackageTarball(pkgName, pkgVer, outputDir string, runAsRoot func(*exe
 	return nil
 }
 
-func getModifiedFiles(pkgName, rootDir string) ([]string, error) {
+func getModifiedFiles(pkgName, rootDir string, execCtx *Executor) ([]string, error) {
 
 	installedDir := filepath.Join(rootDir, "var", "db", "hokuto", "installed", pkgName)
 	manifestFile := filepath.Join(installedDir, "manifest")
@@ -1252,7 +1195,7 @@ func getModifiedFiles(pkgName, rootDir string) ([]string, error) {
 		absPath := filepath.Join(rootDir, relPath)
 
 		// Compute b3sum of installed file
-		sum, err := b3sum(absPath)
+		sum, err := b3sum(absPath, execCtx)
 		if err != nil {
 			continue // skip missing files or checksum failures
 		}
@@ -1271,18 +1214,22 @@ func getModifiedFiles(pkgName, rootDir string) ([]string, error) {
 }
 
 // Helper to compute b3sum of a file, using system b3sum binary
-func b3sum(path string) (string, error) {
-	var cmd *exec.Cmd
-	if os.Geteuid() != 0 {
-		cmd = exec.Command("sudo", "b3sum", path)
-	} else {
-		cmd = exec.Command("b3sum", path)
+func b3sum(path string, execCtx *Executor) (string, error) {
+	// We remove the internal privilege check (if os.Geteuid() != 0)
+	// and let the Executor handle it.
+
+	cmd := exec.Command("b3sum", path)
+
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = os.Stderr // Pipe errors to the calling process stderr
+
+	// Use the Executor provided by the caller
+	if err := execCtx.Run(cmd); err != nil {
+		return "", fmt.Errorf("b3sum failed for %s: %w", path, err)
 	}
-	out, err := cmd.Output()
-	if err != nil {
-		return "", err
-	}
-	fields := strings.Fields(string(out))
+
+	fields := strings.Fields(out.String())
 	if len(fields) == 0 {
 		return "", fmt.Errorf("b3sum produced no output for %s", path)
 	}
@@ -1306,7 +1253,7 @@ func readFileAsRoot(path string) ([]byte, error) {
 // removeObsoleteFiles compares the installed manifest (under Installed/<pkg>/manifest)
 // with the manifest present in the staging tree. It returns a slice of absolute
 // paths (under rootDir) that should be deleted after the staging has been rsynced.
-func removeObsoleteFiles(pkgName, stagingDir, rootDir string, runAsRoot func(*exec.Cmd) error) ([]string, error) {
+func removeObsoleteFiles(pkgName, stagingDir, rootDir string) ([]string, error) {
 	installedManifestPath := filepath.Join(rootDir, Installed, pkgName, "manifest")
 	stagingManifestPath := filepath.Join(stagingDir, "var", "db", "hokuto", "installed", pkgName, "manifest")
 
@@ -1376,13 +1323,13 @@ func removeObsoleteFiles(pkgName, stagingDir, rootDir string, runAsRoot func(*ex
 
 // rsyncStaging syncs the contents of stagingDir into rootDir.
 // Helper to sync staging dir into rootDir, respecting existing symlinks
-func rsyncStaging(stagingDir, rootDir string, runAsRoot func(*exec.Cmd) error) error {
+func rsyncStaging(stagingDir, rootDir string, execCtx *Executor) error {
 	// Ensure trailing slash on stagingDir so rsync copies contents
 	stagingPath := filepath.Clean(stagingDir) + string(os.PathSeparator)
 
 	// Ensure rootDir exists
 	mkdirCmd := exec.Command("mkdir", "-p", rootDir)
-	if err := runAsRoot(mkdirCmd); err != nil {
+	if err := execCtx.Run(mkdirCmd); err != nil {
 		return fmt.Errorf("failed to create rootDir %s: %v", rootDir, err)
 	}
 
@@ -1404,64 +1351,22 @@ func rsyncStaging(stagingDir, rootDir string, runAsRoot func(*exec.Cmd) error) e
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 
-	if err := runAsRoot(cmd); err != nil {
+	if err := execCtx.Run(cmd); err != nil {
 		return fmt.Errorf("failed to sync staging to %s: %v", rootDir, err)
 	}
 	// Clean up staging directory
 	rmCmd := exec.Command("rm", "-rf", stagingDir)
-	if err := runAsRoot(rmCmd); err != nil {
+	if err := execCtx.Run(rmCmd); err != nil {
 		return fmt.Errorf("failed to remove staging dir %s: %v", stagingDir, err)
 	}
 
 	return nil
 }
 
-// runAsRoot executes cmd as root. If already root it runs cmd directly.
-// If not root it executes: sudo -E <cmd.Path> <cmd.Args[1:]...>
-// It preserves cmd.Dir, cmd.Env and stdio so interactive programs and
-// working-directory-dependent scripts behave correctly.
-func runAsRoot(cmd *exec.Cmd) error {
-	// ensure stdio is set on the original cmd so we can reuse them
-	if cmd.Stdin == nil {
-		cmd.Stdin = os.Stdin
-	}
-	if cmd.Stdout == nil {
-		cmd.Stdout = os.Stdout
-	}
-	if cmd.Stderr == nil {
-		cmd.Stderr = os.Stderr
-	}
-
-	if os.Geteuid() == 0 {
-		// already root: just run it with its env/dir/stdio
-		cmd.Env = append(os.Environ(), cmd.Env...) // prefer cmd.Env if set
-		return cmd.Run()
-	}
-
-	// Not root: construct sudo -E <binary> <args...>
-	// cmd.Args[0] is the invoked program (== cmd.Path), cmd.Args[1:] are the args
-	args := append([]string{"-E", cmd.Path}, cmd.Args[1:]...)
-	sudoCmd := exec.Command("sudo", args...)
-	sudoCmd.Stdin = cmd.Stdin
-	sudoCmd.Stdout = cmd.Stdout
-	sudoCmd.Stderr = cmd.Stderr
-	sudoCmd.Dir = cmd.Dir
-
-	// preserve the environment intended for the child
-	// if cmd.Env was set use it, otherwise inherit current env
-	if len(cmd.Env) > 0 {
-		sudoCmd.Env = cmd.Env
-	} else {
-		sudoCmd.Env = os.Environ()
-	}
-
-	return sudoCmd.Run()
-}
-
 // executePostInstall runs the post-install script for pkgName if present.
 // If rootDir != "/" it attempts to run the same absolute path via chroot.
 // If chroot fails the function prints a warning and returns nil.
-func executePostInstall(pkgName, rootDir string, runAsRoot func(*exec.Cmd) error) error {
+func executePostInstall(pkgName, rootDir string, execCtx *Executor) error {
 
 	// absolute path inside the system (and inside the chroot)
 	const relScript = "/var/db/hokuto/installed"
@@ -1492,190 +1397,15 @@ func executePostInstall(pkgName, rootDir string, runAsRoot func(*exec.Cmd) error
 
 	// If chroot is used and fails, print a warning and continue (non-fatal).
 	if rootDir != "/" {
-		if err := runAsRoot(cmd); err != nil {
+		if err := execCtx.Run(cmd); err != nil {
 			fmt.Printf("warning: chroot to %s failed or post-install could not run: %v\n", rootDir, err)
 			return nil
 		}
 		return nil
 	}
 
-	if err := runAsRoot(cmd); err != nil {
+	if err := execCtx.Run(cmd); err != nil {
 		return fmt.Errorf("post-install script %s failed: %v", hostScript, err)
-	}
-	return nil
-}
-
-func pkgInstall(tarballPath, pkgName string, cfg *Config) error {
-
-	stagingDir := filepath.Join(tmpDir, "staging", pkgName)
-
-	// Clean staging dir
-	os.RemoveAll(stagingDir)
-	if err := os.MkdirAll(stagingDir, 0o755); err != nil {
-		return fmt.Errorf("failed to create staging dir: %v", err)
-	}
-
-	// 1. Unpack tarball into staging
-	fmt.Printf("Unpacking %s into %s\n", tarballPath, stagingDir)
-	untarCmd := exec.Command("tar", "--zstd", "-xf", tarballPath, "-C", stagingDir)
-	if err := runAsRoot(untarCmd); err != nil {
-		return fmt.Errorf("failed to unpack tarball: %v", err)
-	}
-
-	// 2. Detect user-modified files
-	modifiedFiles, err := getModifiedFiles(pkgName, rootDir)
-	if err != nil {
-		return err
-	}
-
-	// 3. Interactive handling of modified files
-	for _, file := range modifiedFiles {
-		stagingFile := filepath.Join(stagingDir, file)
-		currentFile := filepath.Join(rootDir, file) // file under the install root
-
-		if _, err := os.Stat(stagingFile); err == nil {
-			// file exists in staging
-			cmd := exec.Command("diff", "-u", currentFile, stagingFile)
-			cmd.Stdout = os.Stdout
-			cmd.Stderr = os.Stderr
-			cmd.Run()
-
-			fmt.Printf("File %s modified, choose action: [k]eep current, [u]se new, [e]dit: ", file)
-			var input string
-			fmt.Scanln(&input)
-			switch input {
-			case "k":
-				cpCmd := exec.Command("cp", "--remove-destination", currentFile, stagingFile)
-				if err := runAsRoot(cpCmd); err != nil {
-					return fmt.Errorf("failed to overwrite %s: %v", stagingFile, err)
-				}
-			case "u":
-				// keep staging file as-is
-			case "e":
-				// read staging content
-				stContent, err := os.ReadFile(stagingFile)
-				if err != nil {
-					return fmt.Errorf("failed to read staging file %s: %v", stagingFile, err)
-				}
-
-				// produce unified diff (currentFile vs stagingFile); ignore diff errors (non-zero exit means differences)
-				diffCmd := exec.Command("diff", "-u", currentFile, stagingFile)
-				diffOut, _ := diffCmd.Output() // we don't fail if diff returns non-zero
-
-				// create temp file prefilled with staging content + marked diff
-				tmp, err := os.CreateTemp("", "hokuto-edit-")
-				if err != nil {
-					return fmt.Errorf("failed to create temp file for editing: %v", err)
-				}
-				tmpPath := tmp.Name()
-				defer func() {
-					tmp.Close()
-					_ = os.Remove(tmpPath)
-				}()
-
-				if _, err := tmp.Write(stContent); err != nil {
-					return fmt.Errorf("failed to write staging content to temp file: %v", err)
-				}
-
-				// append a separator and diff output for reference
-				if len(diffOut) > 0 {
-					if _, err := tmp.WriteString("\n\n--- diff (installed -> staging) ---\n"); err != nil {
-						return fmt.Errorf("failed to write diff header to temp file: %v", err)
-					}
-					if _, err := tmp.Write(diffOut); err != nil {
-						return fmt.Errorf("failed to write diff to temp file: %v", err)
-					}
-				}
-
-				// close before launching editor
-				if err := tmp.Close(); err != nil {
-					return fmt.Errorf("failed to close temp file before editing: %v", err)
-				}
-
-				editor := os.Getenv("EDITOR")
-				if editor == "" {
-					editor = "nano"
-				}
-
-				// Launch editor against the temp file as the invoking user so they can edit comfortably.
-				editCmd := exec.Command(editor, tmpPath)
-				editCmd.Stdin, editCmd.Stdout, editCmd.Stderr = os.Stdin, os.Stdout, os.Stderr
-				if err := editCmd.Run(); err != nil {
-					return fmt.Errorf("editor failed: %v", err)
-				}
-
-				// After editing, copy temp back to staging (use runAsRoot to preserve ownership/permissions)
-				cpCmd := exec.Command("cp", "--preserve=mode,ownership,timestamps", tmpPath, stagingFile)
-				if err := runAsRoot(cpCmd); err != nil {
-					return fmt.Errorf("failed to copy edited file back to staging %s: %v", stagingFile, err)
-				}
-			}
-		} else {
-			// file does NOT exist in staging
-			fmt.Printf("User modified %s, but new package has no file. Keep it? [y/N]: ", file)
-			var input string
-			fmt.Scanln(&input)
-			ans := strings.ToLower(strings.TrimSpace(input))
-			if ans == "y" {
-				// ensure staging directory exists (run as root)
-				stagingFileDir := filepath.Dir(stagingFile)
-				mkdirCmd := exec.Command("mkdir", "-p", stagingFileDir)
-				if err := runAsRoot(mkdirCmd); err != nil {
-					return fmt.Errorf("failed to create directory %s: %v", stagingFileDir, err)
-				}
-				// copy current file into staging preserving attributes
-				cpCmd := exec.Command("cp", "--preserve=mode,ownership,timestamps", currentFile, stagingFile)
-				if err := runAsRoot(cpCmd); err != nil {
-					return fmt.Errorf("failed to copy %s to staging: %v", file, err)
-				}
-				fmt.Printf("Kept modified file by copying %s into staging\n", file)
-			} else {
-				// user chose not to keep it -> remove the installed file (run as root)
-				rmCmd := exec.Command("rm", "-f", currentFile)
-				if err := runAsRoot(rmCmd); err != nil {
-					// warn but continue install; do not abort the whole install for a removal failure
-					fmt.Printf("warning: failed to remove %s: %v\n", currentFile, err)
-				} else {
-					fmt.Printf("Removed user-modified file: %s\n", file)
-				}
-			}
-		}
-	}
-	// Generate updated manifest of staging
-	stagingManifest := stagingDir + "/var/db/hokuto/installed/" + pkgName + "/manifest"
-	stagingManifest2dir := tmpDir + "/staging-manifest-" + pkgName
-	stagingManifest2file := filepath.Join(stagingManifest2dir, "/manifest")
-	if err := generateManifest(stagingDir, stagingManifest2dir, runAsRoot); err != nil {
-		return fmt.Errorf("failed to generate manifest: %v", err)
-	}
-	if err := updateManifestWithNewFiles(stagingManifest, stagingManifest2file); err != nil {
-		fmt.Fprintf(os.Stderr, "Manifest update failed: %v\n", err)
-	}
-	// 4. Determine obsolete files (compare manifests)
-	filesToDelete, err := removeObsoleteFiles(pkgName, stagingDir, rootDir, runAsRoot)
-	if err != nil {
-		return err
-	}
-
-	// 5. Rsync staging into root
-	if err := rsyncStaging(stagingDir, rootDir, runAsRoot); err != nil {
-		return fmt.Errorf("failed to sync staging to %s: %v", rootDir, err)
-	}
-
-	// 6. Remove files that were scheduled for deletion
-	for _, p := range filesToDelete {
-		rmCmd := exec.Command("rm", "-f", p)
-		if err := runAsRoot(rmCmd); err != nil {
-			fmt.Printf("warning: failed to remove obsolete file %s: %v\n", p, err)
-		} else {
-			fmt.Printf("Removed obsolete file: %s\n", p)
-		}
-	}
-	// 7. Run package post-install script (non-fatal on chroot failure)
-	if err := executePostInstall(pkgName, rootDir, runAsRoot); err != nil {
-		// executePostInstall will already treat chroot failures as non-fatal,
-		// but handle any unexpected errors here.
-		fmt.Printf("warning: post-install for %s returned error: %v\n", pkgName, err)
 	}
 	return nil
 }
@@ -1744,11 +1474,13 @@ func parseManifest(filePath string) (map[string]ManifestEntry, error) {
 	return entries, nil
 }
 
-// updateManifestWithNewFiles compares stagingManifest2 with stagingManifest.
-// Any file path in stagingManifest2 that is NOT in stagingManifest is appended
-// to stagingManifest with a zeroed checksum ("000000").
+// updateManifestWithNewFiles appends new entries from stagingManifest2 to stagingManifest.
+// This operation requires root privileges, so it uses the global RootExec.
 func updateManifestWithNewFiles(stagingManifest, stagingManifest2 string) error {
 	// 1. Parse the base manifest (currently tracked files)
+	// NOTE: parseManifest likely handles reading the file contents, which may require
+	// elevated access if called during installation, but here it's likely called on
+	// staged files, which should be accessible by the running user.
 	baseEntries, err := parseManifest(stagingManifest)
 	if err != nil {
 		return fmt.Errorf("error parsing base manifest (%s): %w", stagingManifest, err)
@@ -1770,7 +1502,6 @@ func updateManifestWithNewFiles(stagingManifest, stagingManifest2 string) error 
 			// This is a new file! Add it to the list to be appended,
 			// but with the zero checksum.
 
-			// Create a copy to modify the checksum
 			entryToAdd := newEntry
 			entryToAdd.Checksum = zeroChecksum
 			newFilesToTrack = append(newFilesToTrack, entryToAdd)
@@ -1782,24 +1513,31 @@ func updateManifestWithNewFiles(stagingManifest, stagingManifest2 string) error 
 		return nil
 	}
 
-	// 4. Append the new entries to stagingManifest
-	// Use os.OpenFile with os.O_APPEND to add new lines without rewriting the whole file.
-	outputFile, err := os.OpenFile(stagingManifest, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	if err != nil {
-		return fmt.Errorf("failed to open manifest file for appending (%s): %w", stagingManifest, err)
-	}
-	defer outputFile.Close()
+	// 4. CENTRALIZED PRIVILEGED APPEND (Replaces os.OpenFile and writer logic)
 
-	writer := bufio.NewWriter(outputFile)
+	// First, format the data we want to append into an in-memory string.
+	var manifestLines strings.Builder
 	for _, entry := range newFilesToTrack {
 		// Append new entries in the specified format: path<space><space>checksum<newline>
-		_, err := writer.WriteString(fmt.Sprintf("%s  %s\n", entry.Path, entry.Checksum))
-		if err != nil {
-			return fmt.Errorf("failed to write to manifest file: %w", err)
-		}
+		manifestLines.WriteString(fmt.Sprintf("%s  %s\n", entry.Path, entry.Checksum))
 	}
 
-	return writer.Flush()
+	// Second, use the RootExec to run the privileged 'tee -a' command.
+	// 'tee -a' reads from stdin and appends to the specified file, running as root
+	// via the Executor's mechanism (e.g., sudo).
+
+	// Arguments: tee -a <stagingManifest>
+	cmd := exec.Command("tee", "-a", stagingManifest)
+
+	// Pipe the data from the strings.Builder into the command's standard input
+	cmd.Stdin = strings.NewReader(manifestLines.String())
+
+	// Run the command using the global RootExec
+	if err := RootExec.Run(cmd); err != nil {
+		return fmt.Errorf("failed to append to manifest file %s via RootExec: %w", stagingManifest, err)
+	}
+
+	return nil
 }
 
 // getRepoVersion reads pkgname/version from repoPaths and returns the version string.
@@ -1853,6 +1591,385 @@ func getRepoVersion(pkgName string) (string, error) {
 	return "", fmt.Errorf("version file for %s not found in any of the specified paths", pkgName)
 }
 
+// build package
+func pkgBuild(pkgName string, cfg *Config) error {
+	// set tmpdir
+	pkgTmpDir := filepath.Join(tmpDir, pkgName)
+	buildDir := filepath.Join(pkgTmpDir, "build")
+	outputDir := filepath.Join(pkgTmpDir, "output")
+
+	// Create build/output dirs (non-root, inside TMPDIR)
+	for _, dir := range []string{buildDir, outputDir} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return fmt.Errorf("failed to create dir %s: %v", dir, err)
+		}
+	}
+
+	paths := strings.Split(repoPaths, ":")
+	var pkgDir string
+	found := false
+	for _, repo := range paths {
+		tryPath := filepath.Join(repo, pkgName)
+		if info, err := os.Stat(tryPath); err == nil && info.IsDir() {
+			pkgDir = tryPath
+			found = true
+			break
+		}
+	}
+	if !found {
+		return fmt.Errorf("package %s not found in HOKUTO_PATH", pkgName)
+	}
+	// 1. Determine the Execution Context for THIS PACKAGE.
+	// This check MUST stay here as it is package-specific.
+	asRootFile := filepath.Join(pkgDir, "asroot")
+	needsRootBuild := false
+	if _, err := os.Stat(asRootFile); err == nil {
+		needsRootBuild = true
+	}
+
+	// 2. Select the correct Executor for the build phase.
+	var buildExec *Executor
+	if needsRootBuild {
+		buildExec = RootExec // Use the privileged executor
+	} else {
+		buildExec = UserExec // Use the unprivileged executor
+	}
+	// Prepare sources in build directory
+	if err := prepareSources(pkgName, pkgDir, buildDir, buildExec); err != nil {
+		return fmt.Errorf("failed to prepare sources: %v", err)
+	}
+
+	// Read version
+	versionFile := filepath.Join(pkgDir, "version")
+	versionData, err := os.ReadFile(versionFile)
+	if err != nil {
+		return fmt.Errorf("failed to read version file: %v", err)
+	}
+	version := strings.Fields(string(versionData))[0]
+
+	// Build script
+	buildScript := filepath.Join(pkgDir, "build")
+	if _, err := os.Stat(buildScript); err != nil {
+		return fmt.Errorf("build script not found: %v", err)
+	}
+
+	// Build environment
+	env := os.Environ()
+	defaults := map[string]string{
+		"AR":          "gcc-ar",
+		"CC":          "cc",
+		"CXX":         "c++",
+		"NM":          "gcc-nm",
+		"RANLIB":      "gcc-ranlib",
+		"CFLAGS":      "-O2 -march=x86-64 -mtune=generic -pipe -fPIC",
+		"CXXFLAGS":    "",
+		"LDFLAGS":     "",
+		"MAKEFLAGS":   fmt.Sprintf("-j%d", runtime.NumCPU()),
+		"RUSTFLAGS":   fmt.Sprintf("--remap-path-prefix=%s=.", buildDir),
+		"GOFLAGS":     "-trimpath -modcacherw",
+		"GOPATH":      filepath.Join(buildDir, "go"),
+		"HOKUTO_ROOT": cfg.Values["HOKUTO_ROOT"],
+		"TMPDIR":      tmpDir,
+	}
+
+	for k, def := range defaults {
+		val := cfg.Values[k]
+		if val == "" {
+			val = def
+		}
+		if k == "CXXFLAGS" && val == "" {
+			val = cfg.Values["CFLAGS"]
+			if val == "" {
+				val = defaults["CFLAGS"]
+			}
+		}
+		env = append(env, fmt.Sprintf("%s=%s", k, val))
+	}
+
+	// Run build script
+	fmt.Printf("Building %s (version %s) in %s, install to %s (root=%v)\n",
+		pkgName, version, buildDir, outputDir, buildExec.ShouldRunAsRoot)
+
+	cmd := exec.Command(buildScript, outputDir, version)
+	cmd.Dir = buildDir
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.Env = env
+	// 3. CENTRALIZED EXECUTION: Use the selected Executor regardless of privilege.
+	// This replaces the entire conditional if/else block.
+	if err := buildExec.Run(cmd); err != nil {
+		return fmt.Errorf("build failed: %v", err)
+	}
+
+	// Create /var/db/hokuto/installed/<pkgName> inside the staging outputDir
+	installedDir := filepath.Join(outputDir, "var", "db", "hokuto", "installed", pkgName)
+	fmt.Printf("Creating metadata directory: %s\n", installedDir)
+	mkdirCmd := exec.Command("mkdir", "-p", installedDir)
+	if err := buildExec.Run(mkdirCmd); err != nil {
+		return fmt.Errorf("failed to create installed dir: %v", err)
+	}
+
+	// Generate libdeps
+	libdepsFile := filepath.Join(installedDir, "libdeps")
+	if err := generateLibDeps(outputDir, libdepsFile, buildExec); err != nil {
+		fmt.Printf("Warning: failed to generate libdeps: %v\n", err)
+	} else {
+		fmt.Printf("Library dependencies written to %s\n", libdepsFile)
+	}
+
+	// Generate depends
+	if err := generateDepends(pkgName, pkgDir, outputDir, rootDir, buildExec); err != nil {
+		return fmt.Errorf("failed to generate depends: %v", err)
+	}
+	fmt.Printf("Depends written to %s\n", filepath.Join(installedDir, "depends"))
+
+	fmt.Printf("%s built successfully, output in %s\n", pkgName, outputDir)
+
+	// Copy version file from pkgDir
+	versionSrc := filepath.Join(pkgDir, "version")
+	versionDst := filepath.Join(installedDir, "version")
+	cpCmd := exec.Command("cp", "--remove-destination", versionSrc, versionDst)
+	if err := buildExec.Run(cpCmd); err != nil {
+		return fmt.Errorf("failed to copy version file: %v", err)
+	}
+
+	// Copy post-install file from pkgDir if it exists
+	postinstallSrc := filepath.Join(pkgDir, "post-install")
+	postinstallDst := filepath.Join(installedDir, "post-install")
+
+	if fi, err := os.Stat(postinstallSrc); err == nil && !fi.IsDir() {
+		// ensure installedDir exists
+		if err := os.MkdirAll(filepath.Dir(postinstallDst), 0o755); err != nil {
+			return fmt.Errorf("failed to create installed dir: %v", err)
+		}
+
+		cpCmd := exec.Command("cp", "--remove-destination", postinstallSrc, postinstallDst)
+		if err := buildExec.Run(cpCmd); err != nil {
+			return fmt.Errorf("failed to copy post-install file: %v", err)
+		}
+	} else if err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("failed to stat post-install file: %v", err)
+	}
+
+	// Generate manifest
+	if err := generateManifest(outputDir, installedDir, buildExec); err != nil {
+		return fmt.Errorf("failed to generate manifest: %v", err)
+	}
+
+	// Generate package archive
+	if err := createPackageTarball(pkgName, version, outputDir, buildExec); err != nil {
+		return fmt.Errorf("failed to package tarball: %v", err)
+	}
+
+	// Cleanup tmpdirs
+	if os.Getenv("HOKUTO_DEBUG") == "1" {
+		fmt.Fprintf(os.Stderr, "INFO: Skipping cleanup of %s due to HOKUTO_DEBUG=1\n", pkgTmpDir)
+	} else {
+		rmCmd := exec.Command("rm", "-rf", pkgTmpDir)
+		if err := buildExec.Run(rmCmd); err != nil {
+			fmt.Fprintf(os.Stderr, "failed to cleanup build tmpdirs: %v\n", err)
+		}
+	}
+
+	return nil
+}
+
+func pkgInstall(tarballPath, pkgName string, cfg *Config) error {
+
+	stagingDir := filepath.Join(tmpDir, "staging", pkgName)
+
+	// Clean staging dir
+	os.RemoveAll(stagingDir)
+	if err := os.MkdirAll(stagingDir, 0o755); err != nil {
+		return fmt.Errorf("failed to create staging dir: %v", err)
+	}
+
+	// 1. Unpack tarball into staging
+	fmt.Printf("Unpacking %s into %s\n", tarballPath, stagingDir)
+	untarCmd := exec.Command("tar", "--zstd", "-xf", tarballPath, "-C", stagingDir)
+	if err := RootExec.Run(untarCmd); err != nil {
+		return fmt.Errorf("failed to unpack tarball: %v", err)
+	}
+
+	// 2. Detect user-modified files
+	modifiedFiles, err := getModifiedFiles(pkgName, rootDir, RootExec)
+	if err != nil {
+		return err
+	}
+
+	// 3. Interactive handling of modified files
+	for _, file := range modifiedFiles {
+		stagingFile := filepath.Join(stagingDir, file)
+		currentFile := filepath.Join(rootDir, file) // file under the install root
+
+		if _, err := os.Stat(stagingFile); err == nil {
+			// file exists in staging
+			cmd := exec.Command("diff", "-u", currentFile, stagingFile)
+			cmd.Stdout = os.Stdout
+			cmd.Stderr = os.Stderr
+			cmd.Run()
+
+			fmt.Printf("File %s modified, choose action: [k]eep current, [u]se new, [e]dit: ", file)
+			var input string
+			fmt.Scanln(&input)
+			switch input {
+			case "k":
+				cpCmd := exec.Command("cp", "--remove-destination", currentFile, stagingFile)
+				if err := RootExec.Run(cpCmd); err != nil {
+					return fmt.Errorf("failed to overwrite %s: %v", stagingFile, err)
+				}
+			case "u":
+				// keep staging file as-is
+			case "e":
+				// --- NEW: Get original staging file permissions ---
+				stagingInfo, err := os.Stat(stagingFile)
+				if err != nil {
+					return fmt.Errorf("failed to stat staging file %s: %v", stagingFile, err)
+				}
+				originalMode := stagingInfo.Mode()
+				// read staging content
+				stContent, err := os.ReadFile(stagingFile)
+				if err != nil {
+					return fmt.Errorf("failed to read staging file %s: %v", stagingFile, err)
+				}
+
+				// produce unified diff (currentFile vs stagingFile); ignore diff errors (non-zero exit means differences)
+				diffCmd := exec.Command("diff", "-u", currentFile, stagingFile)
+				diffOut, _ := diffCmd.Output() // we don't fail if diff returns non-zero
+
+				// create temp file prefilled with staging content + marked diff
+				tmp, err := os.CreateTemp("", "hokuto-edit-")
+				if err != nil {
+					return fmt.Errorf("failed to create temp file for editing: %v", err)
+				}
+				tmpPath := tmp.Name()
+				defer func() {
+					tmp.Close()
+					_ = os.Remove(tmpPath)
+				}()
+
+				if _, err := tmp.Write(stContent); err != nil {
+					return fmt.Errorf("failed to write staging content to temp file: %v", err)
+				}
+
+				// append a separator and diff output for reference
+				if len(diffOut) > 0 {
+					if _, err := tmp.WriteString("\n\n--- diff (installed -> staging) ---\n"); err != nil {
+						return fmt.Errorf("failed to write diff header to temp file: %v", err)
+					}
+					if _, err := tmp.Write(diffOut); err != nil {
+						return fmt.Errorf("failed to write diff to temp file: %v", err)
+					}
+				}
+
+				// close before launching editor
+				if err := tmp.Close(); err != nil {
+					return fmt.Errorf("failed to close temp file before editing: %v", err)
+				}
+
+				editor := os.Getenv("EDITOR")
+				if editor == "" {
+					editor = "nano"
+				}
+
+				// Launch editor against the temp file as the invoking user so they can edit comfortably.
+				editCmd := exec.Command(editor, tmpPath)
+				editCmd.Stdin, editCmd.Stdout, editCmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+				if err := editCmd.Run(); err != nil {
+					return fmt.Errorf("editor failed: %v", err)
+				}
+
+				// After editing, copy temp back to staging
+				cpCmd := exec.Command("cp", "--preserve=mode,ownership,timestamps", tmpPath, stagingFile)
+				if err := RootExec.Run(cpCmd); err != nil {
+					return fmt.Errorf("failed to copy edited file back to staging %s: %v", stagingFile, err)
+				}
+				// --- NEW: Explicitly restore permissions ---
+				// The `cp --preserve=mode` relies on the temp file's mode, which is wrong.
+				// Use chmod to ensure the correct original mode is set.
+				// We format the mode to an octal string (e.g., "0644").
+				modeStr := fmt.Sprintf("%#o", originalMode.Perm())
+
+				chmodCmd := exec.Command("chmod", modeStr, stagingFile)
+				if err := RootExec.Run(chmodCmd); err != nil {
+					return fmt.Errorf("failed to restore permissions on %s to %s: %v", stagingFile, modeStr, err)
+				}
+			}
+		} else {
+			// file does NOT exist in staging
+			fmt.Printf("User modified %s, but new package has no file. Keep it? [y/N]: ", file)
+			var input string
+			fmt.Scanln(&input)
+			ans := strings.ToLower(strings.TrimSpace(input))
+			if ans == "y" {
+				// ensure staging directory exists (run as root)
+				stagingFileDir := filepath.Dir(stagingFile)
+				mkdirCmd := exec.Command("mkdir", "-p", stagingFileDir)
+				if err := RootExec.Run(mkdirCmd); err != nil {
+					return fmt.Errorf("failed to create directory %s: %v", stagingFileDir, err)
+				}
+				// copy current file into staging preserving attributes
+				cpCmd := exec.Command("cp", "--preserve=mode,ownership,timestamps", currentFile, stagingFile)
+				if err := RootExec.Run(cpCmd); err != nil {
+					return fmt.Errorf("failed to copy %s to staging: %v", file, err)
+				}
+				fmt.Printf("Kept modified file by copying %s into staging\n", file)
+			} else {
+				// user chose not to keep it -> remove the installed file (run as root)
+				rmCmd := exec.Command("rm", "-f", currentFile)
+				if err := RootExec.Run(rmCmd); err != nil {
+					// warn but continue install; do not abort the whole install for a removal failure
+					fmt.Printf("warning: failed to remove %s: %v\n", currentFile, err)
+				} else {
+					fmt.Printf("Removed user-modified file: %s\n", file)
+				}
+			}
+		}
+	}
+	// Generate updated manifest of staging
+	stagingManifest := stagingDir + "/var/db/hokuto/installed/" + pkgName + "/manifest"
+	stagingManifest2dir := "/tmp/staging-manifest-" + pkgName
+	stagingManifest2file := filepath.Join(stagingManifest2dir, "/manifest")
+	if err := generateManifest(stagingDir, stagingManifest2dir, RootExec); err != nil {
+		return fmt.Errorf("failed to generate manifest: %v", err)
+	}
+	if err := updateManifestWithNewFiles(stagingManifest, stagingManifest2file); err != nil {
+		fmt.Fprintf(os.Stderr, "Manifest update failed: %v\n", err)
+	}
+	// Delete stagingManifest2dir
+	rmCmd := exec.Command("rm", "-rf", stagingManifest2dir)
+	if err := RootExec.Run(rmCmd); err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to remove StagingManifest: %v", err)
+	}
+	// 4. Determine obsolete files (compare manifests)
+	filesToDelete, err := removeObsoleteFiles(pkgName, stagingDir, rootDir)
+	if err != nil {
+		return err
+	}
+
+	// 5. Rsync staging into root
+	if err := rsyncStaging(stagingDir, rootDir, RootExec); err != nil {
+		return fmt.Errorf("failed to sync staging to %s: %v", rootDir, err)
+	}
+
+	// 6. Remove files that were scheduled for deletion
+	for _, p := range filesToDelete {
+		rmCmd = exec.Command("rm", "-f", p)
+		if err := RootExec.Run(rmCmd); err != nil {
+			fmt.Printf("warning: failed to remove obsolete file %s: %v\n", p, err)
+		} else {
+			fmt.Printf("Removed obsolete file: %s\n", p)
+		}
+	}
+	// 7. Run package post-install script (non-fatal on chroot failure)
+	if err := executePostInstall(pkgName, rootDir, RootExec); err != nil {
+		// executePostInstall will already treat chroot failures as non-fatal,
+		// but handle any unexpected errors here.
+		fmt.Printf("warning: post-install for %s returned error: %v\n", pkgName, err)
+	}
+	return nil
+}
+
 // Entry point
 func main() {
 	if len(os.Args) < 2 {
@@ -1895,7 +2012,7 @@ func main() {
 		pkgName := os.Args[2]
 
 		// Assume cfg is already loaded from /etc/hokuto.conf
-		if err := buildEntry(pkgName, cfg); err != nil {
+		if err := pkgBuild(pkgName, cfg); err != nil {
 			fmt.Printf("Error building package %s: %v\n", pkgName, err)
 			os.Exit(1)
 		}
