@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"flag"
 	"fmt"
 	"io"
 	"io/fs"
@@ -644,7 +645,7 @@ func verifyOrCreateChecksums(pkgName, pkgDir string) error {
 }
 
 // checksum command
-func hokutoChecksum(pkgName string, cfg *Config) error {
+func hokutoChecksum(pkgName string) error {
 
 	paths := strings.Split(repoPaths, ":")
 	var pkgDir string
@@ -1943,6 +1944,23 @@ type fileMetadata struct {
 	B3Sum   string
 }
 
+// userprompt for install after build
+func getUserConfirmation(prompt string) bool {
+	reader := bufio.NewReader(os.Stdin)
+	for {
+		fmt.Print(prompt)
+		input, _ := reader.ReadString('\n')
+		input = strings.TrimSpace(strings.ToLower(input))
+		if input == "y" || input == "" {
+			return true
+		}
+		if input == "n" {
+			return false
+		}
+		fmt.Println("Invalid input. Please enter 'y' or 'n'.")
+	}
+}
+
 // build package
 func pkgBuild(pkgName string, cfg *Config, execCtx *Executor) error {
 	// set tmpdir
@@ -1984,7 +2002,10 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor) error {
 		Context:         execCtx.Context, // Inherit the main cancellation context
 		ShouldRunAsRoot: needsRootBuild,  // Set the privilege based on 'asroot' file
 	}
-
+	// Download sources if required
+	if err := hokutoChecksum(pkgName); err != nil {
+		return fmt.Errorf("failed to fetch sources: %v", err)
+	}
 	// Prepare sources in build directory
 	if err := prepareSources(pkgName, pkgDir, buildDir, buildExec); err != nil {
 		return fmt.Errorf("failed to prepare sources: %v", err)
@@ -2172,6 +2193,10 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 		ShouldRunAsRoot: needsRootBuild,
 	}
 
+	// Download sources if required
+	if err := hokutoChecksum(pkgName); err != nil {
+		return fmt.Errorf("failed to fetch sources: %v", err)
+	}
 	// Prepare sources
 	if err := prepareSources(pkgName, pkgDir, buildDir, buildExec); err != nil {
 		return fmt.Errorf("failed to prepare sources: %v", err)
@@ -3044,165 +3069,332 @@ func main() {
 			return
 		}
 		pkg := os.Args[2]
-		if err := hokutoChecksum(pkg, cfg); err != nil {
+		if err := hokutoChecksum(pkg); err != nil {
 			fmt.Println("Error:", err)
 		}
+
 	case "build":
-		if len(os.Args) < 3 {
-			fmt.Println("Usage: hokuto build <package>")
+		// 1. Initialize a FlagSet for the "build" subcommand
+		buildCmd := flag.NewFlagSet("build", flag.ExitOnError)
+		var autoInstall = buildCmd.Bool("a", false, "Automatically install the package(s) after successful build without prompting.")
+
+		// Parse the arguments specific to the "build" subcommand,
+		// starting from os.Args[2] (i.e., skipping "hokuto" and "build")
+		if err := buildCmd.Parse(os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "Error parsing build flags: %v\n", err)
 			os.Exit(1)
 		}
-		pkgName := os.Args[2]
+
+		// The positional arguments (package names) are now in buildCmd.Args()
+		packagesToProcess := buildCmd.Args()
+		if len(packagesToProcess) < 1 {
+			fmt.Println("Usage: hokuto build [options] <package> [package...]")
+			fmt.Println("Options:")
+			buildCmd.PrintDefaults()
+			os.Exit(1)
+		}
 
 		// Set to non-critical (0 is default, but good to be explicit)
 		isCriticalAtomic.Store(0)
 
-		// --- NEW DEPENDENCY CHECK LOGIC ---
+		// --- GLOBAL DEPENDENCY RESOLUTION & BINARY CHECK ---
 
-		// Initialize tracking maps and list
-		processed := make(map[string]bool)
-		var missingDeps []string
+		// masterMissingDeps will hold all unique packages needed across all requested builds (in reverse build order)
+		var masterMissingDeps []string
+		// masterProcessed tracks all dependencies across all packages to avoid duplicates and loops
+		masterProcessed := make(map[string]bool)
 
-		// Resolve all missing dependencies, including the target package itself
-		// if it's not installed (though the build logic handles that later).
-		fmt.Printf("Resolving dependencies for package %s...\n", pkgName)
-		if err := resolveMissingDeps(pkgName, processed, &missingDeps); err != nil {
-			fmt.Fprintf(os.Stderr, "Error resolving dependencies: %v\n", err)
-			os.Exit(1)
+		// Track which packages the user explicitly requested (to defer final install)
+		targetPackages := make(map[string]bool)
+		for _, pkg := range packagesToProcess {
+			targetPackages[pkg] = true
 		}
 
-		// The list is currently in **reverse build order** (e.g., mpv, libass, ffmpeg).
-		// We reverse it to get the correct build order (ffmpeg, libass, mpv).
-		// This is a simple form of topological sort.
+		// 2. Resolve dependencies for ALL requested packages
+		for _, pkgName := range packagesToProcess {
+			fmt.Printf("Resolving dependencies for target package %s...\n", pkgName)
 
-		packagesToBuild := missingDeps
+			// NOTE: resolveMissingDeps must be able to handle being called multiple times
+			// and update masterProcessed and masterMissingDeps correctly, acting like a global resolver.
+			if err := resolveMissingDeps(pkgName, masterProcessed, &masterMissingDeps); err != nil {
+				fmt.Fprintf(os.Stderr, "Error resolving dependencies for %s: %v\n", pkgName, err)
+				os.Exit(1)
+			}
+		}
 
-		// If packagesToBuild is empty, the target package and all its deps are installed.
+		// masterMissingDeps now contains the union of all missing packages (dependencies + targets) in reverse build order.
+		packagesToBuild := masterMissingDeps
+		var finalPackagesToBuild []string
+
+		// 3. BINARY CHECK AND USER PROMPT LOGIC (for all collected packages)
+		for _, depPkg := range packagesToBuild {
+			version, err := getRepoVersion(depPkg)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Fatal error: could not determine version for %s: %v\n", depPkg, err)
+				os.Exit(1)
+			}
+			tarballPath := filepath.Join(BinDir, fmt.Sprintf("%s-%s.tar.zst", depPkg, version))
+
+			// Only consider using a binary if it is NOT one of the user-requested target packages
+			if !targetPackages[depPkg] {
+				if _, err := os.Stat(tarballPath); err == nil {
+					// Binary exists
+					fmt.Printf("Dependency '%s' is not installed, but a built binary (%s) is available.\n", depPkg, filepath.Base(tarballPath))
+
+					// PROMPT: Do you want to use the pre-built binary?
+					if !getUserConfirmation(fmt.Sprintf("Do you want to use the available binary package for dependency %s? (Y/n) ", depPkg)) {
+						fmt.Printf("User chose to build %s.\n", depPkg)
+						finalPackagesToBuild = append(finalPackagesToBuild, depPkg)
+					} else {
+						fmt.Printf("Using available binary for %s. Installing...\n", depPkg)
+						// Immediate install of dependency binary
+						isCriticalAtomic.Store(1)
+						if err := pkgInstall(tarballPath, depPkg, cfg, RootExec); err != nil {
+							isCriticalAtomic.Store(0)
+							fmt.Fprintf(os.Stderr, "Fatal error installing binary %s: %v\n", depPkg, err)
+							os.Exit(1)
+						}
+						isCriticalAtomic.Store(0)
+						fmt.Printf("Dependency %s installed successfully from binary.\n", depPkg)
+						// This package is installed and won't be built, so skip adding to finalPackagesToBuild
+					}
+				} else {
+					// No binary found, must build
+					finalPackagesToBuild = append(finalPackagesToBuild, depPkg)
+				}
+			} else {
+				// User-requested target package, always proceed to build
+				finalPackagesToBuild = append(finalPackagesToBuild, depPkg)
+			}
+		}
+
+		// Update the final list of packages to actually build
+		packagesToBuild = finalPackagesToBuild
+
+		// --- FINAL LIST CHECK AND SORTING ---
+
+		// Check for the rebuild-only case for packages that were originally requested
 		if len(packagesToBuild) == 0 {
-			// Build the target package only (user requested a rebuild).
-			// ... (rest of the logic for rebuild) ...
-			fmt.Printf("Package %s and all its dependencies are already installed. Rebuilding target package.\n", pkgName)
-			packagesToBuild = []string{pkgName}
-		} else {
-			// Build the missing dependencies plus the target package.
-			fmt.Printf("The following packages need to be built: %s\n", strings.Join(packagesToBuild, ", "))
+			if len(masterMissingDeps) == 0 {
+				// If masterMissingDeps was initially empty, the user wants a rebuild of all targets
+				fmt.Printf("All packages and dependencies are already installed. Rebuilding target package(s).\n")
+				packagesToBuild = packagesToProcess // Set to the original requested list
+			} else {
+				// All required packages were installed from available binaries. Nothing left to do.
+				fmt.Printf("All required packages are installed (many from available binaries). No build needed.\n")
+				os.Exit(0)
+			}
 		}
+
+		fmt.Printf("The following packages will be built in order: %s\n", strings.Join(packagesToBuild, ", "))
 
 		// --- EXECUTION OF BUILD LOOP ---
-		// Loop through the final list:
+		var builtTargetPackages []string // Track the target packages that were successfully built
 		for _, buildPkg := range packagesToBuild {
-
-			// --- STEP 3A: Get Version ---
-			// Use the existing global getRepoVersion function.
+			// ... (Steps 3A, 3B - Get Version, Build) ...
 			version, err := getRepoVersion(buildPkg)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Fatal error: could not determine version for %s: %v\n", buildPkg, err)
 				os.Exit(1)
 			}
-
-			// Determine the final tarball path (using the global BinDir)
 			tarballPath := filepath.Join(BinDir, fmt.Sprintf("%s-%s.tar.zst", buildPkg, version))
 
-			// --- STEP 3B: Build ---
 			fmt.Printf("--- Starting Build: %s (%s) ---\n", buildPkg, version)
-			// NOTE: pkgBuild uses UserExec because the build process should run under the user's privilege.
 			if err := pkgBuild(buildPkg, cfg, UserExec); err != nil {
 				fmt.Fprintf(os.Stderr, "Fatal error building %s: %v\n", buildPkg, err)
 				os.Exit(1)
 			}
 
-			// --- STEP 3C: Install ---
-			// If the build was successful, install the result immediately using the RootExecutor.
-
-			// 1. Set to CRITICAL (1) before install (as done in the "install" case)
-			isCriticalAtomic.Store(1)
-
-			// 2. Call pkgInstall with the required tarballPath, pkgName, cfg, and RootExec
-			if err := pkgInstall(tarballPath, buildPkg, cfg, RootExec); err != nil {
-				// 3. Reset CRITICAL state on failure
+			// --- STEP 3C: Install (Dependencies are installed immediately) ---
+			if !targetPackages[buildPkg] { // If it's *not* a target package (i.e., it's a dependency)
+				// Install dependencies immediately
+				isCriticalAtomic.Store(1)
+				if err := pkgInstall(tarballPath, buildPkg, cfg, RootExec); err != nil {
+					isCriticalAtomic.Store(0)
+					fmt.Fprintf(os.Stderr, "Fatal error installing dependency %s: %v\n", buildPkg, err)
+					os.Exit(1)
+				}
 				isCriticalAtomic.Store(0)
-				fmt.Fprintf(os.Stderr, "Fatal error installing %s: %v\n", buildPkg, err)
-				os.Exit(1)
+				fmt.Printf("Dependency %s installed successfully.\n", buildPkg)
+			} else {
+				// If it's a target package, defer install and save its name
+				builtTargetPackages = append(builtTargetPackages, buildPkg)
+				fmt.Printf("Target package %s built successfully. Installation deferred.\n", buildPkg)
 			}
-
-			// 4. Reset CRITICAL state on success
-			isCriticalAtomic.Store(0)
-
-			fmt.Printf("Package %s installed successfully.\n", buildPkg)
 		}
 
+		// --- FINAL INSTALL PROMPT ---
+		if len(builtTargetPackages) > 0 {
+			// Note: The prompt/auto-install applies to ALL built target packages
+			shouldInstall := *autoInstall
+			if !shouldInstall {
+				// Prompt user once for all built target packages
+				targetsList := strings.Join(builtTargetPackages, ", ")
+				shouldInstall = getUserConfirmation(fmt.Sprintf("Build finished. Do you want to install the following package(s): %s? (Y/n) ", targetsList))
+			}
+
+			if shouldInstall {
+				// Loop and install all successfully built target packages
+				for _, finalPkg := range builtTargetPackages {
+					version, _ := getRepoVersion(finalPkg) // Re-get version (should not fail)
+					tarballPath := filepath.Join(BinDir, fmt.Sprintf("%s-%s.tar.zst", finalPkg, version))
+
+					fmt.Printf("Starting installation of target package %s...\n", finalPkg)
+					isCriticalAtomic.Store(1)
+					if err := pkgInstall(tarballPath, finalPkg, cfg, RootExec); err != nil {
+						isCriticalAtomic.Store(0)
+						fmt.Fprintf(os.Stderr, "Fatal error installing final package %s: %v\n", finalPkg, err)
+						os.Exit(1)
+					}
+					isCriticalAtomic.Store(0)
+					fmt.Printf("Package %s installed successfully.\n", finalPkg)
+				}
+			} else {
+				fmt.Printf("Installation of target packages skipped by user. Built packages remain in %s.\n", BinDir)
+			}
+		}
+
+		// Clean up or exit after a successful run
+		os.Exit(0)
+
 	case "install":
-		if len(os.Args) < 3 {
-			fmt.Println("Usage: hokuto install <tarball|pkgname>")
+		// Get all arguments after "hokuto" and "install"
+		args := os.Args[2:]
+		if len(args) == 0 {
+			fmt.Println("Usage: hokuto install <tarball|pkgname> [tarball|pkgname...]")
 			os.Exit(1)
 		}
 
-		arg := os.Args[2]
-		var tarballPath, pkgName string
-
-		if strings.HasSuffix(arg, ".tar.zst") {
-			// Direct tarball path
-			tarballPath = arg
-			base := filepath.Base(tarballPath)
-			pkgName = strings.SplitN(base, "-", 2)[0]
-		} else {
-			// Package name
-			pkgName = arg
-			version, err := getRepoVersion(pkgName)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-				os.Exit(1)
-			}
-
-			tarballPath = filepath.Join(BinDir, fmt.Sprintf("%s-%s.tar.zst", pkgName, version))
-			if _, err := os.Stat(tarballPath); err != nil {
-				fmt.Fprintf(os.Stderr, "Tarball not found: %s\n", tarballPath)
-				os.Exit(1)
-			}
-		}
-
-		// Set to CRITICAL (1)
+		// Set to CRITICAL (1) for the entire installation process
 		isCriticalAtomic.Store(1)
 		// Ensure it is reset when the install function returns/panics
 		defer isCriticalAtomic.Store(0)
 
-		if err := pkgInstall(tarballPath, pkgName, cfg, RootExec); err != nil {
-			fmt.Fprintf(os.Stderr, "Error installing package %s: %v\n", pkgName, err)
+		allSucceeded := true
+
+		// Loop through all provided arguments (tarballs or package names)
+		for _, arg := range args {
+			var tarballPath, pkgName string
+
+			fmt.Printf("Processing argument: %s\n", arg)
+
+			if strings.HasSuffix(arg, ".tar.zst") {
+				// Direct tarball path
+				tarballPath = arg
+				base := filepath.Base(tarballPath)
+
+				// Determine package name from tarball filename (e.g., pkgname-version.tar.zst)
+				parts := strings.SplitN(base, "-", 2)
+				if len(parts) < 1 {
+					fmt.Fprintf(os.Stderr, "Error: Could not determine package name from tarball file name: %s\n", arg)
+					allSucceeded = false
+					continue
+				}
+				pkgName = parts[0]
+
+				// Verify the tarball actually exists before attempting install
+				if _, err := os.Stat(tarballPath); err != nil {
+					fmt.Fprintf(os.Stderr, "Error: Tarball not found or inaccessible: %s\n", tarballPath)
+					allSucceeded = false
+					continue
+				}
+
+			} else {
+				// Package name
+				pkgName = arg
+
+				// 1. Get the version for the package
+				version, err := getRepoVersion(pkgName)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "Error determining version for %s: %v\n", pkgName, err)
+					allSucceeded = false
+					continue
+				}
+
+				// 2. Determine the expected path in BinDir
+				tarballPath = filepath.Join(BinDir, fmt.Sprintf("%s-%s.tar.zst", pkgName, version))
+
+				// 3. Check if the pre-built tarball exists
+				if _, err := os.Stat(tarballPath); err != nil {
+					fmt.Fprintf(os.Stderr, "Error: Built package tarball not found for %s at %s. You must 'hokuto build' it first.\n", pkgName, tarballPath)
+					allSucceeded = false
+					continue
+				}
+			}
+
+			// --- Installation Execution ---
+			fmt.Printf("Starting installation of %s from %s...\n", pkgName, tarballPath)
+
+			if err := pkgInstall(tarballPath, pkgName, cfg, RootExec); err != nil {
+				fmt.Fprintf(os.Stderr, "Error installing package %s: %v\n", pkgName, err)
+				allSucceeded = false
+				// Continue to the next package
+				continue
+			}
+
+			fmt.Printf("Package %s installed successfully.\n", pkgName)
+		}
+
+		if !allSucceeded {
+			// Exit with an error code if any package failed to install
 			os.Exit(1)
 		}
 
 	case "uninstall":
-		if len(os.Args) < 3 {
-			fmt.Println("Usage: hokuto uninstall [-f] [-y] <pkgname>")
+		// 1. Initialize a FlagSet for the "uninstall" subcommand
+		uninstallCmd := flag.NewFlagSet("uninstall", flag.ExitOnError)
+		var force = uninstallCmd.Bool("f", false, "Force uninstallation, ignoring dependency checks.")
+		var yes = uninstallCmd.Bool("y", false, "Assume 'yes' to all prompts.")
+		// Also support long flags for consistency, though the user didn't specify them
+		var forceLong = uninstallCmd.Bool("force", false, "Force uninstallation, ignoring dependency checks.")
+		var yesLong = uninstallCmd.Bool("yes", false, "Assume 'yes' to all prompts.")
+
+		// Parse the arguments specific to the "uninstall" subcommand,
+		// starting from os.Args[2] (i.e., skipping "hokuto" and "uninstall")
+		if err := uninstallCmd.Parse(os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "Error parsing uninstall flags: %v\n", err)
 			os.Exit(1)
 		}
-		// simple flag parsing
-		force := false
-		yes := false
-		var pkgName string
-		for _, a := range os.Args[2:] {
-			if a == "-f" || a == "--force" {
-				force = true
-				continue
-			}
-			if a == "-y" || a == "--yes" {
-				yes = true
-				continue
-			}
-			pkgName = a
-		}
-		if pkgName == "" {
-			fmt.Println("Usage: hokuto uninstall [-f] [-y] <pkgname>")
+
+		// The positional arguments (package names) are now in uninstallCmd.Args()
+		packagesToUninstall := uninstallCmd.Args()
+
+		if len(packagesToUninstall) == 0 {
+			fmt.Println("Usage: hokuto uninstall [options] <pkgname> [pkgname...]")
+			fmt.Println("Options:")
+			uninstallCmd.PrintDefaults()
 			os.Exit(1)
 		}
-		// critical section
+
+		// Combine short and long flags for the final effective value
+		effectiveForce := *force || *forceLong
+		effectiveYes := *yes || *yesLong
+
+		// critical section for the entire operation
 		isCriticalAtomic.Store(1)
 		defer isCriticalAtomic.Store(0)
-		if err := pkgUninstall(pkgName, cfg, RootExec, force, yes); err != nil {
-			fmt.Fprintf(os.Stderr, "Error uninstalling %s: %v\n", pkgName, err)
+
+		// Loop through all provided packages and attempt to uninstall each one
+		allSucceeded := true
+		for _, pkgName := range packagesToUninstall {
+			fmt.Printf("Attempting to uninstall package: %s\n", pkgName)
+
+			// The pkgUninstall function must be updated to accept the final flag values
+			if err := pkgUninstall(pkgName, cfg, RootExec, effectiveForce, effectiveYes); err != nil {
+				fmt.Fprintf(os.Stderr, "Error uninstalling %s: %v\n", pkgName, err)
+				allSucceeded = false
+				// Continue to the next package instead of os.Exit(1) immediately
+				// This allows for partial success if one package fails but others succeed.
+			} else {
+				fmt.Printf("Package %s removed\n", pkgName)
+			}
+		}
+
+		if !allSucceeded {
+			// Exit with an error code if any package failed to uninstall
 			os.Exit(1)
 		}
-		fmt.Printf("Package %s removed\n", pkgName)
+		// If all packages were successfully uninstalled, exit cleanly
 
 	default:
 		fmt.Println("Unknown command:", os.Args[1])
