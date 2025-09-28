@@ -2125,9 +2125,208 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor) error {
 	return nil
 }
 
+// pkgBuildRebuild is used after an uninstall/upgrade to rebuild dependent packages.
+// It skips tarball creation, cleanup, and runs with an adjusted environment.
+// oldLibsDir is the path to the temporary directory containing backed-up libraries.
+func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir string) error {
+
+	// --- Setup (Same as pkgBuild) ---
+	pkgTmpDir := filepath.Join(tmpDir, pkgName)
+	buildDir := filepath.Join(pkgTmpDir, "build")
+	outputDir := filepath.Join(pkgTmpDir, "output")
+
+	// Clean and re-create build/output dirs
+	if err := os.RemoveAll(pkgTmpDir); err != nil {
+		return fmt.Errorf("failed to clean pkg tmp dir %s: %v", pkgTmpDir, err)
+	}
+	for _, dir := range []string{buildDir, outputDir} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return fmt.Errorf("failed to create dir %s: %v", dir, err)
+		}
+	}
+
+	// Determine package source directory (Same as pkgBuild)
+	paths := strings.Split(repoPaths, ":")
+	var pkgDir string
+	found := false
+	for _, repo := range paths {
+		tryPath := filepath.Join(repo, pkgName)
+		if info, err := os.Stat(tryPath); err == nil && info.IsDir() {
+			pkgDir = tryPath
+			found = true
+			break
+		}
+	}
+	if !found {
+		return fmt.Errorf("package %s not found in HOKUTO_PATH", pkgName)
+	}
+
+	// 1. Determine the Execution Context
+	asRootFile := filepath.Join(pkgDir, "asroot")
+	needsRootBuild := false
+	if _, err := os.Stat(asRootFile); err == nil {
+		needsRootBuild = true
+	}
+	buildExec := &Executor{
+		Context:         execCtx.Context,
+		ShouldRunAsRoot: needsRootBuild,
+	}
+
+	// Prepare sources
+	if err := prepareSources(pkgName, pkgDir, buildDir, buildExec); err != nil {
+		return fmt.Errorf("failed to prepare sources: %v", err)
+	}
+
+	// Read version
+	versionFile := filepath.Join(pkgDir, "version")
+	versionData, err := os.ReadFile(versionFile)
+	if err != nil {
+		return fmt.Errorf("failed to read version file: %v", err)
+	}
+	version := strings.Fields(string(versionData))[0]
+
+	// Build script
+	buildScript := filepath.Join(pkgDir, "build")
+	if _, err := os.Stat(buildScript); err != nil {
+		return fmt.Errorf("build script not found: %v", err)
+	}
+
+	// 2. Build environment (Modified to include the backed-up libs for Executor tools)
+	env := os.Environ()
+	defaults := map[string]string{
+		"AR":          "gcc-ar",
+		"CC":          "cc",
+		"CXX":         "c++",
+		"NM":          "gcc-nm",
+		"RANLIB":      "gcc-ranlib",
+		"CFLAGS":      "-O2 -march=x86-64 -mtune=generic -pipe -fPIC",
+		"CXXFLAGS":    "",
+		"LDFLAGS":     "",
+		"MAKEFLAGS":   fmt.Sprintf("-j%d", runtime.NumCPU()),
+		"RUSTFLAGS":   fmt.Sprintf("--remap-path-prefix=%s=.", buildDir),
+		"GOFLAGS":     "-trimpath -modcacherw",
+		"GOPATH":      filepath.Join(buildDir, "go"),
+		"HOKUTO_ROOT": rootDir,
+		"TMPDIR":      tmpDir,
+	}
+
+	// Prepend oldLibsDir to PATH and LD_LIBRARY_PATH for tools run by the Executor
+	// This allows system tools (tar, rsync, cp) used by the Executor to function,
+	// even if they depend on the newly removed libraries.
+	// The build script itself *should not* rely on the executor's PATH/LD_LIBRARY_PATH
+	// for finding its own build dependencies.
+	oldLibBin := filepath.Join(oldLibsDir, "bin")
+	oldLibUsrBin := filepath.Join(oldLibsDir, "usr", "bin")
+	oldLibLib := filepath.Join(oldLibsDir, "lib")
+	oldLibUsrLib := filepath.Join(oldLibsDir, "usr", "lib")
+
+	// Update PATH
+	currentPath := os.Getenv("PATH")
+	newPath := fmt.Sprintf("PATH=%s:%s:%s", oldLibBin, oldLibUsrBin, currentPath)
+	env = append(env, newPath)
+
+	// Update LD_LIBRARY_PATH
+	currentLdLibPath := os.Getenv("LD_LIBRARY_PATH")
+	newLdLibPath := fmt.Sprintf("LD_LIBRARY_PATH=%s:%s:%s", oldLibLib, oldLibUsrLib, currentLdLibPath)
+	env = append(env, newLdLibPath)
+
+	for k, def := range defaults {
+		val := cfg.Values[k]
+		if val == "" {
+			val = def
+		}
+		if k == "CXXFLAGS" && val == "" {
+			val = cfg.Values["CFLAGS"]
+			if val == "" {
+				val = defaults["CFLAGS"]
+			}
+		}
+		// Only append non-overridden environment variables
+		if k != "PATH" && k != "LD_LIBRARY_PATH" {
+			env = append(env, fmt.Sprintf("%s=%s", k, val))
+		}
+	}
+
+	// Run build script
+	fmt.Printf("Rebuilding %s (version %s) in %s, install to %s (root=%v)\n",
+		pkgName, version, buildDir, outputDir, buildExec)
+
+	cmd := exec.Command(buildScript, outputDir, version)
+	cmd.Dir = buildDir
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.Env = env
+	if err := buildExec.Run(cmd); err != nil {
+		return fmt.Errorf("rebuild failed: %v", err)
+	}
+
+	// Create /var/db/hokuto/installed/<pkgName> inside the staging outputDir
+	installedDir := filepath.Join(outputDir, "var", "db", "hokuto", "installed", pkgName)
+	fmt.Printf("Creating metadata directory: %s\n", installedDir)
+	mkdirCmd := exec.Command("mkdir", "-p", installedDir)
+	if err := buildExec.Run(mkdirCmd); err != nil {
+		return fmt.Errorf("failed to create installed dir: %v", err)
+	}
+
+	// Generate libdeps
+	libdepsFile := filepath.Join(installedDir, "libdeps")
+	if err := generateLibDeps(outputDir, libdepsFile, buildExec); err != nil {
+		fmt.Printf("Warning: failed to generate libdeps: %v\n", err)
+	} else {
+		fmt.Printf("Library dependencies written to %s\n", libdepsFile)
+	}
+
+	// Generate depends
+	if err := generateDepends(pkgName, pkgDir, outputDir, rootDir, buildExec); err != nil {
+		return fmt.Errorf("failed to generate depends: %v", err)
+	}
+	fmt.Printf("Depends written to %s\n", filepath.Join(installedDir, "depends"))
+
+	fmt.Printf("%s built successfully, output in %s\n", pkgName, outputDir)
+
+	// Copy version file from pkgDir
+	versionSrc := filepath.Join(pkgDir, "version")
+	versionDst := filepath.Join(installedDir, "version")
+	cpCmd := exec.Command("cp", "--remove-destination", versionSrc, versionDst)
+	if err := buildExec.Run(cpCmd); err != nil {
+		return fmt.Errorf("failed to copy version file: %v", err)
+	}
+
+	// Copy post-install file from pkgDir if it exists
+	postinstallSrc := filepath.Join(pkgDir, "post-install")
+	postinstallDst := filepath.Join(installedDir, "post-install")
+
+	if fi, err := os.Stat(postinstallSrc); err == nil && !fi.IsDir() {
+		// ensure installedDir exists
+		if err := os.MkdirAll(filepath.Dir(postinstallDst), 0o755); err != nil {
+			return fmt.Errorf("failed to create installed dir: %v", err)
+		}
+
+		cpCmd := exec.Command("cp", "--remove-destination", postinstallSrc, postinstallDst)
+		if err := buildExec.Run(cpCmd); err != nil {
+			return fmt.Errorf("failed to copy post-install file: %v", err)
+		}
+	} else if err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("failed to stat post-install file: %v", err)
+	}
+
+	// Generate manifest
+	if err := generateManifest(outputDir, installedDir, buildExec); err != nil {
+		return fmt.Errorf("failed to generate manifest: %v", err)
+	}
+
+	fmt.Printf("%s rebuilt successfully, output in %s\n", pkgName, outputDir)
+
+	// Key difference: Skip tarball creation and cleanup to allow pkgInstall to sync and clean up.
+	return nil
+}
+
 func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor) error {
 
 	stagingDir := filepath.Join(tmpDir, "staging", pkgName)
+
+	// Declare and initialize the 'failed' slice for tracking non-fatal errors
+	var failed []string
 
 	// Clean staging dir
 	os.RemoveAll(stagingDir)
@@ -2292,10 +2491,107 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor) err
 	if err := execCtx.Run(rmCmd); err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to remove StagingManifest: %v", err)
 	}
+
 	// 4. Determine obsolete files (compare manifests)
 	filesToDelete, err := removeObsoleteFiles(pkgName, stagingDir, rootDir)
 	if err != nil {
 		return err
+	}
+
+	// --- NEW: Dependency Check and Backup (Before deletion) ---
+	affectedPackages := make(map[string]struct{})
+	libFilesToDelete := make(map[string]struct{})
+	tempLibBackupDir, err := os.MkdirTemp(tmpDir, "hokuto-lib-backup-")
+	if err != nil {
+		return fmt.Errorf("failed to create temporary backup directory: %v", err)
+	}
+	// CLEANUP: Ensure the backup directory is removed on exit
+	defer func() {
+		if os.Getenv("HOKUTO_DEBUG") != "1" {
+			rmCmd := exec.Command("rm", "-rf", tempLibBackupDir)
+			if err := execCtx.Run(rmCmd); err != nil {
+				fmt.Fprintf(os.Stderr, "warning: failed to cleanup temporary library backup: %v\n", err)
+			}
+		} else {
+			fmt.Fprintf(os.Stderr, "INFO: Skipping cleanup of %s due to HOKUTO_DEBUG=1\n", tempLibBackupDir)
+		}
+	}()
+
+	// 4a. Check filesToDelete against all libdeps
+	allInstalledEntries, err := os.ReadDir(Installed)
+	if err == nil {
+		for _, entry := range allInstalledEntries {
+			if !entry.IsDir() || entry.Name() == pkgName {
+				continue // Skip files or the package currently being installed
+			}
+
+			otherPkgName := entry.Name()
+			libdepsPath := filepath.Join(Installed, otherPkgName, "libdeps")
+
+			libdepsContent, err := readFileAsRoot(libdepsPath)
+			if err != nil {
+				continue // Skip if libdeps file is unreadable
+			}
+
+			// Check if any file in filesToDelete is a libdep of otherPkgName
+			lines := strings.Split(string(libdepsContent), "\n")
+			for _, line := range lines {
+				libPath := strings.TrimSpace(line)
+				if libPath == "" {
+					continue
+				}
+
+				// Construct the absolute path to the library file currently on the system
+				// libdeps should contain paths relative to rootDir (e.g., /usr/lib/libfoo.so)
+				absLibPath := libPath
+				if rootDir != "/" && strings.HasPrefix(libPath, "/") {
+					absLibPath = filepath.Join(rootDir, libPath[1:])
+				} else if !strings.HasPrefix(libPath, "/") {
+					// This is unexpected for libdeps, but handle defensively
+					absLibPath = filepath.Join(rootDir, libPath)
+				}
+
+				// Check if this library is scheduled for deletion
+				for _, fileToDelete := range filesToDelete {
+					if fileToDelete == absLibPath {
+						affectedPackages[otherPkgName] = struct{}{}
+						libFilesToDelete[absLibPath] = struct{}{}
+						// Break inner loop and check the next libdep
+						break
+					}
+				}
+			}
+		}
+	}
+
+	// 4b. Backup all affected library files
+	for libPath := range libFilesToDelete {
+		// libPath is the HOKUTO_ROOT-prefixed path (e.g., /tmp/hokuto/usr/lib/libfoo.so)
+
+		// Determine the relative path inside the HOKUTO_ROOT (e.g., usr/lib/libfoo.so)
+		relPath, err := filepath.Rel(rootDir, libPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "warning: failed to determine relative path for backup %s: %v\n", libPath, err)
+			continue
+		}
+
+		// Construct the full backup path (e.g., /tmp/hokuto-lib-backup-XXXX/usr/lib/libfoo.so)
+		backupPath := filepath.Join(tempLibBackupDir, relPath)
+		backupDir := filepath.Dir(backupPath)
+
+		// Create the directory structure in the backup location
+		mkdirCmd := exec.Command("mkdir", "-p", backupDir)
+		if err := execCtx.Run(mkdirCmd); err != nil {
+			return fmt.Errorf("failed to create backup dir %s: %v", backupDir, err)
+		}
+
+		// Copy the library file to the backup location
+		cpCmd := exec.Command("cp", "--remove-destination", "--preserve=mode,ownership,timestamps", libPath, backupPath)
+		if err := execCtx.Run(cpCmd); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: failed to backup library %s: %v\n", libPath, err)
+		} else {
+			fmt.Printf("Backed up affected library %s to %s\n", libPath, backupPath)
+		}
 	}
 
 	// 5. Rsync staging into root
@@ -2305,18 +2601,81 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor) err
 
 	// 6. Remove files that were scheduled for deletion
 	for _, p := range filesToDelete {
-		rmCmd = exec.Command("rm", "-f", p)
+		rmCmd := exec.Command("rm", "-f", p)
 		if err := execCtx.Run(rmCmd); err != nil {
 			fmt.Printf("warning: failed to remove obsolete file %s: %v\n", p, err)
 		} else {
 			fmt.Printf("Removed obsolete file: %s\n", p)
 		}
 	}
-	// 7. Run package post-install script (non-fatal on chroot failure)
+
+	// 7. Run package post-install script
 	if err := executePostInstall(pkgName, rootDir, execCtx); err != nil {
-		// executePostInstall will already treat chroot failures as non-fatal,
-		// but handle any unexpected errors here.
 		fmt.Printf("warning: post-install for %s returned error: %v\n", pkgName, err)
+	}
+
+	// --- Rebuild Affected Packages (Step 8) ---
+	if len(affectedPackages) > 0 {
+		affectedList := make([]string, 0, len(affectedPackages))
+		for pkg := range affectedPackages {
+			affectedList = append(affectedList, pkg)
+		}
+		sort.Strings(affectedList)
+
+		// 8a. Prompt for rebuild (Hokuto is guaranteed to be run in a terminal)
+		fmt.Printf("\nWARNING: The following packages depend on libraries that were removed/upgraded:\n  %s\n", strings.Join(affectedList, ", "))
+
+		performRebuild := true // Default to true, and allow user input to override
+
+		fmt.Printf("Do you want to rebuild these packages now? This is highly recommended. [Y/n]: ")
+
+		var answer string
+		// Read the line. Using '_' to discard the error and the count,
+		// as we only care if 'answer' is "n".
+		_, _ = fmt.Scanln(&answer) // Corrected line: 'err' replaced with '_'
+
+		// Check if the trimmed input is 'n' (No). An empty input (user pressed Enter)
+		// or an error (like EOF on Enter) will fall through to 'performRebuild = true'.
+		if strings.ToLower(strings.TrimSpace(answer)) == "n" {
+			fmt.Println("Skipping rebuild. System stability may be compromised.")
+			performRebuild = false
+		}
+		// If err != nil (like when only Enter is pressed), or input is empty/ 'y',
+		// performRebuild remains true.
+
+		// 8b. Perform rebuild
+		if performRebuild {
+			fmt.Println("Starting rebuild of affected packages...")
+			for _, pkg := range affectedList {
+				fmt.Printf("\n--- Rebuilding %s ---\n", pkg)
+
+				if err := pkgBuildRebuild(pkg, cfg, execCtx, tempLibBackupDir); err != nil {
+					failed = append(failed, fmt.Sprintf("rebuild of %s failed: %v", pkg, err))
+					fmt.Printf("WARNING: Rebuild of %s failed: %v\n", pkg, err)
+				} else {
+					rebuildOutputDir := filepath.Join(tmpDir, pkg, "output")
+
+					if err := rsyncStaging(rebuildOutputDir, rootDir, execCtx); err != nil {
+						failed = append(failed, fmt.Sprintf("failed to sync rebuilt package %s to root: %v", pkg, err))
+						fmt.Printf("WARNING: Failed to sync rebuilt package %s to root: %v\n", pkg, err)
+					}
+
+					rmCmd := exec.Command("rm", "-rf", filepath.Join(tmpDir, pkg))
+					if err := execCtx.Run(rmCmd); err != nil {
+						fmt.Fprintf(os.Stderr, "failed to cleanup rebuild tmpdirs for %s: %v\n", pkg, err)
+					}
+					fmt.Printf("Rebuild of %s finished and installed.\n", pkg)
+				}
+			}
+		}
+	}
+
+	// 9. Cleanup original staging dir
+	os.RemoveAll(stagingDir)
+
+	// 10. Report failures if any
+	if len(failed) > 0 { // 'failed' slice is correctly declared at the start of pkgInstall
+		return fmt.Errorf("some file actions failed:\n%s", strings.Join(failed, "\n"))
 	}
 	return nil
 }
