@@ -1871,13 +1871,76 @@ func parseDependsFile(pkgDir string) ([]string, error) {
 	return dependencies, nil
 }
 
-// reverseStringSlice reverses the order of a string slice in place.
-// helper for correct build order
-func reverseStringSlice(s []string) []string {
-	for i, j := 0, len(s)-1; i < j; i, j = i+1, j-1 {
-		s[i], s[j] = s[j], s[i]
-	}
-	return s
+// list of essential directories that should never be removed by rmdir.
+// These are absolute paths expected to be found under the HOKUTO_ROOT.
+// We use a map for O(1) lookup.
+var forbiddenSystemDirs = map[string]struct{}{
+	"/bin":   {},
+	"/dev":   {},
+	"/home":  {},
+	"/lib":   {},
+	"/lib32": {},
+	"/lib64": {},
+	"/mnt":   {},
+	"/opt":   {},
+	"/proc":  {},
+	"/root":  {},
+	"/sbin":  {},
+	"/sys":   {},
+	"/usr":   {},
+	"/var":   {},
+	"/etc":   {},
+	"/tmp":   {},
+	"/boot":  {},
+	"/run":   {},
+	"/swap":  {},
+	// Common subdirectories
+	"/etc/profile.d":           {},
+	"/usr/bin":                 {},
+	"/usr/include":             {},
+	"/usr/lib":                 {},
+	"/usr/lib32":               {},
+	"/usr/lib64":               {},
+	"/usr/local":               {},
+	"/usr/sbin":                {},
+	"/usr/share":               {},
+	"/usr/src":                 {},
+	"/usr/share/man":           {},
+	"/usr/share/man/man1":      {},
+	"/usr/share/man/man2":      {},
+	"/usr/share/man/man3":      {},
+	"/usr/share/man/man4":      {},
+	"/usr/share/man/man5":      {},
+	"/usr/share/man/man6":      {},
+	"/usr/share/man/man7":      {},
+	"/usr/share/man/man8":      {},
+	"/var/cache":               {},
+	"/var/db":                  {},
+	"/var/db/hokuto":           {},
+	"/var/db/hokuto/installed": {},
+	"/var/db/hokuto/sources":   {},
+	"/var/empty":               {},
+	"/var/lib":                 {},
+	"/var/local":               {},
+	"/var/lock":                {},
+	"/var/log":                 {},
+	"/var/mail":                {},
+	"/var/opt":                 {},
+	"/var/run":                 {},
+	"/var/service":             {},
+	"/var/spool":               {},
+	"/var/tmp":                 {},
+	"/var/tmpdir":              {},
+	"/var/lib/misc":            {},
+	"/var/spool/mail":          {},
+	"/var/log/old":             {},
+	// Custom/provided paths
+	"/repo": {}, // If 'repo' is a top-level system directory
+}
+
+type fileMetadata struct {
+	AbsPath string
+	B3Sum   string
 }
 
 // build package
@@ -2258,6 +2321,255 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor) err
 	return nil
 }
 
+// uninstallPackage removes an installed package safely.
+// - pkgName: package to remove
+// - cfg: configuration (used for HOKUTO_ROOT)
+// - execCtx: Executor that must have ShouldRunAsRoot=true (RootExec)
+// - force: ignore reverse-dep checks
+// - yes: assume confirmation
+func pkgUninstall(pkgName string, cfg *Config, execCtx *Executor, force, yes bool) error {
+	// Resolve HOKUTO_ROOT (fall back to "/")
+	hRoot := cfg.Values["HOKUTO_ROOT"]
+	if hRoot == "" {
+		hRoot = "/"
+	}
+
+	installedDir := filepath.Join(hRoot, "var", "db", "hokuto", "installed", pkgName)
+	manifestPath := filepath.Join(installedDir, "manifest")
+
+	// Path prefix for internal metadata files that should skip the b3sum check.
+	internalFilePrefix := filepath.Join(hRoot, "var", "db", "hokuto", "installed")
+
+	// 1. Verify package exists
+	if _, err := os.Stat(installedDir); err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("package %s is not installed", pkgName)
+		}
+		return fmt.Errorf("failed to stat package metadata: %v", err)
+	}
+
+	// 2. Read manifest as root
+	manifestBytes, err := readFileAsRoot(manifestPath)
+	if err != nil {
+		return fmt.Errorf("failed to read manifest for %s: %v", pkgName, err)
+	}
+
+	// 3. Build list of files and directories from manifest.
+	var files []fileMetadata // CHANGED: Use new struct to store B3Sum
+	var dirs []string
+	var fileCount int // Track only installable files for confirmation message
+
+	sc := bufio.NewScanner(strings.NewReader(string(manifestBytes)))
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 1 { // Need at least the path
+			continue
+		}
+		pathInManifest := fields[0]
+
+		// b3sum is the second field if it exists, otherwise empty.
+		expectedSum := ""
+		if len(fields) > 1 {
+			expectedSum = fields[1]
+		}
+
+		// Calculate the absolute path on the filesystem, relative to HOKUTO_ROOT.
+		absPath := pathInManifest
+		if filepath.IsAbs(pathInManifest) {
+			if hRoot != "/" {
+				absPath = filepath.Join(hRoot, pathInManifest[1:])
+			} else {
+				absPath = pathInManifest
+			}
+		} else {
+			absPath = filepath.Join(hRoot, pathInManifest)
+		}
+
+		// directory entries end with '/'
+		if strings.HasSuffix(pathInManifest, "/") {
+			dirs = append(dirs, absPath)
+			continue
+		}
+
+		// Only count actual files for the confirmation prompt (Step 5)
+		fileCount++
+		files = append(files, fileMetadata{AbsPath: absPath, B3Sum: expectedSum})
+	}
+	if err := sc.Err(); err != nil {
+		return fmt.Errorf("error parsing manifest: %v", err)
+	}
+
+	// 4. Check reverse dependencies (unchanged)
+	// ... (Original Step 4 code) ...
+	dependents := []string{}
+	dbRoot := filepath.Join(hRoot, "var", "db", "hokuto", "installed")
+	entries, err := os.ReadDir(dbRoot)
+	if err == nil {
+		for _, e := range entries {
+			if !e.IsDir() {
+				continue
+			}
+			other := e.Name()
+			if other == pkgName {
+				continue
+			}
+			depFile := filepath.Join(dbRoot, other, "depends")
+			b, err := readFileAsRoot(depFile)
+			if err != nil {
+				continue
+			}
+			lines := strings.Split(string(b), "\n")
+			for _, L := range lines {
+				L = strings.TrimSpace(L)
+				if L == "" {
+					continue
+				}
+				parts := strings.Fields(L)
+				if len(parts) == 0 {
+					continue
+				}
+				if parts[0] == pkgName {
+					dependents = append(dependents, other)
+					break
+				}
+			}
+		}
+	}
+	if len(dependents) > 0 && !force {
+		return fmt.Errorf("cannot uninstall %s: other packages depend on it: %s", pkgName, strings.Join(dependents, ", "))
+	}
+
+	// 5. Confirm with user unless 'yes' is set
+	if !yes {
+		// Use fileCount for the prompt
+		fmt.Printf("About to remove package %s and %d file(s). Continue? [y/N]: ", pkgName, fileCount)
+		var answer string
+		fmt.Scanln(&answer)
+		if strings.ToLower(strings.TrimSpace(answer)) != "y" {
+			return fmt.Errorf("aborted by user")
+		}
+	}
+
+	// 6. Run pre-uninstall if present (unchanged)
+	preScript := filepath.Join(installedDir, "pre-uninstall")
+	if fi, err := os.Stat(preScript); err == nil && !fi.IsDir() {
+		cmd := exec.Command(preScript)
+		cmd.Stdin = os.Stdin
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		if err := execCtx.Run(cmd); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: pre-uninstall script failed: %v\n", err)
+		}
+	}
+
+	// 7. Remove files (with b3sum check)
+	var failed []string
+	for _, meta := range files {
+		p := meta.AbsPath // The full HOKUTO_ROOT prefixed path
+
+		// Safety check: don't remove root
+		clean := filepath.Clean(p)
+		if clean == "/" || clean == hRoot {
+			failed = append(failed, fmt.Sprintf("%s: refused to remove root", p))
+			continue
+		}
+
+		// Check b3sum unless the file is internal metadata
+		if !strings.HasPrefix(p, internalFilePrefix) && meta.B3Sum != "" {
+			currentSum, err := b3sum(p, execCtx)
+			if err != nil {
+				// Treat inability to check as a failure to remove for safety
+				failed = append(failed, fmt.Sprintf("%s: failed to compute b3sum: %v", p, err))
+				continue
+			}
+
+			if currentSum != meta.B3Sum {
+				fmt.Printf("\nWARNING: File %s has been modified (expected %s, found %s).\n", p, meta.B3Sum, currentSum)
+
+				// Prompt user unless 'yes' is set
+				if !yes {
+					fmt.Printf("File content mismatch. Remove anyway? [y/N]: ")
+					var answer string
+					fmt.Scanln(&answer)
+					if strings.ToLower(strings.TrimSpace(answer)) != "y" {
+						failed = append(failed, fmt.Sprintf("%s: content mismatch, removal skipped by user", p))
+						continue // Skip removal
+					}
+				}
+			}
+		}
+
+		// Removal command
+		rmCmd := exec.Command("rm", "-f", clean)
+		if err := execCtx.Run(rmCmd); err != nil {
+			failed = append(failed, fmt.Sprintf("%s: %v", p, err))
+			continue
+		}
+		fmt.Printf("Removed %s\n", p)
+	}
+
+	// 8. Try to rmdir directories recorded in manifest, deepest first (unchanged)
+	sort.Slice(dirs, func(i, j int) bool { return len(dirs[i]) > len(dirs[j]) })
+	for _, d := range dirs {
+		clean := filepath.Clean(d)
+
+		// Safety check 1: Don't attempt to rmdir outside HOKUTO_ROOT.
+		if !strings.HasPrefix(clean, filepath.Clean(hRoot)) {
+			continue
+		}
+
+		// Safety check 2: Check against forbidden system directories.
+		relToHRoot := strings.TrimPrefix(clean, filepath.Clean(hRoot))
+		if relToHRoot == "" {
+			relToHRoot = "/"
+		}
+
+		if !strings.HasPrefix(relToHRoot, "/") {
+			relToHRoot = "/" + relToHRoot
+		}
+
+		if _, found := forbiddenSystemDirs[relToHRoot]; found {
+			fmt.Printf("Skipping removal of protected system directory: %s\n", clean)
+			continue
+		}
+
+		rmdirCmd := exec.Command("rmdir", clean)
+		if err := execCtx.Run(rmdirCmd); err == nil {
+			fmt.Printf("Removed empty directory %s\n", clean)
+		}
+	}
+
+	// 9. Remove package metadata directory (unchanged)
+	rmMetaCmd := exec.Command("rm", "-rf", installedDir)
+	if err := execCtx.Run(rmMetaCmd); err != nil {
+		failed = append(failed, fmt.Sprintf("failed to remove metadata %s: %v", installedDir, err))
+	} else {
+		fmt.Printf("Removed package metadata: %s\n", installedDir)
+	}
+
+	// 10. Run post-uninstall hook if present (unchanged)
+	postScript := filepath.Join(installedDir, "post-uninstall")
+	if fi, err := os.Stat(postScript); err == nil && !fi.IsDir() {
+		cmd := exec.Command(postScript)
+		cmd.Stdin = os.Stdin
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		if err := execCtx.Run(cmd); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: post-uninstall script failed: %v\n", err)
+		}
+	}
+
+	// 11. Report failures if any (unchanged)
+	if len(failed) > 0 {
+		return fmt.Errorf("some removals failed:\n%s", strings.Join(failed, "\n"))
+	}
+	return nil
+}
+
 // Entry point
 func main() {
 
@@ -2499,6 +2811,40 @@ func main() {
 			fmt.Fprintf(os.Stderr, "Error installing package %s: %v\n", pkgName, err)
 			os.Exit(1)
 		}
+
+	case "uninstall":
+		if len(os.Args) < 3 {
+			fmt.Println("Usage: hokuto uninstall [-f] [-y] <pkgname>")
+			os.Exit(1)
+		}
+		// simple flag parsing
+		force := false
+		yes := false
+		var pkgName string
+		for _, a := range os.Args[2:] {
+			if a == "-f" || a == "--force" {
+				force = true
+				continue
+			}
+			if a == "-y" || a == "--yes" {
+				yes = true
+				continue
+			}
+			pkgName = a
+		}
+		if pkgName == "" {
+			fmt.Println("Usage: hokuto uninstall [-f] [-y] <pkgname>")
+			os.Exit(1)
+		}
+		// critical section
+		isCriticalAtomic.Store(1)
+		defer isCriticalAtomic.Store(0)
+		if err := pkgUninstall(pkgName, cfg, RootExec, force, yes); err != nil {
+			fmt.Fprintf(os.Stderr, "Error uninstalling %s: %v\n", pkgName, err)
+			os.Exit(1)
+		}
+		fmt.Printf("Package %s removed\n", pkgName)
+
 	default:
 		fmt.Println("Unknown command:", os.Args[1])
 	}
