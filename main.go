@@ -2235,80 +2235,74 @@ func stripPackage(outputDir string, buildExec *Executor) error {
 	}
 	concurrencyLimit := make(chan struct{}, maxConcurrency)
 
-	isStripable := func(path string, info os.FileInfo) bool {
-		// Must be a regular file (not a symlink) and have any execute bit set.
-		if !info.Mode().IsRegular() {
-			return false
-		}
-		if (info.Mode() & 0o111) == 0 {
-			return false
-		}
+	// --- PHASE 1: Execute 'find' command via the Executor to get the file list ---
 
-		// Quick magic check: read first 4 bytes and verify ELF magic.
-		f, err := os.Open(path)
-		if err != nil {
-			return false
-		}
-		defer f.Close()
+	shellCommand := fmt.Sprintf(
+		"find %s -type f \\( -perm /u+x -o -perm /g+x -o -perm /o+x \\) -exec sh -c 'file -0 {} | grep -q ELF && echo {}' \\;",
+		outputDir,
+	)
 
-		var hdr [4]byte
-		n, err := io.ReadFull(f, hdr[:])
-		if err != nil || n != 4 {
-			return false
-		}
+	// 1. Set up a buffer to capture the output of the find command.
+	var findOutput bytes.Buffer
 
-		// ELF magic: 0x7f 'E' 'L' 'F'
-		if hdr[0] == 0x7f && hdr[1] == 'E' && hdr[2] == 'L' && hdr[3] == 'F' {
-			return true
-		}
+	// 2. Wrap the complex logic in 'sh -c'
+	findCmd := exec.Command("sh", "-c", shellCommand)
 
-		// Not an ELF executable; skip.
-		return false
+	// Redirect find's Stdout to our buffer
+	findCmd.Stdout = &findOutput
+	// Ensure find's Stderr still goes to the system for debugging
+	findCmd.Stderr = os.Stderr
+
+	// 3. Run the find command using the Executor.
+	fmt.Println("  -> Discovering stripable ELF files...")
+	if err := buildExec.Run(findCmd); err != nil {
+		return fmt.Errorf("failed to execute file discovery command (find/file filter): %w", err)
 	}
 
-	walkFn := func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
+	// --- PHASE 2: Process the collected output (now newline-separated, not null) ---
+
+	// Because 'echo {}' is used, the paths are now separated by newlines,
+	// unless the file name itself contains a newline. For build systems, this is a safe assumption.
+	paths := strings.Split(strings.TrimSpace(findOutput.String()), "\n")
+
+	for _, path := range paths {
+		if path == "" {
+			continue
 		}
 
-		if info.IsDir() {
-			return nil
-		}
+		// Launch the stripping job
+		wg.Add(1)
+		concurrencyLimit <- struct{}{}
 
-		if isStripable(path, info) {
-			wg.Add(1)
-			concurrencyLimit <- struct{}{}
+		// capture local copy of path for goroutine
+		p := path
 
-			// capture local copy of path for goroutine
-			p := path
+		go func(p string) {
+			defer wg.Done()
+			defer func() { <-concurrencyLimit }()
 
-			go func(p string) {
-				defer wg.Done()
-				defer func() { <-concurrencyLimit }()
+			fmt.Printf("  -> Stripping %s\n", p)
 
-				fmt.Printf("  -> Stripping %s\n", p)
-
-				cmd := exec.Command("strip", p)
-				if err := buildExec.Run(cmd); err != nil {
-					errOnce.Do(func() {
-						firstError = fmt.Errorf("failed to strip %s: %w", p, err)
-					})
-					fmt.Fprintf(os.Stderr, "Warning: failed to strip %s: %v. Continuing.\n", p, err)
-				}
-			}(p)
-		}
-
-		return nil
+			stripCmd := exec.Command("strip", p)
+			// The strip command itself is executed with the Executor's privileges
+			if err := buildExec.Run(stripCmd); err != nil {
+				errOnce.Do(func() {
+					firstError = fmt.Errorf("failed to strip %s: %w", p, err)
+				})
+				// Use os.Stderr since the buildExec's Stderr is connected there
+				fmt.Fprintf(os.Stderr, "Warning: failed to strip %s: %v. Continuing.\n", p, err)
+			}
+		}(p)
 	}
 
-	if err := filepath.Walk(outputDir, walkFn); err != nil {
-		return fmt.Errorf("error walking output directory: %w", err)
-	}
+	// If the buffer is not terminated by a null byte, the remaining data is ignored.
+	// This is safe as 'find -print0' guarantees a null delimiter for every path.
 
+	// --- PHASE 3: Wait for all strip jobs to complete ---
 	wg.Wait()
 
 	if firstError != nil {
-		return fmt.Errorf("build failed during stripping phase for %s: %w", outputDir, firstError)
+		return fmt.Errorf("stripping phase failed for %s: %w", outputDir, firstError)
 	}
 
 	return nil
@@ -2972,7 +2966,7 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 
 func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor) error {
 
-	stagingDir := filepath.Join(tmpDir, "staging", pkgName)
+	stagingDir := filepath.Join(tmpDir, pkgName, "staging")
 
 	// Declare and initialize the 'failed' slice for tracking non-fatal errors
 	var failed []string
