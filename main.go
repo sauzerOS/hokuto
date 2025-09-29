@@ -40,6 +40,9 @@ var (
 	repoPaths  string
 	tmpDir     string
 	WantStrip  string
+	WantDebug  string
+	Debug      bool
+	WantLTO    string
 	ConfigFile = "/etc/hokuto.conf"
 	// Global executors (declared, to be assigned in main)
 	UserExec *Executor
@@ -50,6 +53,7 @@ var (
 type Config struct {
 	Values       map[string]string
 	DefaultStrip bool
+	DefaultLTO   bool
 }
 
 // Load /etc/hokuto.conf and apply defaults
@@ -114,6 +118,15 @@ func initConfig(cfg *Config) {
 		log.Fatalf("Critical error: HOKUTO_PATH is not set in the configuration.")
 	}
 
+	WantDebug = cfg.Values["HOKUTO_DEBUG"]
+	if WantDebug == "" {
+		WantDebug = "0"
+	}
+	Debug = false
+	if WantDebug == "1" {
+		Debug = true
+	}
+
 	tmpDir = cfg.Values["TMPDIR"]
 	if tmpDir == "" {
 		tmpDir = "/tmp"
@@ -123,6 +136,12 @@ func initConfig(cfg *Config) {
 	WantStrip := cfg.Values["HOKUTO_STRIP"]
 	if WantStrip == "0" {
 		cfg.DefaultStrip = false
+	}
+
+	cfg.DefaultLTO = false
+	WantLTO := cfg.Values["HOKUTO_LTO"]
+	if WantLTO == "1" {
+		cfg.DefaultLTO = true
 	}
 
 	CacheDir = "/var/cache/hokuto"
@@ -2463,6 +2482,14 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor) error {
 		shouldStrip = false // Override the global setting for this package only
 	}
 
+	// Check if LTO should be enabled
+	shouldLTO := cfg.DefaultLTO
+	noLTOFile := filepath.Join(pkgDir, "nolto")
+	if _, err := os.Stat(noLTOFile); err == nil {
+		fmt.Printf("Local 'nolto' file found in %s. Disabling LTO.\n", pkgDir)
+		shouldLTO = false // Override the global setting for this package only
+	}
+
 	// Read version
 	versionFile := filepath.Join(pkgDir, "version")
 	versionData, err := os.ReadFile(versionFile)
@@ -2496,18 +2523,58 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor) error {
 		"TMPDIR":      tmpDir,
 	}
 
+	// 1. Define the base C/C++/LD flags
+	var defaultCFLAGS = "-O2 -march=x86-64 -mtune=generic -pipe -fPIC"
+	var defaultLDFLAGS = ""
+
+	// 2. Select the appropriate keys and default values based on cfg.DefaultLTO
+	var cflagsKey, cxxflagsKey, ldflagsKey string
+
+	if shouldLTO {
+		cflagsKey = "CFLAGS_LTO"
+		cxxflagsKey = "CXXFLAGS_LTO"
+		ldflagsKey = "LDFLAGS_LTO"
+		// Set LTO defaults if they are not defined in the configuration
+		// (You'd likely define these globally in your program)
+		defaults["CFLAGS"] = defaultCFLAGS + " -flto=auto"   // Example LTO flag
+		defaults["LDFLAGS"] = defaultLDFLAGS + " -flto=auto" // Example LTO flag
+	} else {
+		cflagsKey = "CFLAGS"
+		cxxflagsKey = "CXXFLAGS"
+		ldflagsKey = "LDFLAGS"
+		defaults["CFLAGS"] = defaultCFLAGS
+		defaults["LDFLAGS"] = defaultLDFLAGS
+	}
+
+	// 3. Set CXXFLAGS default based on CFLAGS if not set, regardless of LTO
+	defaults["CXXFLAGS"] = ""
+
+	// 4. Override defaults with actual config values
+	// We only need to check the CFLAGS, CXXFLAGS, LDFLAGS keys now
+	// This ensures the correct, prioritized value from the config is used.
+	if val := cfg.Values[cflagsKey]; val != "" {
+		defaults["CFLAGS"] = val
+	}
+	if val := cfg.Values[cxxflagsKey]; val != "" {
+		defaults["CXXFLAGS"] = val
+	}
+	if val := cfg.Values[ldflagsKey]; val != "" {
+		defaults["LDFLAGS"] = val
+	}
+
+	// The CXXFLAGS fallback logic must be applied AFTER CFLAGS is finalized.
+	// We must apply it before the final loop, as the final loop simply appends.
+	finalCXXFLAGS := defaults["CXXFLAGS"]
+	if finalCXXFLAGS == "" {
+		// Fallback to CFLAGS if CXXFLAGS is still empty
+		finalCXXFLAGS = defaults["CFLAGS"]
+	}
+	defaults["CXXFLAGS"] = finalCXXFLAGS // Update the map with the resolved value
+
+	// 5. Final loop to assemble the environment array
 	for k, def := range defaults {
-		val := cfg.Values[k]
-		if val == "" {
-			val = def
-		}
-		if k == "CXXFLAGS" && val == "" {
-			val = cfg.Values["CFLAGS"]
-			if val == "" {
-				val = defaults["CFLAGS"]
-			}
-		}
-		env = append(env, fmt.Sprintf("%s=%s", k, val))
+		// k == "CXXFLAGS" logic is now simplified/removed from here because it was handled above.
+		env = append(env, fmt.Sprintf("%s=%s", k, def))
 	}
 
 	// Run build script
@@ -2516,9 +2583,20 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor) error {
 
 	cmd := exec.Command(buildScript, outputDir, version)
 	cmd.Dir = buildDir
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
 	cmd.Env = env
+
+	// Determine the output writer based on the Debug flag.
+	var outputWriter io.Writer = os.Stdout
+	var errorWriter io.Writer = os.Stderr
+
+	if !Debug {
+		// If not in debug mode, use io.Discard to suppress output.
+		outputWriter = io.Discard
+		errorWriter = io.Discard
+	}
+
+	cmd.Stdout = outputWriter
+	cmd.Stderr = errorWriter
 	// 3. CENTRALIZED EXECUTION: Use the selected Executor regardless of privilege.
 	// This replaces the entire conditional if/else block.
 	if err := buildExec.Run(cmd); err != nil {
@@ -2597,7 +2675,7 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor) error {
 	}
 
 	// Cleanup tmpdirs
-	if os.Getenv("HOKUTO_DEBUG") == "1" {
+	if Debug {
 		fmt.Fprintf(os.Stderr, "INFO: Skipping cleanup of %s due to HOKUTO_DEBUG=1\n", pkgTmpDir)
 	} else {
 		rmCmd := exec.Command("rm", "-rf", pkgTmpDir)
@@ -2673,6 +2751,14 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 		shouldStrip = false // Override the global setting for this package only
 	}
 
+	// Check if LTO should be enabled
+	shouldLTO := cfg.DefaultLTO
+	noLTOFile := filepath.Join(pkgDir, "nolto")
+	if _, err := os.Stat(noLTOFile); err == nil {
+		fmt.Printf("Local 'nolto' file found in %s. Disabling LTO.\n", pkgDir)
+		shouldLTO = false // Override the global setting for this package only
+	}
+
 	// Read version
 	versionFile := filepath.Join(pkgDir, "version")
 	versionData, err := os.ReadFile(versionFile)
@@ -2726,21 +2812,65 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 	newLdLibPath := fmt.Sprintf("LD_LIBRARY_PATH=%s:%s:%s", oldLibLib, oldLibUsrLib, currentLdLibPath)
 	env = append(env, newLdLibPath)
 
+	// 1. Define the base C/C++/LD flags
+	var defaultCFLAGS = "-O2 -march=x86-64 -mtune=generic -pipe -fPIC"
+	var defaultLDFLAGS = ""
+
+	// 2. Select the appropriate keys and default values based on cfg.DefaultLTO
+	var cflagsKey, cxxflagsKey, ldflagsKey string
+
+	if shouldLTO {
+		cflagsKey = "CFLAGS_LTO"
+		cxxflagsKey = "CXXFLAGS_LTO"
+		ldflagsKey = "LDFLAGS_LTO"
+		// Set LTO defaults if they are not defined in the configuration
+		// (You'd likely define these globally in your program)
+		defaults["CFLAGS"] = defaultCFLAGS + " -flto=auto"   // Example LTO flag
+		defaults["LDFLAGS"] = defaultLDFLAGS + " -flto=auto" // Example LTO flag
+	} else {
+		cflagsKey = "CFLAGS"
+		cxxflagsKey = "CXXFLAGS"
+		ldflagsKey = "LDFLAGS"
+		defaults["CFLAGS"] = defaultCFLAGS
+		defaults["LDFLAGS"] = defaultLDFLAGS
+	}
+
+	// 3. Set CXXFLAGS default based on CFLAGS if not set, regardless of LTO
+	defaults["CXXFLAGS"] = ""
+
+	// 4. Override defaults with actual config values
+	// We only need to check the CFLAGS, CXXFLAGS, LDFLAGS keys now
+	// This ensures the correct, prioritized value from the config is used.
+	if val := cfg.Values[cflagsKey]; val != "" {
+		defaults["CFLAGS"] = val
+	}
+	if val := cfg.Values[cxxflagsKey]; val != "" {
+		defaults["CXXFLAGS"] = val
+	}
+	if val := cfg.Values[ldflagsKey]; val != "" {
+		defaults["LDFLAGS"] = val
+	}
+
+	// The CXXFLAGS fallback logic must be applied AFTER CFLAGS is finalized.
+	// We must apply it before the final loop, as the final loop simply appends.
+	finalCXXFLAGS := defaults["CXXFLAGS"]
+	if finalCXXFLAGS == "" {
+		// Fallback to CFLAGS if CXXFLAGS is still empty
+		finalCXXFLAGS = defaults["CFLAGS"]
+	}
+	defaults["CXXFLAGS"] = finalCXXFLAGS // Update the map with the resolved value
+
+	// 5. Final loop to assemble the environment array
 	for k, def := range defaults {
-		val := cfg.Values[k]
-		if val == "" {
-			val = def
+		// Check if the current key should be excluded from being appended.
+		// This prevents the build process from overriding the system's PATH
+		// or LD_LIBRARY_PATH with an (potentially empty) value from 'defaults'.
+		if k == "PATH" || k == "LD_LIBRARY_PATH" {
+			continue // Skip appending the variable to respect the system's value
 		}
-		if k == "CXXFLAGS" && val == "" {
-			val = cfg.Values["CFLAGS"]
-			if val == "" {
-				val = defaults["CFLAGS"]
-			}
-		}
-		// Only append non-overridden environment variables
-		if k != "PATH" && k != "LD_LIBRARY_PATH" {
-			env = append(env, fmt.Sprintf("%s=%s", k, val))
-		}
+
+		// Append the build variable and its calculated value.
+		env = append(env, fmt.Sprintf("%s=%s", k, def))
 	}
 
 	// Run build script
@@ -2749,9 +2879,21 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 
 	cmd := exec.Command(buildScript, outputDir, version)
 	cmd.Dir = buildDir
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
 	cmd.Env = env
+
+	// Determine the output writer based on the Debug flag.
+	var outputWriter io.Writer = os.Stdout
+	var errorWriter io.Writer = os.Stderr
+
+	if !Debug {
+		// If not in debug mode, use io.Discard to suppress output.
+		// NOTE: You must have 'io' imported for io.Discard.
+		outputWriter = io.Discard
+		errorWriter = io.Discard
+	}
+
+	cmd.Stdout = outputWriter
+	cmd.Stderr = errorWriter
 	if err := buildExec.Run(cmd); err != nil {
 		return fmt.Errorf("rebuild failed: %v", err)
 	}
@@ -3014,7 +3156,7 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor) err
 	}
 	// CLEANUP: Ensure the backup directory is removed on exit
 	defer func() {
-		if os.Getenv("HOKUTO_DEBUG") != "1" {
+		if !Debug {
 			rmCmd := exec.Command("rm", "-rf", tempLibBackupDir)
 			if err := execCtx.Run(rmCmd); err != nil {
 				fmt.Fprintf(os.Stderr, "warning: failed to cleanup temporary library backup: %v\n", err)
