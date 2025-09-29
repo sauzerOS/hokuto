@@ -1098,11 +1098,40 @@ func shellEscape(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'"
 }
 
-// listOutputFiles generates a list of all files and directories in outputDir.
+// isDirectoryPrivileged uses the Executor to check if a path is a directory.
+// helper for listOutputFiles
+func isDirectoryPrivileged(path string, execCtx *Executor) (bool, error) {
+	// We use the shell 'test -d <path>' command.
+	// It returns exit code 0 if the path is a directory, 1 otherwise.
+	// Since this command is simple, we run it directly through the Executor.
+	cmd := exec.Command("test", "-d", path)
+
+	// The Run method returns nil on success (exit code 0).
+	err := execCtx.Run(cmd)
+
+	if err == nil {
+		// Exit code 0: it is a directory.
+		return true, nil
+	}
+
+	if exitError, ok := err.(*exec.ExitError); ok {
+		// Exit code 1: it is NOT a directory (or the path doesn't exist, etc.).
+		// Since 'find' already gave us the path, we assume exit code 1 means 'not a directory'.
+		if exitError.ExitCode() == 1 {
+			return false, nil
+		}
+		// Handle other non-zero exit codes as a genuine error (e.g., -1 for failure)
+		return false, fmt.Errorf("privileged test failed with unexpected exit code %d: %w", exitError.ExitCode(), err)
+	}
+
+	// Handle non-ExitError (e.g., failed to start the command)
+	return false, err
+}
+
 func listOutputFiles(outputDir string, execCtx *Executor) ([]string, error) {
 	var entries []string
 
-	// Use find via sudo to safely list all files and directories
+	// 1. Use find via sudo to safely list all files and directories (as before)
 	cmd := exec.Command("find", outputDir)
 	var out bytes.Buffer
 	cmd.Stdout = &out
@@ -1129,18 +1158,23 @@ func listOutputFiles(outputDir string, execCtx *Executor) ([]string, error) {
 			continue
 		}
 
-		info, err := os.Stat(path)
+		// --- AMENDED LOGIC: Use Executor to check file type ---
+
+		// 2. Determine if the file is a directory using the privileged Executor
+		isDir, err := isDirectoryPrivileged(path, execCtx)
 		if err != nil {
+			// Log this, but usually safe to skip if we can't determine the type
+			fmt.Fprintf(os.Stderr, "Warning: failed to stat file with privilege, skipping %s: %v\n", path, err)
 			continue
 		}
 
-		if info.IsDir() {
+		if isDir {
 			entries = append(entries, "/"+rel+"/")
 		} else {
 			entries = append(entries, "/"+rel)
 		}
 	}
-
+	// ... rest of listOutputFiles remains the same ...
 	if err := scanner.Err(); err != nil {
 		return nil, fmt.Errorf("scanner error: %v", err)
 	}
@@ -1167,20 +1201,32 @@ func generateManifest(outputDir, installedDir string, execCtx *Executor) error {
 	if err != nil {
 		return fmt.Errorf("failed to list output files: %v", err)
 	}
-
+	// --- AMENDMENT START ---
+	/*
+		fmt.Printf("\n--- Output Files in %s ---\n", outputDir)
+		// Assuming 'entries' is a []string or similar slice of file/directory names/paths
+		for _, entry := range entries {
+			// Print each entry to standard output
+			fmt.Println(entry)
+		}
+		fmt.Println("--------------------------------")
+	*/
+	// --- AMENDMENT END ---
 	// Remove manifest from entries if present
 	relManifest, err := filepath.Rel(outputDir, manifestFile)
 	if err != nil {
 		return fmt.Errorf("failed to compute relative path for manifest: %v", err)
 	}
+	// We only need the manifest path in the format used in 'entries'
+	manifestEntryPath := "/" + relManifest
 
+	// The final list will exclude the manifest (if found in outputDir) and then be manually added later.
 	filtered := []string{}
 	for _, e := range entries {
-		if e != "/"+relManifest {
+		if e != manifestEntryPath {
 			filtered = append(filtered, e)
 		}
 	}
-	filtered = append(filtered, "/"+relManifest)
 
 	// Open temp manifest for writing
 	f, err := os.OpenFile(tmpManifest, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
@@ -1190,13 +1236,13 @@ func generateManifest(outputDir, installedDir string, execCtx *Executor) error {
 	defer f.Close()
 
 	for _, entry := range filtered {
-		absPath := filepath.Join(outputDir, strings.TrimPrefix(entry, "/"))
-		info, err := os.Stat(absPath)
-		if err != nil {
-			continue
-		}
+		// NOTE: NO NEED FOR os.Stat HERE.
+		// We rely on the / suffix set by listOutputFiles.
 
-		if info.IsDir() {
+		isDir := strings.HasSuffix(entry, "/")
+
+		if isDir {
+			// Directory entry is cleaned to ensure proper format (e.g., // -> /)
 			cleaned := "/" + strings.Trim(strings.TrimPrefix(entry, "/"), "/") + "/"
 			if _, err := fmt.Fprintf(f, "%s\n", cleaned); err != nil {
 				return fmt.Errorf("failed to write manifest entry: %v", err)
@@ -1204,24 +1250,47 @@ func generateManifest(outputDir, installedDir string, execCtx *Executor) error {
 			continue
 		}
 
-		// Compute checksum with b3sum helper
+		// It is a file: need absolute path for b3sum
+		absPath := filepath.Join(outputDir, strings.TrimPrefix(entry, "/"))
+
+		// Compute checksum with b3sum helper (MUST be privileged if file is restricted)
 		checksum, err := b3sum(absPath, execCtx)
 		if err != nil {
+			// This now correctly fails if b3sum (which MUST use the Executor) fails
 			return fmt.Errorf("b3sum failed for %s: %v", absPath, err)
 		}
-
-		// The output parsing and error checking is now handled inside the b3sum function,
-		// but we still check the overall function error.
-		// Note: The rest of the logic remains the same, as the b3sum function now returns
-		// the computed checksum string directly.
 
 		if _, err := fmt.Fprintf(f, "%s  %s\n", entry, checksum); err != nil {
 			return fmt.Errorf("failed to write manifest entry: %v", err)
 		}
-
 	}
 
 	f.Close() // close before moving
+
+	// 2. Calculate checksum of the temporary manifest file.
+	// NOTE: This must use the unprivileged b3sum if possible, as the file is owned by the Go process.
+	// If b3sum MUST use the Executor, then you'd have to elevate here. Assuming unprivileged is fine
+	// since the file is in /tmp and owned by the builder.
+	tempChecksum, err := b3sum(tmpManifest, execCtx)
+	if err != nil {
+		return fmt.Errorf("b3sum failed for temporary manifest %s: %v", tmpManifest, err)
+	}
+
+	// 3. Re-open the temporary file in APPEND mode to add the final entry.
+	// We open it unprivileged, as the builder owns it.
+	f, err = os.OpenFile(tmpManifest, os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		return fmt.Errorf("failed to re-open temporary manifest file for final entry: %v", err)
+	}
+
+	// 4. Write the final manifest entry (path and checksum)
+	if _, err := fmt.Fprintf(f, "%s  %s\n", manifestEntryPath, tempChecksum); err != nil {
+		// Re-close and return the error.
+		f.Close()
+		return fmt.Errorf("failed to write final manifest entry: %v", err)
+	}
+
+	f.Close() // Close before moving
 
 	// Move temp manifest into installedDir as root
 	cpCmd := exec.Command("cp", "--remove-destination", tmpManifest, manifestFile)
@@ -1675,6 +1744,12 @@ func updateManifestWithNewFiles(stagingManifest, stagingManifest2 string) error 
 	const zeroChecksum = "000000" // The required replacement checksum
 
 	for path, newEntry := range newEntries {
+		// Ignore any entry that contains the temporary manifest identifier.
+		// This prevents the manifest file itself from being added to the final manifest.
+		if strings.Contains(path, "staging-manifest") {
+			continue
+		}
+
 		// Check if the file path exists in the original base manifest
 		if _, exists := baseEntries[path]; !exists {
 			// This is a new file! Add it to the list to be appended,
@@ -2422,11 +2497,12 @@ func askForConfirmation(prompt string) bool {
 func pkgBuild(pkgName string, cfg *Config, execCtx *Executor) error {
 	// set tmpdir
 	pkgTmpDir := filepath.Join(tmpDir, pkgName)
+	logDir := filepath.Join(pkgTmpDir, "log")
 	buildDir := filepath.Join(pkgTmpDir, "build")
 	outputDir := filepath.Join(pkgTmpDir, "output")
 
 	// Create build/output dirs (non-root, inside TMPDIR)
-	for _, dir := range []string{buildDir, outputDir} {
+	for _, dir := range []string{buildDir, outputDir, logDir} {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return fmt.Errorf("failed to create dir %s: %v", dir, err)
 		}
@@ -2575,22 +2651,46 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor) error {
 	fmt.Printf("Building %s (version %s) in %s, install to %s (root=%v)\n",
 		pkgName, version, buildDir, outputDir, buildExec)
 
+	// 1. Define the log file path
+	logFile, err := os.Create(filepath.Join(logDir, "build-log.txt"))
+	if err != nil {
+		// Handle the error (e.g., return it, or panic if log file creation is mandatory)
+		return fmt.Errorf("failed to create build log file: %w", err)
+	}
+	defer logFile.Close() // Ensure the log file is closed when the function exits
+
 	cmd := exec.Command(buildScript, outputDir, version)
 	cmd.Dir = buildDir
 	cmd.Env = env
 
-	// Determine the output writer based on the Debug flag.
-	var outputWriter io.Writer = os.Stdout
-	var errorWriter io.Writer = os.Stderr
+	// 2. Define the base writers: always log to the file.
+	// The file writer must be included regardless of the Debug flag.
+	var stdoutWriters []io.Writer
+	var stderrWriters []io.Writer
+
+	// Always write to the log file
+	stdoutWriters = append(stdoutWriters, logFile)
+	stderrWriters = append(stderrWriters, logFile)
+
+	// 3. Conditionally add the console writers based on the Debug flag.
+	var consoleOutputWriter io.Writer = os.Stdout
+	var consoleErrorWriter io.Writer = os.Stderr
 
 	if !Debug {
-		// If not in debug mode, use io.Discard to suppress output.
-		outputWriter = io.Discard
-		errorWriter = io.Discard
+		// If not in debug mode, suppress console output by discarding it.
+		consoleOutputWriter = io.Discard
+		consoleErrorWriter = io.Discard
 	}
 
-	cmd.Stdout = outputWriter
-	cmd.Stderr = errorWriter
+	// Add the console writers (either os.Stdout/os.Stderr or io.Discard)
+	stdoutWriters = append(stdoutWriters, consoleOutputWriter)
+	stderrWriters = append(stderrWriters, consoleErrorWriter)
+
+	// 4. Create the final MultiWriters
+	// io.MultiWriter combines all the writers in the slices.
+	cmd.Stdout = io.MultiWriter(stdoutWriters...)
+	cmd.Stderr = io.MultiWriter(stderrWriters...)
+
 	// 3. CENTRALIZED EXECUTION: Use the selected Executor regardless of privilege.
 	// This replaces the entire conditional if/else block.
 	if err := buildExec.Run(cmd); err != nil {
@@ -2690,6 +2790,7 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 	pkgTmpDir := filepath.Join(tmpDir, pkgName)
 	buildDir := filepath.Join(pkgTmpDir, "build")
 	outputDir := filepath.Join(pkgTmpDir, "output")
+	logDir := filepath.Join(pkgTmpDir, "log")
 
 	// Clean and re-create build/output dirs
 	if err := os.RemoveAll(pkgTmpDir); err != nil {
@@ -2871,23 +2972,46 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 	fmt.Printf("Rebuilding %s (version %s) in %s, install to %s (root=%v)\n",
 		pkgName, version, buildDir, outputDir, buildExec)
 
+	// 1. Define the log file path
+	logFile, err := os.Create(filepath.Join(logDir, "build-log.txt"))
+	if err != nil {
+		// Handle the error (e.g., return it, or panic if log file creation is mandatory)
+		return fmt.Errorf("failed to create build log file: %w", err)
+	}
+	defer logFile.Close() // Ensure the log file is closed when the function exits
+
 	cmd := exec.Command(buildScript, outputDir, version)
 	cmd.Dir = buildDir
 	cmd.Env = env
 
-	// Determine the output writer based on the Debug flag.
-	var outputWriter io.Writer = os.Stdout
-	var errorWriter io.Writer = os.Stderr
+	// 2. Define the base writers: always log to the file.
+	// The file writer must be included regardless of the Debug flag.
+	var stdoutWriters []io.Writer
+	var stderrWriters []io.Writer
+
+	// Always write to the log file
+	stdoutWriters = append(stdoutWriters, logFile)
+	stderrWriters = append(stderrWriters, logFile)
+
+	// 3. Conditionally add the console writers based on the Debug flag.
+	var consoleOutputWriter io.Writer = os.Stdout
+	var consoleErrorWriter io.Writer = os.Stderr
 
 	if !Debug {
-		// If not in debug mode, use io.Discard to suppress output.
-		// NOTE: You must have 'io' imported for io.Discard.
-		outputWriter = io.Discard
-		errorWriter = io.Discard
+		// If not in debug mode, suppress console output by discarding it.
+		consoleOutputWriter = io.Discard
+		consoleErrorWriter = io.Discard
 	}
 
-	cmd.Stdout = outputWriter
-	cmd.Stderr = errorWriter
+	// Add the console writers (either os.Stdout/os.Stderr or io.Discard)
+	stdoutWriters = append(stdoutWriters, consoleOutputWriter)
+	stderrWriters = append(stderrWriters, consoleErrorWriter)
+
+	// 4. Create the final MultiWriters
+	// io.MultiWriter combines all the writers in the slices.
+	cmd.Stdout = io.MultiWriter(stdoutWriters...)
+	cmd.Stderr = io.MultiWriter(stderrWriters...)
+
 	if err := buildExec.Run(cmd); err != nil {
 		return fmt.Errorf("rebuild failed: %v", err)
 	}
@@ -3129,6 +3253,7 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor) err
 	if err := updateManifestWithNewFiles(stagingManifest, stagingManifest2file); err != nil {
 		fmt.Fprintf(os.Stderr, "Manifest update failed: %v\n", err)
 	}
+
 	// Delete stagingManifest2dir
 	rmCmd := exec.Command("rm", "-rf", stagingManifest2dir)
 	if err := execCtx.Run(rmCmd); err != nil {
