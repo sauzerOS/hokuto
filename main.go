@@ -2388,23 +2388,14 @@ func stripPackage(outputDir string, buildExec *Executor) error {
 // We use a map for O(1) lookup.
 var forbiddenSystemDirs = map[string]struct{}{
 	"/bin":   {},
-	"/dev":   {},
-	"/home":  {},
 	"/lib":   {},
 	"/lib32": {},
 	"/lib64": {},
-	"/mnt":   {},
 	"/opt":   {},
-	"/proc":  {},
-	"/root":  {},
 	"/sbin":  {},
-	"/sys":   {},
 	"/usr":   {},
 	"/var":   {},
 	"/etc":   {},
-	"/tmp":   {},
-	"/boot":  {},
-	"/run":   {},
 	"/swap":  {},
 	// Common subdirectories
 	"/etc/profile.d":           {},
@@ -2446,8 +2437,22 @@ var forbiddenSystemDirs = map[string]struct{}{
 	"/var/lib/misc":            {},
 	"/var/spool/mail":          {},
 	"/var/log/old":             {},
-	// Custom/provided paths
-	"/repo": {}, // If 'repo' is a top-level system directory
+}
+
+// list of essential directories that should NEVER be removed, nor should any of their contents.
+// These use a prefix check (recursive protection).
+var forbiddenSystemDirsRecursive = map[string]struct{}{
+	"/boot":      {},
+	"/dev":       {},
+	"/home":      {},
+	"/mnt":       {},
+	"/proc":      {},
+	"/root":      {},
+	"/sys":       {},
+	"/tmp":       {},
+	"/run":       {},
+	"/snapshots": {},
+	"/repo":      {},
 }
 
 type fileMetadata struct {
@@ -2495,18 +2500,6 @@ func askForConfirmation(prompt string) bool {
 
 // build package
 func pkgBuild(pkgName string, cfg *Config, execCtx *Executor) error {
-	// set tmpdir
-	pkgTmpDir := filepath.Join(tmpDir, pkgName)
-	logDir := filepath.Join(pkgTmpDir, "log")
-	buildDir := filepath.Join(pkgTmpDir, "build")
-	outputDir := filepath.Join(pkgTmpDir, "output")
-
-	// Create build/output dirs (non-root, inside TMPDIR)
-	for _, dir := range []string{buildDir, outputDir, logDir} {
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			return fmt.Errorf("failed to create dir %s: %v", dir, err)
-		}
-	}
 
 	paths := strings.Split(repoPaths, ":")
 	var pkgDir string
@@ -2522,6 +2515,28 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor) error {
 	if !found {
 		return fmt.Errorf("package %s not found in HOKUTO_PATH", pkgName)
 	}
+
+	// 1. Initialize a LOCAL temporary directory variable with the global default.
+	currentTmpDir := tmpDir
+	// override tmpDir if noram is set
+	tmpDirfile := filepath.Join(pkgDir, "noram")
+	if _, err := os.Stat(tmpDirfile); err == nil {
+		currentTmpDir = "/var/tmpdir"
+	}
+
+	// set tmpdirs for build
+	pkgTmpDir := filepath.Join(currentTmpDir, pkgName)
+	logDir := filepath.Join(pkgTmpDir, "log")
+	buildDir := filepath.Join(pkgTmpDir, "build")
+	outputDir := filepath.Join(pkgTmpDir, "output")
+
+	// Create build/output dirs (non-root, inside TMPDIR)
+	for _, dir := range []string{buildDir, outputDir, logDir} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return fmt.Errorf("failed to create dir %s: %v", dir, err)
+		}
+	}
+
 	// 1. Determine the Execution Context for THIS PACKAGE.
 	// This check MUST stay here as it is package-specific.
 	asRootFile := filepath.Join(pkgDir, "asroot")
@@ -2590,7 +2605,7 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor) error {
 		"GOFLAGS":     "-trimpath -modcacherw",
 		"GOPATH":      filepath.Join(buildDir, "go"),
 		"HOKUTO_ROOT": cfg.Values["HOKUTO_ROOT"],
-		"TMPDIR":      tmpDir,
+		"TMPDIR":      currentTmpDir,
 	}
 
 	// 1. Define the base C/C++/LD flags
@@ -2785,23 +2800,6 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor) error {
 // It skips tarball creation, cleanup, and runs with an adjusted environment.
 // oldLibsDir is the path to the temporary directory containing backed-up libraries.
 func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir string) error {
-
-	// --- Setup (Same as pkgBuild) ---
-	pkgTmpDir := filepath.Join(tmpDir, pkgName)
-	buildDir := filepath.Join(pkgTmpDir, "build")
-	outputDir := filepath.Join(pkgTmpDir, "output")
-	logDir := filepath.Join(pkgTmpDir, "log")
-
-	// Clean and re-create build/output dirs
-	if err := os.RemoveAll(pkgTmpDir); err != nil {
-		return fmt.Errorf("failed to clean pkg tmp dir %s: %v", pkgTmpDir, err)
-	}
-	for _, dir := range []string{buildDir, outputDir} {
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			return fmt.Errorf("failed to create dir %s: %v", dir, err)
-		}
-	}
-
 	// Determine package source directory (Same as pkgBuild)
 	paths := strings.Split(repoPaths, ":")
 	var pkgDir string
@@ -2816,6 +2814,30 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 	}
 	if !found {
 		return fmt.Errorf("package %s not found in HOKUTO_PATH", pkgName)
+	}
+
+	// 1. Initialize a LOCAL temporary directory variable with the global default.
+	currentTmpDir := tmpDir
+	// override tmpDir if noram is set
+	tmpDirfile := filepath.Join(pkgDir, "noram")
+	if _, err := os.Stat(tmpDirfile); err == nil {
+		currentTmpDir = "/var/tmpdir"
+	}
+
+	// --- Setup (Same as pkgBuild) ---
+	pkgTmpDir := filepath.Join(currentTmpDir, pkgName)
+	buildDir := filepath.Join(pkgTmpDir, "build")
+	outputDir := filepath.Join(pkgTmpDir, "output")
+	logDir := filepath.Join(pkgTmpDir, "log")
+
+	// Clean and re-create build/output dirs
+	if err := os.RemoveAll(pkgTmpDir); err != nil {
+		return fmt.Errorf("failed to clean pkg tmp dir %s: %v", pkgTmpDir, err)
+	}
+	for _, dir := range []string{buildDir, outputDir} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return fmt.Errorf("failed to create dir %s: %v", dir, err)
+		}
 	}
 
 	// 1. Determine the Execution Context
@@ -2884,7 +2906,7 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 		"GOFLAGS":     "-trimpath -modcacherw",
 		"GOPATH":      filepath.Join(buildDir, "go"),
 		"HOKUTO_ROOT": rootDir,
-		"TMPDIR":      tmpDir,
+		"TMPDIR":      currentTmpDir,
 	}
 
 	// Prepend oldLibsDir to PATH and LD_LIBRARY_PATH for tools run by the Executor
@@ -3659,7 +3681,33 @@ func pkgUninstall(pkgName string, cfg *Config, execCtx *Executor, force, yes boo
 			relToHRoot = "/" + relToHRoot
 		}
 
-		if _, found := forbiddenSystemDirs[relToHRoot]; found {
+		isForbidden := false
+
+		// A. Check 1: Forbidden Recursive Directories (Prefix Check)
+		for forbiddenPath := range forbiddenSystemDirsRecursive {
+			// Trim the trailing slash for comparison, unless the path itself is "/"
+			recursiveRoot := forbiddenPath
+
+			// The path is forbidden if it's an exact match OR starts with the forbidden path + '/'
+			if relToHRoot == recursiveRoot {
+				isForbidden = true
+				break
+			}
+
+			if strings.HasPrefix(relToHRoot, recursiveRoot+"/") {
+				isForbidden = true
+				break
+			}
+		}
+
+		// B. Check 2: Forbidden Exact Directories (Map Lookup)
+		if !isForbidden {
+			if _, found := forbiddenSystemDirs[relToHRoot]; found {
+				isForbidden = true
+			}
+		}
+
+		if isForbidden {
 			fmt.Printf("Skipping removal of protected system directory: %s\n", clean)
 			continue
 		}
