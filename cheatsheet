@@ -1,0 +1,10 @@
+# Move (or create) the tag to the current HEAD
+git tag -a v1.0 -f -m "v1.0 release"
+
+# Sanity check
+git show v1.0
+
+# Push the tag to the remote, overwriting the old one
+git push origin v1.0 --force
+
+
