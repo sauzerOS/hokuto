@@ -51,10 +51,9 @@ var (
 	// Global executors (declared, to be assigned in main)
 	UserExec *Executor
 	RootExec *Executor
+	//go:embed assets/*.png
+	embeddedImages embed.FS
 )
-
-//go:embed assets/*.png
-var embeddedImages embed.FS
 
 // color helpers
 var (
@@ -87,69 +86,6 @@ func cPrintln(p colorPrinter, a ...interface{}) {
 		return
 	}
 	p.Println(a...)
-}
-
-// listEmbeddedImages returns the list of image asset names (relative to assets/)
-func listEmbeddedImages() ([]string, error) {
-	entries, err := embeddedImages.ReadDir("assets")
-	if err != nil {
-		return nil, err
-	}
-	var names []string
-	for _, e := range entries {
-		if !e.IsDir() {
-			names = append(names, e.Name())
-		}
-	}
-	return names, nil
-}
-
-// displayEmbeddedWithChafa writes the embedded image to a secure temp file and runs chafa.
-// ctx: use a cancellable context (pass the main ctx so Ctrl+C cancels chafa)
-// imgRelPath: the name relative to "assets/" (e.g., "foo.png")
-// chafaArgs: additional chafa flags (optional)
-func displayEmbeddedWithChafa(ctx context.Context, imgRelPath string, chafaArgs ...string) error {
-	// Read embedded bytes
-	data, err := embeddedImages.ReadFile(filepath.Join("assets", imgRelPath))
-	if err != nil {
-		return fmt.Errorf("embedded image not found: %w", err)
-	}
-
-	// Create secure temp file
-	f, err := os.CreateTemp("", "hokuto-img-*.png")
-	if err != nil {
-		return fmt.Errorf("create temp file: %w", err)
-	}
-	tmpPath := f.Name()
-
-	// Ensure file removed; keep f open long enough to write+sync
-	defer func() {
-		f.Close()
-		os.Remove(tmpPath)
-	}()
-
-	if _, err := f.Write(data); err != nil {
-		return fmt.Errorf("write temp image: %w", err)
-	}
-	if err := f.Sync(); err != nil {
-		// best-effort
-	}
-	if err := f.Close(); err != nil {
-		return fmt.Errorf("close tmp image: %w", err)
-	}
-
-	// Build chafa args: [tmpPath] + chafaArgs...
-	args := append([]string{tmpPath}, chafaArgs...)
-	cmd := exec.CommandContext(ctx, "chafa", args...)
-	cmd.Stdin = os.Stdin
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-
-	// Run and return any error (context cancels command when ctx done)
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("chafa failed: %w", err)
-	}
-	return nil
 }
 
 // Config struct
@@ -403,6 +339,69 @@ func (e *Executor) Run(cmd *exec.Cmd) error {
 	return nil
 }
 
+// listEmbeddedImages returns the list of image asset names (relative to assets/)
+func listEmbeddedImages() ([]string, error) {
+	entries, err := embeddedImages.ReadDir("assets")
+	if err != nil {
+		return nil, err
+	}
+	var names []string
+	for _, e := range entries {
+		if !e.IsDir() {
+			names = append(names, e.Name())
+		}
+	}
+	return names, nil
+}
+
+// displayEmbeddedWithChafa writes the embedded image to a secure temp file and runs chafa.
+// ctx: use a cancellable context (pass the main ctx so Ctrl+C cancels chafa)
+// imgRelPath: the name relative to "assets/" (e.g., "foo.png")
+// chafaArgs: additional chafa flags (optional)
+func displayEmbeddedWithChafa(ctx context.Context, imgRelPath string, chafaArgs ...string) error {
+	// Read embedded bytes
+	data, err := embeddedImages.ReadFile(filepath.Join("assets", imgRelPath))
+	if err != nil {
+		return fmt.Errorf("embedded image not found: %w", err)
+	}
+
+	// Create secure temp file
+	f, err := os.CreateTemp("", "hokuto-img-*.png")
+	if err != nil {
+		return fmt.Errorf("create temp file: %w", err)
+	}
+	tmpPath := f.Name()
+
+	// Ensure file removed; keep f open long enough to write+sync
+	defer func() {
+		f.Close()
+		os.Remove(tmpPath)
+	}()
+
+	if _, err := f.Write(data); err != nil {
+		return fmt.Errorf("write temp image: %w", err)
+	}
+	if err := f.Sync(); err != nil {
+		// best-effort
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("close tmp image: %w", err)
+	}
+
+	// Build chafa args: [tmpPath] + chafaArgs...
+	args := append([]string{tmpPath}, chafaArgs...)
+	cmd := exec.CommandContext(ctx, "chafa", args...)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	// Run and return any error (context cancels command when ctx done)
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("chafa failed: %w", err)
+	}
+	return nil
+}
+
 // List installed packages with version, supporting partial matches and showing build time.
 func listPackages(searchTerm string) error {
 	// Step 1: Always get the full list of installed package directories first.
@@ -456,21 +455,39 @@ func listPackages(searchTerm string) error {
 			versionInfo = strings.TrimSpace(string(data))
 		}
 
-		// Read buildtime (seconds) if present and format it as e.g. "8.15s"
+		// Read buildtime (duration string) if present.
 		buildtimeFile := filepath.Join(Installed, p, "buildtime")
 		buildtimeStr := ""
+
 		if data, err := os.ReadFile(buildtimeFile); err == nil {
 			raw := strings.TrimSpace(string(data))
 			if raw != "" {
-				// Try to parse as float seconds
-				if secs, err := strconv.ParseFloat(raw, 64); err == nil {
-					buildtimeStr = fmt.Sprintf("%.2fs", secs)
-				} else {
-					// If not a plain float, try to parse as a duration string
-					if d, err := time.ParseDuration(raw); err == nil {
+				// Try to parse the content as a time.Duration string.
+				if d, err := time.ParseDuration(raw); err == nil {
+
+					// Apply formatting rules based on magnitude:
+					if d >= time.Minute {
+						// >= 1 minute: Truncate to the nearest whole second (e.g., 18m53s)
+						buildtimeStr = d.Truncate(time.Second).String()
+					} else if d >= time.Second {
+						// 1s to 59s: Convert to raw seconds and format with 2 decimal places (e.g., 8.15s)
 						buildtimeStr = fmt.Sprintf("%.2fs", d.Seconds())
+					} else if d >= time.Millisecond {
+						// 1ms to 999ms: Format using milliseconds with limited precision (e.g., 35.29ms)
+						// This converts to floating point milliseconds and formats with 2 decimal places.
+						buildtimeStr = fmt.Sprintf("%.2fms", float64(d)/float64(time.Millisecond))
 					} else {
-						// Fallback: show raw value
+						// < 1ms: Use the standard duration string (e.g., 476µs or 500ns)
+						// Truncate to the nearest microsecond to keep it clean.
+						buildtimeStr = d.Truncate(time.Microsecond).String()
+					}
+
+				} else {
+					// Fallback for old format (plain float seconds)
+					if secs, err := strconv.ParseFloat(raw, 64); err == nil {
+						buildtimeStr = fmt.Sprintf("%.2fs", secs)
+					} else {
+						// Fallback: show the raw value.
 						buildtimeStr = raw
 					}
 				}
@@ -676,6 +693,46 @@ func newPackage(pkgName string) error {
 	cPrintf(colInfo, "=> Package %s created in %s.\n", pkgName, pkgDir)
 
 	return nil
+}
+
+// automatically edit version/sources/build of a package
+func editPackage(pkgName string) error {
+	// Determine editor
+	editor := os.Getenv("EDITOR")
+	if editor == "" {
+		editor = os.Getenv("VISUAL")
+	}
+	if editor == "" {
+		editor = "nano" // sensible default
+	}
+
+	// Build paths relative to current working directory
+	cwd, err := os.Getwd()
+	if err != nil {
+		return err
+	}
+	pkgDir := filepath.Join(cwd, pkgName)
+
+	// Ensure directory exists
+	if fi, err := os.Stat(pkgDir); err != nil || !fi.IsDir() {
+		return fmt.Errorf("package directory %s not found", pkgDir)
+	}
+
+	// Files to open
+	files := []string{
+		filepath.Join(pkgDir, "version"),
+		filepath.Join(pkgDir, "sources"),
+		filepath.Join(pkgDir, "build"),
+		filepath.Join(pkgDir, "depends"),
+	}
+
+	// Launch editor with all files
+	cmd := exec.Command(editor, files...)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	return cmd.Run()
 }
 
 // Hashing helper for cached filenames
@@ -1154,8 +1211,10 @@ func prepareSources(pkgName, pkgDir, buildDir string, execCtx *Executor) error {
 		// Extract archives or copy file (using realPath)
 		switch {
 		case strings.HasSuffix(realPath, ".tar.gz"),
+			strings.HasSuffix(realPath, ".tgz"),
 			strings.HasSuffix(realPath, ".tar.xz"),
 			strings.HasSuffix(realPath, ".tar.bz2"),
+			strings.HasSuffix(realPath, ".tar.zst"),
 			strings.HasSuffix(realPath, ".tar"):
 			// Extraction goes into targetDir (buildDir or buildDir/subdir)
 			if err := extractTar(realPath, targetDir); err != nil {
@@ -2365,50 +2424,6 @@ func getInstalledPackageOutput(searchTerm string) ([]byte, error) {
 	return []byte(outputBuilder.String()), nil
 }
 
-// printHelp prints the commands table
-func printHelp() {
-	type cmdInfo struct {
-		Cmd  string
-		Args string
-		Desc string
-	}
-	cmds := []cmdInfo{
-		{"version", "", "Show hokuto version"},
-		{"list", "[pkg]", "List installed packages; optional partial name to filter"},
-		{"checksum", "<pkg>", "Fetch sources and verify/create checksums for a package"},
-		{"build", "[options] <pkg> [...]", "Build package(s). Options: -a (auto-install)"},
-		{"install", "<tarball|pkg> [...]", "Install a built package tarball or named package"},
-		{"uninstall", "[options] <pkg> [...]", "Uninstall package(s). Options: -f (force) -y (yes)"},
-		{"update", "", "Update repository metadata and check for upgrades"},
-		{"manifest", "<pkg>", "Show manifest file entries (files only) for a package"},
-		{"find", "<string>", "Search all manifests for a path containing the string"},
-		{"new", "<string>", "Create a new package "},
-	}
-
-	color.Info.Println("hokuto commands")
-	color.Info.Println(strings.Repeat("-", 32))
-
-	leftColWidth := 32
-	for _, c := range cmds {
-		left := c.Cmd
-		if c.Args != "" {
-			color.Bold.Printf("  %s ", c.Cmd)
-			color.Cyan.Printf("%s", c.Args)
-			left = c.Cmd + " " + c.Args
-		} else {
-			color.Bold.Printf("  %s", c.Cmd)
-		}
-		pad := leftColWidth - len(left)
-		if pad < 1 {
-			pad = 1
-		}
-		fmt.Print(strings.Repeat(" ", pad))
-		color.Info.Println(c.Desc)
-	}
-
-	color.Info.Println("\nRun 'hokuto <command> --help' for more details where available.")
-}
-
 // Struct to hold package information
 type Package struct {
 	Name              string
@@ -2719,7 +2734,44 @@ func stripPackage(outputDir string, buildExec *Executor) error {
 		go func(p string) {
 			defer wg.Done()
 			defer func() { <-concurrencyLimit }()
+			// --- AMENDMENT START: Save and Restore Permissions ---
 
+			// 1. Get original permissions (using stat via the privileged Executor)
+			// stat -c %a gets the octal permissions (e.g., 555)
+			statCmd := exec.Command("sh", "-c", fmt.Sprintf("stat -c %%a %s", p))
+			var permOut bytes.Buffer
+			statCmd.Stdout = &permOut
+
+			// Note: Since 'p' might be in a root-owned directory, we MUST use buildExec.
+			if err := buildExec.Run(statCmd); err != nil {
+				errOnce.Do(func() {
+					firstError = fmt.Errorf("failed to stat original permissions for %s: %w", p, err)
+				})
+				fmt.Fprintf(os.Stderr, "Fatal Warning: failed to stat %s: %v. Skipping strip.\n", p, err)
+				return
+			}
+			originalPerms := strings.TrimSpace(permOut.String())
+
+			// 2. Defer the permission restoration (executed on function exit)
+			defer func() {
+				// Restore original permissions
+				restoreCmd := exec.Command("chmod", originalPerms, p)
+				if err := buildExec.Run(restoreCmd); err != nil {
+					fmt.Fprintf(os.Stderr, "CRITICAL WARNING: failed to restore permissions on %s to %s: %v\n", p, originalPerms, err)
+					// Do NOT return here, just log the failure.
+				}
+			}()
+
+			// 3. Grant temporary write permission (`u+w`)
+			chmodWriteCmd := exec.Command("chmod", "u+w", p)
+			if err := buildExec.Run(chmodWriteCmd); err != nil {
+				errOnce.Do(func() {
+					firstError = fmt.Errorf("failed to grant write permission to %s: %w", p, err)
+				})
+				fmt.Fprintf(os.Stderr, "Fatal Warning: failed to chmod +w %s: %v. Skipping strip.\n", p, err)
+				return
+			}
+			// --- AMENDMENT END ---
 			fmt.Printf("  -> Stripping %s\n", p)
 
 			stripCmd := exec.Command("strip", p)
@@ -2865,6 +2917,16 @@ func askForConfirmation(prompt string) bool {
 // build package
 func pkgBuild(pkgName string, cfg *Config, execCtx *Executor) error {
 
+	// Define the ANSI escape code format for setting the terminal title.
+	// \033]0; sets the title, and \a (bell character) terminates the sequence.
+	const setTitleFormat = "\033]0;%s\a"
+
+	// Helper function to set the title in the TTY.
+	setTerminalTitle := func(title string) {
+		// Outputting directly to os.Stdout sets the title in the terminal session.
+		fmt.Printf(setTitleFormat, title)
+	}
+
 	// Track build time
 	startTime := time.Now()
 
@@ -2888,7 +2950,7 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor) error {
 	// override tmpDir if noram is set
 	tmpDirfile := filepath.Join(pkgDir, "noram")
 	if _, err := os.Stat(tmpDirfile); err == nil {
-		currentTmpDir = "/var/tmpdir"
+		currentTmpDir = cfg.Values["TMPDIR2"]
 	}
 
 	// set tmpdirs for build
@@ -3074,6 +3136,9 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor) error {
 	cmd.Stderr = io.MultiWriter(stderrWriters...)
 
 	// --- Start interactive build with elapsed timer ---
+	// Set initial title
+	setTerminalTitle(fmt.Sprintf("[HOKUTO BUILD] Starting %s...", pkgName))
+
 	// time started at beginning of function
 	doneCh := make(chan struct{})
 	var runErr error
@@ -3088,6 +3153,8 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor) error {
 			select {
 			case <-ticker.C:
 				elapsed := time.Since(startTime).Truncate(time.Second)
+				title := fmt.Sprintf("[HOKUTO BUILD] %s... elapsed: %s", pkgName, elapsed)
+				setTerminalTitle(title)
 				// carriage return to update the same line; may appear as repeated lines in some logs
 				colInfo.Printf(" Building %s ... elapsed: %s\r", pkgName, elapsed)
 			case <-doneCh:
@@ -3113,6 +3180,8 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor) error {
 	// Check the single runErr variable (compiler knows it may be non-nil)
 	if runErr != nil {
 		cPrintf(colError, "\nBuild failed for %s: %v\n", pkgName, runErr)
+		finalTitle := fmt.Sprintf("[HOKUTO BUILD] ❌ FAILED: %s", pkgName)
+		setTerminalTitle(finalTitle)
 
 		// Flush the log file so tail sees everything written so far.
 		if logFile != nil {
@@ -3235,10 +3304,13 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor) error {
 		fmt.Fprintf(os.Stderr, "INFO: Skipping cleanup of %s due to HOKUTO_DEBUG=1\n", pkgTmpDir)
 	} else {
 		rmCmd := exec.Command("rm", "-rf", pkgTmpDir)
-		if err := buildExec.Run(rmCmd); err != nil {
+		if err := RootExec.Run(rmCmd); err != nil {
 			fmt.Fprintf(os.Stderr, "failed to cleanup build tmpdirs: %v\n", err)
 		}
 	}
+	// Build SUCCESSFUL: Set title to success status
+	finalTitle := fmt.Sprintf("[HOKUTO BUILD] ✅ SUCCESS: %s", pkgName)
+	setTerminalTitle(finalTitle)
 
 	return nil
 }
@@ -3247,6 +3319,16 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor) error {
 // It skips tarball creation, cleanup, and runs with an adjusted environment.
 // oldLibsDir is the path to the temporary directory containing backed-up libraries.
 func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir string) error {
+
+	// Define the ANSI escape code format for setting the terminal title.
+	// \033]0; sets the title, and \a (bell character) terminates the sequence.
+	const setTitleFormat = "\033]0;%s\a"
+
+	// Helper function to set the title in the TTY.
+	setTerminalTitle := func(title string) {
+		//Outputting directly to os.Stdout sets the title in the terminal session.
+		fmt.Printf(setTitleFormat, title)
+	}
 
 	// Track build time
 	startTime := time.Now()
@@ -3272,7 +3354,7 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 	// override tmpDir if noram is set
 	tmpDirfile := filepath.Join(pkgDir, "noram")
 	if _, err := os.Stat(tmpDirfile); err == nil {
-		currentTmpDir = "/var/tmpdir"
+		currentTmpDir = cfg.Values["TMPDIR2"]
 	}
 
 	// --- Setup (Same as pkgBuild) ---
@@ -3486,6 +3568,10 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 	cmd.Stderr = io.MultiWriter(stderrWriters...)
 
 	// --- Start interactive build with elapsed timer ---
+	// Set initial title
+	setTerminalTitle(fmt.Sprintf("[HOKUTO REBUILD] Starting %s...", pkgName))
+
+	// --- Start interactive build with elapsed timer ---
 	// time started at beginning of function
 	doneCh := make(chan struct{})
 	var runErr error
@@ -3500,6 +3586,9 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 			select {
 			case <-ticker.C:
 				elapsed := time.Since(startTime).Truncate(time.Second)
+				// update terminal title
+				title := fmt.Sprintf("[HOKUTO REBUILD] %s... elapsed: %s", pkgName, elapsed)
+				setTerminalTitle(title)
 				// carriage return to update the same line; may appear as repeated lines in some logs
 				colInfo.Printf(" Building %s ... elapsed: %s\r", pkgName, elapsed)
 			case <-doneCh:
@@ -3525,6 +3614,10 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 	// Check the single runErr variable (compiler knows it may be non-nil)
 	if runErr != nil {
 		cPrintf(colError, "\nBuild failed for %s: %v\n", pkgName, runErr)
+
+		// Set title to warning status
+		finalTitle := fmt.Sprintf("[HOKUTO BUILD] ❌ FAILED: %s", pkgName)
+		setTerminalTitle(finalTitle)
 
 		// Flush the log file so tail sees everything written so far.
 		if logFile != nil {
@@ -3638,6 +3731,9 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 	}
 
 	fmt.Printf("%s rebuilt successfully, output in %s\n", pkgName, outputDir)
+	//Set title to success status
+	finalTitle := fmt.Sprintf("[HOKUTO BUILD] ✅ SUCCESS: %s", pkgName)
+	setTerminalTitle(finalTitle)
 
 	// Key difference: Skip tarball creation and cleanup to allow pkgInstall to sync and clean up.
 	return nil
@@ -3646,6 +3742,7 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor) error {
 
 	stagingDir := filepath.Join(tmpDir, pkgName, "staging")
+	pkgTmpDir := filepath.Join(tmpDir, pkgName)
 
 	// Declare and initialize the 'failed' slice for tracking non-fatal errors
 	var failed []string
@@ -3993,8 +4090,11 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor) err
 		}
 	}
 
-	// 9. Cleanup original staging dir
-	os.RemoveAll(stagingDir)
+	// 9. Cleanup
+	rmCmd2 := exec.Command("rm", "-rf", pkgTmpDir)
+	if err := execCtx.Run(rmCmd2); err != nil {
+		fmt.Fprintf(os.Stderr, "failed to cleanup: %v\n", err)
+	}
 
 	// 10. Report failures if any
 	if len(failed) > 0 { // 'failed' slice is correctly declared at the start of pkgInstall
@@ -4278,6 +4378,51 @@ func pkgUninstall(pkgName string, cfg *Config, execCtx *Executor, force, yes boo
 	return nil
 }
 
+// printHelp prints the commands table
+func printHelp() {
+	type cmdInfo struct {
+		Cmd  string
+		Args string
+		Desc string
+	}
+	cmds := []cmdInfo{
+		{"version", "", "Show hokuto version"},
+		{"list", "[pkg]", "List installed packages; optional partial name to filter"},
+		{"checksum", "<pkg>", "Fetch sources and verify/create checksums for a package"},
+		{"build", "[options] <pkg> [...]", "Build package(s). Options: -a (auto-install)"},
+		{"install", "<tarball|pkg> [...]", "Install a built package tarball or named package"},
+		{"uninstall", "[options] <pkg> [...]", "Uninstall package(s). Options: -f (force) -y (yes)"},
+		{"update", "", "Update repository metadata and check for upgrades"},
+		{"manifest", "<pkg>", "Show manifest file entries (files only) for a package"},
+		{"find", "<string>", "Search all manifests for a path containing the string"},
+		{"new", "<string>", "Create a new package "},
+		{"edit", "<string>", "Edit a package"},
+	}
+
+	color.Info.Println("hokuto commands")
+	color.Info.Println(strings.Repeat("-", 32))
+
+	leftColWidth := 32
+	for _, c := range cmds {
+		left := c.Cmd
+		if c.Args != "" {
+			color.Bold.Printf("  %s ", c.Cmd)
+			color.Cyan.Printf("%s", c.Args)
+			left = c.Cmd + " " + c.Args
+		} else {
+			color.Bold.Printf("  %s", c.Cmd)
+		}
+		pad := leftColWidth - len(left)
+		if pad < 1 {
+			pad = 1
+		}
+		fmt.Print(strings.Repeat(" ", pad))
+		color.Info.Println(c.Desc)
+	}
+
+	color.Info.Println("\nRun 'hokuto <command> --help' for more details where available.")
+}
+
 // Entry point
 func main() {
 
@@ -4392,7 +4537,6 @@ func main() {
 		}
 
 		// Choose a random image
-		rand.Seed(time.Now().UnixNano())
 		choice := imgs[rand.Intn(len(imgs))]
 
 		// Inform user which image we'll show (colored if you like)
@@ -4403,6 +4547,7 @@ func main() {
 		if err := displayEmbeddedWithChafa(ctx, choice, "--symbols=block", "--size=80x40"); err != nil {
 			fmt.Fprintln(os.Stderr, "error displaying image:", err)
 		}
+
 	case "list":
 		pkg := ""
 		if len(os.Args) >= 3 {
@@ -4411,6 +4556,7 @@ func main() {
 		if err := listPackages(pkg); err != nil {
 			fmt.Println("Error:", err)
 		}
+
 	case "checksum":
 		if len(os.Args) < 3 {
 			fmt.Println("Usage: hokuto checksum <pkgname>")
@@ -4780,6 +4926,17 @@ func main() {
 		}
 		pkg := os.Args[2]
 		if err := newPackage(pkg); err != nil {
+			fmt.Fprintln(os.Stderr, "Error:", err)
+			os.Exit(1)
+		}
+
+	case "edit":
+		if len(os.Args) < 3 {
+			fmt.Println("Usage: hokuto edit <pkgname>")
+			os.Exit(1)
+		}
+		pkg := os.Args[2]
+		if err := editPackage(pkg); err != nil {
 			fmt.Fprintln(os.Stderr, "Error:", err)
 			os.Exit(1)
 		}
