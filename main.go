@@ -4,11 +4,13 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"embed"
 	"flag"
 	"fmt"
 	"io"
 	"io/fs"
 	"log"
+	"math/rand"
 	"net/url"
 	"os"
 	"os/exec"
@@ -17,12 +19,14 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
 
+	"github.com/gookit/color"
 	"golang.org/x/term"
 )
 
@@ -48,6 +52,105 @@ var (
 	UserExec *Executor
 	RootExec *Executor
 )
+
+//go:embed assets/*.png
+var embeddedImages embed.FS
+
+// color helpers
+var (
+	colInfo    = color.Info // style provided by gookit/color
+	colWarn    = color.Warn
+	colError   = color.Error
+	colSuccess = color.Success
+	colNote    = color.Tag("notice")
+)
+
+// color-compatible printer interface (works with *color.Theme and *color.Style)
+type colorPrinter interface {
+	Printf(format string, a ...interface{})
+	Println(a ...interface{})
+}
+
+// cPrintf prints with a colored style or falls back to fmt.Printf when nil
+func cPrintf(p colorPrinter, format string, a ...interface{}) {
+	if p == nil {
+		fmt.Printf(format, a...)
+		return
+	}
+	p.Printf(format, a...)
+}
+
+// cPrintln prints a line with the given style or falls back to fmt.Println when nil
+func cPrintln(p colorPrinter, a ...interface{}) {
+	if p == nil {
+		fmt.Println(a...)
+		return
+	}
+	p.Println(a...)
+}
+
+// listEmbeddedImages returns the list of image asset names (relative to assets/)
+func listEmbeddedImages() ([]string, error) {
+	entries, err := embeddedImages.ReadDir("assets")
+	if err != nil {
+		return nil, err
+	}
+	var names []string
+	for _, e := range entries {
+		if !e.IsDir() {
+			names = append(names, e.Name())
+		}
+	}
+	return names, nil
+}
+
+// displayEmbeddedWithChafa writes the embedded image to a secure temp file and runs chafa.
+// ctx: use a cancellable context (pass the main ctx so Ctrl+C cancels chafa)
+// imgRelPath: the name relative to "assets/" (e.g., "foo.png")
+// chafaArgs: additional chafa flags (optional)
+func displayEmbeddedWithChafa(ctx context.Context, imgRelPath string, chafaArgs ...string) error {
+	// Read embedded bytes
+	data, err := embeddedImages.ReadFile(filepath.Join("assets", imgRelPath))
+	if err != nil {
+		return fmt.Errorf("embedded image not found: %w", err)
+	}
+
+	// Create secure temp file
+	f, err := os.CreateTemp("", "hokuto-img-*.png")
+	if err != nil {
+		return fmt.Errorf("create temp file: %w", err)
+	}
+	tmpPath := f.Name()
+
+	// Ensure file removed; keep f open long enough to write+sync
+	defer func() {
+		f.Close()
+		os.Remove(tmpPath)
+	}()
+
+	if _, err := f.Write(data); err != nil {
+		return fmt.Errorf("write temp image: %w", err)
+	}
+	if err := f.Sync(); err != nil {
+		// best-effort
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("close tmp image: %w", err)
+	}
+
+	// Build chafa args: [tmpPath] + chafaArgs...
+	args := append([]string{tmpPath}, chafaArgs...)
+	cmd := exec.CommandContext(ctx, "chafa", args...)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	// Run and return any error (context cancels command when ctx done)
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("chafa failed: %w", err)
+	}
+	return nil
+}
 
 // Config struct
 type Config struct {
@@ -300,7 +403,7 @@ func (e *Executor) Run(cmd *exec.Cmd) error {
 	return nil
 }
 
-// List installed packages with version, supporting partial matches.
+// List installed packages with version, supporting partial matches and showing build time.
 func listPackages(searchTerm string) error {
 	// Step 1: Always get the full list of installed package directories first.
 	entries, err := os.ReadDir(Installed)
@@ -323,14 +426,14 @@ func listPackages(searchTerm string) error {
 	// Step 2: Filter the list if a search term was provided.
 	var pkgsToShow []string
 	if searchTerm != "" {
-		// This is the new logic for partial matching
+		// Partial matching
 		for _, pkg := range allPkgs {
 			if strings.Contains(pkg, searchTerm) {
 				pkgsToShow = append(pkgsToShow, pkg)
 			}
 		}
 	} else {
-		// If no search term, we'll show everything
+		// If no search term, show everything
 		pkgsToShow = allPkgs
 	}
 
@@ -345,15 +448,232 @@ func listPackages(searchTerm string) error {
 	}
 
 	// Step 4: Print the information for the final list of packages.
-	// This part remains the same as your original code.
+	// Format: "<name> <version> <revision>    <buildtime>"
 	for _, p := range pkgsToShow {
 		versionFile := filepath.Join(Installed, p, "version")
-		version := "unknown"
+		versionInfo := "unknown"
 		if data, err := os.ReadFile(versionFile); err == nil {
-			version = strings.TrimSpace(string(data))
+			versionInfo = strings.TrimSpace(string(data))
 		}
-		fmt.Printf("%s %s\n", p, version)
+
+		// Read buildtime (seconds) if present and format it as e.g. "8.15s"
+		buildtimeFile := filepath.Join(Installed, p, "buildtime")
+		buildtimeStr := ""
+		if data, err := os.ReadFile(buildtimeFile); err == nil {
+			raw := strings.TrimSpace(string(data))
+			if raw != "" {
+				// Try to parse as float seconds
+				if secs, err := strconv.ParseFloat(raw, 64); err == nil {
+					buildtimeStr = fmt.Sprintf("%.2fs", secs)
+				} else {
+					// If not a plain float, try to parse as a duration string
+					if d, err := time.ParseDuration(raw); err == nil {
+						buildtimeStr = fmt.Sprintf("%.2fs", d.Seconds())
+					} else {
+						// Fallback: show raw value
+						buildtimeStr = raw
+					}
+				}
+			}
+		}
+
+		// Print aligned: versionInfo then some spacing then buildtime if present
+		if buildtimeStr != "" {
+			fmt.Printf("%-30s %s\n", fmt.Sprintf("%s %s", p, versionInfo), buildtimeStr)
+		} else {
+			fmt.Printf("%s %s\n", p, versionInfo)
+		}
 	}
+
+	return nil
+}
+
+// showManifest prints the file list for a package manifest, skipping directories,
+// checksums, and any entries under var/db/hokuto (internal metadata).
+func showManifest(pkgName string) error {
+	manifestPath := filepath.Join(Installed, pkgName, "manifest")
+
+	// Read manifest as the invoking user (no sudo/cat helper)
+	data, err := os.ReadFile(manifestPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("package %s is not installed (manifest not found)", pkgName)
+		}
+		return fmt.Errorf("failed to read manifest for %s: %w", pkgName, err)
+	}
+
+	scanner := bufio.NewScanner(bytes.NewReader(data))
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+
+		// Skip directory entries (lines that end with '/')
+		if strings.HasSuffix(line, "/") {
+			continue
+		}
+
+		// Each file line is expected to be: "<path>  <checksum>"
+		// We only want to print the path (first whitespace-separated field).
+		fields := strings.Fields(line)
+		if len(fields) == 0 {
+			continue
+		}
+		path := fields[0]
+
+		// Normalize for checking internal metadata: consider both absolute and relative variants.
+		clean := filepath.Clean(path)
+		// Remove leading slash for consistent prefix checking
+		cleanNoSlash := strings.TrimPrefix(clean, "/")
+
+		// Filter out internal metadata paths under var/db/hokuto
+		if strings.HasPrefix(cleanNoSlash, filepath.ToSlash(filepath.Clean("var/db/hokuto"))) {
+			continue
+		}
+
+		// Print the manifest file path (exact path as stored in manifest)
+		fmt.Println(path)
+	}
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("error scanning manifest: %w", err)
+	}
+	return nil
+}
+
+// findPackagesByManifestString searches every installed/<pkg>/manifest for the given query string.
+// It prints the package names (one per line) for packages whose manifest contains a path
+// matching the query. Directory entries and internal metadata (var/db/hokuto) are ignored.
+func findPackagesByManifestString(query string) error {
+	if query == "" {
+		return fmt.Errorf("empty search string")
+	}
+
+	entries, err := os.ReadDir(Installed)
+	if err != nil {
+		if os.IsNotExist(err) {
+			fmt.Println("No packages installed.")
+			return nil
+		}
+		return fmt.Errorf("failed to read installed db: %w", err)
+	}
+
+	foundAny := false
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		pkgName := e.Name()
+		manifestPath := filepath.Join(Installed, pkgName, "manifest")
+
+		data, err := os.ReadFile(manifestPath)
+		if err != nil {
+			// skip packages without readable manifest rather than failing the whole run
+			continue
+		}
+
+		match := false
+		scanner := bufio.NewScanner(bytes.NewReader(data))
+		for scanner.Scan() {
+			line := strings.TrimSpace(scanner.Text())
+			if line == "" {
+				continue
+			}
+			// skip directory entries
+			if strings.HasSuffix(line, "/") {
+				continue
+			}
+			fields := strings.Fields(line)
+			if len(fields) == 0 {
+				continue
+			}
+			path := fields[0]
+
+			// skip internal metadata entries
+			clean := filepath.Clean(path)
+			cleanNoSlash := strings.TrimPrefix(clean, "/")
+			if strings.HasPrefix(cleanNoSlash, filepath.ToSlash("var/db/hokuto")) {
+				continue
+			}
+
+			if strings.Contains(path, query) {
+				match = true
+				break
+			}
+		}
+		if scannerErr := scanner.Err(); scannerErr != nil {
+			// ignore malformed manifest for this package
+			continue
+		}
+
+		if match {
+			fmt.Println(pkgName)
+			foundAny = true
+		}
+	}
+
+	if !foundAny {
+		// exit code could indicate no matches; print a friendly message instead
+		fmt.Println("No packages found matching:", query)
+	}
+	return nil
+}
+
+// newPackage creates a minimal package skeleton in the current working directory.
+// - creates directory ./<pkg>
+// - creates ./<pkg>/build with mode 0755 and content "#!/bin/sh -e\n"
+// - creates ./<pkg>/version with mode 0644 and content " 1\n"
+// - creates ./<pkg>/sources with mode 0644 and empty content
+// Everything is created as the current (non-root) user.
+func newPackage(pkgName string) error {
+	// Determine current working dir
+	cwd, err := os.Getwd()
+	if err != nil {
+		return fmt.Errorf("failed to determine current directory: %w", err)
+	}
+
+	pkgDir := filepath.Join(cwd, pkgName)
+
+	// Don't overwrite existing package dir
+	if fi, err := os.Stat(pkgDir); err == nil {
+		if fi.IsDir() {
+			return fmt.Errorf("package %s already exists at %s", pkgName, pkgDir)
+		}
+		return fmt.Errorf("path %s exists and is not a directory", pkgDir)
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("failed to stat path %s: %w", pkgDir, err)
+	}
+
+	// Create package dir
+	if err := os.MkdirAll(pkgDir, 0o755); err != nil {
+		return fmt.Errorf("failed to create package directory %s: %w", pkgDir, err)
+	}
+
+	// 1) build file: mode 0755, content "#!/bin/sh -e\n"
+	buildPath := filepath.Join(pkgDir, "build")
+	buildContent := []byte("#!/bin/sh -e\n")
+	if err := os.WriteFile(buildPath, buildContent, 0o755); err != nil {
+		return fmt.Errorf("failed to create build file: %w", err)
+	}
+
+	// 2) version file: mode 0644, content " 1\n"
+	versionPath := filepath.Join(pkgDir, "version")
+	versionContent := []byte(" 1\n")
+	if err := os.WriteFile(versionPath, versionContent, 0o644); err != nil {
+		return fmt.Errorf("failed to create version file: %w", err)
+	}
+
+	// 3) sources file: mode 0644, empty
+	sourcesPath := filepath.Join(pkgDir, "sources")
+	if err := os.WriteFile(sourcesPath, []byte(""), 0o644); err != nil {
+		return fmt.Errorf("failed to create sources file: %w", err)
+	}
+
+	// Success messages
+	cPrintln(colInfo, "=> Creating build file.")
+	cPrintln(colInfo, "=> Creating version file with ' 1'.")
+	cPrintln(colInfo, "=> Creating sources file with ''.")
+	cPrintf(colInfo, "=> Package %s created in %s.\n", pkgName, pkgDir)
 
 	return nil
 }
@@ -2045,6 +2365,50 @@ func getInstalledPackageOutput(searchTerm string) ([]byte, error) {
 	return []byte(outputBuilder.String()), nil
 }
 
+// printHelp prints the commands table
+func printHelp() {
+	type cmdInfo struct {
+		Cmd  string
+		Args string
+		Desc string
+	}
+	cmds := []cmdInfo{
+		{"version", "", "Show hokuto version"},
+		{"list", "[pkg]", "List installed packages; optional partial name to filter"},
+		{"checksum", "<pkg>", "Fetch sources and verify/create checksums for a package"},
+		{"build", "[options] <pkg> [...]", "Build package(s). Options: -a (auto-install)"},
+		{"install", "<tarball|pkg> [...]", "Install a built package tarball or named package"},
+		{"uninstall", "[options] <pkg> [...]", "Uninstall package(s). Options: -f (force) -y (yes)"},
+		{"update", "", "Update repository metadata and check for upgrades"},
+		{"manifest", "<pkg>", "Show manifest file entries (files only) for a package"},
+		{"find", "<string>", "Search all manifests for a path containing the string"},
+		{"new", "<string>", "Create a new package "},
+	}
+
+	color.Info.Println("hokuto commands")
+	color.Info.Println(strings.Repeat("-", 32))
+
+	leftColWidth := 32
+	for _, c := range cmds {
+		left := c.Cmd
+		if c.Args != "" {
+			color.Bold.Printf("  %s ", c.Cmd)
+			color.Cyan.Printf("%s", c.Args)
+			left = c.Cmd + " " + c.Args
+		} else {
+			color.Bold.Printf("  %s", c.Cmd)
+		}
+		pad := leftColWidth - len(left)
+		if pad < 1 {
+			pad = 1
+		}
+		fmt.Print(strings.Repeat(" ", pad))
+		color.Info.Println(c.Desc)
+	}
+
+	color.Info.Println("\nRun 'hokuto <command> --help' for more details where available.")
+}
+
 // Struct to hold package information
 type Package struct {
 	Name              string
@@ -2501,6 +2865,9 @@ func askForConfirmation(prompt string) bool {
 // build package
 func pkgBuild(pkgName string, cfg *Config, execCtx *Executor) error {
 
+	// Track build time
+	startTime := time.Now()
+
 	paths := strings.Split(repoPaths, ":")
 	var pkgDir string
 	found := false
@@ -2706,11 +3073,72 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor) error {
 	cmd.Stdout = io.MultiWriter(stdoutWriters...)
 	cmd.Stderr = io.MultiWriter(stderrWriters...)
 
-	// 3. CENTRALIZED EXECUTION: Use the selected Executor regardless of privilege.
-	// This replaces the entire conditional if/else block.
+	// --- Start interactive build with elapsed timer ---
+	// time started at beginning of function
+	doneCh := make(chan struct{})
+	var runErr error
+	var runWg sync.WaitGroup
+	runWg.Add(1)
+
+	go func() {
+		defer runWg.Done()
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				elapsed := time.Since(startTime).Truncate(time.Second)
+				// carriage return to update the same line; may appear as repeated lines in some logs
+				colInfo.Printf(" Building %s ... elapsed: %s\r", pkgName, elapsed)
+			case <-doneCh:
+				// clear line and return
+				fmt.Print("\r")
+				return
+			case <-buildExec.Context.Done():
+				// cancelled — stop updating
+				return
+			}
+		}
+	}()
+
+	// Run the build. Use runErr (single variable) to capture the result.
 	if err := buildExec.Run(cmd); err != nil {
-		return fmt.Errorf("build failed: %v", err)
+		runErr = fmt.Errorf("build failed: %w", err)
 	}
+
+	// stop ticker goroutine and wait
+	close(doneCh)
+	runWg.Wait()
+
+	// Check the single runErr variable (compiler knows it may be non-nil)
+	if runErr != nil {
+		cPrintf(colError, "\nBuild failed for %s: %v\n", pkgName, runErr)
+
+		// Flush the log file so tail sees everything written so far.
+		if logFile != nil {
+			_ = logFile.Sync()
+		}
+
+		// Path to the build log (we created this earlier as logFile)
+		logPath := filepath.Join(logDir, "build-log.txt")
+
+		// Launch a tail -n 200 -f so the user can view the last 200 lines and follow live.
+		// Connect stdin/stdout/stderr so the user can Ctrl-C to exit the tail.
+		tailCmd := exec.Command("tail", "-n", "50", "-f", logPath)
+		tailCmd.Stdin = os.Stdin
+		tailCmd.Stdout = os.Stdout
+		tailCmd.Stderr = os.Stderr
+
+		// Run tail via the same Executor so privilege behavior and context cancellation are honored.
+		// Ignore tail errors (user may Ctrl-C to exit); we only return the original build error.
+		_ = buildExec.Run(tailCmd)
+
+		return runErr
+	}
+
+	// success
+	elapsed := time.Since(startTime).Truncate(time.Second)
+	cPrintf(colSuccess, "\n%s built successfully in %s, output in %s\n", pkgName, elapsed, outputDir)
 
 	// Create /var/db/hokuto/installed/<pkgName> inside the staging outputDir
 	installedDir := filepath.Join(outputDir, "var", "db", "hokuto", "installed", pkgName)
@@ -2773,6 +3201,25 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor) error {
 		return fmt.Errorf("failed to stat post-install file: %v", err)
 	}
 
+	// Calculate the elapsed time
+	elapsed = time.Since(startTime)
+
+	// Format the duration into a string (e.g., "1m30.5s")
+	durationStr := fmt.Sprintf("%v", elapsed)
+
+	// Define the output file path
+	buildTimeFile := filepath.Join(installedDir, "buildtime")
+
+	// Save the duration to the file silently using 'echo' and 'tee' via the Executor.
+	echoCmd := exec.Command("sh", "-c",
+		// The shell command is wrapped with '> /dev/null 2>&1' to redirect all output to null.
+		fmt.Sprintf("echo '%s' | tee %s > /dev/null 2>&1", durationStr, buildTimeFile))
+
+	// We use the same Executor context that was used for the build directory creation
+	if err := buildExec.Run(echoCmd); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: failed to save build time to %s: %v\n", buildTimeFile, err)
+	}
+
 	// Generate manifest
 	if err := generateManifest(outputDir, installedDir, buildExec); err != nil {
 		return fmt.Errorf("failed to generate manifest: %v", err)
@@ -2800,6 +3247,10 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor) error {
 // It skips tarball creation, cleanup, and runs with an adjusted environment.
 // oldLibsDir is the path to the temporary directory containing backed-up libraries.
 func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir string) error {
+
+	// Track build time
+	startTime := time.Now()
+
 	// Determine package source directory (Same as pkgBuild)
 	paths := strings.Split(repoPaths, ":")
 	var pkgDir string
@@ -3034,9 +3485,72 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 	cmd.Stdout = io.MultiWriter(stdoutWriters...)
 	cmd.Stderr = io.MultiWriter(stderrWriters...)
 
+	// --- Start interactive build with elapsed timer ---
+	// time started at beginning of function
+	doneCh := make(chan struct{})
+	var runErr error
+	var runWg sync.WaitGroup
+	runWg.Add(1)
+
+	go func() {
+		defer runWg.Done()
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				elapsed := time.Since(startTime).Truncate(time.Second)
+				// carriage return to update the same line; may appear as repeated lines in some logs
+				colInfo.Printf(" Building %s ... elapsed: %s\r", pkgName, elapsed)
+			case <-doneCh:
+				// clear line and return
+				fmt.Print("\r")
+				return
+			case <-buildExec.Context.Done():
+				// cancelled — stop updating
+				return
+			}
+		}
+	}()
+
+	// Run the build. Use runErr (single variable) to capture the result.
 	if err := buildExec.Run(cmd); err != nil {
-		return fmt.Errorf("rebuild failed: %v", err)
+		runErr = fmt.Errorf("build failed: %w", err)
 	}
+
+	// stop ticker goroutine and wait
+	close(doneCh)
+	runWg.Wait()
+
+	// Check the single runErr variable (compiler knows it may be non-nil)
+	if runErr != nil {
+		cPrintf(colError, "\nBuild failed for %s: %v\n", pkgName, runErr)
+
+		// Flush the log file so tail sees everything written so far.
+		if logFile != nil {
+			_ = logFile.Sync()
+		}
+
+		// Path to the build log (we created this earlier as logFile)
+		logPath := filepath.Join(logDir, "build-log.txt")
+
+		// Launch a tail -n 200 -f so the user can view the last 200 lines and follow live.
+		// Connect stdin/stdout/stderr so the user can Ctrl-C to exit the tail.
+		tailCmd := exec.Command("tail", "-n", "50", "-f", logPath)
+		tailCmd.Stdin = os.Stdin
+		tailCmd.Stdout = os.Stdout
+		tailCmd.Stderr = os.Stderr
+
+		// Run tail via the same Executor so privilege behavior and context cancellation are honored.
+		// Ignore tail errors (user may Ctrl-C to exit); we only return the original build error.
+		_ = buildExec.Run(tailCmd)
+
+		return runErr
+	}
+
+	// success
+	elapsed := time.Since(startTime).Truncate(time.Second)
+	cPrintf(colSuccess, "\n%s built successfully in %s, output in %s\n", pkgName, elapsed, outputDir)
 
 	// Create /var/db/hokuto/installed/<pkgName> inside the staging outputDir
 	installedDir := filepath.Join(outputDir, "var", "db", "hokuto", "installed", pkgName)
@@ -3097,6 +3611,25 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 		}
 	} else if err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("failed to stat post-install file: %v", err)
+	}
+
+	// Calculate the elapsed time
+	elapsed = time.Since(startTime)
+
+	// Format the duration into a string (e.g., "1m30.5s")
+	durationStr := fmt.Sprintf("%v", elapsed)
+
+	// Define the output file path
+	buildTimeFile := filepath.Join(installedDir, "buildtime")
+
+	// Save the duration to the file silently using 'echo' and 'tee' via the Executor.
+	echoCmd := exec.Command("sh", "-c",
+		// The shell command is wrapped with '> /dev/null 2>&1' to redirect all output to null.
+		fmt.Sprintf("echo '%s' | tee %s > /dev/null 2>&1", durationStr, buildTimeFile))
+
+	// We use the same Executor context that was used for the build directory creation
+	if err := buildExec.Run(echoCmd); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: failed to save build time to %s: %v\n", buildTimeFile, err)
 	}
 
 	// Generate manifest
@@ -3822,7 +4355,7 @@ func main() {
 	// Now, wrap your existing logic:
 
 	if len(os.Args) < 2 {
-		fmt.Println("Usage: hokuto <command> [args...]")
+		printHelp()
 		return
 	}
 
@@ -3845,7 +4378,31 @@ func main() {
 
 	switch os.Args[1] {
 	case "version":
-		fmt.Println("hokuto 0.1")
+		// Print version first
+		fmt.Println("hokuto 0.2")
+
+		// Try to pick and show a random embedded PNG from assets/
+		imgs, err := listEmbeddedImages()
+		if err != nil || len(imgs) == 0 {
+			// No images available — nothing more to do
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "warning: failed to list embedded images:", err)
+			}
+			break
+		}
+
+		// Choose a random image
+		rand.Seed(time.Now().UnixNano())
+		choice := imgs[rand.Intn(len(imgs))]
+
+		// Inform user which image we'll show (colored if you like)
+		color.Info.Printf("Showing image: %s\n", choice)
+
+		// Display via chafa using the main context (ctx must be in scope in main)
+		// Forward a small default set of chafa flags; you may change or pass none.
+		if err := displayEmbeddedWithChafa(ctx, choice, "--symbols=block", "--size=80x40"); err != nil {
+			fmt.Fprintln(os.Stderr, "error displaying image:", err)
+		}
 	case "list":
 		pkg := ""
 		if len(os.Args) >= 3 {
@@ -4194,7 +4751,40 @@ func main() {
 			os.Exit(1)
 		}
 
+	case "manifest":
+		if len(os.Args) < 3 {
+			fmt.Println("Usage: hokuto manifest <pkgname>")
+			os.Exit(1)
+		}
+		pkg := os.Args[2]
+		if err := showManifest(pkg); err != nil {
+			fmt.Fprintln(os.Stderr, "Error:", err)
+			os.Exit(1)
+		}
+
+	case "find":
+		if len(os.Args) < 3 {
+			fmt.Println("Usage: hokuto find <string>")
+			os.Exit(1)
+		}
+		query := os.Args[2]
+		if err := findPackagesByManifestString(query); err != nil {
+			fmt.Fprintln(os.Stderr, "Error:", err)
+			os.Exit(1)
+		}
+
+	case "new":
+		if len(os.Args) < 3 {
+			fmt.Println("Usage: hokuto new <pkgname>")
+			os.Exit(1)
+		}
+		pkg := os.Args[2]
+		if err := newPackage(pkg); err != nil {
+			fmt.Fprintln(os.Stderr, "Error:", err)
+			os.Exit(1)
+		}
+
 	default:
-		fmt.Println("Unknown command:", os.Args[1])
+		printHelp()
 	}
 }
