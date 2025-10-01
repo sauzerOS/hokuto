@@ -60,18 +60,18 @@ var (
 	colInfo    = color.Info // style provided by gookit/color
 	colWarn    = color.Warn
 	colError   = color.Error
-	colSuccess = color.Success
+	colSuccess = color.Blue
 	colNote    = color.Tag("notice")
 )
 
 // color-compatible printer interface (works with *color.Theme and *color.Style)
 type colorPrinter interface {
-	Printf(format string, a ...interface{})
-	Println(a ...interface{})
+	Printf(format string, a ...any)
+	Println(a ...any)
 }
 
 // cPrintf prints with a colored style or falls back to fmt.Printf when nil
-func cPrintf(p colorPrinter, format string, a ...interface{}) {
+func cPrintf(p colorPrinter, format string, a ...any) {
 	if p == nil {
 		fmt.Printf(format, a...)
 		return
@@ -80,12 +80,19 @@ func cPrintf(p colorPrinter, format string, a ...interface{}) {
 }
 
 // cPrintln prints a line with the given style or falls back to fmt.Println when nil
-func cPrintln(p colorPrinter, a ...interface{}) {
+func cPrintln(p colorPrinter, a ...any) {
 	if p == nil {
 		fmt.Println(a...)
 		return
 	}
 	p.Println(a...)
+}
+
+// debugf prints debug messages when Debug is true
+func debugf(format string, args ...any) {
+	if Debug {
+		fmt.Printf(format, args...)
+	}
 }
 
 // Config struct
@@ -496,9 +503,9 @@ func listPackages(searchTerm string) error {
 
 		// Print aligned: versionInfo then some spacing then buildtime if present
 		if buildtimeStr != "" {
-			fmt.Printf("%-30s %s\n", fmt.Sprintf("%s %s", p, versionInfo), buildtimeStr)
+			cPrintf(color.Cyan, "%-30s %s\n", fmt.Sprintf("%s %s", p, versionInfo), buildtimeStr)
 		} else {
-			fmt.Printf("%s %s\n", p, versionInfo)
+			cPrintf(color.Cyan, "%s %s\n", p, versionInfo)
 		}
 	}
 
@@ -696,6 +703,8 @@ func newPackage(pkgName string) error {
 }
 
 // automatically edit version/sources/build of a package
+// editPackage searches for pkgName under the colon-separated repoPaths
+// and opens version, sources, build, depends in the user's editor.
 func editPackage(pkgName string) error {
 	// Determine editor
 	editor := os.Getenv("EDITOR")
@@ -703,31 +712,55 @@ func editPackage(pkgName string) error {
 		editor = os.Getenv("VISUAL")
 	}
 	if editor == "" {
-		editor = "nano" // sensible default
+		editor = "nano"
 	}
 
-	// Build paths relative to current working directory
-	cwd, err := os.Getwd()
-	if err != nil {
-		return err
-	}
-	pkgDir := filepath.Join(cwd, pkgName)
-
-	// Ensure directory exists
-	if fi, err := os.Stat(pkgDir); err != nil || !fi.IsDir() {
-		return fmt.Errorf("package directory %s not found", pkgDir)
+	// repoPaths is expected to be a colon-separated string of base paths,
+	// for example "/repo/sauzeros/core:/repo/sauzeros/extra".
+	// Use filepath.SplitList so it uses the OS path list separator.
+	paths := filepath.SplitList(repoPaths)
+	if len(paths) == 0 {
+		return fmt.Errorf("no repo paths configured")
 	}
 
-	// Files to open
-	files := []string{
-		filepath.Join(pkgDir, "version"),
-		filepath.Join(pkgDir, "sources"),
-		filepath.Join(pkgDir, "build"),
-		filepath.Join(pkgDir, "depends"),
+	// Find the first directory that contains the package dir
+	var pkgDir string
+	for _, base := range paths {
+		candidate := filepath.Join(base, pkgName)
+		if fi, err := os.Stat(candidate); err == nil && fi.IsDir() {
+			pkgDir = candidate
+			break
+		}
+	}
+
+	if pkgDir == "" {
+		// If no existing package dir found, try creating under the first repo path.
+		// This mirrors a common UX where editing a new package scaffolds it.
+		firstBase := paths[0]
+		pkgDir = filepath.Join(firstBase, pkgName)
+		if err := os.MkdirAll(pkgDir, 0o755); err != nil {
+			return fmt.Errorf("package directory %s not found and failed to create under %s: %v", pkgName, firstBase, err)
+		}
+	}
+
+	// Files to open (create empty files if they don't exist so editor opens them)
+	relFiles := []string{"version", "sources", "build", "depends"}
+	var filesToOpen []string
+	for _, f := range relFiles {
+		full := filepath.Join(pkgDir, f)
+		// Ensure file exists
+		if _, err := os.Stat(full); os.IsNotExist(err) {
+			if err := os.WriteFile(full, nil, 0o644); err != nil {
+				return fmt.Errorf("failed to create %s: %v", full, err)
+			}
+		} else if err != nil {
+			return fmt.Errorf("failed to stat %s: %v", full, err)
+		}
+		filesToOpen = append(filesToOpen, full)
 	}
 
 	// Launch editor with all files
-	cmd := exec.Command(editor, files...)
+	cmd := exec.Command(editor, filesToOpen...)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -755,7 +788,7 @@ func downloadFile(url, destFile string) error {
 
 	// destFile is the filename only (without path)
 	destFile = filepath.Base(destFile)
-	fmt.Printf("Downloading %s -> %s/%s\n", url, CacheStore, destFile)
+	cPrintf(color.Info, "Downloading %s -> %s/%s\n", url, CacheStore, destFile)
 
 	// Try aria2c first
 	cmd := exec.Command("aria2c", "-x", "4", "-s", "4", "-d", CacheStore, "-o", destFile, url)
@@ -822,7 +855,7 @@ func fetchSources(pkgName, pkgDir string) error {
 			destPath := filepath.Join(pkgLinkDir, repoName) // destPath is where the repo is cloned
 
 			if _, err := os.Stat(destPath); os.IsNotExist(err) {
-				fmt.Printf("Cloning git repository %s into %s\n", gitURL, destPath)
+				cPrintf(colInfo, "Cloning git repository %s into %s\n", gitURL, destPath)
 				cmd := exec.Command("git", "clone", gitURL, destPath)
 				cmd.Stdout = os.Stdout
 				cmd.Stderr = os.Stderr
@@ -860,7 +893,7 @@ func fetchSources(pkgName, pkgDir string) error {
 					cmd.Run()
 				}
 			}
-			fmt.Printf("Git repository ready: %s\n", destPath)
+			cPrintf(colInfo, "Git repository ready: %s\n", destPath)
 			continue
 		}
 
@@ -878,7 +911,7 @@ func fetchSources(pkgName, pkgDir string) error {
 				return fmt.Errorf("failed to download %s: %v", sourceURL, err)
 			}
 		} else {
-			fmt.Printf("Already in cache: %s\n", cachePath)
+			cPrintf(colInfo, "Already in cache: %s\n", cachePath)
 		}
 
 		// --- Linked file is created using the original filename from the URL ---
@@ -889,7 +922,7 @@ func fetchSources(pkgName, pkgDir string) error {
 		if err := os.Symlink(cachePath, linkPath); err != nil {
 			return fmt.Errorf("failed to symlink %s -> %s: %v", cachePath, linkPath, err)
 		}
-		fmt.Printf("Linked %s -> %s\n", linkPath, cachePath)
+		debugf("Linked %s -> %s\n", linkPath, cachePath)
 	}
 
 	return nil
@@ -1144,9 +1177,7 @@ func prepareSources(pkgName, pkgDir, buildDir string, execCtx *Executor) error {
 				return fmt.Errorf("invalid git URL in sources file: %w", err)
 			}
 			repoBase := filepath.Base(parsedURL.Path)
-			if strings.HasSuffix(repoBase, ".git") {
-				repoBase = strings.TrimSuffix(repoBase, ".git")
-			}
+			repoBase = strings.TrimSuffix(repoBase, ".git")
 			// srcDir is SourcesDir/pkgName. We look for the cloned repo name inside it.
 			srcPath = filepath.Join(srcDir, repoBase)
 
@@ -1390,7 +1421,7 @@ func generateLibDeps(outputDir, libdepsFile string, execCtx *Executor) error {
 		return fmt.Errorf("failed to move libdeps into place (via Executor): %v", err)
 	}
 
-	fmt.Printf("Library dependencies written to %s (%d deps)\n", libdepsFile, len(seen))
+	debugf("Library dependencies written to %s (%d deps)\n", libdepsFile, len(seen))
 	return nil
 }
 
@@ -1580,17 +1611,7 @@ func generateManifest(outputDir, installedDir string, execCtx *Executor) error {
 	if err != nil {
 		return fmt.Errorf("failed to list output files: %v", err)
 	}
-	// --- AMENDMENT START ---
-	/*
-		fmt.Printf("\n--- Output Files in %s ---\n", outputDir)
-		// Assuming 'entries' is a []string or similar slice of file/directory names/paths
-		for _, entry := range entries {
-			// Print each entry to standard output
-			fmt.Println(entry)
-		}
-		fmt.Println("--------------------------------")
-	*/
-	// --- AMENDMENT END ---
+
 	// Remove manifest from entries if present
 	relManifest, err := filepath.Rel(outputDir, manifestFile)
 	if err != nil {
@@ -1647,9 +1668,6 @@ func generateManifest(outputDir, installedDir string, execCtx *Executor) error {
 	f.Close() // close before moving
 
 	// 2. Calculate checksum of the temporary manifest file.
-	// NOTE: This must use the unprivileged b3sum if possible, as the file is owned by the Go process.
-	// If b3sum MUST use the Executor, then you'd have to elevate here. Assuming unprivileged is fine
-	// since the file is in /tmp and owned by the builder.
 	tempChecksum, err := b3sum(tmpManifest, execCtx)
 	if err != nil {
 		return fmt.Errorf("b3sum failed for temporary manifest %s: %v", tmpManifest, err)
@@ -1680,7 +1698,7 @@ func generateManifest(outputDir, installedDir string, execCtx *Executor) error {
 	// Remove temp manifest
 	os.Remove(tmpManifest)
 
-	fmt.Printf("Manifest written to %s (%d entries)\n", manifestFile, len(filtered))
+	debugf("Manifest written to %s (%d entries)\n", manifestFile, len(filtered))
 	return nil
 }
 
@@ -1741,13 +1759,93 @@ func copyDir(src, dst string) error {
 
 // extractTar extracts a tarball into the destination directory
 func extractTar(archive, dest string) error {
-	cmd := exec.Command("tar", "xf", archive, "-C", dest, "--strip-components=1")
+	// 1. Inspect the tarball to see if it has a single top-level directory
+	strip, err := shouldStripTar(archive)
+	if err != nil {
+		return fmt.Errorf("failed to inspect tarball %s: %w", archive, err)
+	}
+
+	// 2. Build the tar command arguments
+	args := []string{"xf", archive, "-C", dest}
+	if strip {
+		// Only add --strip-components=1 if inspection determined it's necessary
+		args = append(args, "--strip-components=1")
+	}
+
+	// 3. Execute the tar command
+	cmd := exec.Command("tar", args...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
+
 	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("failed to extract %s: %v", archive, err)
+		return fmt.Errorf("failed to extract %s: %w", archive, err)
 	}
 	return nil
+}
+
+// shouldStripTar inspects the tarball to check for a single top-level directory.
+func shouldStripTar(archive string) (bool, error) {
+	// Use 'tar tf' to list the contents quietly
+	cmd := exec.Command("tar", "tf", archive)
+
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	// Don't route stderr to os.Stderr, as we are inspecting the file, not extracting
+	// cmd.Stderr = os.Stderr // (Keep this commented out)
+
+	if err := cmd.Run(); err != nil {
+		// Tar failed to read or list the file.
+		return false, fmt.Errorf("tar tf failed: %w", err)
+	}
+
+	// The first entry determines the structure.
+	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+	if len(lines) == 0 || lines[0] == "" {
+		// Archive is empty or unreadable
+		return false, nil
+	}
+
+	firstEntry := lines[0]
+
+	// A typical top-level directory entry looks like "pkgname-version/".
+	// The path should contain a single slash and end with one.
+	// If the archive only contains one entry (the directory itself),
+	// we still rely on the first file entry.
+
+	// Check if the first entry suggests a top-level directory structure:
+	// 1. Must contain at least one slash.
+	// 2. The string before the first slash (the directory name) must match the rest of the entries.
+
+	parts := strings.Split(firstEntry, string(filepath.Separator))
+	if len(parts) < 2 {
+		// No slash means a file/folder is at the root (e.g., "file1.c"), so don't strip.
+		return false, nil
+	}
+
+	// The assumed top-level directory is the first part (e.g., "pkgname-version")
+	topDir := parts[0] + string(filepath.Separator)
+
+	// Now check all entries to ensure they ALL start with this path.
+	// We only need to check the first few non-directory entries for performance.
+	for i, line := range lines {
+		if i > 50 { // Check a reasonable number of entries (e.g., 50)
+			break
+		}
+
+		// If the entry is a directory itself (ends with /), skip it.
+		// NOTE: 'tar tf' output might not always include the trailing slash,
+		// but checking the prefix is more reliable.
+
+		// If any entry does NOT start with the top directory prefix, then files exist at the root.
+		if !strings.HasPrefix(line, topDir) {
+			// Found a file/folder that is NOT inside the assumed topDir.
+			// e.g., line is "file_at_root.c".
+			return false, nil
+		}
+	}
+
+	// All checked entries start with the same top directory prefix, so strip is needed.
+	return true, nil
 }
 
 func createPackageTarball(pkgName, pkgVer, outputDir string, execCtx *Executor) error {
@@ -1772,12 +1870,12 @@ func createPackageTarball(pkgName, pkgVer, outputDir string, execCtx *Executor) 
 	// Create the final tar command
 	tarCmd := exec.Command("tar", args...)
 
-	fmt.Printf("Creating package tarball: %s\n", tarballPath)
+	debugf("Creating package tarball: %s\n", tarballPath)
 	if err := execCtx.Run(tarCmd); err != nil {
 		return fmt.Errorf("failed to create tarball: %v", err)
 	}
 
-	fmt.Printf("Package tarball created successfully: %s\n", tarballPath)
+	cPrintf(colInfo, "Package tarball created successfully: %s\n", tarballPath)
 	return nil
 }
 
@@ -2024,7 +2122,7 @@ func executePostInstall(pkgName, rootDir string, execCtx *Executor) error {
 	// If chroot is used and fails, print a warning and continue (non-fatal).
 	if rootDir != "/" {
 		if err := execCtx.Run(cmd); err != nil {
-			fmt.Printf("warning: chroot to %s failed or post-install could not run: %v\n", rootDir, err)
+			cPrintf(colWarn, "Warning: chroot to %s failed or post-install could not run: %v\n", rootDir, err)
 			return nil
 		}
 		return nil
@@ -2330,7 +2428,7 @@ func updateRepos() {
 		}
 	}
 
-	fmt.Println("Unique repositories to update:")
+	cPrintln(colInfo, "Unique repositories to update:")
 	for dir := range uniqueRepoDirs {
 		fmt.Printf("- %s\n", dir)
 
@@ -2345,7 +2443,7 @@ func updateRepos() {
 		if err != nil {
 			fmt.Printf("Error pulling repo %s: %v\nOutput:\n%s\n", dir, err, strings.TrimSpace(string(output)))
 		} else {
-			fmt.Printf("Successfully pulled repo %s\nOutput:\n%s\n", dir, strings.TrimSpace(string(output)))
+			cPrintf(colInfo, "Successfully pulled repo %s\nOutput:\n%s\n", dir, strings.TrimSpace(string(output)))
 		}
 	}
 }
@@ -2487,13 +2585,13 @@ func pkgBuildAll(packages []string) error {
 		return fmt.Errorf("pkgBuild failed: %w", err)
 	}
 
-	fmt.Println("pkgBuild completed successfully.")
+	cPrintln(colSuccess, "Build completed successfully.")
 	return nil
 }
 
 // checkForUpgrades is the main function for the upgrade logic.
 func checkForUpgrades() error {
-	fmt.Println("--- Checking for Package Upgrades ---")
+	cPrintln(colInfo, "--- Checking for Package Upgrades ---")
 
 	// 1. Get list of installed packages
 	output, err := getInstalledPackageOutput("")
@@ -2536,15 +2634,15 @@ func checkForUpgrades() error {
 
 	// 3. Handle upgrade list
 	if len(upgradeList) == 0 {
-		fmt.Println("All installed packages are up to date.")
+		cPrintln(colSuccess, "No packages to upgrade.")
 		return nil
 	}
 
-	fmt.Printf("\n--- %d Package(s) to Upgrade ---\n", len(upgradeList))
+	cPrintf(colInfo, "\n--- %d Package(s) to Upgrade ---\n", len(upgradeList))
 	var pkgNames []string
 	for _, pkg := range upgradeList {
 		// Print full version/revision information for clarity
-		fmt.Printf("  - %s: %s %s -> %s %s\n",
+		cPrintf(colInfo, "  - %s: %s %s -> %s %s\n",
 			pkg.Name,
 			pkg.InstalledVersion, pkg.InstalledRevision,
 			pkg.RepoVersion, pkg.RepoRevision)
@@ -2556,7 +2654,7 @@ func checkForUpgrades() error {
 		// 5. Execute pkgBuild
 		return pkgBuildAll(pkgNames)
 	} else {
-		fmt.Println("Upgrade canceled by user.")
+		cPrintln(colNote, "Upgrade canceled by user.")
 	}
 
 	return nil
@@ -2677,7 +2775,7 @@ func parseDependsFile(pkgDir string) ([]string, error) {
 // stripPackage recursively walks outputDir and runs the 'strip' command on every executable file found,
 // executing the stripping concurrently to maximize speed.
 func stripPackage(outputDir string, buildExec *Executor) error {
-	fmt.Printf("Stripping executables in parallel in: %s\n", outputDir)
+	debugf("Stripping executables in parallel in: %s\n", outputDir)
 
 	var wg sync.WaitGroup
 	var firstError error
@@ -2708,7 +2806,7 @@ func stripPackage(outputDir string, buildExec *Executor) error {
 	findCmd.Stderr = os.Stderr
 
 	// 3. Run the find command using the Executor.
-	fmt.Println("  -> Discovering stripable ELF files...")
+	cPrintln(colInfo, "  -> Discovering stripable ELF files...")
 	if err := buildExec.Run(findCmd); err != nil {
 		return fmt.Errorf("failed to execute file discovery command (find/file filter): %w", err)
 	}
@@ -2889,7 +2987,7 @@ func getUserConfirmation(prompt string) bool {
 		if input == "n" {
 			return false
 		}
-		fmt.Println("Invalid input. Please enter 'y' or 'n'.")
+		cPrintln(colWarn, "Invalid input. Please enter 'y' or 'n'.")
 	}
 }
 
@@ -2910,8 +3008,61 @@ func askForConfirmation(prompt string) bool {
 		if response == "n" || response == "no" || response == "" {
 			return false
 		}
-		fmt.Println("Invalid input. Please type 'y' (yes) or 'n' (no).")
+		cPrintln(colWarn, "Invalid input. Please type 'y' (yes) or 'n' (no).")
 	}
+}
+
+// findOwnerPackage searches installed manifests for the exact file path
+// and returns the name of the package that owns it.
+func findOwnerPackage(filePath string) (string, error) {
+	// 1. Normalize the search path for the manifest (e.g., "usr/lib/libnssckbi.so")
+	// The filePath comes from the 'file' variable which is relative to rootDir
+	// so it doesn't need to be stripped of rootDir, but we'll ensure it's clean.
+	searchPath := filepath.Clean(filePath)
+
+	entries, err := os.ReadDir(Installed)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", nil // No packages installed
+		}
+		return "", fmt.Errorf("failed to read installed db: %w", err)
+	}
+
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		pkgName := e.Name()
+		manifestPath := filepath.Join(Installed, pkgName, "manifest")
+
+		data, err := os.ReadFile(manifestPath)
+		if err != nil {
+			continue // skip unreadable manifests
+		}
+
+		scanner := bufio.NewScanner(bytes.NewReader(data))
+		for scanner.Scan() {
+			line := strings.TrimSpace(scanner.Text())
+			if line == "" || strings.HasSuffix(line, "/") {
+				continue
+			}
+			fields := strings.Fields(line)
+			if len(fields) == 0 {
+				continue
+			}
+			manifestPath := fields[0]
+
+			// Normalize the path found in the manifest for an exact match check
+			cleanManifestPath := filepath.Clean(manifestPath)
+
+			// Check for exact match
+			if cleanManifestPath == searchPath {
+				return pkgName, nil // Found the owner!
+			}
+		}
+	}
+
+	return "", nil // No owner found
 }
 
 // build package
@@ -2992,7 +3143,7 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor) error {
 	shouldStrip := cfg.DefaultStrip
 	noStripFile := filepath.Join(pkgDir, "nostrip")
 	if _, err := os.Stat(noStripFile); err == nil {
-		fmt.Printf("Local 'nostrip' file found in %s. Disabling stripping.\n", pkgDir)
+		cPrintf(colInfo, "Local 'nostrip' file found in %s. Disabling stripping.\n", pkgDir)
 		shouldStrip = false // Override the global setting for this package only
 	}
 
@@ -3000,7 +3151,7 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor) error {
 	shouldLTO := cfg.DefaultLTO
 	noLTOFile := filepath.Join(pkgDir, "nolto")
 	if _, err := os.Stat(noLTOFile); err == nil {
-		fmt.Printf("Local 'nolto' file found in %s. Disabling LTO.\n", pkgDir)
+		cPrintf(colInfo, "Local 'nolto' file found in %s. Disabling LTO.\n", pkgDir)
 		shouldLTO = false // Override the global setting for this package only
 	}
 
@@ -3092,7 +3243,7 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor) error {
 	}
 
 	// Run build script
-	fmt.Printf("Building %s (version %s) in %s, install to %s (root=%v)\n",
+	cPrintf(colInfo, "Building %s (version %s) in %s, install to %s (root=%v)\n",
 		pkgName, version, buildDir, outputDir, buildExec)
 
 	// 1. Define the log file path
@@ -3156,7 +3307,7 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor) error {
 				title := fmt.Sprintf("[HOKUTO BUILD] %s... elapsed: %s", pkgName, elapsed)
 				setTerminalTitle(title)
 				// carriage return to update the same line; may appear as repeated lines in some logs
-				colInfo.Printf(" Building %s ... elapsed: %s\r", pkgName, elapsed)
+				colInfo.Printf("-> Building %s ... elapsed: %s\r", pkgName, elapsed)
 			case <-doneCh:
 				// clear line and return
 				fmt.Print("\r")
@@ -3211,7 +3362,7 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor) error {
 
 	// Create /var/db/hokuto/installed/<pkgName> inside the staging outputDir
 	installedDir := filepath.Join(outputDir, "var", "db", "hokuto", "installed", pkgName)
-	fmt.Printf("Creating metadata directory: %s\n", installedDir)
+	debugf("Creating metadata directory: %s\n", installedDir)
 	mkdirCmd := exec.Command("mkdir", "-p", installedDir)
 	if err := buildExec.Run(mkdirCmd); err != nil {
 		return fmt.Errorf("failed to create installed dir: %v", err)
@@ -3222,16 +3373,16 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor) error {
 	if err := generateLibDeps(outputDir, libdepsFile, buildExec); err != nil {
 		fmt.Printf("Warning: failed to generate libdeps: %v\n", err)
 	} else {
-		fmt.Printf("Library dependencies written to %s\n", libdepsFile)
+		debugf("Library dependencies written to %s\n", libdepsFile)
 	}
 
 	// Generate depends
 	if err := generateDepends(pkgName, pkgDir, outputDir, rootDir, buildExec); err != nil {
 		return fmt.Errorf("failed to generate depends: %v", err)
 	}
-	fmt.Printf("Depends written to %s\n", filepath.Join(installedDir, "depends"))
+	debugf("Depends written to %s\n", filepath.Join(installedDir, "depends"))
 
-	fmt.Printf("%s built successfully, output in %s\n", pkgName, outputDir)
+	debugf("%s built successfully, output in %s\n", pkgName, outputDir)
 
 	// Strip the package
 	if shouldStrip {
@@ -3241,7 +3392,7 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor) error {
 			return fmt.Errorf("build failed during stripping phase for %s: %w", pkgName, err)
 		}
 	} else {
-		fmt.Printf("Skipping binary stripping for %s (NoStrip is true).\n", pkgName)
+		debugf("Skipping binary stripping for %s (NoStrip is true).\n", pkgName)
 	}
 
 	// Copy version file from pkgDir
@@ -3287,6 +3438,36 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor) error {
 	// We use the same Executor context that was used for the build directory creation
 	if err := buildExec.Run(echoCmd); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: failed to save build time to %s: %v\n", buildTimeFile, err)
+	}
+
+	// delete /usr/share/info/dir
+	infodirPath := filepath.Join(outputDir, "/usr/share/info/dir")
+	infoRmCmd := exec.Command("rm", "-rf", infodirPath)
+	if err := buildExec.Run(infoRmCmd); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: failed to delete /usr/share/info/dir: %v\n", err)
+	}
+
+	// delete /usr/lib/perl5/*/core_perl/perllocal.pod
+	pattern := filepath.Join(outputDir, "lib", "perl5", "*", "core_perl", "perllocal.pod")
+	matches, err := filepath.Glob(pattern)
+	if err != nil {
+		// This is an error in the pattern itself or a fundamental I/O error
+		fmt.Fprintf(os.Stderr, "Warning: failed to glob for perllocal.pod pattern %s: %v\n", pattern, err)
+		// Continue, as this is a non-fatal cleanup
+	}
+	if len(matches) > 0 {
+		// Prepare the command arguments: ["rm", "-f"] followed by all file paths
+		rmArgs := []string{"rm", "-f"}
+		rmArgs = append(rmArgs, matches...)
+
+		// The "rm" command is run against all gathered paths
+		perlRmCmd := exec.Command(rmArgs[0], rmArgs[1:]...)
+
+		if err := buildExec.Run(perlRmCmd); err != nil {
+			// Note: rm -f will not return an error if the files were not found,
+			// but it will if permission is denied, or other fatal errors occur.
+			fmt.Fprintf(os.Stderr, "Warning: failed to delete perllocal.pod files: %v\n", err)
+		}
 	}
 
 	// Generate manifest
@@ -3397,7 +3578,7 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 	shouldStrip := cfg.DefaultStrip
 	noStripFile := filepath.Join(pkgDir, "nostrip")
 	if _, err := os.Stat(noStripFile); err == nil {
-		fmt.Printf("Local 'nostrip' file found in %s. Disabling stripping.\n", pkgDir)
+		cPrintf(colInfo, "Local 'nostrip' file found in %s. Disabling stripping.\n", pkgDir)
 		shouldStrip = false // Override the global setting for this package only
 	}
 
@@ -3405,7 +3586,7 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 	shouldLTO := cfg.DefaultLTO
 	noLTOFile := filepath.Join(pkgDir, "nolto")
 	if _, err := os.Stat(noLTOFile); err == nil {
-		fmt.Printf("Local 'nolto' file found in %s. Disabling LTO.\n", pkgDir)
+		cPrintf(colInfo, "Local 'nolto' file found in %s. Disabling LTO.\n", pkgDir)
 		shouldLTO = false // Override the global setting for this package only
 	}
 
@@ -3524,7 +3705,7 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 	}
 
 	// Run build script
-	fmt.Printf("Rebuilding %s (version %s) in %s, install to %s (root=%v)\n",
+	cPrintf(colInfo, "RebuildingRebuilding %s (version %s) in %s, install to %s (root=%v)\n",
 		pkgName, version, buildDir, outputDir, buildExec)
 
 	// 1. Define the log file path
@@ -3647,7 +3828,7 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 
 	// Create /var/db/hokuto/installed/<pkgName> inside the staging outputDir
 	installedDir := filepath.Join(outputDir, "var", "db", "hokuto", "installed", pkgName)
-	fmt.Printf("Creating metadata directory: %s\n", installedDir)
+	debugf("Creating metadata directory: %s\n", installedDir)
 	mkdirCmd := exec.Command("mkdir", "-p", installedDir)
 	if err := buildExec.Run(mkdirCmd); err != nil {
 		return fmt.Errorf("failed to create installed dir: %v", err)
@@ -3658,16 +3839,16 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 	if err := generateLibDeps(outputDir, libdepsFile, buildExec); err != nil {
 		fmt.Printf("Warning: failed to generate libdeps: %v\n", err)
 	} else {
-		fmt.Printf("Library dependencies written to %s\n", libdepsFile)
+		debugf("Library dependencies written to %s\n", libdepsFile)
 	}
 
 	// Generate depends
 	if err := generateDepends(pkgName, pkgDir, outputDir, rootDir, buildExec); err != nil {
 		return fmt.Errorf("failed to generate depends: %v", err)
 	}
-	fmt.Printf("Depends written to %s\n", filepath.Join(installedDir, "depends"))
+	debugf("Depends written to %s\n", filepath.Join(installedDir, "depends"))
 
-	fmt.Printf("%s built successfully, output in %s\n", pkgName, outputDir)
+	debugf("%s built successfully, output in %s\n", pkgName, outputDir)
 
 	// Strip the package
 	if shouldStrip {
@@ -3677,7 +3858,7 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 			return fmt.Errorf("build failed during stripping phase for %s: %w", pkgName, err)
 		}
 	} else {
-		fmt.Printf("Skipping binary stripping for %s (NoStrip is true).\n", pkgName)
+		cPrintf(colInfo, "Skipping binary stripping for %s (NoStrip is true).\n", pkgName)
 	}
 
 	// Copy version file from pkgDir
@@ -3725,12 +3906,42 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 		fmt.Fprintf(os.Stderr, "Warning: failed to save build time to %s: %v\n", buildTimeFile, err)
 	}
 
+	// delete /usr/share/info/dir
+	infodirPath := filepath.Join(outputDir, "/usr/share/info/dir")
+	infoRmCmd := exec.Command("rm", "-rf", infodirPath)
+	if err := buildExec.Run(infoRmCmd); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: failed to delete /usr/share/info/dir: %v\n", err)
+	}
+
+	// delete /usr/lib/perl5/*/core_perl/perllocal.pod
+	pattern := filepath.Join(outputDir, "lib", "perl5", "*", "core_perl", "perllocal.pod")
+	matches, err := filepath.Glob(pattern)
+	if err != nil {
+		// This is an error in the pattern itself or a fundamental I/O error
+		fmt.Fprintf(os.Stderr, "Warning: failed to glob for perllocal.pod pattern %s: %v\n", pattern, err)
+		// Continue, as this is a non-fatal cleanup
+	}
+	if len(matches) > 0 {
+		// Prepare the command arguments: ["rm", "-f"] followed by all file paths
+		rmArgs := []string{"rm", "-f"}
+		rmArgs = append(rmArgs, matches...)
+
+		// The "rm" command is run against all gathered paths
+		perlRmCmd := exec.Command(rmArgs[0], rmArgs[1:]...)
+
+		if err := buildExec.Run(perlRmCmd); err != nil {
+			// Note: rm -f will not return an error if the files were not found,
+			// but it will if permission is denied, or other fatal errors occur.
+			fmt.Fprintf(os.Stderr, "Warning: failed to delete perllocal.pod files: %v\n", err)
+		}
+	}
+
 	// Generate manifest
 	if err := generateManifest(outputDir, installedDir, buildExec); err != nil {
 		return fmt.Errorf("failed to generate manifest: %v", err)
 	}
 
-	fmt.Printf("%s rebuilt successfully, output in %s\n", pkgName, outputDir)
+	cPrintf(colSuccess, "%s rebuilt successfully, output in %s\n", pkgName, outputDir)
 	//Set title to success status
 	finalTitle := fmt.Sprintf("[HOKUTO BUILD] ✅ SUCCESS: %s", pkgName)
 	setTerminalTitle(finalTitle)
@@ -3754,7 +3965,7 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor) err
 	}
 
 	// 1. Unpack tarball into staging
-	fmt.Printf("Unpacking %s into %s\n", tarballPath, stagingDir)
+	debugf("Unpacking %s into %s\n", tarballPath, stagingDir)
 	untarCmd := exec.Command("tar", "--zstd", "-xf", tarballPath, "-C", stagingDir)
 	if err := execCtx.Run(untarCmd); err != nil {
 		return fmt.Errorf("failed to unpack tarball: %v", err)
@@ -3771,6 +3982,19 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor) err
 		stagingFile := filepath.Join(stagingDir, file)
 		currentFile := filepath.Join(rootDir, file) // file under the install root
 
+		// --- NEW: Find the owner package ---
+		ownerPkg, err := findOwnerPackage(file)
+		if err != nil {
+			// Non-fatal, but print error
+			cPrintf(color.FgRed, "Warning: Failed to find owner for %s: %v\n", file, err)
+			ownerPkg = "UNKNOWN" // Use UNKNOWN if the lookup failed
+		}
+		if ownerPkg == "" {
+			ownerPkg = "UNMANAGED" // Use UNMANAGED if no manifest lists the file
+		}
+
+		ownerDisplay := fmt.Sprintf("(Owner: %s) ", ownerPkg)
+
 		if _, err := os.Stat(stagingFile); err == nil {
 			// file exists in staging
 			cmd := exec.Command("diff", "-u", currentFile, stagingFile)
@@ -3778,7 +4002,7 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor) err
 			cmd.Stderr = os.Stderr
 			cmd.Run()
 
-			fmt.Printf("File %s modified, choose action: [k]eep current, [u]se new, [e]dit: ", file)
+			cPrintf(colInfo, "File %s modified, %schoose action: [k]eep current, [u]se new, [e]dit: ", file, ownerDisplay)
 			var input string
 			fmt.Scanln(&input)
 			switch input {
@@ -3866,7 +4090,7 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor) err
 			}
 		} else {
 			// file does NOT exist in staging
-			fmt.Printf("User modified %s, but new package has no file. Keep it? [y/N]: ", file)
+			cPrintf(colInfo, "User modified %s, but new package has no file. Keep it? [y/N]: ", file)
 			var input string
 			fmt.Scanln(&input)
 			ans := strings.ToLower(strings.TrimSpace(input))
@@ -3882,15 +4106,15 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor) err
 				if err := execCtx.Run(cpCmd); err != nil {
 					return fmt.Errorf("failed to copy %s to staging: %v", file, err)
 				}
-				fmt.Printf("Kept modified file by copying %s into staging\n", file)
+				debugf("Kept modified file by copying %s into staging\n", file)
 			} else {
 				// user chose not to keep it -> remove the installed file (run as root)
 				rmCmd := exec.Command("rm", "-f", currentFile)
 				if err := execCtx.Run(rmCmd); err != nil {
 					// warn but continue install; do not abort the whole install for a removal failure
-					fmt.Printf("warning: failed to remove %s: %v\n", currentFile, err)
+					cPrintf(colWarn, "Warning: failed to remove %s: %v\n", currentFile, err)
 				} else {
-					fmt.Printf("Removed user-modified file: %s\n", file)
+					debugf("Removed user-modified file: %s\n", file)
 				}
 			}
 		}
@@ -3991,7 +4215,7 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor) err
 		// Determine the relative path inside the HOKUTO_ROOT (e.g., usr/lib/libfoo.so)
 		relPath, err := filepath.Rel(rootDir, libPath)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "warning: failed to determine relative path for backup %s: %v\n", libPath, err)
+			fmt.Fprintf(os.Stderr, "Warning: failed to determine relative path for backup %s: %v\n", libPath, err)
 			continue
 		}
 
@@ -4010,7 +4234,7 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor) err
 		if err := execCtx.Run(cpCmd); err != nil {
 			fmt.Fprintf(os.Stderr, "warning: failed to backup library %s: %v\n", libPath, err)
 		} else {
-			fmt.Printf("Backed up affected library %s to %s\n", libPath, backupPath)
+			cPrintf(colInfo, "Backed up affected library %s to %s\n", libPath, backupPath)
 		}
 	}
 
@@ -4025,7 +4249,7 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor) err
 		if err := execCtx.Run(rmCmd); err != nil {
 			fmt.Printf("warning: failed to remove obsolete file %s: %v\n", p, err)
 		} else {
-			fmt.Printf("Removed obsolete file: %s\n", p)
+			debugf("Removed obsolete file: %s\n", p)
 		}
 	}
 
@@ -4043,11 +4267,11 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor) err
 		sort.Strings(affectedList)
 
 		// 8a. Prompt for rebuild (Hokuto is guaranteed to be run in a terminal)
-		fmt.Printf("\nWARNING: The following packages depend on libraries that were removed/upgraded:\n  %s\n", strings.Join(affectedList, ", "))
+		cPrintf(colWarn, "\nWARNING: The following packages depend on libraries that were removed/upgraded:\n  %s\n", strings.Join(affectedList, ", "))
 
 		performRebuild := true // Default to true, and allow user input to override
 
-		fmt.Printf("Do you want to rebuild these packages now? This is highly recommended. [Y/n]: ")
+		cPrintf(colInfo, "Do you want to rebuild these packages now? This is highly recommended. [Y/n]: ")
 
 		var answer string
 		// Read the line. Using '_' to discard the error and the count,
@@ -4057,7 +4281,7 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor) err
 		// Check if the trimmed input is 'n' (No). An empty input (user pressed Enter)
 		// or an error (like EOF on Enter) will fall through to 'performRebuild = true'.
 		if strings.ToLower(strings.TrimSpace(answer)) == "n" {
-			fmt.Println("Skipping rebuild. System stability may be compromised.")
+			cPrintf(colInfo, "Skipping rebuild")
 			performRebuild = false
 		}
 		// If err != nil (like when only Enter is pressed), or input is empty/ 'y',
@@ -4065,26 +4289,26 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor) err
 
 		// 8b. Perform rebuild
 		if performRebuild {
-			fmt.Println("Starting rebuild of affected packages...")
+			cPrintln(colInfo, "Starting rebuild of affected packages...")
 			for _, pkg := range affectedList {
-				fmt.Printf("\n--- Rebuilding %s ---\n", pkg)
+				cPrintf(colInfo, "\n--- Rebuilding %s ---\n", pkg)
 
 				if err := pkgBuildRebuild(pkg, cfg, execCtx, tempLibBackupDir); err != nil {
 					failed = append(failed, fmt.Sprintf("rebuild of %s failed: %v", pkg, err))
-					fmt.Printf("WARNING: Rebuild of %s failed: %v\n", pkg, err)
+					cPrintf(colWarn, "WARNING: Rebuild of %s failed: %v\n", pkg, err)
 				} else {
 					rebuildOutputDir := filepath.Join(tmpDir, pkg, "output")
 
 					if err := rsyncStaging(rebuildOutputDir, rootDir, execCtx); err != nil {
 						failed = append(failed, fmt.Sprintf("failed to sync rebuilt package %s to root: %v", pkg, err))
-						fmt.Printf("WARNING: Failed to sync rebuilt package %s to root: %v\n", pkg, err)
+						cPrintf(colWarn, "WARNING: Failed to sync rebuilt package %s to root: %v\n", pkg, err)
 					}
 
 					rmCmd := exec.Command("rm", "-rf", filepath.Join(tmpDir, pkg))
 					if err := execCtx.Run(rmCmd); err != nil {
 						fmt.Fprintf(os.Stderr, "failed to cleanup rebuild tmpdirs for %s: %v\n", pkg, err)
 					}
-					fmt.Printf("Rebuild of %s finished and installed.\n", pkg)
+					cPrintf(colSuccess, "Rebuild of %s finished and installed.\n", pkg)
 				}
 			}
 		}
@@ -4228,7 +4452,7 @@ func pkgUninstall(pkgName string, cfg *Config, execCtx *Executor, force, yes boo
 	// 5. Confirm with user unless 'yes' is set
 	if !yes {
 		// Use fileCount for the prompt
-		fmt.Printf("About to remove package %s and %d file(s). Continue? [y/N]: ", pkgName, fileCount)
+		cPrintf(colWarn, "About to remove package %s and %d file(s). Continue? [y/N]: ", pkgName, fileCount)
 		var answer string
 		fmt.Scanln(&answer)
 		if strings.ToLower(strings.TrimSpace(answer)) != "y" {
@@ -4270,7 +4494,7 @@ func pkgUninstall(pkgName string, cfg *Config, execCtx *Executor, force, yes boo
 			}
 
 			if currentSum != meta.B3Sum {
-				fmt.Printf("\nWARNING: File %s has been modified (expected %s, found %s).\n", p, meta.B3Sum, currentSum)
+				cPrintf(colWarn, "\nWARNING: File %s has been modified (expected %s, found %s).\n", p, meta.B3Sum, currentSum)
 
 				// Prompt user unless 'yes' is set
 				if !yes {
@@ -4341,13 +4565,13 @@ func pkgUninstall(pkgName string, cfg *Config, execCtx *Executor, force, yes boo
 		}
 
 		if isForbidden {
-			fmt.Printf("Skipping removal of protected system directory: %s\n", clean)
+			debugf("Skipping removal of protected system directory: %s\n", clean)
 			continue
 		}
 
 		rmdirCmd := exec.Command("rmdir", clean)
 		if err := execCtx.Run(rmdirCmd); err == nil {
-			fmt.Printf("Removed empty directory %s\n", clean)
+			debugf("Removed empty directory %s\n", clean)
 		}
 	}
 
@@ -4356,7 +4580,7 @@ func pkgUninstall(pkgName string, cfg *Config, execCtx *Executor, force, yes boo
 	if err := execCtx.Run(rmMetaCmd); err != nil {
 		failed = append(failed, fmt.Sprintf("failed to remove metadata %s: %v", installedDir, err))
 	} else {
-		fmt.Printf("Removed package metadata: %s\n", installedDir)
+		debugf("Removed package metadata: %s\n", installedDir)
 	}
 
 	// 10. Run post-uninstall hook if present (unchanged)
@@ -4713,7 +4937,7 @@ func main() {
 			} else {
 				// If it's a target package, defer install and save its name
 				builtTargetPackages = append(builtTargetPackages, buildPkg)
-				fmt.Printf("Target package %s built successfully. Installation deferred.\n", buildPkg)
+				debugf("Target package %s built successfully. Installation deferred.\n", buildPkg)
 			}
 		}
 
@@ -4733,7 +4957,7 @@ func main() {
 					version, _ := getRepoVersion(finalPkg) // Re-get version (should not fail)
 					tarballPath := filepath.Join(BinDir, fmt.Sprintf("%s-%s.tar.zst", finalPkg, version))
 
-					fmt.Printf("Starting installation of target package %s...\n", finalPkg)
+					cPrintf(colInfo, "Starting installation of target package %s...\n", finalPkg)
 					isCriticalAtomic.Store(1)
 					if err := pkgInstall(tarballPath, finalPkg, cfg, RootExec); err != nil {
 						isCriticalAtomic.Store(0)
@@ -4741,7 +4965,7 @@ func main() {
 						os.Exit(1)
 					}
 					isCriticalAtomic.Store(0)
-					fmt.Printf("Package %s installed successfully.\n", finalPkg)
+					cPrintf(colSuccess, "Package %s installed successfully.\n", finalPkg)
 				}
 			} else {
 				fmt.Printf("Installation of target packages skipped by user. Built packages remain in %s.\n", BinDir)
@@ -4770,7 +4994,7 @@ func main() {
 		for _, arg := range args {
 			var tarballPath, pkgName string
 
-			fmt.Printf("Processing argument: %s\n", arg)
+			cPrintf(colInfo, "Processing argument: %s\n", arg)
 
 			if strings.HasSuffix(arg, ".tar.zst") {
 				// Direct tarball path
@@ -4817,7 +5041,7 @@ func main() {
 			}
 
 			// --- Installation Execution ---
-			fmt.Printf("Starting installation of %s from %s...\n", pkgName, tarballPath)
+			cPrintf(colInfo, "Starting installation of %s from %s...\n", pkgName, tarballPath)
 
 			if err := pkgInstall(tarballPath, pkgName, cfg, RootExec); err != nil {
 				fmt.Fprintf(os.Stderr, "Error installing package %s: %v\n", pkgName, err)
@@ -4826,7 +5050,7 @@ func main() {
 				continue
 			}
 
-			fmt.Printf("Package %s installed successfully.\n", pkgName)
+			cPrintf(colSuccess, "Package %s installed successfully.\n", pkgName)
 		}
 
 		if !allSucceeded {
@@ -4871,7 +5095,7 @@ func main() {
 		// Loop through all provided packages and attempt to uninstall each one
 		allSucceeded := true
 		for _, pkgName := range packagesToUninstall {
-			fmt.Printf("Attempting to uninstall package: %s\n", pkgName)
+			cPrintf(colInfo, "Attempting to uninstall package: %s\n", pkgName)
 
 			// The pkgUninstall function must be updated to accept the final flag values
 			if err := pkgUninstall(pkgName, cfg, RootExec, effectiveForce, effectiveYes); err != nil {
@@ -4880,7 +5104,7 @@ func main() {
 				// Continue to the next package instead of os.Exit(1) immediately
 				// This allows for partial success if one package fails but others succeed.
 			} else {
-				fmt.Printf("Package %s removed\n", pkgName)
+				cPrintf(colSuccess, "Package %s removed\n", pkgName)
 			}
 		}
 
@@ -4888,7 +5112,6 @@ func main() {
 			// Exit with an error code if any package failed to uninstall
 			os.Exit(1)
 		}
-		// If all packages were successfully uninstalled, exit cleanly
 
 	case "update":
 		updateRepos()
