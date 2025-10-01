@@ -7,4 +7,5 @@ git show v1.0
 # Push the tag to the remote, overwriting the old one
 git push origin v1.0 --force
 
-
+# Add a release on github
+gh release create v0.2 hokuto-v0.2.tar.xz --title hokuto v0.2 --notes hokuto v0.2 release
