@@ -807,7 +807,7 @@ func downloadFile(url, destFile string) error {
 }
 
 // Fetch sources (HTTP/FTP + Git)
-func fetchSources(pkgName, pkgDir string) error {
+func fetchSources(pkgName, pkgDir string, force bool) error {
 	data, err := os.ReadFile(filepath.Join(pkgDir, "sources"))
 	if err != nil {
 		return fmt.Errorf("could not read sources file: %v", err)
@@ -928,7 +928,7 @@ func fetchSources(pkgName, pkgDir string) error {
 	return nil
 }
 
-func verifyOrCreateChecksums(pkgName, pkgDir string) error {
+func verifyOrCreateChecksums(pkgName, pkgDir string, force bool) error {
 	pkgSrcDir := filepath.Join(SourcesDir, pkgName)
 	checksumFile := filepath.Join(pkgDir, "checksums") // repo package dir
 
@@ -968,7 +968,10 @@ func verifyOrCreateChecksums(pkgName, pkgDir string) error {
 		mismatch := false
 		skipped := false
 
-		if oldSum, ok := existing[f.Name()]; ok {
+		if force {
+			fmt.Printf("Force-redownloading and updating checksum for %s\n", f.Name())
+			mismatch = true // Treat as a mismatch to trigger the redownload logic below
+		} else if oldSum, ok := existing[f.Name()]; ok {
 			cmd := exec.Command("b3sum", "-c")
 			cmd.Stdin = strings.NewReader(fmt.Sprintf("%s  %s\n", oldSum, filePath))
 			if err := cmd.Run(); err == nil {
@@ -979,11 +982,23 @@ func verifyOrCreateChecksums(pkgName, pkgDir string) error {
 		}
 
 		if mismatch {
-			fmt.Printf("Checksum mismatch for %s. Redownload and regenerate checksum? [y/N]: ", f.Name())
-			var response string
-			fmt.Scanln(&response)
-			if strings.ToLower(strings.TrimSpace(response)) == "y" {
-				// Redownload
+			// Note: When 'force' is true, this entire block executes without prompting.
+
+			// If not forced, prompt the user (existing logic)
+			shouldRedownload := false
+			if force {
+				shouldRedownload = true
+			} else {
+				fmt.Printf("Checksum mismatch for %s. Redownload and regenerate checksum? [y/N]: ", f.Name())
+				var response string
+				fmt.Scanln(&response)
+				if strings.ToLower(strings.TrimSpace(response)) == "y" {
+					shouldRedownload = true
+				}
+			}
+
+			if shouldRedownload {
+				// Redownload logic (same as before, but without the prompt)
 				sourceLines, _ := os.ReadFile(filepath.Join(pkgDir, "sources"))
 				for _, line := range strings.Split(string(sourceLines), "\n") {
 					if strings.Contains(line, f.Name()) {
@@ -1083,7 +1098,7 @@ func verifyOrCreateChecksums(pkgName, pkgDir string) error {
 }
 
 // checksum command
-func hokutoChecksum(pkgName string) error {
+func hokutoChecksum(pkgName string, force bool) error {
 
 	paths := strings.Split(repoPaths, ":")
 	var pkgDir string
@@ -1100,10 +1115,10 @@ func hokutoChecksum(pkgName string) error {
 		return fmt.Errorf("package %s not found in HOKUTO_PATH", pkgName)
 	}
 
-	if err := fetchSources(pkgName, pkgDir); err != nil {
+	if err := fetchSources(pkgName, pkgDir, force); err != nil {
 		return fmt.Errorf("error fetching sources: %v", err)
 	}
-	if err := verifyOrCreateChecksums(pkgName, pkgDir); err != nil {
+	if err := verifyOrCreateChecksums(pkgName, pkgDir, force); err != nil {
 		return fmt.Errorf("error verifying checksums: %v", err)
 	}
 
@@ -3131,7 +3146,7 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor) error {
 		ShouldRunAsRoot: needsRootBuild,  // Set the privilege based on 'asroot' file
 	}
 	// Download sources if required
-	if err := hokutoChecksum(pkgName); err != nil {
+	if err := hokutoChecksum(pkgName, false); err != nil {
 		return fmt.Errorf("failed to fetch sources: %v", err)
 	}
 	// Prepare sources in build directory
@@ -3566,7 +3581,7 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 	}
 
 	// Download sources if required
-	if err := hokutoChecksum(pkgName); err != nil {
+	if err := hokutoChecksum(pkgName, false); err != nil {
 		return fmt.Errorf("failed to fetch sources: %v", err)
 	}
 	// Prepare sources
@@ -4782,12 +4797,26 @@ func main() {
 		}
 
 	case "checksum":
+		force := false
+		pkg := ""
+
 		if len(os.Args) < 3 {
-			fmt.Println("Usage: hokuto checksum <pkgname>")
+			fmt.Println("Usage: hokuto checksum <pkgname> [-f]")
 			return
 		}
-		pkg := os.Args[2]
-		if err := hokutoChecksum(pkg); err != nil {
+
+		// Check for optional -f flag (must be the 3rd argument if it exists)
+		if len(os.Args) == 4 && os.Args[3] == "-f" {
+			force = true
+			pkg = os.Args[2]
+		} else if len(os.Args) == 3 {
+			pkg = os.Args[2]
+		} else {
+			fmt.Println("Usage: hokuto checksum <pkgname> [-f]")
+			return
+		}
+
+		if err := hokutoChecksum(pkg, force); err != nil {
 			fmt.Println("Error:", err)
 		}
 
