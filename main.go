@@ -35,19 +35,21 @@ import (
 var isCriticalAtomic atomic.Int32
 
 var (
-	rootDir    string
-	CacheDir   string
-	SourcesDir string
-	BinDir     string
-	CacheStore string
-	Installed  string
-	repoPaths  string
-	tmpDir     string
-	WantStrip  string
-	WantDebug  string
-	Debug      bool
-	WantLTO    string
-	ConfigFile = "/etc/hokuto.conf"
+	rootDir         string
+	CacheDir        string
+	SourcesDir      string
+	BinDir          string
+	CacheStore      string
+	Installed       string
+	repoPaths       string
+	tmpDir          string
+	WantStrip       string
+	WantDebug       string
+	Debug           bool
+	WantLTO         string
+	idleUpdate      bool
+	setIdlePriority bool
+	ConfigFile      = "/etc/hokuto.conf"
 	// Global executors (declared, to be assigned in main)
 	UserExec *Executor
 	RootExec *Executor
@@ -295,6 +297,20 @@ func (e *Executor) Run(cmd *exec.Cmd) error {
 
 	// --- Phase 2: build the final command ---
 	var finalCmd *exec.Cmd
+
+	// Start with the base command and arguments
+	basePath := cmd.Path
+	baseArgs := cmd.Args[1:]
+
+	// 2a. Apply IDLE/NICENESS wrapper first (nice -n 19)
+	if setIdlePriority { // global variable checked here
+		// Prepend 'nice -n 19' to the command.
+		// The new command becomes `nice` and its arguments are the nice flags + the original command.
+		baseArgs = append([]string{"-n", "19", basePath}, baseArgs...)
+		basePath = "nice"
+	}
+
+	// 2b. Apply SUDO wrapper if needed
 	if e.ShouldRunAsRoot && os.Geteuid() != 0 {
 		// use -E only so sudo reads its own tty and uses our cached ticket
 		args := append([]string{"-E", cmd.Path}, cmd.Args[1:]...)
@@ -705,7 +721,7 @@ func newPackage(pkgName string) error {
 // automatically edit version/sources/build of a package
 // editPackage searches for pkgName under the colon-separated repoPaths
 // and opens version, sources, build, depends in the user's editor.
-func editPackage(pkgName string) error {
+func editPackage(pkgName string, openAll bool) error {
 	// Determine editor
 	editor := os.Getenv("EDITOR")
 	if editor == "" {
@@ -743,12 +759,20 @@ func editPackage(pkgName string) error {
 		}
 	}
 
-	// Files to open (create empty files if they don't exist so editor opens them)
-	relFiles := []string{"version", "sources", "build", "depends"}
+	// --- Files to open
+	var relFiles []string
+	if openAll {
+		// -a flag is present: open all four files
+		relFiles = []string{"version", "sources", "build", "depends"}
+	} else {
+		// Default behavior: open only version and sources
+		relFiles = []string{"version", "sources"}
+	}
+
 	var filesToOpen []string
 	for _, f := range relFiles {
 		full := filepath.Join(pkgDir, f)
-		// Ensure file exists
+		// Ensure file exists (unchanged logic)
 		if _, err := os.Stat(full); os.IsNotExist(err) {
 			if err := os.WriteFile(full, nil, 0o644); err != nil {
 				return fmt.Errorf("failed to create %s: %v", full, err)
@@ -2585,22 +2609,35 @@ func pkgBuildAll(packages []string) error {
 		return nil
 	}
 
-	args := append([]string{"build"}, packages...)
+	var failed []string
 
-	fmt.Printf("\n--> Executing pkgBuild for: %s\n", strings.Join(packages, ", "))
+	for _, pkg := range packages {
+		fmt.Printf("\n--> Executing pkgBuild for: %s\n", pkg)
 
-	cmd := exec.Command("hokuto", args...)
+		args := []string{"build", "-a"}
+		if idleUpdate {
+			args = append(args, "-i")
+		}
+		args = append(args, pkg)
 
-	// Inherit Stdin, Stdout, Stderr for interactive build process
-	cmd.Stdin = os.Stdin
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+		cmd := exec.Command("hokuto", args...)
+		cmd.Stdin = os.Stdin
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
 
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("pkgBuild failed: %w", err)
+		if err := cmd.Run(); err != nil {
+			fmt.Fprintf(os.Stderr, "pkgBuild failed for %s: %v\n", pkg, err)
+			failed = append(failed, pkg)
+			continue
+		}
+
+		cPrintln(colSuccess, "Build+Install completed successfully.")
 	}
 
-	cPrintln(colSuccess, "Build completed successfully.")
+	if len(failed) > 0 {
+		return fmt.Errorf("some packages failed: %s", strings.Join(failed, ", "))
+	}
+
 	return nil
 }
 
@@ -4625,17 +4662,17 @@ func printHelp() {
 		Desc string
 	}
 	cmds := []cmdInfo{
-		{"version", "", "Show hokuto version"},
-		{"list", "[pkg]", "List installed packages; optional partial name to filter"},
-		{"checksum", "<pkg>", "Fetch sources and verify/create checksums for a package"},
-		{"build", "[options] <pkg> [...]", "Build package(s). Options: -a (auto-install)"},
-		{"install", "<tarball|pkg> [...]", "Install a built package tarball or named package"},
-		{"uninstall", "[options] <pkg> [...]", "Uninstall package(s). Options: -f (force) -y (yes)"},
-		{"update", "", "Update repository metadata and check for upgrades"},
-		{"manifest", "<pkg>", "Show manifest file entries (files only) for a package"},
-		{"find", "<string>", "Search all manifests for a path containing the string"},
-		{"new", "<string>", "Create a new package "},
-		{"edit", "<string>", "Edit a package"},
+		{"version, --version, -v", "", "Show hokuto version"},
+		{"list, ls", "[pkg]", "List installed packages; optional partial name to filter"},
+		{"checksum, c", "<pkg>", "Fetch sources and verify/create checksums for a package"},
+		{"build, b", "[options] <pkg> [...]", "Build package(s). Options: -a (auto-install)"},
+		{"install, remove, r", "<tarball|pkg> [...]", "Install a built package tarball or named package"},
+		{"uninstall, u", "[options] <pkg> [...]", "Uninstall package(s). Options: -f (force) -y (yes)"},
+		{"update, u", "", "Update repository metadata and check for upgrades"},
+		{"manifest, m", "<pkg>", "Show manifest file entries (files only) for a package"},
+		{"find, f", "<string>", "Search all manifests for a path containing the string"},
+		{"new, n", "<string>", "Create a new package "},
+		{"edit, e", "<string>", "Edit a package"},
 	}
 
 	color.Info.Println("hokuto commands")
@@ -4761,9 +4798,9 @@ func main() {
 	}
 
 	switch os.Args[1] {
-	case "version":
+	case "version", "--version", "-v":
 		// Print version first
-		fmt.Println("hokuto 0.2")
+		fmt.Println("hokuto 0.2.5")
 
 		// Try to pick and show a random embedded PNG from assets/
 		imgs, err := listEmbeddedImages()
@@ -4787,7 +4824,7 @@ func main() {
 			fmt.Fprintln(os.Stderr, "error displaying image:", err)
 		}
 
-	case "list":
+	case "list", "ls":
 		pkg := ""
 		if len(os.Args) >= 3 {
 			pkg = os.Args[2]
@@ -4796,7 +4833,7 @@ func main() {
 			fmt.Println("Error:", err)
 		}
 
-	case "checksum":
+	case "checksum", "c":
 		force := false
 		pkg := ""
 
@@ -4820,18 +4857,19 @@ func main() {
 			fmt.Println("Error:", err)
 		}
 
-	case "build":
+	case "build", "b":
 		// 1. Initialize a FlagSet for the "build" subcommand
 		buildCmd := flag.NewFlagSet("build", flag.ExitOnError)
 		var autoInstall = buildCmd.Bool("a", false, "Automatically install the package(s) after successful build without prompting.")
-
+		var idleBuild = buildCmd.Bool("i", false, "Set the build process and all child processes to idle (lowest) CPU/IO priority (nice -n 19).")
 		// Parse the arguments specific to the "build" subcommand,
 		// starting from os.Args[2] (i.e., skipping "hokuto" and "build")
 		if err := buildCmd.Parse(os.Args[2:]); err != nil {
 			fmt.Fprintf(os.Stderr, "Error parsing build flags: %v\n", err)
 			os.Exit(1)
 		}
-
+		// Set the global variable based on the parsed flag
+		setIdlePriority = *idleBuild
 		// The positional arguments (package names) are now in buildCmd.Args()
 		packagesToProcess := buildCmd.Args()
 		if len(packagesToProcess) < 1 {
@@ -4934,6 +4972,10 @@ func main() {
 		}
 
 		fmt.Printf("The following packages will be built in order: %s\n", strings.Join(packagesToBuild, ", "))
+		// If idle priority is set, inform the user
+		if setIdlePriority {
+			cPrintf(colWarn, "NOTE: Build process niceness set to IDLE (nice -n 19).\n")
+		}
 
 		// --- EXECUTION OF BUILD LOOP ---
 		var builtTargetPackages []string // Track the target packages that were successfully built
@@ -5004,7 +5046,7 @@ func main() {
 		// Clean up or exit after a successful run
 		os.Exit(0)
 
-	case "install":
+	case "install", "i":
 		// Get all arguments after "hokuto" and "install"
 		args := os.Args[2:]
 		if len(args) == 0 {
@@ -5087,7 +5129,7 @@ func main() {
 			os.Exit(1)
 		}
 
-	case "uninstall":
+	case "uninstall", "remove", "r":
 		// 1. Initialize a FlagSet for the "uninstall" subcommand
 		uninstallCmd := flag.NewFlagSet("uninstall", flag.ExitOnError)
 		var force = uninstallCmd.Bool("f", false, "Force uninstallation, ignoring dependency checks.")
@@ -5142,14 +5184,24 @@ func main() {
 			os.Exit(1)
 		}
 
-	case "update":
+	case "update", "u":
+		// check for -i in the arguments for the update command
+		// os.Args layout: [program, "update", ...flags...]
+		for _, a := range os.Args[2:] {
+			if a == "-i" || a == "--idle" {
+				idleUpdate = true
+				break
+			}
+		}
+
 		updateRepos()
+
 		if err := checkForUpgrades(); err != nil {
 			fmt.Fprintf(os.Stderr, "Upgrade process failed: %v\n", err)
 			os.Exit(1)
 		}
 
-	case "manifest":
+	case "manifest", "m":
 		if len(os.Args) < 3 {
 			fmt.Println("Usage: hokuto manifest <pkgname>")
 			os.Exit(1)
@@ -5160,7 +5212,7 @@ func main() {
 			os.Exit(1)
 		}
 
-	case "find":
+	case "find", "f":
 		if len(os.Args) < 3 {
 			fmt.Println("Usage: hokuto find <string>")
 			os.Exit(1)
@@ -5171,7 +5223,7 @@ func main() {
 			os.Exit(1)
 		}
 
-	case "new":
+	case "new", "n":
 		if len(os.Args) < 3 {
 			fmt.Println("Usage: hokuto new <pkgname>")
 			os.Exit(1)
@@ -5182,13 +5234,33 @@ func main() {
 			os.Exit(1)
 		}
 
-	case "edit":
+	case "edit", "e":
 		if len(os.Args) < 3 {
-			fmt.Println("Usage: hokuto edit <pkgname>")
+			fmt.Println("Usage: hokuto edit <pkgname> [-a]")
 			os.Exit(1)
 		}
+
+		// Default: pkgName is os.Args[2]
 		pkg := os.Args[2]
-		if err := editPackage(pkg); err != nil {
+		openAll := false
+
+		// Check if there is a third argument and if it's the -a flag
+		if len(os.Args) == 4 {
+			if os.Args[3] == "-a" {
+				openAll = true
+			} else {
+				// Handle invalid third argument (e.g., hokuto edit pkgname junk)
+				fmt.Println("Usage: hokuto edit <pkgname> [-a]")
+				os.Exit(1)
+			}
+		} else if len(os.Args) > 4 {
+			// Handle too many arguments
+			fmt.Println("Usage: hokuto edit <pkgname> [-a]")
+			os.Exit(1)
+		}
+
+		// Pass the flag to the function
+		if err := editPackage(pkg, openAll); err != nil {
 			fmt.Fprintln(os.Stderr, "Error:", err)
 			os.Exit(1)
 		}
