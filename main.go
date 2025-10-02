@@ -4289,21 +4289,48 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor) err
 				}
 
 				// Construct the absolute path to the library file currently on the system
-				// libdeps should contain paths relative to rootDir (e.g., /usr/lib/libfoo.so)
+				// This is primarily for the OLD format (full path in libdeps).
 				absLibPath := libPath
 				if rootDir != "/" && strings.HasPrefix(libPath, "/") {
+					// Old format: path is absolute, reconstruct relative to rootDir
 					absLibPath = filepath.Join(rootDir, libPath[1:])
 				} else if !strings.HasPrefix(libPath, "/") {
-					// This is unexpected for libdeps, but handle defensively
+					// Handle defensively, but for the NEW format (basename), we will use the full path
+					// from filesToDelete, ignoring this potentially incorrect path construction.
 					absLibPath = filepath.Join(rootDir, libPath)
 				}
 
+				// Determine if the libPath is a full absolute path or just a basename.
+				isFullPath := strings.HasPrefix(libPath, "/")
+
 				// Check if this library is scheduled for deletion
+				matchFound := false
+				finalAbsPath := "" // Stores the correct absolute path of the file being deleted
+
 				for _, fileToDelete := range filesToDelete {
-					if fileToDelete == absLibPath {
+
+					if isFullPath {
+						// Case 1: Old format (full path in libdeps).
+						// Match the full path (relying on absLibPath reconstruction).
+						if fileToDelete == absLibPath {
+							finalAbsPath = absLibPath
+							matchFound = true
+						}
+					} else {
+						// Case 2: New format (basename only in libdeps).
+						// Match the basename of the file being deleted against the libdep entry.
+						fileToDeleteBasename := filepath.Base(fileToDelete)
+						if fileToDeleteBasename == libPath {
+							// Found a match, use the actual path being deleted
+							finalAbsPath = fileToDelete
+							matchFound = true
+						}
+					}
+
+					if matchFound {
 						affectedPackages[otherPkgName] = struct{}{}
-						libFilesToDelete[absLibPath] = struct{}{}
-						// Break inner loop and check the next libdep
+						libFilesToDelete[finalAbsPath] = struct{}{}
+						// Break inner loop (over filesToDelete) and check the next libdep
 						break
 					}
 				}
