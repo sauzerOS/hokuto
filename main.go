@@ -3117,6 +3117,57 @@ func findOwnerPackage(filePath string) (string, error) {
 	return "", nil // No owner found
 }
 
+// PostInstallTasks runs common system cache updates after package installs.
+// Call with RootExec:  if err := PostInstallTasks(RootExec); err != nil { ... }
+func PostInstallTasks(e *Executor) error {
+	tasks := []struct {
+		name string
+		args []string
+	}{
+		// Icon cache
+		{"gtk-update-icon-cache", []string{"-q", "-t", "-f", "/usr/share/icons/hicolor"}},
+		// GSettings schemas
+		{"glib-compile-schemas", []string{"--quiet", "/usr/share/glib-2.0/schemas"}},
+		// Font cache
+		{"fc-cache", []string{"-f", "-q"}},
+		// MIME database
+		{"update-mime-database", []string{"-q", "/usr/share/mime"}},
+		// Desktop entry database
+		{"update-desktop-database", []string{"-q", "/usr/share/applications"}},
+		// Pixbuf loaders (no quiet flag available)
+		{"gdk-pixbuf-query-loaders", []string{"--update-cache"}},
+		// Shared library cache (quiet by default)
+		{"ldconfig", nil},
+		// Man page index
+		{"mandb", []string{"-q"}},
+		// Systemd unit reload
+		{"systemctl", []string{"daemon-reload"}},
+	}
+
+	var errs []error
+	for _, t := range tasks {
+		if _, err := exec.LookPath(t.name); err != nil {
+			continue
+		}
+		cmd := exec.CommandContext(e.Context, t.name, t.args...)
+		// Silence all output to TTY
+		cmd.Stdout = io.Discard
+		cmd.Stderr = io.Discard
+		// Avoid inheriting stdin (prevents accidental prompts)
+		cmd.Stdin = nil
+
+		if err := e.Run(cmd); err != nil {
+			errs = append(errs, fmt.Errorf("%s failed: %w", t.name, err))
+		}
+	}
+
+	if len(errs) > 0 {
+		return nil
+		//fmt.Errorf("some post-install tasks failed: %v", errs)
+	}
+	return nil
+}
+
 // build package
 func pkgBuild(pkgName string, cfg *Config, execCtx *Executor) error {
 
@@ -4800,7 +4851,7 @@ func main() {
 	switch os.Args[1] {
 	case "version", "--version", "-v":
 		// Print version first
-		fmt.Println("hokuto 0.2.5")
+		fmt.Println("hokuto 0.2.6")
 
 		// Try to pick and show a random embedded PNG from assets/
 		imgs, err := listEmbeddedImages()
@@ -4816,7 +4867,7 @@ func main() {
 		choice := imgs[rand.Intn(len(imgs))]
 
 		// Inform user which image we'll show (colored if you like)
-		color.Info.Printf("Showing image: %s\n", choice)
+		//color.Info.Printf("Showing image: %s\n", choice)
 
 		// Display via chafa using the main context (ctx must be in scope in main)
 		// Forward a small default set of chafa flags; you may change or pass none.
@@ -5043,6 +5094,10 @@ func main() {
 			}
 		}
 
+		if err := PostInstallTasks(RootExec); err != nil {
+			fmt.Fprintf(os.Stderr, "post-remove tasks completed with warnings: %v\n", err)
+		}
+
 		// Clean up or exit after a successful run
 		os.Exit(0)
 
@@ -5123,6 +5178,9 @@ func main() {
 
 			cPrintf(colSuccess, "Package %s installed successfully.\n", pkgName)
 		}
+		if err := PostInstallTasks(RootExec); err != nil {
+			fmt.Fprintf(os.Stderr, "post-remove tasks completed with warnings: %v\n", err)
+		}
 
 		if !allSucceeded {
 			// Exit with an error code if any package failed to install
@@ -5195,6 +5253,10 @@ func main() {
 		}
 
 		updateRepos()
+
+		if err := PostInstallTasks(RootExec); err != nil {
+			fmt.Fprintf(os.Stderr, "post-remove tasks completed with warnings: %v\n", err)
+		}
 
 		if err := checkForUpgrades(); err != nil {
 			fmt.Fprintf(os.Stderr, "Upgrade process failed: %v\n", err)
