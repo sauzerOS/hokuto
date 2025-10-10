@@ -47,6 +47,7 @@ var (
 	WantDebug       string
 	Debug           bool
 	WantLTO         string
+	newPackageDir   string
 	idleUpdate      bool
 	setIdlePriority bool
 	ConfigFile      = "/etc/hokuto.conf"
@@ -197,6 +198,7 @@ func initConfig(cfg *Config) {
 	BinDir = CacheDir + "/bin"
 	CacheStore = SourcesDir + "/_cache"
 	Installed = rootDir + "/var/db/hokuto/installed"
+	newPackageDir = "/repo/sauzeros/extra" // default for 'hokuto new'
 
 }
 
@@ -659,20 +661,18 @@ func findPackagesByManifestString(query string) error {
 	return nil
 }
 
-// newPackage creates a minimal package skeleton in the current working directory.
-// - creates directory ./<pkg>
-// - creates ./<pkg>/build with mode 0755 and content "#!/bin/sh -e\n"
-// - creates ./<pkg>/version with mode 0644 and content " 1\n"
-// - creates ./<pkg>/sources with mode 0644 and empty content
-// Everything is created as the current (non-root) user.
+// assume declared somewhere globally:
+// var newPackageDir string
+
+// newPackage creates a minimal package skeleton in $newPackageDir/<pkg>.
+// - creates directory $newPackageDir/<pkg>
+// - creates build, version, sources files with the right modes and contents
 func newPackage(pkgName string) error {
-	// Determine current working dir
-	cwd, err := os.Getwd()
-	if err != nil {
-		return fmt.Errorf("failed to determine current directory: %w", err)
+	if newPackageDir == "" {
+		return fmt.Errorf("newPackageDir is not set")
 	}
 
-	pkgDir := filepath.Join(cwd, pkgName)
+	pkgDir := filepath.Join(newPackageDir, pkgName)
 
 	// Don't overwrite existing package dir
 	if fi, err := os.Stat(pkgDir); err == nil {
@@ -718,7 +718,6 @@ func newPackage(pkgName string) error {
 	return nil
 }
 
-// automatically edit version/sources/build of a package
 // editPackage searches for pkgName under the colon-separated repoPaths
 // and opens version, sources, build, depends in the user's editor.
 func editPackage(pkgName string, openAll bool) error {
@@ -733,7 +732,6 @@ func editPackage(pkgName string, openAll bool) error {
 
 	// repoPaths is expected to be a colon-separated string of base paths,
 	// for example "/repo/sauzeros/core:/repo/sauzeros/extra".
-	// Use filepath.SplitList so it uses the OS path list separator.
 	paths := filepath.SplitList(repoPaths)
 	if len(paths) == 0 {
 		return fmt.Errorf("no repo paths configured")
@@ -750,29 +748,22 @@ func editPackage(pkgName string, openAll bool) error {
 	}
 
 	if pkgDir == "" {
-		// If no existing package dir found, try creating under the first repo path.
-		// This mirrors a common UX where editing a new package scaffolds it.
-		firstBase := paths[0]
-		pkgDir = filepath.Join(firstBase, pkgName)
-		if err := os.MkdirAll(pkgDir, 0o755); err != nil {
-			return fmt.Errorf("package directory %s not found and failed to create under %s: %v", pkgName, firstBase, err)
-		}
+		// Instead of creating, just return an error
+		return fmt.Errorf("package %s not found in any repo path", pkgName)
 	}
 
 	// --- Files to open
 	var relFiles []string
 	if openAll {
-		// -a flag is present: open all four files
 		relFiles = []string{"version", "sources", "build", "depends"}
 	} else {
-		// Default behavior: open only version and sources
 		relFiles = []string{"version", "sources"}
 	}
 
 	var filesToOpen []string
 	for _, f := range relFiles {
 		full := filepath.Join(pkgDir, f)
-		// Ensure file exists (unchanged logic)
+		// Ensure file exists
 		if _, err := os.Stat(full); os.IsNotExist(err) {
 			if err := os.WriteFile(full, nil, 0o644); err != nil {
 				return fmt.Errorf("failed to create %s: %v", full, err)
@@ -4878,7 +4869,7 @@ func main() {
 	switch os.Args[1] {
 	case "version", "--version", "-v":
 		// Print version first
-		fmt.Println("hokuto 0.2.6")
+		fmt.Println("hokuto 0.2.8")
 
 		// Try to pick and show a random embedded PNG from assets/
 		imgs, err := listEmbeddedImages()
