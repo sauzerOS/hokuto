@@ -738,16 +738,16 @@ func editPackage(pkgName string, openAll bool) error {
 	}
 
 	// Find the first directory that contains the package dir
-	var pkgDir string
+	var pkgDirEd string
 	for _, base := range paths {
 		candidate := filepath.Join(base, pkgName)
 		if fi, err := os.Stat(candidate); err == nil && fi.IsDir() {
-			pkgDir = candidate
+			pkgDirEd = candidate
 			break
 		}
 	}
 
-	if pkgDir == "" {
+	if pkgDirEd == "" {
 		// Instead of creating, just return an error
 		return fmt.Errorf("package %s not found in any repo path", pkgName)
 	}
@@ -762,7 +762,7 @@ func editPackage(pkgName string, openAll bool) error {
 
 	var filesToOpen []string
 	for _, f := range relFiles {
-		full := filepath.Join(pkgDir, f)
+		full := filepath.Join(pkgDirEd, f)
 		// Ensure file exists
 		if _, err := os.Stat(full); os.IsNotExist(err) {
 			if err := os.WriteFile(full, nil, 0o644); err != nil {
@@ -1168,12 +1168,25 @@ func prepareSources(pkgName, pkgDir, buildDir string, execCtx *Executor) error {
 			continue
 		}
 
-		// 1. Split the line into source path and optional target subdirectory
-		parts := strings.SplitN(line, " ", 2)
-		relPath := parts[0]
+		// Split into tokens: path, optional subdir, optional flags
+		tokens := strings.Fields(line)
+		if len(tokens) == 0 {
+			continue
+		}
+		relPath := tokens[0]
+
 		targetSubdir := ""
-		if len(parts) == 2 {
-			targetSubdir = parts[1]
+		noExtract := false
+		for _, tok := range tokens[1:] {
+			switch tok {
+			case "noextract":
+				noExtract = true
+			default:
+				// treat as target subdir if not a flag
+				if targetSubdir == "" {
+					targetSubdir = tok
+				}
+			}
 		}
 
 		// 2. Determine the final target directory
@@ -1267,6 +1280,18 @@ func prepareSources(pkgName, pkgDir, buildDir string, execCtx *Executor) error {
 		realPath, err := filepath.EvalSymlinks(srcPath)
 		if err != nil {
 			return fmt.Errorf("failed to resolve symlink %s: %v", relPath, err)
+		}
+
+		// If flagged noextract, just copy the file
+		if noExtract {
+			destPath := filepath.Join(targetDir, filepath.Base(relPath))
+			if err := os.MkdirAll(filepath.Dir(destPath), 0o755); err != nil {
+				return fmt.Errorf("failed to create parent dir for %s: %v", destPath, err)
+			}
+			if err := copyFile(realPath, destPath); err != nil {
+				return fmt.Errorf("failed to copy file %s: %v", relPath, err)
+			}
+			continue
 		}
 
 		// Extract archives or copy file (using realPath)
@@ -1623,6 +1648,17 @@ func listOutputFiles(outputDir string, execCtx *Executor) ([]string, error) {
 	return entries, nil
 }
 
+func lstatViaExecutor(path string, execCtx *Executor) (string, error) {
+	cmd := exec.Command("stat", "-c", "%F", path)
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &out
+	if err := execCtx.Run(cmd); err != nil {
+		return "", fmt.Errorf("failed to stat %s: %v: %s", path, err, out.String())
+	}
+	return strings.TrimSpace(out.String()), nil
+}
+
 // generateManifest scans outputDir and writes a manifest file
 // installedDir is the directory where the manifest file will be placed
 // outputDir is the dir scanned for files
@@ -1647,10 +1683,8 @@ func generateManifest(outputDir, installedDir string, execCtx *Executor) error {
 	if err != nil {
 		return fmt.Errorf("failed to compute relative path for manifest: %v", err)
 	}
-	// We only need the manifest path in the format used in 'entries'
 	manifestEntryPath := "/" + relManifest
 
-	// The final list will exclude the manifest (if found in outputDir) and then be manually added later.
 	filtered := []string{}
 	for _, e := range entries {
 		if e != manifestEntryPath {
@@ -1666,30 +1700,36 @@ func generateManifest(outputDir, installedDir string, execCtx *Executor) error {
 	defer f.Close()
 
 	for _, entry := range filtered {
-		// NOTE: NO NEED FOR os.Stat HERE.
-		// We rely on the / suffix set by listOutputFiles.
-
 		isDir := strings.HasSuffix(entry, "/")
-
 		if isDir {
-			// Directory entry is cleaned to ensure proper format (e.g., // -> /)
 			cleaned := "/" + strings.Trim(strings.TrimPrefix(entry, "/"), "/") + "/"
-			if _, err := fmt.Fprintf(f, "%s\n", cleaned); err != nil {
+			if _, err := fmt.Fprintln(f, cleaned); err != nil {
 				return fmt.Errorf("failed to write manifest entry: %v", err)
 			}
 			continue
 		}
 
-		// It is a file: need absolute path for b3sum
 		absPath := filepath.Join(outputDir, strings.TrimPrefix(entry, "/"))
 
-		// Compute checksum with b3sum helper (MUST be privileged if file is restricted)
-		checksum, err := b3sum(absPath, execCtx)
+		// Use executor-based lstat so we can detect symlinks without following them
+		fileType, err := lstatViaExecutor(absPath, execCtx)
 		if err != nil {
-			// This now correctly fails if b3sum (which MUST use the Executor) fails
-			return fmt.Errorf("b3sum failed for %s: %v", absPath, err)
+			return fmt.Errorf("failed to lstat %s: %v", absPath, err)
 		}
 
+		if fileType == "symbolic link" {
+			// Record the symlink path itself, followed by a dummy hash placeholder
+			if _, err := fmt.Fprintf(f, "%s 000000\n", entry); err != nil {
+				return fmt.Errorf("failed to write symlink entry: %v", err)
+			}
+			continue
+		}
+
+		// Regular file: compute checksum
+		checksum, err := b3sum(absPath, execCtx)
+		if err != nil {
+			return fmt.Errorf("b3sum failed for %s: %v", absPath, err)
+		}
 		if _, err := fmt.Fprintf(f, "%s  %s\n", entry, checksum); err != nil {
 			return fmt.Errorf("failed to write manifest entry: %v", err)
 		}
@@ -1697,27 +1737,22 @@ func generateManifest(outputDir, installedDir string, execCtx *Executor) error {
 
 	f.Close() // close before moving
 
-	// 2. Calculate checksum of the temporary manifest file.
+	// Calculate checksum of the temporary manifest file.
 	tempChecksum, err := b3sum(tmpManifest, execCtx)
 	if err != nil {
 		return fmt.Errorf("b3sum failed for temporary manifest %s: %v", tmpManifest, err)
 	}
 
-	// 3. Re-open the temporary file in APPEND mode to add the final entry.
-	// We open it unprivileged, as the builder owns it.
+	// Append the manifest entry itself
 	f, err = os.OpenFile(tmpManifest, os.O_APPEND|os.O_WRONLY, 0o644)
 	if err != nil {
 		return fmt.Errorf("failed to re-open temporary manifest file for final entry: %v", err)
 	}
-
-	// 4. Write the final manifest entry (path and checksum)
 	if _, err := fmt.Fprintf(f, "%s  %s\n", manifestEntryPath, tempChecksum); err != nil {
-		// Re-close and return the error.
 		f.Close()
 		return fmt.Errorf("failed to write final manifest entry: %v", err)
 	}
-
-	f.Close() // Close before moving
+	f.Close()
 
 	// Move temp manifest into installedDir as root
 	cpCmd := exec.Command("cp", "--remove-destination", tmpManifest, manifestFile)
@@ -1725,7 +1760,6 @@ func generateManifest(outputDir, installedDir string, execCtx *Executor) error {
 		return fmt.Errorf("failed to copy temporary manifest into place: %v", err)
 	}
 
-	// Remove temp manifest
 	os.Remove(tmpManifest)
 
 	debugf("Manifest written to %s (%d entries)\n", manifestFile, len(filtered))
@@ -1955,8 +1989,14 @@ func getModifiedFiles(pkgName, rootDir string, execCtx *Executor) ([]string, err
 		}
 
 		// Compare with recorded hash in manifest (if present)
-		if len(parts) > 1 && parts[1] != sum {
-			modified = append(modified, relPath)
+		if len(parts) > 1 {
+			// Ignore entries with a 000000 hash
+			if parts[1] == "000000" {
+				continue
+			}
+			if parts[1] != sum {
+				modified = append(modified, relPath)
+			}
 		}
 	}
 
@@ -3111,6 +3151,7 @@ func findOwnerPackage(filePath string) (string, error) {
 // PostInstallTasks runs common system cache updates after package installs.
 // Call with RootExec:  if err := PostInstallTasks(RootExec); err != nil { ... }
 func PostInstallTasks(e *Executor) error {
+	cPrintln(colWarn, "Executing post-install tasks")
 	tasks := []struct {
 		name string
 		args []string
@@ -3382,7 +3423,7 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor) error {
 
 	// --- Start interactive build with elapsed timer ---
 	// Set initial title
-	setTerminalTitle(fmt.Sprintf("[HOKUTO BUILD] Starting %s...", pkgName))
+	setTerminalTitle(fmt.Sprintf("Starting %s...", pkgName))
 
 	// time started at beginning of function
 	doneCh := make(chan struct{})
@@ -3398,7 +3439,7 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor) error {
 			select {
 			case <-ticker.C:
 				elapsed := time.Since(startTime).Truncate(time.Second)
-				title := fmt.Sprintf("[HOKUTO BUILD] %s... elapsed: %s", pkgName, elapsed)
+				title := fmt.Sprintf("%s... elapsed: %s", pkgName, elapsed)
 				setTerminalTitle(title)
 				// carriage return to update the same line; may appear as repeated lines in some logs
 				colInfo.Printf("-> Building %s ... elapsed: %s\r", pkgName, elapsed)
@@ -3425,7 +3466,7 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor) error {
 	// Check the single runErr variable (compiler knows it may be non-nil)
 	if runErr != nil {
 		cPrintf(colError, "\nBuild failed for %s: %v\n", pkgName, runErr)
-		finalTitle := fmt.Sprintf("[HOKUTO BUILD] ❌ FAILED: %s", pkgName)
+		finalTitle := fmt.Sprintf("❌ FAILED: %s", pkgName)
 		setTerminalTitle(finalTitle)
 
 		// Flush the log file so tail sees everything written so far.
@@ -3584,7 +3625,7 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor) error {
 		}
 	}
 	// Build SUCCESSFUL: Set title to success status
-	finalTitle := fmt.Sprintf("[HOKUTO BUILD] ✅ SUCCESS: %s", pkgName)
+	finalTitle := fmt.Sprintf("✅ SUCCESS: %s", pkgName)
 	setTerminalTitle(finalTitle)
 
 	return nil
@@ -3891,7 +3932,7 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 		cPrintf(colError, "\nBuild failed for %s: %v\n", pkgName, runErr)
 
 		// Set title to warning status
-		finalTitle := fmt.Sprintf("[HOKUTO BUILD] ❌ FAILED: %s", pkgName)
+		finalTitle := fmt.Sprintf("❌ FAILED: %s", pkgName)
 		setTerminalTitle(finalTitle)
 
 		// Flush the log file so tail sees everything written so far.
@@ -4037,7 +4078,7 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 
 	cPrintf(colSuccess, "%s rebuilt successfully, output in %s\n", pkgName, outputDir)
 	//Set title to success status
-	finalTitle := fmt.Sprintf("[HOKUTO BUILD] ✅ SUCCESS: %s", pkgName)
+	finalTitle := fmt.Sprintf("✅ SUCCESS: %s", pkgName)
 	setTerminalTitle(finalTitle)
 
 	// Key difference: Skip tarball creation and cleanup to allow pkgInstall to sync and clean up.
@@ -4445,6 +4486,11 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor) err
 	if len(failed) > 0 { // 'failed' slice is correctly declared at the start of pkgInstall
 		return fmt.Errorf("some file actions failed:\n%s", strings.Join(failed, "\n"))
 	}
+
+	// 11. Run global post-install tasks
+	if err := PostInstallTasks(RootExec); err != nil {
+		fmt.Fprintf(os.Stderr, "post-remove tasks completed with warnings: %v\n", err)
+	}
 	return nil
 }
 
@@ -4619,10 +4665,14 @@ func pkgUninstall(pkgName string, cfg *Config, execCtx *Executor, force, yes boo
 
 				// Prompt user unless 'yes' is set
 				if !yes {
-					fmt.Printf("File content mismatch. Remove anyway? [y/N]: ")
+					fmt.Printf("File content mismatch. Remove anyway? [Y/n]: ")
 					var answer string
 					fmt.Scanln(&answer)
-					if strings.ToLower(strings.TrimSpace(answer)) != "y" {
+					answer = strings.ToLower(strings.TrimSpace(answer))
+					if answer == "" {
+						answer = "y" // default to Yes if user just presses Enter
+					}
+					if answer != "y" {
 						failed = append(failed, fmt.Sprintf("%s: content mismatch, removal skipped by user", p))
 						continue // Skip removal
 					}
@@ -4735,8 +4785,8 @@ func printHelp() {
 		{"list, ls", "[pkg]", "List installed packages; optional partial name to filter"},
 		{"checksum, c", "<pkg>", "Fetch sources and verify/create checksums for a package"},
 		{"build, b", "[options] <pkg> [...]", "Build package(s). Options: -a (auto-install)"},
-		{"install, remove, r", "<tarball|pkg> [...]", "Install a built package tarball or named package"},
-		{"uninstall, u", "[options] <pkg> [...]", "Uninstall package(s). Options: -f (force) -y (yes)"},
+		{"install, i", "<tarball|pkg> [...]", "Install a built package tarball or named package"},
+		{"uninstall, r", "[options] <pkg> [...]", "Uninstall package(s). Options: -f (force) -y (yes)"},
 		{"update, u", "", "Update repository metadata and check for upgrades"},
 		{"manifest, m", "<pkg>", "Show manifest file entries (files only) for a package"},
 		{"find, f", "<string>", "Search all manifests for a path containing the string"},
@@ -4869,7 +4919,7 @@ func main() {
 	switch os.Args[1] {
 	case "version", "--version", "-v":
 		// Print version first
-		fmt.Println("hokuto 0.2.8")
+		fmt.Println("hokuto 0.2.14")
 
 		// Try to pick and show a random embedded PNG from assets/
 		imgs, err := listEmbeddedImages()
@@ -5112,10 +5162,6 @@ func main() {
 			}
 		}
 
-		if err := PostInstallTasks(RootExec); err != nil {
-			fmt.Fprintf(os.Stderr, "post-remove tasks completed with warnings: %v\n", err)
-		}
-
 		// Clean up or exit after a successful run
 		os.Exit(0)
 
@@ -5123,7 +5169,7 @@ func main() {
 		// Get all arguments after "hokuto" and "install"
 		args := os.Args[2:]
 		if len(args) == 0 {
-			fmt.Println("Usage: hokuto install <tarball|pkgname> [tarball|pkgname...]")
+			fmt.Println("Usage: hokuto install <tarball|pkgname>")
 			os.Exit(1)
 		}
 
@@ -5195,9 +5241,6 @@ func main() {
 			}
 
 			cPrintf(colSuccess, "Package %s installed successfully.\n", pkgName)
-		}
-		if err := PostInstallTasks(RootExec); err != nil {
-			fmt.Fprintf(os.Stderr, "post-remove tasks completed with warnings: %v\n", err)
 		}
 
 		if !allSucceeded {
