@@ -302,14 +302,13 @@ func (e *Executor) Run(cmd *exec.Cmd) error {
 
 	// Start with the base command and arguments
 	basePath := cmd.Path
-	baseArgs := cmd.Args[1:]
-
 	// 2a. Apply IDLE/NICENESS wrapper first (nice -n 19)
 	if setIdlePriority { // global variable checked here
 		// Prepend 'nice -n 19' to the command.
 		// The new command becomes `nice` and its arguments are the nice flags + the original command.
-		baseArgs = append([]string{"-n", "19", basePath}, baseArgs...)
+		baseArgs := append([]string{"-n", "19", basePath}, cmd.Args[1:]...)
 		basePath = "nice"
+		cmd.Args = append([]string{basePath}, baseArgs...)
 	}
 
 	// 2b. Apply SUDO wrapper if needed
@@ -977,6 +976,10 @@ func verifyOrCreateChecksums(pkgName, pkgDir string, force bool) error {
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
+		// Skip local files (files that start with "files/")
+		if strings.HasPrefix(line, "files/") {
+			continue
+		}
 		// Assume last field is the filename
 		parts := strings.Fields(line)
 		fname := filepath.Base(parts[len(parts)-1])
@@ -1026,6 +1029,10 @@ func verifyOrCreateChecksums(pkgName, pkgDir string, force bool) error {
 						if line == "" || strings.HasPrefix(line, "#") {
 							continue
 						}
+						// Skip local files (files that start with "files/")
+						if strings.HasPrefix(line, "files/") {
+							continue
+						}
 
 						hashName := fmt.Sprintf("%s-%s", hashString(line+fname), fname)
 						cachePath := filepath.Join(CacheStore, hashName)
@@ -1056,6 +1063,10 @@ func verifyOrCreateChecksums(pkgName, pkgDir string, force bool) error {
 					if strings.Contains(line, fname) {
 						line = strings.TrimSpace(line)
 						if line == "" || strings.HasPrefix(line, "#") {
+							continue
+						}
+						// Skip local files (files that start with "files/")
+						if strings.HasPrefix(line, "files/") {
 							continue
 						}
 						hashName := fmt.Sprintf("%s-%s", hashString(line+fname), fname)
@@ -1687,13 +1698,14 @@ func generateManifest(outputDir, installedDir string, execCtx *Executor) error {
 	}
 	defer f.Close()
 
+	// Separate directories, symlinks, and regular files for optimization
+	var dirs, symlinks, regularFiles []string
+	var symlinkMap = make(map[string]bool)
+
 	for _, entry := range filtered {
 		isDir := strings.HasSuffix(entry, "/")
 		if isDir {
-			cleaned := "/" + strings.Trim(strings.TrimPrefix(entry, "/"), "/") + "/"
-			if _, err := fmt.Fprintln(f, cleaned); err != nil {
-				return fmt.Errorf("failed to write manifest entry: %v", err)
-			}
+			dirs = append(dirs, entry)
 			continue
 		}
 
@@ -1706,18 +1718,60 @@ func generateManifest(outputDir, installedDir string, execCtx *Executor) error {
 		}
 
 		if fileType == "symbolic link" {
-			// Record the symlink path itself, followed by a dummy hash placeholder
-			if _, err := fmt.Fprintf(f, "%s 000000\n", entry); err != nil {
-				return fmt.Errorf("failed to write symlink entry: %v", err)
+			symlinks = append(symlinks, entry)
+			symlinkMap[entry] = true
+		} else {
+			regularFiles = append(regularFiles, absPath)
+		}
+	}
+
+	// Write directory entries first
+	for _, entry := range dirs {
+		cleaned := "/" + strings.Trim(strings.TrimPrefix(entry, "/"), "/") + "/"
+		if _, err := fmt.Fprintln(f, cleaned); err != nil {
+			return fmt.Errorf("failed to write manifest entry: %v", err)
+		}
+	}
+
+	// Write symlink entries
+	for _, entry := range symlinks {
+		if _, err := fmt.Fprintf(f, "%s 000000\n", entry); err != nil {
+			return fmt.Errorf("failed to write symlink entry: %v", err)
+		}
+	}
+
+	// Compute checksums for regular files - use optimized path for user builds
+	var checksums map[string]string
+	if !execCtx.ShouldRunAsRoot {
+		// Fast path: parallel processing for user-built packages
+		checksums, err = b3sumBatch(regularFiles, runtime.NumCPU()*2)
+		if err != nil {
+			return fmt.Errorf("batch b3sum failed: %v", err)
+		}
+	} else {
+		// Slow path: sequential processing for root-built packages (maintains existing behavior)
+		checksums = make(map[string]string)
+		for _, absPath := range regularFiles {
+			checksum, err := b3sum(absPath, execCtx)
+			if err != nil {
+				return fmt.Errorf("b3sum failed for %s: %v", absPath, err)
 			}
-			continue
+			checksums[absPath] = checksum
+		}
+	}
+
+	// Write regular file entries with their checksums
+	for _, entry := range filtered {
+		if strings.HasSuffix(entry, "/") || symlinkMap[entry] {
+			continue // already handled above
 		}
 
-		// Regular file: compute checksum
-		checksum, err := b3sum(absPath, execCtx)
-		if err != nil {
-			return fmt.Errorf("b3sum failed for %s: %v", absPath, err)
+		absPath := filepath.Join(outputDir, strings.TrimPrefix(entry, "/"))
+		checksum, exists := checksums[absPath]
+		if !exists {
+			return fmt.Errorf("missing checksum for %s", absPath)
 		}
+
 		if _, err := fmt.Fprintf(f, "%s  %s\n", entry, checksum); err != nil {
 			return fmt.Errorf("failed to write manifest entry: %v", err)
 		}
@@ -1947,8 +2001,10 @@ func getModifiedFiles(pkgName, rootDir string, execCtx *Executor) ([]string, err
 		return nil, fmt.Errorf("failed to read manifest: %v", err)
 	}
 
-	var modified []string
+	// First pass: collect all file paths that need checksumming
+	var filesToCheck []string
 	scanner := bufio.NewScanner(strings.NewReader(string(data)))
+
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" || strings.HasSuffix(line, "/") {
@@ -1970,21 +2026,80 @@ func getModifiedFiles(pkgName, rootDir string, execCtx *Executor) ([]string, err
 
 		absPath := filepath.Join(rootDir, relPath)
 
-		// Compute b3sum of installed file
-		sum, err := b3sum(absPath, execCtx)
-		if err != nil {
-			continue // skip missing files or checksum failures
+		// Skip entries with 000000 hash (symlinks)
+		if len(parts) > 1 && parts[1] == "000000" {
+			continue
 		}
 
-		// Compare with recorded hash in manifest (if present)
-		if len(parts) > 1 {
-			// Ignore entries with a 000000 hash
-			if parts[1] == "000000" {
-				continue
+		filesToCheck = append(filesToCheck, absPath)
+	}
+
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("error scanning manifest: %v", err)
+	}
+
+	// Compute checksums - use optimized path for user-built packages
+	var checksums map[string]string
+	if !execCtx.ShouldRunAsRoot {
+		// Fast path: parallel processing for user-built packages
+		var err error
+		checksums, err = b3sumBatch(filesToCheck, runtime.NumCPU()*2)
+		if err != nil {
+			// Fall back to sequential processing if batch fails
+			checksums = make(map[string]string)
+			for _, absPath := range filesToCheck {
+				sum, err := b3sum(absPath, execCtx)
+				if err != nil {
+					continue // skip missing files or checksum failures
+				}
+				checksums[absPath] = sum
 			}
-			if parts[1] != sum {
-				modified = append(modified, relPath)
+		}
+	} else {
+		// Slow path: sequential processing for root-built packages
+		checksums = make(map[string]string)
+		for _, absPath := range filesToCheck {
+			sum, err := b3sum(absPath, execCtx)
+			if err != nil {
+				continue // skip missing files or checksum failures
 			}
+			checksums[absPath] = sum
+		}
+	}
+
+	// Second pass: compare checksums and find modified files
+	var modified []string
+	scanner = bufio.NewScanner(strings.NewReader(string(data)))
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasSuffix(line, "/") {
+			continue
+		}
+
+		parts := strings.Fields(line)
+		if len(parts) < 2 {
+			continue
+		}
+
+		relPath := parts[0]
+		relSlash := filepath.ToSlash(relPath)
+		if strings.HasSuffix(relSlash, "/installed/"+pkgName+"/manifest") {
+			continue
+		}
+
+		// Skip entries with 000000 hash (symlinks)
+		if parts[1] == "000000" {
+			continue
+		}
+
+		absPath := filepath.Join(rootDir, relPath)
+		currentSum, exists := checksums[absPath]
+		if !exists {
+			continue // file doesn't exist or checksum failed
+		}
+
+		if parts[1] != currentSum {
+			modified = append(modified, relPath)
 		}
 	}
 
@@ -2016,6 +2131,69 @@ func b3sum(path string, execCtx *Executor) (string, error) {
 		return "", fmt.Errorf("b3sum produced no output for %s", path)
 	}
 	return fields[0], nil
+}
+
+// b3sumFast computes b3sum for user-built packages without Executor overhead
+func b3sumFast(path string) (string, error) {
+	cmd := exec.Command("b3sum", path)
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = os.Stderr
+
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("b3sum failed for %s: %w", path, err)
+	}
+
+	fields := strings.Fields(out.String())
+	if len(fields) == 0 {
+		return "", fmt.Errorf("b3sum produced no output for %s", path)
+	}
+	return fields[0], nil
+}
+
+// b3sumBatch computes checksums for multiple files in parallel for user-built packages
+func b3sumBatch(paths []string, maxWorkers int) (map[string]string, error) {
+	if maxWorkers <= 0 {
+		maxWorkers = 10 // reasonable default
+	}
+
+	results := make(map[string]string)
+	errors := make(map[string]error)
+	var mu sync.Mutex
+
+	semaphore := make(chan struct{}, maxWorkers)
+	var wg sync.WaitGroup
+
+	for _, path := range paths {
+		wg.Add(1)
+		go func(p string) {
+			defer wg.Done()
+			semaphore <- struct{}{}        // acquire
+			defer func() { <-semaphore }() // release
+
+			checksum, err := b3sumFast(p)
+
+			mu.Lock()
+			if err != nil {
+				errors[p] = err
+			} else {
+				results[p] = checksum
+			}
+			mu.Unlock()
+		}(path)
+	}
+
+	wg.Wait()
+
+	if len(errors) > 0 {
+		var errMsgs []string
+		for path, err := range errors {
+			errMsgs = append(errMsgs, fmt.Sprintf("%s: %v", path, err))
+		}
+		return results, fmt.Errorf("b3sum errors: %s", strings.Join(errMsgs, "; "))
+	}
+
+	return results, nil
 }
 
 // Helper to read a file as root if needed
@@ -3544,6 +3722,16 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor) error {
 		return fmt.Errorf("failed to stat post-install file: %v", err)
 	}
 
+	// Add asroot file to package metadata if the package was built as root
+	if buildExec.ShouldRunAsRoot {
+		asRootFile := filepath.Join(installedDir, "asroot")
+		touchCmd := exec.Command("touch", asRootFile)
+		if err := buildExec.Run(touchCmd); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to create asroot marker file %s: %v\n", asRootFile, err)
+		}
+		debugf("Added asroot marker file to package metadata (package built as root)\n")
+	}
+
 	// Calculate the elapsed time
 	elapsed = time.Since(startTime)
 
@@ -4010,6 +4198,16 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 		return fmt.Errorf("failed to stat post-install file: %v", err)
 	}
 
+	// Add asroot file to package metadata if the package was built as root
+	if buildExec.ShouldRunAsRoot {
+		asRootFile := filepath.Join(installedDir, "asroot")
+		touchCmd := exec.Command("touch", asRootFile)
+		if err := buildExec.Run(touchCmd); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to create asroot marker file %s: %v\n", asRootFile, err)
+		}
+		debugf("Added asroot marker file to package metadata (package built as root)\n")
+	}
+
 	// Calculate the elapsed time
 	elapsed = time.Since(startTime)
 
@@ -4096,7 +4294,31 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor) err
 
 	// 2. Detect user-modified files
 	debugf("detect user modified files")
-	modifiedFiles, err := getModifiedFiles(pkgName, rootDir, execCtx)
+
+	// Determine if this package was built as a user (for optimization)
+	// Check for asroot file in the staging directory metadata (embedded during build)
+	stagingMetadataDir := filepath.Join(stagingDir, "var", "db", "hokuto", "installed", pkgName)
+	asRootFile := filepath.Join(stagingMetadataDir, "asroot")
+	needsRootBuild := false
+	if _, err := os.Stat(asRootFile); err == nil {
+		needsRootBuild = true
+	}
+
+	// Use appropriate executor for modified files detection
+	var modifiedExec *Executor
+	if needsRootBuild {
+		// Package was built as root, use root executor
+		modifiedExec = execCtx
+	} else {
+		// Package was built as user, use user executor for faster checksum computation
+		modifiedExec = &Executor{
+			Context:         execCtx.Context,
+			ShouldRunAsRoot: false,
+		}
+		debugf("Using optimized user executor for modified files detection (package built as user)\n")
+	}
+
+	modifiedFiles, err := getModifiedFiles(pkgName, rootDir, modifiedExec)
 	if err != nil {
 		return err
 	}
@@ -4248,7 +4470,22 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor) err
 	stagingManifest := stagingDir + "/var/db/hokuto/installed/" + pkgName + "/manifest"
 	stagingManifest2dir := "/tmp/staging-manifest-" + pkgName
 	stagingManifest2file := filepath.Join(stagingManifest2dir, "/manifest")
-	if err := generateManifest(stagingDir, stagingManifest2dir, execCtx); err != nil {
+
+	// Use appropriate executor for manifest generation (reuse the same logic as modified files detection)
+	var manifestExec *Executor
+	if needsRootBuild {
+		// Package was built as root, use root executor
+		manifestExec = execCtx
+	} else {
+		// Package was built as user, use user executor for faster manifest generation
+		manifestExec = &Executor{
+			Context:         execCtx.Context,
+			ShouldRunAsRoot: false,
+		}
+		debugf("Using optimized user executor for manifest generation (package built as user)\n")
+	}
+
+	if err := generateManifest(stagingDir, stagingManifest2dir, manifestExec); err != nil {
 		return fmt.Errorf("failed to generate manifest: %v", err)
 	}
 	debugf("Generate update manifest\n")
