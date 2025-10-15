@@ -965,28 +965,38 @@ func verifyOrCreateChecksums(pkgName, pkgDir string, force bool) error {
 		f.Close()
 	}
 
-	files, err := os.ReadDir(pkgSrcDir)
+	// Parse sources file to get expected files for this package version
+	sourceLines, err := os.ReadFile(filepath.Join(pkgDir, "sources"))
 	if err != nil {
-		return fmt.Errorf("cannot read source dir: %v", err)
+		return fmt.Errorf("cannot read sources file: %v", err)
+	}
+
+	var expectedFiles []string
+	for _, line := range strings.Split(string(sourceLines), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		// Assume last field is the filename
+		parts := strings.Fields(line)
+		fname := filepath.Base(parts[len(parts)-1])
+		expectedFiles = append(expectedFiles, fname)
 	}
 
 	var summary []string
 	var updatedChecksums []string
 
-	for _, f := range files {
-		if f.IsDir() {
-			continue
-		}
-		filePath := filepath.Join(pkgSrcDir, f.Name())
+	for _, fname := range expectedFiles {
+		filePath := filepath.Join(pkgSrcDir, fname)
 
 		hashValid := false
 		mismatch := false
 		skipped := false
 
 		if force {
-			fmt.Printf("Force-redownloading and updating checksum for %s\n", f.Name())
-			mismatch = true // Treat as a mismatch to trigger the redownload logic below
-		} else if oldSum, ok := existing[f.Name()]; ok {
+			fmt.Printf("Force-redownloading and updating checksum for %s\n", fname)
+			mismatch = true
+		} else if oldSum, ok := existing[fname]; ok {
 			cmd := exec.Command("b3sum", "-c")
 			cmd.Stdin = strings.NewReader(fmt.Sprintf("%s  %s\n", oldSum, filePath))
 			if err := cmd.Run(); err == nil {
@@ -997,14 +1007,11 @@ func verifyOrCreateChecksums(pkgName, pkgDir string, force bool) error {
 		}
 
 		if mismatch {
-			// Note: When 'force' is true, this entire block executes without prompting.
-
-			// If not forced, prompt the user (existing logic)
 			shouldRedownload := false
 			if force {
 				shouldRedownload = true
 			} else {
-				fmt.Printf("Checksum mismatch for %s. Redownload and regenerate checksum? [y/N]: ", f.Name())
+				fmt.Printf("Checksum mismatch for %s. Redownload and regenerate checksum? [y/N]: ", fname)
 				var response string
 				fmt.Scanln(&response)
 				if strings.ToLower(strings.TrimSpace(response)) == "y" {
@@ -1013,65 +1020,51 @@ func verifyOrCreateChecksums(pkgName, pkgDir string, force bool) error {
 			}
 
 			if shouldRedownload {
-				// Redownload logic (same as before, but without the prompt)
-				sourceLines, _ := os.ReadFile(filepath.Join(pkgDir, "sources"))
 				for _, line := range strings.Split(string(sourceLines), "\n") {
-					if strings.Contains(line, f.Name()) {
+					if strings.Contains(line, fname) {
 						line = strings.TrimSpace(line)
 						if line == "" || strings.HasPrefix(line, "#") {
 							continue
 						}
 
-						// Compute hash filename for _cache
-						hashName := fmt.Sprintf("%s-%s", hashString(line+f.Name()), f.Name())
+						hashName := fmt.Sprintf("%s-%s", hashString(line+fname), fname)
 						cachePath := filepath.Join(CacheStore, hashName)
 
-						// Remove old cache file if exists
 						if _, err := os.Stat(cachePath); err == nil {
 							os.Remove(cachePath)
 						}
-
-						// Remove old symlink/file in source dir
 						if _, err := os.Lstat(filePath); err == nil {
 							os.Remove(filePath)
 						}
 
-						// Download into _cache
 						if err := downloadFile(line, cachePath); err != nil {
-							return fmt.Errorf("failed to redownload %s: %v", f.Name(), err)
+							return fmt.Errorf("failed to redownload %s: %v", fname, err)
 						}
-
-						// Create symlink in pkg dir
 						if err := os.Symlink(cachePath, filePath); err != nil {
 							return fmt.Errorf("failed to symlink %s -> %s: %v", cachePath, filePath, err)
 						}
 
-						hashValid = false // recompute checksum
+						hashValid = false
 					}
 				}
 			} else {
-				fmt.Printf("Skipping update for %s\n", f.Name())
-				// Remove invalid symlink
+				fmt.Printf("Skipping update for %s\n", fname)
 				if _, err := os.Lstat(filePath); err == nil {
 					os.Remove(filePath)
 				}
-
-				// Remove cache file as well
-				sourceLines, _ := os.ReadFile(filepath.Join(pkgDir, "sources"))
 				for _, line := range strings.Split(string(sourceLines), "\n") {
-					if strings.Contains(line, f.Name()) {
+					if strings.Contains(line, fname) {
 						line = strings.TrimSpace(line)
 						if line == "" || strings.HasPrefix(line, "#") {
 							continue
 						}
-						hashName := fmt.Sprintf("%s-%s", hashString(line+f.Name()), f.Name())
+						hashName := fmt.Sprintf("%s-%s", hashString(line+fname), fname)
 						cachePath := filepath.Join(CacheStore, hashName)
 						if _, err := os.Stat(cachePath); err == nil {
 							os.Remove(cachePath)
 						}
 					}
 				}
-
 				skipped = true
 				hashValid = false
 			}
@@ -1079,27 +1072,25 @@ func verifyOrCreateChecksums(pkgName, pkgDir string, force bool) error {
 
 		if !hashValid {
 			if !skipped {
-				fmt.Printf("Updating checksum for %s\n", f.Name())
+				fmt.Printf("Updating checksum for %s\n", fname)
 				cmd := exec.Command("b3sum", filePath)
 				out, err := cmd.Output()
 				if err != nil {
 					return fmt.Errorf("failed to compute checksum: %v", err)
 				}
 				sum := strings.Fields(string(out))[0]
-				updatedChecksums = append(updatedChecksums, fmt.Sprintf("%s  %s", sum, f.Name()))
-				summary = append(summary, fmt.Sprintf("%s: updated", f.Name()))
+				updatedChecksums = append(updatedChecksums, fmt.Sprintf("%s  %s", sum, fname))
+				summary = append(summary, fmt.Sprintf("%s: updated", fname))
 			} else {
-				// User skipped → mark as mismatch
-				updatedChecksums = append(updatedChecksums, fmt.Sprintf("%s  %s", existing[f.Name()], f.Name()))
-				summary = append(summary, fmt.Sprintf("%s: mismatch (skipped)", f.Name()))
+				updatedChecksums = append(updatedChecksums, fmt.Sprintf("%s  %s", existing[fname], fname))
+				summary = append(summary, fmt.Sprintf("%s: mismatch (skipped)", fname))
 			}
 		} else {
-			updatedChecksums = append(updatedChecksums, fmt.Sprintf("%s  %s", existing[f.Name()], f.Name()))
-			summary = append(summary, fmt.Sprintf("%s: ok", f.Name()))
+			updatedChecksums = append(updatedChecksums, fmt.Sprintf("%s  %s", existing[fname], fname))
+			summary = append(summary, fmt.Sprintf("%s: ok", fname))
 		}
 	}
 
-	// Write back to the package directory
 	if err := os.WriteFile(checksumFile, []byte(strings.Join(updatedChecksums, "\n")+"\n"), 0o644); err != nil {
 		return fmt.Errorf("failed to write checksums file: %v", err)
 	}
@@ -1208,9 +1199,6 @@ func prepareSources(pkgName, pkgDir, buildDir string, execCtx *Executor) error {
 		switch {
 		case strings.HasPrefix(relPath, "files/"):
 			// Local files in package directory
-			srcPath = filepath.Join(pkgDir, relPath)
-		case strings.HasPrefix(relPath, "patches/"):
-			// Local patches in package directory
 			srcPath = filepath.Join(pkgDir, relPath)
 		case isGitSource:
 			// Git sources: Source path is the cloned directory in the cache (SourcesDir/pkgName/repoName)
@@ -3683,7 +3671,7 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 	if err := os.RemoveAll(pkgTmpDir); err != nil {
 		return fmt.Errorf("failed to clean pkg tmp dir %s: %v", pkgTmpDir, err)
 	}
-	for _, dir := range []string{buildDir, outputDir} {
+	for _, dir := range []string{buildDir, outputDir, logDir} {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return fmt.Errorf("failed to create dir %s: %v", dir, err)
 		}
@@ -4107,6 +4095,7 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor) err
 	}
 
 	// 2. Detect user-modified files
+	debugf("detect user modified files")
 	modifiedFiles, err := getModifiedFiles(pkgName, rootDir, execCtx)
 	if err != nil {
 		return err
@@ -4255,12 +4244,14 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor) err
 		}
 	}
 	// Generate updated manifest of staging
+	debugf("Generating staging manifest\n")
 	stagingManifest := stagingDir + "/var/db/hokuto/installed/" + pkgName + "/manifest"
 	stagingManifest2dir := "/tmp/staging-manifest-" + pkgName
 	stagingManifest2file := filepath.Join(stagingManifest2dir, "/manifest")
 	if err := generateManifest(stagingDir, stagingManifest2dir, execCtx); err != nil {
 		return fmt.Errorf("failed to generate manifest: %v", err)
 	}
+	debugf("Generate update manifest\n")
 	if err := updateManifestWithNewFiles(stagingManifest, stagingManifest2file); err != nil {
 		fmt.Fprintf(os.Stderr, "Manifest update failed: %v\n", err)
 	}
@@ -4272,12 +4263,14 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor) err
 	}
 
 	// 4. Determine obsolete files (compare manifests)
+	debugf("Find obsolete files\n")
 	filesToDelete, err := removeObsoleteFiles(pkgName, stagingDir, rootDir)
 	if err != nil {
 		return err
 	}
 
 	// --- NEW: Dependency Check and Backup (Before deletion) ---
+	debugf("Dependency check")
 	affectedPackages := make(map[string]struct{})
 	libFilesToDelete := make(map[string]struct{})
 	tempLibBackupDir, err := os.MkdirTemp(tmpDir, "hokuto-lib-backup-")
@@ -4401,6 +4394,7 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor) err
 	}
 
 	// 5. Rsync staging into root
+	debugf("Rsync staging into root")
 	if err := rsyncStaging(stagingDir, rootDir, execCtx); err != nil {
 		return fmt.Errorf("failed to sync staging to %s: %v", rootDir, err)
 	}
