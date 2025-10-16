@@ -1300,6 +1300,7 @@ func prepareSources(pkgName, pkgDir, buildDir string, execCtx *Executor) error {
 			strings.HasSuffix(realPath, ".tar.xz"),
 			strings.HasSuffix(realPath, ".tar.bz2"),
 			strings.HasSuffix(realPath, ".tar.zst"),
+			strings.HasSuffix(realPath, ".tar.lz"),
 			strings.HasSuffix(realPath, ".tar"):
 			// Extraction goes into targetDir (buildDir or buildDir/subdir)
 			if err := extractTar(realPath, targetDir); err != nil {
@@ -4348,9 +4349,13 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor) err
 			cmd.Stderr = os.Stderr
 			cmd.Run()
 
-			cPrintf(colInfo, "File %s modified, %schoose action: [k]eep current, [u]se new, [e]dit: ", file, ownerDisplay)
+			cPrintf(colInfo, "File %s modified, %schoose action: [k]eep current, [U]se new, [e]dit: ", file, ownerDisplay)
 			var input string
 			fmt.Scanln(&input)
+			input = strings.TrimSpace(input)
+			if input == "" {
+				input = "u" // default to use new when user just presses enter
+			}
 			switch input {
 			case "k":
 				cpCmd := exec.Command("cp", "--remove-destination", currentFile, stagingFile)
@@ -4891,7 +4896,8 @@ func pkgUninstall(pkgName string, cfg *Config, execCtx *Executor, force, yes boo
 				continue
 			}
 
-			if currentSum != meta.B3Sum {
+			// Skip modification warning for files with 000000 checksum
+			if currentSum != meta.B3Sum && meta.B3Sum != "000000" {
 				cPrintf(colWarn, "\nWARNING: File %s has been modified (expected %s, found %s).\n", p, meta.B3Sum, currentSum)
 
 				// Prompt user unless 'yes' is set
@@ -5150,7 +5156,7 @@ func main() {
 	switch os.Args[1] {
 	case "version", "--version", "-v":
 		// Print version first
-		fmt.Println("hokuto 0.2.16")
+		fmt.Println("hokuto 0.2.18")
 
 		// Try to pick and show a random embedded PNG from assets/
 		imgs, err := listEmbeddedImages()
