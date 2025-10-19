@@ -2933,10 +2933,9 @@ func resolveMissingDeps(pkgName string, processed map[string]bool, missing *[]st
 	}
 	processed[pkgName] = true
 
-	// 2. Check if the package is already installed
-	if isPackageInstalled(pkgName) {
-		return nil
-	}
+	// 2. [OLD POSITION - REMOVED]
+	// The check for isPackageInstalled(pkgName) was here.
+	// It must be moved to the end.
 
 	// --- 3. Find the Package Source Directory (pkgDir) ---
 	// Assuming repoPaths comes from cfg.RepoPaths or a global var,
@@ -2976,13 +2975,40 @@ func resolveMissingDeps(pkgName string, processed map[string]bool, missing *[]st
 	}
 
 	// --- 5. Recursively check all dependencies ---
-	for _, depName := range dependencies {
+	// This loop will now run even for installed packages, allowing the
+	// version check to happen.
+	for _, dep := range dependencies {
+		depName := dep.Name
 		// Safety check: a package cannot depend on itself.
 		if depName == pkgName {
 			continue
 		}
 
-		// Ensure cfg is passed for the recursive call!
+		// If a version constraint exists and the dependency is already installed,
+		// enforce the constraint before proceeding.
+		if dep.Op != "" && isPackageInstalled(depName) {
+			if installedVer, ok := getInstalledVersion(depName); ok {
+				if !versionSatisfies(installedVer, dep.Op, dep.Version) {
+					// Build an error message tailored to the operator
+					switch dep.Op {
+					case "<=":
+						return fmt.Errorf("error %s version %s or lower required for build (installed %s)", depName, dep.Version, installedVer)
+					case ">=":
+						return fmt.Errorf("error %s version %s or higher required for build (installed %s)", depName, dep.Version, installedVer)
+					case "==":
+						// This case will now be triggered for python-sip
+						return fmt.Errorf("error %s version exactly %s required for build (installed %s)", depName, dep.Version, installedVer)
+					case "<":
+						return fmt.Errorf("error %s version lower than %s required for build (installed %s)", depName, dep.Version, installedVer)
+					case ">":
+						return fmt.Errorf("error %s version greater than %s required for build (installed %s)", depName, dep.Version, installedVer)
+					default:
+						return fmt.Errorf("error %s version constraint %s%s not satisfied (installed %s)", depName, dep.Op, dep.Version, installedVer)
+					}
+				}
+			}
+		}
+
 		if err := resolveMissingDeps(depName, processed, missing); err != nil {
 			// Propagate the error up
 			return err
@@ -2990,7 +3016,14 @@ func resolveMissingDeps(pkgName string, processed map[string]bool, missing *[]st
 	}
 
 	// --- 6. Add the missing package to the list ---
-	// Add the package to the list *after* its dependencies have been processed.
+	// [NEW POSITION]
+	// Only *after* checking all dependencies, we check if the
+	// package itself is installed. If it is, we're done.
+	if isPackageInstalled(pkgName) {
+		return nil
+	}
+
+	// If it's not installed, *then* we add it to the list.
 	*missing = append(*missing, pkgName)
 
 	return nil
@@ -3003,18 +3036,24 @@ func isPackageInstalled(pkgName string) bool {
 	return checkPackageExists(pkgName)
 }
 
-// parseDependsFile reads the package's depends file and returns a list of package names.
-func parseDependsFile(pkgDir string) ([]string, error) {
+type DepSpec struct {
+	Name    string
+	Op      string // one of: "<=", ">=", "==", "<", ">", or empty for no constraint
+	Version string
+}
+
+// parseDependsFile reads the package's depends file and returns a list of dependency specs (with optional version constraints).
+func parseDependsFile(pkgDir string) ([]DepSpec, error) {
 	dependsPath := filepath.Join(pkgDir, "depends")
 	content, err := os.ReadFile(dependsPath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return []string{}, nil // No depends file is fine
+			return []DepSpec{}, nil // No depends file is fine
 		}
 		return nil, fmt.Errorf("failed to read depends file: %w", err)
 	}
 
-	var dependencies []string
+	var dependencies []DepSpec
 	lines := strings.Split(string(content), "\n")
 
 	for _, line := range lines {
@@ -3026,13 +3065,107 @@ func parseDependsFile(pkgDir string) ([]string, error) {
 		// Split the line, e.g., "alsa-lib" or "python make"
 		parts := strings.Fields(line)
 
-		// The first part is always the dependency name.
+		// The first part is the dependency token, which may include a version constraint, e.g., python-sip<=9.8.6
 		if len(parts) > 0 {
-			dependencies = append(dependencies, parts[0])
+			name, op, ver := parseDepToken(parts[0])
+			dependencies = append(dependencies, DepSpec{Name: name, Op: op, Version: ver})
 		}
 	}
 
 	return dependencies, nil
+}
+
+// parseDepToken parses tokens like "pkg", "pkg<=1.2.3", "pkg==1.0", "pkg>=2.0" and returns name, op, version.
+func parseDepToken(token string) (string, string, string) {
+	// Check for multi-char operators first to avoid partial matches
+	ops := []string{"<=", ">=", "==", "<", ">"}
+	for _, op := range ops {
+		if idx := strings.Index(token, op); idx != -1 {
+			name := token[:idx]
+			ver := token[idx+len(op):]
+			return strings.TrimSpace(name), op, strings.TrimSpace(ver)
+		}
+	}
+	return token, "", ""
+}
+
+// getInstalledVersion reads the installed version string from the package's metadata. Returns (version, true) if found.
+func getInstalledVersion(pkgName string) (string, bool) {
+	// Installed root directory is stored in global variable Installed
+	versionPath := filepath.Join(Installed, pkgName, "version")
+	b, err := os.ReadFile(versionPath)
+	if err != nil {
+		return "", false
+	}
+	v := strings.TrimSpace(string(b))
+	if v == "" {
+		return "", false
+	}
+	return v, true
+}
+
+// versionSatisfies checks if installed satisfies op refVersion.
+func versionSatisfies(installed, op, ref string) bool {
+	cmp := compareVersions(installed, ref)
+	switch op {
+	case "==":
+		return cmp == 0
+	case "<=":
+		return cmp <= 0
+	case ">=":
+		return cmp >= 0
+	case "<":
+		return cmp < 0
+	case ">":
+		return cmp > 0
+	default:
+		return true
+	}
+}
+
+// compareVersions compares two version strings split by dots. Numeric segments are compared numerically; non-numeric fall back to lexicographic.
+// Returns -1 if a<b, 0 if equal, 1 if a>b.
+func compareVersions(a, b string) int {
+	as := strings.Split(a, ".")
+	bs := strings.Split(b, ".")
+	n := len(as)
+	if len(bs) > n {
+		n = len(bs)
+	}
+	for i := 0; i < n; i++ {
+		var av, bv string
+		if i < len(as) {
+			av = as[i]
+		} else {
+			av = "0"
+		}
+		if i < len(bs) {
+			bv = bs[i]
+		} else {
+			bv = "0"
+		}
+
+		// Try numeric compare
+		ai, aerr := strconv.Atoi(av)
+		bi, berr := strconv.Atoi(bv)
+		if aerr == nil && berr == nil {
+			if ai < bi {
+				return -1
+			}
+			if ai > bi {
+				return 1
+			}
+			continue
+		}
+		// Fallback string compare
+		if av < bv {
+			return -1
+		}
+		if av > bv {
+			return 1
+		}
+	}
+	return 0
 }
 
 // stripPackage recursively walks outputDir and runs the 'strip' command on every executable file found,
@@ -5220,7 +5353,7 @@ func main() {
 	case "version", "--version":
 		// Print version first
 		// HOKUTOVERSION (string for search)
-		fmt.Println("hokuto 0.2.22")
+		fmt.Println("hokuto 0.2.23")
 
 		// Try to pick and show a random embedded PNG from assets/
 		imgs, err := listEmbeddedImages()
