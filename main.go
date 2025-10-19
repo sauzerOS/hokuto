@@ -5412,6 +5412,17 @@ func main() {
 					version, _ := getRepoVersion(finalPkg) // Re-get version (should not fail)
 					tarballPath := filepath.Join(BinDir, fmt.Sprintf("%s-%s.tar.zst", finalPkg, version))
 
+					// Check if package name is "python" or starts with "python-" and uninstall first
+					if finalPkg == "python" || strings.HasPrefix(finalPkg, "python-") {
+						cPrintf(colInfo, "Package %s is a Python package, uninstalling existing version first...\n", finalPkg)
+						if err := pkgUninstall(finalPkg, cfg, RootExec, true, true); err != nil {
+							// Log warning but continue with installation
+							fmt.Fprintf(os.Stderr, "Warning: failed to uninstall existing %s: %v (continuing with installation)\n", finalPkg, err)
+						} else {
+							cPrintf(colSuccess, "Existing %s uninstalled successfully.\n", finalPkg)
+						}
+					}
+
 					cPrintf(colInfo, "Starting installation of target package %s...\n", finalPkg)
 					isCriticalAtomic.Store(1)
 					if err := pkgInstall(tarballPath, finalPkg, cfg, RootExec); err != nil {
@@ -5457,13 +5468,20 @@ func main() {
 				base := filepath.Base(tarballPath)
 
 				// Determine package name from tarball filename (e.g., pkgname-version.tar.zst)
-				parts := strings.SplitN(base, "-", 2)
-				if len(parts) < 1 {
+				// Remove .tar.zst extension first
+				nameWithoutExt := strings.TrimSuffix(base, ".tar.zst")
+
+				// Find the last dash that separates package name from version
+				// Version typically contains dots, so we look for the last dash before the version
+				lastDashIndex := strings.LastIndex(nameWithoutExt, "-")
+				if lastDashIndex == -1 {
 					fmt.Fprintf(os.Stderr, "Error: Could not determine package name from tarball file name: %s\n", arg)
 					allSucceeded = false
 					continue
 				}
-				pkgName = parts[0]
+
+				// Extract the part before the last dash as package name
+				pkgName = nameWithoutExt[:lastDashIndex]
 
 				// Verify the tarball actually exists before attempting install
 				if _, err := os.Stat(tarballPath); err != nil {
@@ -5496,6 +5514,17 @@ func main() {
 			}
 
 			// --- Installation Execution ---
+			// Check if package name is "python" or starts with "python-" and uninstall first
+			if pkgName == "python" || strings.HasPrefix(pkgName, "python-") {
+				cPrintf(colInfo, "Package %s is a Python package, uninstalling existing version first...\n", pkgName)
+				if err := pkgUninstall(pkgName, cfg, RootExec, true, true); err != nil {
+					// Log warning but continue with installation
+					fmt.Fprintf(os.Stderr, "Warning: failed to uninstall existing %s: %v (continuing with installation)\n", pkgName, err)
+				} else {
+					cPrintf(colSuccess, "Existing %s uninstalled successfully.\n", pkgName)
+				}
+			}
+
 			cPrintf(colInfo, "Starting installation of %s from %s...\n", pkgName, tarballPath)
 
 			if err := pkgInstall(tarballPath, pkgName, cfg, RootExec); err != nil {
