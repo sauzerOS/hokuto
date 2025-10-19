@@ -46,6 +46,7 @@ var (
 	WantStrip       string
 	WantDebug       string
 	Debug           bool
+	Verbose         bool
 	WantLTO         string
 	newPackageDir   string
 	idleUpdate      bool
@@ -3585,8 +3586,8 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor) error {
 	var consoleOutputWriter io.Writer = os.Stdout
 	var consoleErrorWriter io.Writer = os.Stderr
 
-	if !Debug {
-		// If not in debug mode, suppress console output by discarding it.
+	if !Debug && !Verbose {
+		// If not in debug mode and not verbose, suppress console output by discarding it.
 		consoleOutputWriter = io.Discard
 		consoleErrorWriter = io.Discard
 	}
@@ -4065,8 +4066,8 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 	var consoleOutputWriter io.Writer = os.Stdout
 	var consoleErrorWriter io.Writer = os.Stderr
 
-	if !Debug {
-		// If not in debug mode, suppress console output by discarding it.
+	if !Debug && !Verbose {
+		// If not in debug mode and not verbose, suppress console output by discarding it.
 		consoleOutputWriter = io.Discard
 		consoleErrorWriter = io.Discard
 	}
@@ -4882,11 +4883,11 @@ func pkgUninstall(pkgName string, cfg *Config, execCtx *Executor, force, yes boo
 
 	// 5. Confirm with user unless 'yes' is set
 	if !yes {
-		// Use fileCount for the prompt
-		cPrintf(colWarn, "About to remove package %s and %d file(s). Continue? [y/N]: ", pkgName, fileCount)
+		cPrintf(colWarn, "About to remove package %s and %d file(s). Continue? [Y/n]: ", pkgName, fileCount)
 		var answer string
 		fmt.Scanln(&answer)
-		if strings.ToLower(strings.TrimSpace(answer)) != "y" {
+		answer = strings.ToLower(strings.TrimSpace(answer))
+		if answer != "" && answer != "y" {
 			return fmt.Errorf("aborted by user")
 		}
 	}
@@ -5039,6 +5040,7 @@ func pkgUninstall(pkgName string, cfg *Config, execCtx *Executor, force, yes boo
 		}
 
 		rmdirCmd := exec.Command("rmdir", clean)
+		rmdirCmd.Stderr = io.Discard // Silence stderr to avoid "Directory not empty" warnings
 		if err := execCtx.Run(rmdirCmd); err == nil {
 			debugf("Removed empty directory %s\n", clean)
 		}
@@ -5079,13 +5081,13 @@ func printHelp() {
 		Desc string
 	}
 	cmds := []cmdInfo{
-		{"version, --version, -v", "", "Show hokuto version"},
+		{"version, --version", "", "Show hokuto version"},
 		{"list, ls", "[pkg]", "List installed packages; optional partial name to filter"},
 		{"checksum, c", "<pkg>", "Fetch sources and verify/create checksums for a package"},
-		{"build, b", "[options] <pkg> [...]", "Build package(s). Options: -a (auto-install)"},
+		{"build, b", "[options] <pkg> [...]", "Build package(s). Options: -a (auto-install) -v (verbose)"},
 		{"install, i", "<tarball|pkg> [...]", "Install a built package tarball or named package"},
 		{"uninstall, r", "[options] <pkg> [...]", "Uninstall package(s). Options: -f (force) -y (yes)"},
-		{"update, u", "", "Update repository metadata and check for upgrades"},
+		{"update, u", "", "Update repository metadata and check for upgrades. Options: -v (verbose)"},
 		{"manifest, m", "<pkg>", "Show manifest file entries (files only) for a package"},
 		{"find, f", "<string>", "Search all manifests for a path containing the string"},
 		{"new, n", "<string>", "Create a new package "},
@@ -5215,9 +5217,10 @@ func main() {
 	}
 
 	switch os.Args[1] {
-	case "version", "--version", "-v":
+	case "version", "--version":
 		// Print version first
-		fmt.Println("hokuto 0.2.21")
+		// HOKUTOVERSION (string for search)
+		fmt.Println("hokuto 0.2.22")
 
 		// Try to pick and show a random embedded PNG from assets/
 		imgs, err := listEmbeddedImages()
@@ -5279,14 +5282,17 @@ func main() {
 		buildCmd := flag.NewFlagSet("build", flag.ExitOnError)
 		var autoInstall = buildCmd.Bool("a", false, "Automatically install the package(s) after successful build without prompting.")
 		var idleBuild = buildCmd.Bool("i", false, "Set the build process and all child processes to idle (lowest) CPU/IO priority (nice -n 19).")
+		var verbose = buildCmd.Bool("v", false, "Enable verbose output (show build process output).")
+		var verboseLong = buildCmd.Bool("verbose", false, "Enable verbose output (show build process output).")
 		// Parse the arguments specific to the "build" subcommand,
 		// starting from os.Args[2] (i.e., skipping "hokuto" and "build")
 		if err := buildCmd.Parse(os.Args[2:]); err != nil {
 			fmt.Fprintf(os.Stderr, "Error parsing build flags: %v\n", err)
 			os.Exit(1)
 		}
-		// Set the global variable based on the parsed flag
+		// Set the global variables based on the parsed flags
 		setIdlePriority = *idleBuild
+		Verbose = *verbose || *verboseLong
 		// The positional arguments (package names) are now in buildCmd.Args()
 		packagesToProcess := buildCmd.Args()
 		if len(packagesToProcess) < 1 {
@@ -5631,12 +5637,14 @@ func main() {
 		}
 
 	case "update", "u":
-		// check for -i in the arguments for the update command
+		// check for -i and -v in the arguments for the update command
 		// os.Args layout: [program, "update", ...flags...]
 		for _, a := range os.Args[2:] {
 			if a == "-i" || a == "--idle" {
 				idleUpdate = true
-				break
+			}
+			if a == "-v" || a == "--verbose" {
+				Verbose = true
 			}
 		}
 
