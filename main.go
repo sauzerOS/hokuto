@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/tls"
 	"embed"
 	"flag"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"io/fs"
 	"log"
 	"math/rand"
+	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
@@ -661,9 +663,6 @@ func findPackagesByManifestString(query string) error {
 	return nil
 }
 
-// assume declared somewhere globally:
-// var newPackageDir string
-
 // newPackage creates a minimal package skeleton in $newPackageDir/<pkg>.
 // - creates directory $newPackageDir/<pkg>
 // - creates build, version, sources files with the right modes and contents
@@ -794,30 +793,83 @@ func hashString(s string) string {
 	return strings.Fields(string(out))[0]
 }
 
-// downloadFile downloads a URL into the hokuto cache
+// downloadFile downloads a URL into the hokuto cache.
+// It attempts to use 'aria2c', then 'curl', and finally falls back to a native
+// Go HTTP implementation that ignores SSL certificate errors.
 func downloadFile(url, destFile string) error {
-	// Ensure cache directory exists
+	// 1. Ensure the cache directory exists
 	if err := os.MkdirAll(CacheStore, 0o755); err != nil {
-		return err
+		return fmt.Errorf("failed to create cache directory %s: %w", CacheStore, err)
 	}
 
-	// destFile is the filename only (without path)
-	destFile = filepath.Base(destFile)
-	cPrintf(color.Info, "Downloading %s -> %s/%s\n", url, CacheStore, destFile)
+	// 2. Prepare the destination path
+	destFile = filepath.Base(destFile) // Ensure we only have the filename
+	absPath := filepath.Join(CacheStore, destFile)
 
-	// Try aria2c first
-	cmd := exec.Command("aria2c", "-x", "4", "-s", "4", "-d", CacheStore, "-o", destFile, url)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
-		fmt.Println("aria2c failed, falling back to curl")
+	cPrintf(color.Info, "Downloading %s -> %s\n", url, absPath)
 
-		absPath := filepath.Join(CacheStore, destFile)
-		cmd = exec.Command("curl", "-L", "-o", absPath, url)
+	// --- Fallback 1: Try aria2c ---
+	if _, err := exec.LookPath("aria2c"); err == nil {
+		cmd := exec.Command("aria2c", "-x", "4", "-s", "4", "-d", CacheStore, "-o", destFile, url)
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
-		return cmd.Run()
+		if err := cmd.Run(); err == nil {
+			fmt.Println("Download successful with aria2c.")
+			return nil // Success
+		}
+		fmt.Println("aria2c failed, falling back to curl...")
+	} else {
+		fmt.Println("aria2c not found, trying curl...")
 	}
+
+	// --- Fallback 2: Try curl ---
+	if _, err := exec.LookPath("curl"); err == nil {
+		cmd := exec.Command("curl", "--fail", "-L", "-o", absPath, url)
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		if err := cmd.Run(); err == nil {
+			fmt.Println("Download successful with curl.")
+			return nil // Success
+		}
+		fmt.Println("curl failed, falling back to native Go HTTP client...")
+	} else {
+		fmt.Println("curl not found, using native Go HTTP client...")
+	}
+
+	// --- Fallback 3: Native Go HTTP Client ---
+	// This is the most robust fallback, with no external dependencies.
+	// It's configured to skip TLS certificate verification.
+	transport := &http.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+	}
+	client := &http.Client{Transport: transport}
+
+	// Create the destination file
+	out, err := os.Create(absPath)
+	if err != nil {
+		return fmt.Errorf("failed to create destination file %s: %w", absPath, err)
+	}
+	defer out.Close()
+
+	// Perform the GET request
+	resp, err := client.Get(url)
+	if err != nil {
+		return fmt.Errorf("native http get failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// Check for a successful status code
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("download failed with status: %s", resp.Status)
+	}
+
+	// Stream the body to the file
+	_, err = io.Copy(out, resp.Body)
+	if err != nil {
+		return fmt.Errorf("failed to write to destination file: %w", err)
+	}
+
+	fmt.Println("Download successful with native Go HTTP client.")
 	return nil
 }
 
