@@ -4903,8 +4903,12 @@ func pkgUninstall(pkgName string, cfg *Config, execCtx *Executor, force, yes boo
 		}
 	}
 
-	// 7. Remove files (with b3sum check)
+	// 7. Remove files (with optional b3sum check)
 	var failed []string
+	var filesToRemove []string
+	var filesToCheck []fileMetadata
+
+	// Separate files that need checksum verification from those that don't
 	for _, meta := range files {
 		p := meta.AbsPath // The full HOKUTO_ROOT prefixed path
 
@@ -4915,43 +4919,72 @@ func pkgUninstall(pkgName string, cfg *Config, execCtx *Executor, force, yes boo
 			continue
 		}
 
-		// Check b3sum unless the file is internal metadata
-		if !strings.HasPrefix(p, internalFilePrefix) && meta.B3Sum != "" {
-			currentSum, err := b3sum(p, execCtx)
-			if err != nil {
-				// Treat inability to check as a failure to remove for safety
-				failed = append(failed, fmt.Sprintf("%s: failed to compute b3sum: %v", p, err))
-				continue
-			}
+		// Always check b3sums for files in /etc (critical system files)
+		// Skip checksum verification if force=true or if it's internal metadata, but not for /etc files
+		isEtcFile := strings.HasPrefix(clean, "/etc/") || strings.HasPrefix(clean, filepath.Join(hRoot, "etc/"))
 
-			// Skip modification warning for files with 000000 checksum
-			if currentSum != meta.B3Sum && meta.B3Sum != "000000" {
-				cPrintf(colWarn, "\nWARNING: File %s has been modified (expected %s, found %s).\n", p, meta.B3Sum, currentSum)
+		if (force || strings.HasPrefix(p, internalFilePrefix) || meta.B3Sum == "") && !isEtcFile {
+			filesToRemove = append(filesToRemove, clean)
+		} else {
+			filesToCheck = append(filesToCheck, meta)
+		}
+	}
 
-				// Prompt user unless 'yes' is set
-				if !yes {
-					fmt.Printf("File content mismatch. Remove anyway? [Y/n]: ")
-					var answer string
-					fmt.Scanln(&answer)
-					answer = strings.ToLower(strings.TrimSpace(answer))
-					if answer == "" {
-						answer = "y" // default to Yes if user just presses Enter
-					}
-					if answer != "y" {
-						failed = append(failed, fmt.Sprintf("%s: content mismatch, removal skipped by user", p))
-						continue // Skip removal
-					}
+	// Check files that need verification
+	for _, meta := range filesToCheck {
+		p := meta.AbsPath
+		clean := filepath.Clean(p)
+
+		currentSum, err := b3sum(p, execCtx)
+		if err != nil {
+			// Treat inability to check as a failure to remove for safety
+			failed = append(failed, fmt.Sprintf("%s: failed to compute b3sum: %v", p, err))
+			continue
+		}
+
+		// Skip modification warning for files with 000000 checksum
+		if currentSum != meta.B3Sum && meta.B3Sum != "000000" {
+			cPrintf(colWarn, "\nWARNING: File %s has been modified (expected %s, found %s).\n", p, meta.B3Sum, currentSum)
+
+			// Prompt user unless 'yes' is set
+			if !yes {
+				fmt.Printf("File content mismatch. Remove anyway? [Y/n]: ")
+				var answer string
+				fmt.Scanln(&answer)
+				answer = strings.ToLower(strings.TrimSpace(answer))
+				if answer == "" {
+					answer = "y" // default to Yes if user just presses Enter
+				}
+				if answer != "y" {
+					failed = append(failed, fmt.Sprintf("%s: content mismatch, removal skipped by user", p))
+					continue // Skip removal
 				}
 			}
 		}
 
-		// Removal command
-		rmCmd := exec.Command("rm", "-f", clean)
+		filesToRemove = append(filesToRemove, clean)
+	}
+
+	// Batch remove all files at once
+	if len(filesToRemove) > 0 {
+		// Use rm with multiple files for better performance
+		rmCmd := exec.Command("rm", "-f")
+		rmCmd.Args = append(rmCmd.Args, filesToRemove...)
+
 		if err := execCtx.Run(rmCmd); err != nil {
-			failed = append(failed, fmt.Sprintf("%s: %v", p, err))
-			continue
+			// If batch removal fails, try individual removals
+			fmt.Printf("Batch removal failed, trying individual removals...\n")
+			for _, file := range filesToRemove {
+				rmCmd := exec.Command("rm", "-f", file)
+				if err := execCtx.Run(rmCmd); err != nil {
+					failed = append(failed, fmt.Sprintf("%s: %v", file, err))
+				} else {
+					fmt.Printf("Removed %s\n", file)
+				}
+			}
+		} else {
+			fmt.Printf("Removed %d files\n", len(filesToRemove))
 		}
-		fmt.Printf("Removed %s\n", p)
 	}
 
 	// 8. Try to rmdir directories recorded in manifest, deepest first (unchanged)
