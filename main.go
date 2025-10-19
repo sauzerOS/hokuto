@@ -1,8 +1,10 @@
 package main
 
 import (
+	"archive/tar"
 	"bufio"
 	"bytes"
+	"compress/bzip2"
 	"context"
 	"crypto/tls"
 	"embed"
@@ -29,6 +31,10 @@ import (
 	"time"
 
 	"github.com/gookit/color"
+	"github.com/klauspost/compress/zstd"
+	"github.com/klauspost/pgzip"
+	"github.com/ulikunitz/xz"
+	"golang.org/x/sys/unix"
 	"golang.org/x/term"
 	"lukechampine.com/blake3"
 )
@@ -1985,7 +1991,9 @@ func copyDir(src, dst string) error {
 	return nil
 }
 
-// extractTar extracts a tarball into the destination directory
+// extractTar extracts a tarball into the destination directory.
+// It tries the system `tar` first, then falls back to pure-Go extraction
+// with support for gzip (parallel), zstd, xz, and bzip2.
 func extractTar(archive, dest string) error {
 	// 1. Inspect the tarball to see if it has a single top-level directory
 	strip, err := shouldStripTar(archive)
@@ -1993,89 +2001,237 @@ func extractTar(archive, dest string) error {
 		return fmt.Errorf("failed to inspect tarball %s: %w", archive, err)
 	}
 
-	// 2. Build the tar command arguments
+	// 2. Try system tar first
 	args := []string{"xf", archive, "-C", dest}
 	if strip {
-		// Only add --strip-components=1 if inspection determined it's necessary
 		args = append(args, "--strip-components=1")
 	}
+	if err := exec.Command("tar", args...).Run(); err == nil {
+		return nil
+	}
 
-	// 3. Execute the tar command
-	cmd := exec.Command("tar", args...)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+	// 3. Fallback: internal extraction
+	f, err := os.Open(archive)
+	if err != nil {
+		return fmt.Errorf("failed to open archive: %w", err)
+	}
+	defer f.Close()
 
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("failed to extract %s: %w", archive, err)
+	var r io.Reader = f
+	switch {
+	case strings.HasSuffix(archive, ".tar.gz"), strings.HasSuffix(archive, ".tgz"):
+		gr, err := pgzip.NewReader(f)
+		if err != nil {
+			return fmt.Errorf("pgzip reader: %w", err)
+		}
+		defer gr.Close()
+		r = gr
+	case strings.HasSuffix(archive, ".tar.zst"):
+		zr, err := zstd.NewReader(f)
+		if err != nil {
+			return fmt.Errorf("zstd reader: %w", err)
+		}
+		defer zr.Close()
+		r = zr
+	case strings.HasSuffix(archive, ".tar.xz"):
+		xr, err := xz.NewReader(f)
+		if err != nil {
+			return fmt.Errorf("xz reader: %w", err)
+		}
+		r = xr
+	case strings.HasSuffix(archive, ".tar.bz2"):
+		r = bzip2.NewReader(f)
+	}
+
+	tr := tar.NewReader(r)
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return fmt.Errorf("tar read error: %w", err)
+		}
+
+		// Adjust path if stripping top-level directory
+		name := hdr.Name
+		if strip {
+			parts := strings.SplitN(name, string(os.PathSeparator), 2)
+			if len(parts) == 2 {
+				name = parts[1]
+			} else {
+				continue
+			}
+		}
+		target := filepath.Join(dest, name)
+
+		switch hdr.Typeflag {
+		case tar.TypeDir:
+			if err := os.MkdirAll(target, os.FileMode(hdr.Mode)); err != nil {
+				return err
+			}
+		case tar.TypeReg:
+			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+				return err
+			}
+			out, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, os.FileMode(hdr.Mode))
+			if err != nil {
+				return err
+			}
+			if _, err := io.Copy(out, tr); err != nil {
+				out.Close()
+				return err
+			}
+			out.Close()
+		case tar.TypeSymlink:
+			if err := os.Symlink(hdr.Linkname, target); err != nil && !os.IsExist(err) {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// unpackTarballFallback extracts a .tar.zst into dest using pure-Go.
+func unpackTarballFallback(tarballPath, dest string) error {
+	f, err := os.Open(tarballPath)
+	if err != nil {
+		return fmt.Errorf("open tarball: %w", err)
+	}
+	defer f.Close()
+
+	zr, err := zstd.NewReader(f)
+	if err != nil {
+		return fmt.Errorf("zstd reader: %w", err)
+	}
+	defer zr.Close()
+
+	tr := tar.NewReader(zr)
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return fmt.Errorf("tar read: %w", err)
+		}
+		target := filepath.Join(dest, hdr.Name)
+
+		switch hdr.Typeflag {
+		case tar.TypeDir:
+			if err := os.MkdirAll(target, os.FileMode(hdr.Mode)); err != nil {
+				return err
+			}
+		case tar.TypeReg:
+			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+				return err
+			}
+			out, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, os.FileMode(hdr.Mode))
+			if err != nil {
+				return err
+			}
+			if _, err := io.Copy(out, tr); err != nil {
+				out.Close()
+				return err
+			}
+			out.Close()
+		case tar.TypeSymlink:
+			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+				return err
+			}
+			_ = os.Remove(target)
+			if err := os.Symlink(hdr.Linkname, target); err != nil && !os.IsExist(err) {
+				return err
+			}
+		}
 	}
 	return nil
 }
 
 // shouldStripTar inspects the tarball to check for a single top-level directory.
+// It tries system `tar tf` first, then falls back to pure-Go tar reader.
 func shouldStripTar(archive string) (bool, error) {
-	// Use 'tar tf' to list the contents quietly
-	cmd := exec.Command("tar", "tf", archive)
-
-	var out bytes.Buffer
-	cmd.Stdout = &out
-	// Don't route stderr to os.Stderr, as we are inspecting the file, not extracting
-	// cmd.Stderr = os.Stderr // (Keep this commented out)
-
-	if err := cmd.Run(); err != nil {
-		// Tar failed to read or list the file.
-		return false, fmt.Errorf("tar tf failed: %w", err)
+	// --- Try system tar first ---
+	if _, err := exec.LookPath("tar"); err == nil {
+		cmd := exec.Command("tar", "tf", archive)
+		var out bytes.Buffer
+		cmd.Stdout = &out
+		if err := cmd.Run(); err == nil {
+			lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+			return analyzeTarListing(lines), nil
+		}
 	}
 
-	// The first entry determines the structure.
-	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
-	if len(lines) == 0 || lines[0] == "" {
-		// Archive is empty or unreadable
-		return false, nil
+	// --- Fallback: pure-Go tar reader ---
+	f, err := os.Open(archive)
+	if err != nil {
+		return false, fmt.Errorf("open archive: %w", err)
+	}
+	defer f.Close()
+
+	var r io.Reader = f
+	switch {
+	case strings.HasSuffix(archive, ".tar.zst"):
+		zr, err := zstd.NewReader(f)
+		if err != nil {
+			return false, fmt.Errorf("zstd reader: %w", err)
+		}
+		defer zr.Close()
+		r = zr
+	case strings.HasSuffix(archive, ".tar.gz"), strings.HasSuffix(archive, ".tgz"):
+		gr, err := pgzip.NewReader(f)
+		if err != nil {
+			return false, fmt.Errorf("gzip reader: %w", err)
+		}
+		defer gr.Close()
+		r = gr
+	case strings.HasSuffix(archive, ".tar.xz"):
+		xr, err := xz.NewReader(f)
+		if err != nil {
+			return false, fmt.Errorf("xz reader: %w", err)
+		}
+		r = xr
 	}
 
-	firstEntry := lines[0]
-
-	// A typical top-level directory entry looks like "pkgname-version/".
-	// The path should contain a single slash and end with one.
-	// If the archive only contains one entry (the directory itself),
-	// we still rely on the first file entry.
-
-	// Check if the first entry suggests a top-level directory structure:
-	// 1. Must contain at least one slash.
-	// 2. The string before the first slash (the directory name) must match the rest of the entries.
-
-	parts := strings.Split(firstEntry, string(filepath.Separator))
-	if len(parts) < 2 {
-		// No slash means a file/folder is at the root (e.g., "file1.c"), so don't strip.
-		return false, nil
-	}
-
-	// The assumed top-level directory is the first part (e.g., "pkgname-version")
-	topDir := parts[0] + string(filepath.Separator)
-
-	// Now check all entries to ensure they ALL start with this path.
-	// We only need to check the first few non-directory entries for performance.
-	for i, line := range lines {
-		if i > 50 { // Check a reasonable number of entries (e.g., 50)
+	tr := tar.NewReader(r)
+	var lines []string
+	for i := 0; i < 100; i++ { // read up to 100 entries
+		hdr, err := tr.Next()
+		if err == io.EOF {
 			break
 		}
-
-		// If the entry is a directory itself (ends with /), skip it.
-		// NOTE: 'tar tf' output might not always include the trailing slash,
-		// but checking the prefix is more reliable.
-
-		// If any entry does NOT start with the top directory prefix, then files exist at the root.
-		if !strings.HasPrefix(line, topDir) {
-			// Found a file/folder that is NOT inside the assumed topDir.
-			// e.g., line is "file_at_root.c".
-			return false, nil
+		if err != nil {
+			return false, fmt.Errorf("tar read error: %w", err)
 		}
+		lines = append(lines, hdr.Name)
 	}
-
-	// All checked entries start with the same top directory prefix, so strip is needed.
-	return true, nil
+	return analyzeTarListing(lines), nil
 }
 
+// analyzeTarListing checks whether all entries share a single top-level directory.
+func analyzeTarListing(lines []string) bool {
+	if len(lines) == 0 || lines[0] == "" {
+		return false
+	}
+	firstEntry := lines[0]
+	parts := strings.Split(firstEntry, string(filepath.Separator))
+	if len(parts) < 2 {
+		return false
+	}
+	topDir := parts[0] + string(filepath.Separator)
+	for i, line := range lines {
+		if i > 50 {
+			break
+		}
+		if !strings.HasPrefix(line, topDir) {
+			return false
+		}
+	}
+	return true
+}
+
+// createPackageTarball creates a .tar.zst archive of outputDir into BinDir.
+// It uses system tar if available, otherwise falls back to pure-Go tar+zstd.
 func createPackageTarball(pkgName, pkgVer, outputDir string, execCtx *Executor) error {
 	// Ensure BinDir exists
 	if err := os.MkdirAll(BinDir, 0o755); err != nil {
@@ -2084,26 +2240,86 @@ func createPackageTarball(pkgName, pkgVer, outputDir string, execCtx *Executor) 
 
 	tarballPath := filepath.Join(BinDir, fmt.Sprintf("%s-%s.tar.zst", pkgName, pkgVer))
 
-	args := []string{"-cf", tarballPath, "-C", outputDir, "."}
-	args = append([]string{"--zstd"}, args...) // always compress
-
-	// Check if the build phase ran as an unprivileged user.
-	// If ShouldRunAsRoot is FALSE, the build ran as the user, and we must override ownership inside the tarball.
-	if !execCtx.ShouldRunAsRoot {
-		// Force numeric root ownership for user builds
-		// This ensures the files inside the tarball are always 0:0 regardless of the builder's UID.
-		args = append(args, "--owner=0", "--group=0", "--numeric-owner")
+	// --- Try system tar first ---
+	if _, err := exec.LookPath("tar"); err == nil {
+		args := []string{"--zstd", "-cf", tarballPath, "-C", outputDir, "."}
+		if !execCtx.ShouldRunAsRoot {
+			args = append(args, "--owner=0", "--group=0", "--numeric-owner")
+		}
+		tarCmd := exec.Command("tar", args...)
+		debugf("Creating package tarball with system tar: %s\n", tarballPath)
+		if err := execCtx.Run(tarCmd); err == nil {
+			cPrintf(colInfo, "Package tarball created successfully: %s\n", tarballPath)
+			return nil
+		}
+		// fall through to internal if tar fails
 	}
 
-	// Create the final tar command
-	tarCmd := exec.Command("tar", args...)
+	// --- Fallback: internal tar+zstd ---
+	debugf("System tar not available, falling back to internal tar+zstd for %s\n", tarballPath)
 
-	debugf("Creating package tarball: %s\n", tarballPath)
-	if err := execCtx.Run(tarCmd); err != nil {
-		return fmt.Errorf("failed to create tarball: %v", err)
+	outFile, err := os.Create(tarballPath)
+	if err != nil {
+		return fmt.Errorf("failed to create tarball file: %v", err)
+	}
+	defer outFile.Close()
+
+	// Create zstd writer
+	zw, err := zstd.NewWriter(outFile)
+	if err != nil {
+		return fmt.Errorf("failed to create zstd writer: %v", err)
+	}
+	defer zw.Close()
+
+	tw := tar.NewWriter(zw)
+	defer tw.Close()
+
+	// Walk outputDir and add files
+	err = filepath.Walk(outputDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(outputDir, path)
+		if err != nil {
+			return err
+		}
+		if rel == "." {
+			return nil
+		}
+
+		hdr, err := tar.FileInfoHeader(info, "")
+		if err != nil {
+			return err
+		}
+		hdr.Name = rel
+
+		// Force numeric root ownership if not run as root
+		if !execCtx.ShouldRunAsRoot {
+			hdr.Uid, hdr.Gid = 0, 0
+			hdr.Uname, hdr.Gname = "root", "root"
+		}
+
+		if err := tw.WriteHeader(hdr); err != nil {
+			return err
+		}
+		if info.Mode().IsRegular() {
+			f, err := os.Open(path)
+			if err != nil {
+				return err
+			}
+			if _, err := io.Copy(tw, f); err != nil {
+				f.Close()
+				return err
+			}
+			f.Close()
+		}
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("failed to add files to tarball: %v", err)
 	}
 
-	cPrintf(colInfo, "Package tarball created successfully: %s\n", tarballPath)
+	cPrintf(colInfo, "Package tarball created successfully (internal): %s\n", tarballPath)
 	return nil
 }
 
@@ -2432,9 +2648,8 @@ func removeObsoleteFiles(pkgName, stagingDir, rootDir string) ([]string, error) 
 }
 
 // rsyncStaging syncs the contents of stagingDir into rootDir.
-// Helper to sync staging dir into rootDir, respecting existing symlinks
+// It uses system rsync if available, otherwise falls back to a Go-native copy.
 func rsyncStaging(stagingDir, rootDir string, execCtx *Executor) error {
-	// Ensure trailing slash on stagingDir so rsync copies contents
 	stagingPath := filepath.Clean(stagingDir) + string(os.PathSeparator)
 
 	// Ensure rootDir exists
@@ -2443,34 +2658,146 @@ func rsyncStaging(stagingDir, rootDir string, execCtx *Executor) error {
 		return fmt.Errorf("failed to create rootDir %s: %v", rootDir, err)
 	}
 
-	// rsync args:
-	// -aHAX         : archive mode (permissions, symlinks, hardlinks, xattrs)
-	// --numeric-ids : preserve numeric ownership
-	// --no-implied-dirs : only create directories that exist in staging
-	// --keep-dirlinks : treat symlinked directory on receiver as directory (don't replace the symlink)
-	args := []string{
-		"-aHAX",
-		"--numeric-ids",
-		"--no-implied-dirs",
-		"--keep-dirlinks",
-		stagingPath,
-		rootDir,
+	// --- Try system rsync first ---
+	if _, err := exec.LookPath("rsync"); err == nil {
+		args := []string{
+			"-aHAX",
+			"--numeric-ids",
+			"--no-implied-dirs",
+			"--keep-dirlinks",
+			stagingPath,
+			rootDir,
+		}
+		cmd := exec.Command("rsync", args...)
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+
+		if err := execCtx.Run(cmd); err == nil {
+			rmCmd := exec.Command("rm", "-rf", stagingDir)
+			if err := execCtx.Run(rmCmd); err != nil {
+				return fmt.Errorf("failed to remove staging dir %s: %v", stagingDir, err)
+			}
+			return nil
+		}
 	}
 
-	cmd := exec.Command("rsync", args...)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-
-	if err := execCtx.Run(cmd); err != nil {
-		return fmt.Errorf("failed to sync staging to %s: %v", rootDir, err)
+	// --- Fallback: Go-native recursive copy ---
+	if err := copyTree(stagingPath, rootDir); err != nil {
+		return fmt.Errorf("fallback copy failed: %v", err)
 	}
-	// Clean up staging directory
-	rmCmd := exec.Command("rm", "-rf", stagingDir)
-	if err := execCtx.Run(rmCmd); err != nil {
+	if err := os.RemoveAll(stagingDir); err != nil {
 		return fmt.Errorf("failed to remove staging dir %s: %v", stagingDir, err)
 	}
-
 	return nil
+}
+
+// copyTree recursively copies files from src to dst, preserving mode, symlinks, timestamps, and xattrs.
+func copyTree(src, dst string) error {
+	return filepath.Walk(src, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(src, path)
+		if err != nil {
+			return err
+		}
+		if rel == "." {
+			return nil
+		}
+		target := filepath.Join(dst, rel)
+
+		switch {
+		case info.Mode().IsDir():
+			return os.MkdirAll(target, info.Mode())
+		case info.Mode()&os.ModeSymlink != 0:
+			return copySymlink(path, target)
+		case info.Mode().IsRegular():
+			return copyFile2(path, target, info)
+		}
+		return nil
+	})
+}
+
+func copyFile2(src, dst string, info os.FileInfo) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		return err
+	}
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, info.Mode())
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		out.Close()
+		return err
+	}
+	out.Close()
+
+	// Preserve timestamps
+	if stat, ok := info.Sys().(*syscall.Stat_t); ok {
+		times := []syscall.Timespec{stat.Atim, stat.Mtim}
+		_ = syscall.UtimesNano(dst, times)
+	}
+	// Preserve xattrs
+	_ = copyXattrs(src, dst)
+	return nil
+}
+
+func copySymlink(src, dst string) error {
+	target, err := os.Readlink(src)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		return err
+	}
+	os.Remove(dst)
+	if err := os.Symlink(target, dst); err != nil {
+		return err
+	}
+	_ = copyXattrs(src, dst)
+	return nil
+}
+
+func copyXattrs(src, dst string) error {
+	size, err := unix.Listxattr(src, nil)
+	if err != nil || size == 0 {
+		return nil
+	}
+	buf := make([]byte, size)
+	read, err := unix.Listxattr(src, buf)
+	if err != nil {
+		return nil
+	}
+	names := buf[:read]
+	for _, name := range splitNullTerminated(names) {
+		val := make([]byte, 64*1024)
+		n, err := unix.Getxattr(src, name, val)
+		if err != nil {
+			continue
+		}
+		_ = unix.Setxattr(dst, name, val[:n], 0)
+	}
+	return nil
+}
+
+func splitNullTerminated(b []byte) []string {
+	var out []string
+	start := 0
+	for i, c := range b {
+		if c == 0 {
+			if i > start {
+				out = append(out, string(b[start:i]))
+			}
+			start = i + 1
+		}
+	}
+	return out
 }
 
 // executePostInstall runs the post-install script for pkgName if present.
@@ -4586,9 +4913,23 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor) err
 
 	// 1. Unpack tarball into staging
 	debugf("Unpacking %s into %s\n", tarballPath, stagingDir)
-	untarCmd := exec.Command("tar", "--zstd", "-xf", tarballPath, "-C", stagingDir)
-	if err := execCtx.Run(untarCmd); err != nil {
-		return fmt.Errorf("failed to unpack tarball: %v", err)
+
+	// Try system tar first
+	if _, err := exec.LookPath("tar"); err == nil {
+		untarCmd := exec.Command("tar", "--zstd", "-xf", tarballPath, "-C", stagingDir)
+		if err := execCtx.Run(untarCmd); err == nil {
+			// success with system tar
+		} else {
+			// fallback if tar failed
+			if err := unpackTarballFallback(tarballPath, stagingDir); err != nil {
+				return fmt.Errorf("failed to unpack tarball (fallback): %v", err)
+			}
+		}
+	} else {
+		// fallback if tar not found
+		if err := unpackTarballFallback(tarballPath, stagingDir); err != nil {
+			return fmt.Errorf("failed to unpack tarball (fallback): %v", err)
+		}
 	}
 
 	// 2. Detect user-modified files
