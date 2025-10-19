@@ -980,6 +980,10 @@ func verifyOrCreateChecksums(pkgName, pkgDir string, force bool) error {
 		if strings.HasPrefix(line, "files/") {
 			continue
 		}
+		// Skip git sources (sources that start with "git+")
+		if strings.HasPrefix(line, "git+") {
+			continue
+		}
 		// Assume last field is the filename
 		parts := strings.Fields(line)
 		fname := filepath.Base(parts[len(parts)-1])
@@ -1033,6 +1037,10 @@ func verifyOrCreateChecksums(pkgName, pkgDir string, force bool) error {
 						if strings.HasPrefix(line, "files/") {
 							continue
 						}
+						// Skip git sources (sources that start with "git+")
+						if strings.HasPrefix(line, "git+") {
+							continue
+						}
 
 						hashName := fmt.Sprintf("%s-%s", hashString(line+fname), fname)
 						cachePath := filepath.Join(CacheStore, hashName)
@@ -1067,6 +1075,10 @@ func verifyOrCreateChecksums(pkgName, pkgDir string, force bool) error {
 						}
 						// Skip local files (files that start with "files/")
 						if strings.HasPrefix(line, "files/") {
+							continue
+						}
+						// Skip git sources (sources that start with "git+")
+						if strings.HasPrefix(line, "git+") {
 							continue
 						}
 						hashName := fmt.Sprintf("%s-%s", hashString(line+fname), fname)
@@ -3705,6 +3717,14 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor) error {
 		return fmt.Errorf("failed to copy version file: %v", err)
 	}
 
+	// Copy build file from pkgDir
+	buildSrc := filepath.Join(pkgDir, "build")
+	buildDst := filepath.Join(installedDir, "build")
+	cpbCmd := exec.Command("cp", "--remove-destination", buildSrc, buildDst)
+	if err := buildExec.Run(cpbCmd); err != nil {
+		return fmt.Errorf("failed to copy build file: %v", err)
+	}
+
 	// Copy post-install file from pkgDir if it exists
 	postinstallSrc := filepath.Join(pkgDir, "post-install")
 	postinstallDst := filepath.Join(installedDir, "post-install")
@@ -4179,6 +4199,14 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 	cpCmd := exec.Command("cp", "--remove-destination", versionSrc, versionDst)
 	if err := buildExec.Run(cpCmd); err != nil {
 		return fmt.Errorf("failed to copy version file: %v", err)
+	}
+
+	// Copy build file from pkgDir
+	buildSrc := filepath.Join(pkgDir, "build")
+	buildDst := filepath.Join(installedDir, "build")
+	cpbCmd := exec.Command("cp", "--remove-destination", buildSrc, buildDst)
+	if err := buildExec.Run(cpbCmd); err != nil {
+		return fmt.Errorf("failed to copy build file: %v", err)
 	}
 
 	// Copy post-install file from pkgDir if it exists
@@ -5156,7 +5184,7 @@ func main() {
 	switch os.Args[1] {
 	case "version", "--version", "-v":
 		// Print version first
-		fmt.Println("hokuto 0.2.18")
+		fmt.Println("hokuto 0.2.20")
 
 		// Try to pick and show a random embedded PNG from assets/
 		imgs, err := listEmbeddedImages()
