@@ -30,6 +30,7 @@ import (
 
 	"github.com/gookit/color"
 	"golang.org/x/term"
+	"lukechampine.com/blake3"
 )
 
 // --- NEW GLOBAL STATE ---
@@ -782,17 +783,6 @@ func editPackage(pkgName string, openAll bool) error {
 	return cmd.Run()
 }
 
-// Hashing helper for cached filenames
-func hashString(s string) string {
-	cmd := exec.Command("b3sum")
-	cmd.Stdin = strings.NewReader(s)
-	out, err := cmd.Output()
-	if err != nil {
-		return "hashfail"
-	}
-	return strings.Fields(string(out))[0]
-}
-
 // downloadFile downloads a URL into the hokuto cache.
 // It attempts to use 'aria2c', then 'curl', and finally falls back to a native
 // Go HTTP implementation that ignores SSL certificate errors.
@@ -874,7 +864,7 @@ func downloadFile(url, destFile string) error {
 }
 
 // Fetch sources (HTTP/FTP + Git)
-func fetchSources(pkgName, pkgDir string, force bool) error {
+func fetchSources(pkgName, pkgDir string, _ bool) error {
 	data, err := os.ReadFile(filepath.Join(pkgDir, "sources"))
 	if err != nil {
 		return fmt.Errorf("could not read sources file: %v", err)
@@ -995,6 +985,51 @@ func fetchSources(pkgName, pkgDir string, force bool) error {
 	return nil
 }
 
+// Hashing helper for cached filenames
+// Uses system b3sum if available, otherwise falls back to internal Go BLAKE3.
+func hashString(s string) string {
+	// Try system b3sum first
+	if _, err := exec.LookPath("b3sum"); err == nil {
+		cmd := exec.Command("b3sum")
+		cmd.Stdin = strings.NewReader(s)
+		var out bytes.Buffer
+		cmd.Stdout = &out
+		if err := cmd.Run(); err == nil {
+			fields := strings.Fields(out.String())
+			if len(fields) > 0 {
+				return fields[0]
+			}
+		}
+	}
+
+	// Fallback: internal Go BLAKE3 (32-byte output, no key)
+	h := blake3.New(32, nil)
+	h.Write([]byte(s))
+	return fmt.Sprintf("%x", h.Sum(nil))
+}
+
+// compute b3sum with go implementation lukechampime.com/blake3
+func blake3SumFile(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+
+	// Create a BLAKE3 hasher with a 32-byte output and no key.
+	h := blake3.New(32, nil)
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%x", h.Sum(nil)), nil
+}
+
+// check if b3sum is installed on system
+func hasB3sum() bool {
+	_, err := exec.LookPath("b3sum")
+	return err == nil
+}
+
 func verifyOrCreateChecksums(pkgName, pkgDir string, force bool) error {
 	pkgSrcDir := filepath.Join(SourcesDir, pkgName)
 	checksumFile := filepath.Join(pkgDir, "checksums") // repo package dir
@@ -1057,12 +1092,25 @@ func verifyOrCreateChecksums(pkgName, pkgDir string, force bool) error {
 			fmt.Printf("Force-redownloading and updating checksum for %s\n", fname)
 			mismatch = true
 		} else if oldSum, ok := existing[fname]; ok {
-			cmd := exec.Command("b3sum", "-c")
-			cmd.Stdin = strings.NewReader(fmt.Sprintf("%s  %s\n", oldSum, filePath))
-			if err := cmd.Run(); err == nil {
-				hashValid = true
+			if hasB3sum() {
+				cmd := exec.Command("b3sum", "-c")
+				cmd.Stdin = strings.NewReader(fmt.Sprintf("%s  %s\n", oldSum, filePath))
+				if err := cmd.Run(); err == nil {
+					hashValid = true
+				} else {
+					mismatch = true
+				}
 			} else {
-				mismatch = true
+				// Native Go fallback
+				sum, err := blake3SumFile(filePath)
+				if err != nil {
+					return fmt.Errorf("failed to compute checksum: %v", err)
+				}
+				if sum == oldSum {
+					hashValid = true
+				} else {
+					mismatch = true
+				}
 			}
 		}
 
@@ -1149,13 +1197,21 @@ func verifyOrCreateChecksums(pkgName, pkgDir string, force bool) error {
 		if !hashValid {
 			if !skipped {
 				fmt.Printf("Updating checksum for %s\n", fname)
-				cmd := exec.Command("b3sum", filePath)
-				out, err := cmd.Output()
-				if err != nil {
-					return fmt.Errorf("failed to compute checksum: %v", err)
+				if hasB3sum() {
+					cmd := exec.Command("b3sum", filePath)
+					out, err := cmd.Output()
+					if err != nil {
+						return fmt.Errorf("failed to compute checksum: %v", err)
+					}
+					sum := strings.Fields(string(out))[0]
+					updatedChecksums = append(updatedChecksums, fmt.Sprintf("%s  %s", sum, fname))
+				} else {
+					sum, err := blake3SumFile(filePath)
+					if err != nil {
+						return fmt.Errorf("failed to compute checksum: %v", err)
+					}
+					updatedChecksums = append(updatedChecksums, fmt.Sprintf("%s  %s", sum, fname))
 				}
-				sum := strings.Fields(string(out))[0]
-				updatedChecksums = append(updatedChecksums, fmt.Sprintf("%s  %s", sum, fname))
 				summary = append(summary, fmt.Sprintf("%s: updated", fname))
 			} else {
 				updatedChecksums = append(updatedChecksums, fmt.Sprintf("%s  %s", existing[fname], fname))
@@ -2176,45 +2232,73 @@ func getModifiedFiles(pkgName, rootDir string, execCtx *Executor) ([]string, err
 	return modified, nil
 }
 
-// Helper to compute b3sum of a file, using system b3sum binary
+// Helper to compute b3sum of a file, using system b3sum binary if available,
+// otherwise falling back to the internal Go BLAKE3 implementation.
 func b3sum(path string, execCtx *Executor) (string, error) {
-	// We remove the internal privilege check (if os.Geteuid() != 0)
-	// and let the Executor handle it.
+	// First try the system b3sum binary
+	if _, err := exec.LookPath("b3sum"); err == nil {
+		cmd := exec.Command("b3sum", path)
 
-	cmd := exec.Command("b3sum", path)
+		var out bytes.Buffer
+		cmd.Stdout = &out
+		cmd.Stderr = os.Stderr // Pipe errors to the calling process stderr
 
-	var out bytes.Buffer
-	cmd.Stdout = &out
-	cmd.Stderr = os.Stderr // Pipe errors to the calling process stderr
-
-	// Use the Executor provided by the caller
-	if err := execCtx.Run(cmd); err != nil {
-		return "", fmt.Errorf("b3sum failed for %s: %w", path, err)
+		if err := execCtx.Run(cmd); err == nil {
+			fields := strings.Fields(out.String())
+			if len(fields) > 0 {
+				return fields[0], nil
+			}
+			// fall through to internal if no output
+		}
 	}
 
-	fields := strings.Fields(out.String())
-	if len(fields) == 0 {
-		return "", fmt.Errorf("b3sum produced no output for %s", path)
+	// Fallback: internal Go BLAKE3
+	f, err := os.Open(path)
+	if err != nil {
+		return "", fmt.Errorf("failed to open file for blake3: %w", err)
 	}
-	return fields[0], nil
+	defer f.Close()
+
+	// Create a BLAKE3 hasher with a 32-byte output and no key.
+	h := blake3.New(32, nil)
+	if _, err := io.Copy(h, f); err != nil {
+		return "", fmt.Errorf("failed to hash file with blake3: %w", err)
+	}
+	return fmt.Sprintf("%x", h.Sum(nil)), nil
 }
 
-// b3sumFast computes b3sum for user-built packages without Executor overhead
+// b3sumFast computes BLAKE3 for a file, using the system `b3sum` if available,
+// and falling back to the internal pure-Go implementation otherwise.
 func b3sumFast(path string) (string, error) {
-	cmd := exec.Command("b3sum", path)
-	var out bytes.Buffer
-	cmd.Stdout = &out
-	cmd.Stderr = os.Stderr
+	// Try the system b3sum first (only if it's present in PATH).
+	if _, err := exec.LookPath("b3sum"); err == nil {
+		cmd := exec.Command("b3sum", path)
+		var out bytes.Buffer
+		cmd.Stdout = &out
+		cmd.Stderr = os.Stderr
 
-	if err := cmd.Run(); err != nil {
-		return "", fmt.Errorf("b3sum failed for %s: %w", path, err)
+		if err := cmd.Run(); err == nil {
+			fields := strings.Fields(out.String())
+			if len(fields) > 0 {
+				return fields[0], nil
+			}
+			// fall through to internal if b3sum produced no output
+		}
+		// If b3sum failed to run, we’ll fall back to internal below.
 	}
 
-	fields := strings.Fields(out.String())
-	if len(fields) == 0 {
-		return "", fmt.Errorf("b3sum produced no output for %s", path)
+	// Fallback: internal Go BLAKE3 (32-byte output, no key).
+	f, err := os.Open(path)
+	if err != nil {
+		return "", fmt.Errorf("failed to open file for blake3: %w", err)
 	}
-	return fields[0], nil
+	defer f.Close()
+
+	h := blake3.New(32, nil)
+	if _, err := io.Copy(h, f); err != nil {
+		return "", fmt.Errorf("failed to hash file with blake3: %w", err)
+	}
+	return fmt.Sprintf("%x", h.Sum(nil)), nil
 }
 
 // b3sumBatch computes checksums for multiple files in parallel for user-built packages
