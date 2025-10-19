@@ -1720,61 +1720,6 @@ func isDirectoryPrivileged(path string, execCtx *Executor) (bool, error) {
 	return false, err
 }
 
-func listOutputFiles(outputDir string, execCtx *Executor) ([]string, error) {
-	var entries []string
-
-	// 1. Use find via sudo to safely list all files and directories (as before)
-	cmd := exec.Command("find", outputDir)
-	var out bytes.Buffer
-	cmd.Stdout = &out
-	if err := execCtx.Run(cmd); err != nil {
-		return nil, fmt.Errorf("failed to list output files via find: %v", err)
-	}
-
-	scanner := bufio.NewScanner(&out)
-	for scanner.Scan() {
-		path := scanner.Text()
-
-		// Compute path relative to outputDir
-		rel, err := filepath.Rel(outputDir, path)
-		if err != nil {
-			continue
-		}
-
-		if rel == "." {
-			continue
-		}
-
-		// Filter out libtool .la files and charset.alias
-		if strings.HasSuffix(rel, ".la") || strings.HasSuffix(rel, "charset.alias") {
-			continue
-		}
-
-		// --- AMENDED LOGIC: Use Executor to check file type ---
-
-		// 2. Determine if the file is a directory using the privileged Executor
-		isDir, err := isDirectoryPrivileged(path, execCtx)
-		if err != nil {
-			// Log this, but usually safe to skip if we can't determine the type
-			fmt.Fprintf(os.Stderr, "Warning: failed to stat file with privilege, skipping %s: %v\n", path, err)
-			continue
-		}
-
-		if isDir {
-			entries = append(entries, "/"+rel+"/")
-		} else {
-			entries = append(entries, "/"+rel)
-		}
-	}
-	// ... rest of listOutputFiles remains the same ...
-	if err := scanner.Err(); err != nil {
-		return nil, fmt.Errorf("scanner error: %v", err)
-	}
-
-	sort.Strings(entries)
-	return entries, nil
-}
-
 func lstatViaExecutor(path string, execCtx *Executor) (string, error) {
 	cmd := exec.Command("stat", "-c", "%F", path)
 	var out bytes.Buffer
@@ -1786,65 +1731,99 @@ func lstatViaExecutor(path string, execCtx *Executor) (string, error) {
 	return strings.TrimSpace(out.String()), nil
 }
 
-// generateManifest scans outputDir and writes a manifest file
-// installedDir is the directory where the manifest file will be placed
-// outputDir is the dir scanned for files
+func listOutputFiles(outputDir string, execCtx *Executor) ([]string, error) {
+	var entries []string
+
+	cmd := exec.Command("find", outputDir)
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	if err := execCtx.Run(cmd); err != nil {
+		return nil, fmt.Errorf("failed to list output files via find: %v", err)
+	}
+
+	scanner := bufio.NewScanner(&out)
+	for scanner.Scan() {
+		path := scanner.Text()
+
+		rel, err := filepath.Rel(outputDir, path)
+		if err != nil {
+			continue
+		}
+		if rel == "." {
+			continue
+		}
+
+		// Filter out libtool .la files and charset.alias
+		if strings.HasSuffix(rel, ".la") || strings.HasSuffix(rel, "charset.alias") {
+			continue
+		}
+
+		isDir, err := isDirectoryPrivileged(path, execCtx)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to stat file with privilege, skipping %s: %v\n", path, err)
+			continue
+		}
+
+		if isDir {
+			entries = append(entries, "/"+rel+"/")
+		} else {
+			entries = append(entries, "/"+rel)
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("scanner error: %v", err)
+	}
+
+	sort.Strings(entries)
+	return entries, nil
+}
+
 func generateManifest(outputDir, installedDir string, execCtx *Executor) error {
 	manifestFile := filepath.Join(installedDir, "manifest")
 	tmpManifest := filepath.Join(os.TempDir(), filepath.Base(manifestFile)+".tmp")
 
-	// Ensure installedDir exists as root
 	mkdirCmd := exec.Command("mkdir", "-p", installedDir)
 	if err := execCtx.Run(mkdirCmd); err != nil {
 		return fmt.Errorf("failed to create installedDir: %v", err)
 	}
 
-	// List all output files
 	entries, err := listOutputFiles(outputDir, execCtx)
 	if err != nil {
 		return fmt.Errorf("failed to list output files: %v", err)
 	}
 
-	// Remove manifest from entries if present
 	relManifest, err := filepath.Rel(outputDir, manifestFile)
 	if err != nil {
 		return fmt.Errorf("failed to compute relative path for manifest: %v", err)
 	}
 	manifestEntryPath := "/" + relManifest
 
-	filtered := []string{}
+	filtered := make([]string, 0, len(entries))
 	for _, e := range entries {
 		if e != manifestEntryPath {
 			filtered = append(filtered, e)
 		}
 	}
 
-	// Open temp manifest for writing
 	f, err := os.OpenFile(tmpManifest, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
 	if err != nil {
 		return fmt.Errorf("failed to open temporary manifest file: %v", err)
 	}
 	defer f.Close()
 
-	// Separate directories, symlinks, and regular files for optimization
 	var dirs, symlinks, regularFiles []string
-	var symlinkMap = make(map[string]bool)
+	symlinkMap := make(map[string]bool)
 
 	for _, entry := range filtered {
-		isDir := strings.HasSuffix(entry, "/")
-		if isDir {
+		if strings.HasSuffix(entry, "/") {
 			dirs = append(dirs, entry)
 			continue
 		}
-
 		absPath := filepath.Join(outputDir, strings.TrimPrefix(entry, "/"))
-
-		// Use executor-based lstat so we can detect symlinks without following them
 		fileType, err := lstatViaExecutor(absPath, execCtx)
 		if err != nil {
 			return fmt.Errorf("failed to lstat %s: %v", absPath, err)
 		}
-
 		if fileType == "symbolic link" {
 			symlinks = append(symlinks, entry)
 			symlinkMap[entry] = true
@@ -1853,31 +1832,39 @@ func generateManifest(outputDir, installedDir string, execCtx *Executor) error {
 		}
 	}
 
-	// Write directory entries first
+	// Write directory entries correctly
 	for _, entry := range dirs {
-		cleaned := "/" + strings.Trim(strings.TrimPrefix(entry, "/"), "/") + "/"
+		rel := strings.TrimPrefix(entry, "/")
+		if !strings.HasSuffix(rel, "/") {
+			rel += "/"
+		}
+		cleaned := "/" + rel
 		if _, err := fmt.Fprintln(f, cleaned); err != nil {
 			return fmt.Errorf("failed to write manifest entry: %v", err)
 		}
 	}
 
-	// Write symlink entries
 	for _, entry := range symlinks {
 		if _, err := fmt.Fprintf(f, "%s 000000\n", entry); err != nil {
 			return fmt.Errorf("failed to write symlink entry: %v", err)
 		}
 	}
 
-	// Compute checksums for regular files - use optimized path for user builds
 	var checksums map[string]string
 	if !execCtx.ShouldRunAsRoot {
-		// Fast path: parallel processing for user-built packages
 		checksums, err = b3sumBatch(regularFiles, runtime.NumCPU()*2)
 		if err != nil {
-			return fmt.Errorf("batch b3sum failed: %v", err)
+			debugf("parallel b3sum failed (%v), falling back to sequential\n", err)
+			checksums = make(map[string]string)
+			for _, absPath := range regularFiles {
+				checksum, serr := b3sum(absPath, RootExec)
+				if serr != nil {
+					return fmt.Errorf("b3sum failed for %s: %v", absPath, serr)
+				}
+				checksums[absPath] = checksum
+			}
 		}
 	} else {
-		// Slow path: sequential processing for root-built packages (maintains existing behavior)
 		checksums = make(map[string]string)
 		for _, absPath := range regularFiles {
 			checksum, err := b3sum(absPath, execCtx)
@@ -1888,32 +1875,27 @@ func generateManifest(outputDir, installedDir string, execCtx *Executor) error {
 		}
 	}
 
-	// Write regular file entries with their checksums
 	for _, entry := range filtered {
 		if strings.HasSuffix(entry, "/") || symlinkMap[entry] {
-			continue // already handled above
+			continue
 		}
-
 		absPath := filepath.Join(outputDir, strings.TrimPrefix(entry, "/"))
 		checksum, exists := checksums[absPath]
 		if !exists {
 			return fmt.Errorf("missing checksum for %s", absPath)
 		}
-
 		if _, err := fmt.Fprintf(f, "%s  %s\n", entry, checksum); err != nil {
 			return fmt.Errorf("failed to write manifest entry: %v", err)
 		}
 	}
 
-	f.Close() // close before moving
+	f.Close()
 
-	// Calculate checksum of the temporary manifest file.
 	tempChecksum, err := b3sum(tmpManifest, execCtx)
 	if err != nil {
 		return fmt.Errorf("b3sum failed for temporary manifest %s: %v", tmpManifest, err)
 	}
 
-	// Append the manifest entry itself
 	f, err = os.OpenFile(tmpManifest, os.O_APPEND|os.O_WRONLY, 0o644)
 	if err != nil {
 		return fmt.Errorf("failed to re-open temporary manifest file for final entry: %v", err)
@@ -1924,13 +1906,11 @@ func generateManifest(outputDir, installedDir string, execCtx *Executor) error {
 	}
 	f.Close()
 
-	// Move temp manifest into installedDir as root
 	cpCmd := exec.Command("cp", "--remove-destination", tmpManifest, manifestFile)
 	if err := execCtx.Run(cpCmd); err != nil {
 		return fmt.Errorf("failed to copy temporary manifest into place: %v", err)
 	}
-
-	os.Remove(tmpManifest)
+	_ = os.Remove(tmpManifest)
 
 	debugf("Manifest written to %s (%d entries)\n", manifestFile, len(filtered))
 	return nil
@@ -2287,7 +2267,16 @@ func createPackageTarball(pkgName, pkgVer, outputDir string, execCtx *Executor) 
 			return nil
 		}
 
-		hdr, err := tar.FileInfoHeader(info, "")
+		var linkTarget string
+		if info.Mode()&os.ModeSymlink != 0 {
+			// Read the symlink target so we can store it in the tar header
+			linkTarget, err = os.Readlink(path)
+			if err != nil {
+				return fmt.Errorf("readlink %s: %w", path, err)
+			}
+		}
+
+		hdr, err := tar.FileInfoHeader(info, linkTarget)
 		if err != nil {
 			return err
 		}
@@ -2302,6 +2291,8 @@ func createPackageTarball(pkgName, pkgVer, outputDir string, execCtx *Executor) 
 		if err := tw.WriteHeader(hdr); err != nil {
 			return err
 		}
+
+		// Only copy file contents for regular files
 		if info.Mode().IsRegular() {
 			f, err := os.Open(path)
 			if err != nil {
@@ -2601,11 +2592,10 @@ func removeObsoleteFiles(pkgName, stagingDir, rootDir string) ([]string, error) 
 			if line == "" || strings.HasSuffix(line, "/") {
 				continue
 			}
-			fields := strings.Fields(line)
-			if len(fields) < 1 {
-				continue
-			}
-			stagingSet[fields[0]] = struct{}{}
+			// Split into path and optional checksum: path is always first token
+			parts := strings.SplitN(line, "  ", 2) // manifest uses "␣␣" separator
+			path := strings.Fields(parts[0])[0]    // defensive: take first token
+			stagingSet[path] = struct{}{}
 		}
 		if err := sc.Err(); err != nil {
 			return nil, fmt.Errorf("error reading staging manifest: %v", err)
@@ -2621,24 +2611,20 @@ func removeObsoleteFiles(pkgName, stagingDir, rootDir string) ([]string, error) 
 		if line == "" || strings.HasSuffix(line, "/") {
 			continue
 		}
-		fields := strings.Fields(line)
-		if len(fields) < 1 {
-			continue
-		}
-		relPath := fields[0]
+		parts := strings.SplitN(line, "  ", 2)
+		path := strings.Fields(parts[0])[0]
 
 		// if present in staging manifest -> skip
-		if _, ok := stagingSet[relPath]; ok {
+		if _, ok := stagingSet[path]; ok {
 			continue
 		}
 
-		installedPath := filepath.Join(rootDir, relPath)
+		installedPath := filepath.Join(rootDir, path)
 
 		// if installed file exists on disk, schedule for deletion
-		if fi, err := os.Stat(installedPath); err == nil && !fi.IsDir() {
+		if fi, err := os.Lstat(installedPath); err == nil && !fi.IsDir() {
 			filesToDelete = append(filesToDelete, installedPath)
 		}
-		// if file does not exist or is a directory, skip it
 	}
 	if err := iscanner.Err(); err != nil {
 		return nil, fmt.Errorf("error reading installed manifest: %v", err)
@@ -5413,20 +5399,21 @@ func pkgUninstall(pkgName string, cfg *Config, execCtx *Executor, force, yes boo
 		if line == "" {
 			continue
 		}
-		fields := strings.Fields(line)
-		if len(fields) < 1 { // Need at least the path
-			continue
-		}
-		pathInManifest := fields[0]
-
-		// b3sum is the second field if it exists, otherwise empty.
+		// Split into path and optional checksum
+		pathInManifest := line
 		expectedSum := ""
-		if len(fields) > 1 {
-			expectedSum = fields[1]
+		if strings.HasSuffix(line, "/") {
+			// directory entry, no checksum
+		} else {
+			parts := strings.SplitN(line, "  ", 2)
+			pathInManifest = parts[0]
+			if len(parts) > 1 {
+				expectedSum = strings.TrimSpace(parts[1])
+			}
 		}
 
-		// Calculate the absolute path on the filesystem, relative to HOKUTO_ROOT.
-		absPath := pathInManifest
+		// Absolute path on disk
+		var absPath string
 		if filepath.IsAbs(pathInManifest) {
 			if hRoot != "/" {
 				absPath = filepath.Join(hRoot, pathInManifest[1:])
@@ -5437,13 +5424,11 @@ func pkgUninstall(pkgName string, cfg *Config, execCtx *Executor, force, yes boo
 			absPath = filepath.Join(hRoot, pathInManifest)
 		}
 
-		// directory entries end with '/'
 		if strings.HasSuffix(pathInManifest, "/") {
 			dirs = append(dirs, absPath)
 			continue
 		}
 
-		// Only count actual files for the confirmation prompt (Step 5)
 		fileCount++
 		files = append(files, fileMetadata{AbsPath: absPath, B3Sum: expectedSum})
 	}
@@ -5830,7 +5815,7 @@ func main() {
 	case "version", "--version":
 		// Print version first
 		// HOKUTOVERSION (string for search)
-		fmt.Println("hokuto 0.2.23")
+		fmt.Println("hokuto 0.2.24")
 
 		// Try to pick and show a random embedded PNG from assets/
 		imgs, err := listEmbeddedImages()
