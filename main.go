@@ -6016,6 +6016,11 @@ func runChrootCommand(args []string, execCtx *Executor) (exitCode int) {
 	return
 }
 
+func isPyOrCythonPackage(name string) bool {
+	return name == "python" || strings.HasPrefix(name, "python-") ||
+		name == "cython" || strings.HasPrefix(name, "cython-")
+}
+
 // printHelp prints the commands table
 func printHelp() {
 	type cmdInfo struct {
@@ -6167,7 +6172,7 @@ func main() {
 	case "version", "--version":
 		// Print version first
 		// HOKUTOVERSION (string for search)
-		fmt.Println("hokuto 0.2.26")
+		fmt.Println("hokuto 0.2.27")
 
 		// Try to pick and show a random embedded PNG from assets/
 		imgs, err := listEmbeddedImages()
@@ -6418,9 +6423,9 @@ func main() {
 					version, _ := getRepoVersion(finalPkg) // Re-get version (should not fail)
 					tarballPath := filepath.Join(BinDir, fmt.Sprintf("%s-%s.tar.zst", finalPkg, version))
 
-					// Check if package name is "python" or starts with "python-" and uninstall first
-					if finalPkg == "python" || strings.HasPrefix(finalPkg, "python-") {
-						cPrintf(colInfo, "Package %s is a Python package, uninstalling existing version first...\n", finalPkg)
+					// Check if package name is "python" or starts with "python-" or is "cython" or starts with "cython-" and uninstall first
+					if isPyOrCythonPackage(finalPkg) {
+						cPrintf(colInfo, "Package %s is a Python/Cython package, uninstalling existing version first...\n", finalPkg)
 						if err := pkgUninstall(finalPkg, cfg, RootExec, true, true); err != nil {
 							// Log warning but continue with installation
 							fmt.Fprintf(os.Stderr, "Warning: failed to uninstall existing %s: %v (continuing with installation)\n", finalPkg, err)
@@ -6520,9 +6525,9 @@ func main() {
 			}
 
 			// --- Installation Execution ---
-			// Check if package name is "python" or starts with "python-" and uninstall first
-			if pkgName == "python" || strings.HasPrefix(pkgName, "python-") {
-				cPrintf(colInfo, "Package %s is a Python package, uninstalling existing version first...\n", pkgName)
+			// Check if package name is "python" or starts with "python-" or is "cython" or starts with "cython-" and uninstall first
+			if isPyOrCythonPackage(pkgName) {
+				cPrintf(colInfo, "Package %s is a Python/Cython package, uninstalling existing version first...\n", pkgName)
 				if err := pkgUninstall(pkgName, cfg, RootExec, true, true); err != nil {
 					// Log warning but continue with installation
 					fmt.Fprintf(os.Stderr, "Warning: failed to uninstall existing %s: %v (continuing with installation)\n", pkgName, err)
@@ -6530,7 +6535,6 @@ func main() {
 					cPrintf(colSuccess, "Existing %s uninstalled successfully.\n", pkgName)
 				}
 			}
-
 			cPrintf(colInfo, "Starting installation of %s from %s...\n", pkgName, tarballPath)
 
 			if err := pkgInstall(tarballPath, pkgName, cfg, RootExec); err != nil {
