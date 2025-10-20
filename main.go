@@ -6168,7 +6168,7 @@ func main() {
 	case "version", "--version":
 		// Print version first
 		// HOKUTOVERSION (string for search)
-		fmt.Println("hokuto 0.2.25")
+		fmt.Println("hokuto 0.2.26")
 
 		// Try to pick and show a random embedded PNG from assets/
 		imgs, err := listEmbeddedImages()
@@ -6267,6 +6267,8 @@ func main() {
 
 			// 2. Override HOKUTO_ROOT in the configuration map
 			cfg.Values["HOKUTO_ROOT"] = lfsRoot
+			// Override HOKUTO_PATH in the configuration map
+			cfg.Values["HOKUTO_PATH"] = "/repo/bootstrap"
 		}
 		// Call initConfig with the possibly modified config
 		initConfig(cfg)
