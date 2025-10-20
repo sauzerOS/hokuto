@@ -164,6 +164,14 @@ func mergeEnvOverrides(cfg *Config) {
 			}
 		}
 	}
+
+	// Also import LFS from the environment if present, without overwriting an explicit config file value
+	if lfs := os.Getenv("LFS"); lfs != "" {
+		// Use key "LFS" in cfg.Values to match environment variable name
+		if _, exists := cfg.Values["LFS"]; !exists {
+			cfg.Values["LFS"] = lfs
+		}
+	}
 }
 
 func initConfig(cfg *Config) {
@@ -6172,7 +6180,7 @@ func main() {
 	case "version", "--version":
 		// Print version first
 		// HOKUTOVERSION (string for search)
-		fmt.Println("hokuto 0.2.27")
+		fmt.Println("hokuto 0.2.26")
 
 		// Try to pick and show a random embedded PNG from assets/
 		imgs, err := listEmbeddedImages()
@@ -6258,21 +6266,104 @@ func main() {
 		// Set to non-critical (0 is default, but good to be explicit)
 		isCriticalAtomic.Store(0)
 
-		// --- CONDITIONAL OVERRIDE FOR HOKUTO_ROOT (NEW LOGIC) ---
+		// --- CONDITIONAL OVERRIDE FOR HOKUTO_ROOT ---
 		if *bootstrap {
-			// 1. Get the LFS root path (assuming you have a way to access it, e.g., from config)
-			//    If 'lfsRoot' is defined in 'cfg.Values', retrieve it.
+			// 1. Get the LFS root path
 			lfsRoot := cfg.Values["LFS"]
-
 			if lfsRoot == "" {
-				// Handle the error if LFS is required but not set
 				log.Fatalf("bootstrap mode requires LFS to be set in config")
 			}
 
-			// 2. Override HOKUTO_ROOT in the configuration map
+			// 2. Override HOKUTO_ROOT
 			cfg.Values["HOKUTO_ROOT"] = lfsRoot
-			// Override HOKUTO_PATH in the configuration map
-			cfg.Values["HOKUTO_PATH"] = "/repo/bootstrap"
+
+			// 3. Check for existing bootstrap dirs
+			if fi, err := os.Stat("/repo/bootstrap"); err == nil && fi.IsDir() {
+				// Use pre-existing /repo/bootstrap
+				cfg.Values["HOKUTO_PATH"] = "/repo/bootstrap"
+				log.Printf("Using existing bootstrap repo at /repo/bootstrap")
+			} else {
+				// If /tmp/bootstrap already exists, just use it
+				if fi, err := os.Stat("/tmp/bootstrap"); err == nil && fi.IsDir() {
+					cfg.Values["HOKUTO_PATH"] = "/tmp/bootstrap"
+					log.Printf("Using existing bootstrap repo at /tmp/bootstrap")
+				} else {
+					// Need to download and unpack into /tmp/bootstrap
+					url := "https://github.com/sauzeros/bootstrap/releases/download/latest/bootstrap-repo.tar.xz"
+					tmpFile := filepath.Join(os.TempDir(), "bootstrap-repo.tar.xz")
+
+					log.Printf("Downloading bootstrap repo from %s ...", url)
+					resp, err := http.Get(url)
+					if err != nil {
+						log.Fatalf("failed to download bootstrap repo: %v", err)
+					}
+					defer resp.Body.Close()
+
+					out, err := os.Create(tmpFile)
+					if err != nil {
+						log.Fatalf("failed to create temp file: %v", err)
+					}
+					if _, err := io.Copy(out, resp.Body); err != nil {
+						out.Close()
+						log.Fatalf("failed to save bootstrap archive: %v", err)
+					}
+					out.Close()
+
+					// Unpack into /tmp
+					log.Printf("Unpacking bootstrap repo into /tmp ...")
+					f, err := os.Open(tmpFile)
+					if err != nil {
+						log.Fatalf("failed to open downloaded archive: %v", err)
+					}
+					defer f.Close()
+
+					xzr, err := xz.NewReader(f)
+					if err != nil {
+						log.Fatalf("failed to create xz reader: %v", err)
+					}
+
+					tr := tar.NewReader(xzr)
+					for {
+						hdr, err := tr.Next()
+						if err == io.EOF {
+							break
+						}
+						if err != nil {
+							log.Fatalf("error reading tar: %v", err)
+						}
+
+						target := filepath.Join(os.TempDir(), hdr.Name)
+						switch hdr.Typeflag {
+						case tar.TypeDir:
+							if err := os.MkdirAll(target, os.FileMode(hdr.Mode)); err != nil {
+								log.Fatalf("failed to create dir %s: %v", target, err)
+							}
+						case tar.TypeReg:
+							if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
+								log.Fatalf("failed to create parent dir: %v", err)
+							}
+							outFile, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, os.FileMode(hdr.Mode))
+							if err != nil {
+								log.Fatalf("failed to create file %s: %v", target, err)
+							}
+							if _, err := io.Copy(outFile, tr); err != nil {
+								outFile.Close()
+								log.Fatalf("failed to write file %s: %v", target, err)
+							}
+							outFile.Close()
+						case tar.TypeSymlink:
+							if err := os.Symlink(hdr.Linkname, target); err != nil && !os.IsExist(err) {
+								log.Fatalf("failed to create symlink %s -> %s: %v", target, hdr.Linkname, err)
+							}
+						default:
+							// skip other types
+						}
+					}
+
+					log.Printf("Bootstrap repo unpacked successfully into /tmp")
+					cfg.Values["HOKUTO_PATH"] = "/tmp/bootstrap"
+				}
+			}
 		}
 		// Call initConfig with the possibly modified config
 		initConfig(cfg)
