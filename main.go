@@ -3639,12 +3639,9 @@ func stripPackage(outputDir string, buildExec *Executor) error {
 
 	// --- PHASE 1: Execute 'find' command via the Executor to get the file list ---
 
-	// Use find to locate files with any exec bit and then filter by ELF using `file`
-	// We keep the same approach but capture stdout into a buffer.
 	shellCommand := fmt.Sprintf(
-		"find %s -type f \\( -perm /u+x -o -perm /g+x -o -perm /o+x \\) -exec sh -c 'file -0 {} | grep -q ELF && printf \"%s\\n\" {}' \\;",
+		"find %s -type f \\( -perm /u+x -o -perm /g+x -o -perm /o+x \\) -exec sh -c 'file -0 {} | grep -q ELF && printf \"%%s\\n\" {}' \\;",
 		outputDir,
-		"%s",
 	)
 
 	var findOutput bytes.Buffer
@@ -3662,12 +3659,15 @@ func stripPackage(outputDir string, buildExec *Executor) error {
 
 	pathsRaw := strings.TrimSpace(findOutput.String())
 	if pathsRaw == "" {
-		// Nothing to strip
 		cPrintln(colInfo, "  -> No stripable ELF files found.")
 		return nil
 	}
 
 	paths := strings.Split(pathsRaw, "\n")
+
+	// Track per-file failures but do not make them fatal
+	var failedMu sync.Mutex
+	var failedFiles []string
 
 	for _, path := range paths {
 		if path == "" {
@@ -3689,13 +3689,18 @@ func stripPackage(outputDir string, buildExec *Executor) error {
 			statCmd.Stderr = os.Stderr
 
 			if err := buildExec.Run(statCmd); err != nil {
-				// Log and skip this file; do not fail the whole run.
 				fmt.Fprintf(os.Stderr, "Warning: failed to stat permissions for %s: %v. Skipping this file.\n", p, err)
+				failedMu.Lock()
+				failedFiles = append(failedFiles, p)
+				failedMu.Unlock()
 				return
 			}
 			originalPerms := strings.TrimSpace(permOut.String())
 			if originalPerms == "" {
 				fmt.Fprintf(os.Stderr, "Warning: empty perms from stat for %s. Skipping this file.\n", p)
+				failedMu.Lock()
+				failedFiles = append(failedFiles, p)
+				failedMu.Unlock()
 				return
 			}
 
@@ -3713,6 +3718,9 @@ func stripPackage(outputDir string, buildExec *Executor) error {
 			chmodWriteCmd.Stderr = os.Stderr
 			if err := buildExec.Run(chmodWriteCmd); err != nil {
 				fmt.Fprintf(os.Stderr, "Warning: failed to chmod +w %s: %v. Skipping strip for this file.\n", p, err)
+				failedMu.Lock()
+				failedFiles = append(failedFiles, p)
+				failedMu.Unlock()
 				return
 			}
 
@@ -3722,15 +3730,21 @@ func stripPackage(outputDir string, buildExec *Executor) error {
 			if err := buildExec.Run(stripCmd); err != nil {
 				// Log as warning only. Do not mark the whole package as failed.
 				fmt.Fprintf(os.Stderr, "Warning: failed to strip %s: %v. Continuing with other files.\n", p, err)
+				failedMu.Lock()
+				failedFiles = append(failedFiles, p)
+				failedMu.Unlock()
 				return
 			}
 		}(p)
 	}
 
-	// Wait for all goroutines to finish
 	wg.Wait()
 
-	// Do not return an error for per-file strip failures; discovery errors were returned earlier.
+	if len(failedFiles) > 0 {
+		// Provide an informational summary but do not fail the whole build.
+		fmt.Fprintf(os.Stderr, "Warning: some files failed to be stripped (%d). See above for details. Continuing.\n", len(failedFiles))
+	}
+
 	return nil
 }
 
@@ -3831,7 +3845,7 @@ func getUserConfirmation(prompt string) bool {
 func askForConfirmation(prompt string) bool {
 	reader := bufio.NewReader(os.Stdin)
 	for {
-		fmt.Printf("%s [y/N]: ", prompt)
+		fmt.Printf("%s [Y/n]: ", prompt)
 		response, err := reader.ReadString('\n')
 		if err != nil {
 			return false
@@ -3839,10 +3853,10 @@ func askForConfirmation(prompt string) bool {
 
 		response = strings.ToLower(strings.TrimSpace(response))
 
-		if response == "y" || response == "yes" {
+		if response == "y" || response == "yes" || response == "" {
 			return true
 		}
-		if response == "n" || response == "no" || response == "" {
+		if response == "n" || response == "no" {
 			return false
 		}
 		cPrintln(colWarn, "Invalid input. Please type 'y' (yes) or 'n' (no).")
