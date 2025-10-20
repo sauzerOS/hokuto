@@ -3630,8 +3630,6 @@ func stripPackage(outputDir string, buildExec *Executor) error {
 	debugf("Stripping executables in parallel in: %s\n", outputDir)
 
 	var wg sync.WaitGroup
-	var firstError error
-	var errOnce sync.Once
 
 	maxConcurrency := runtime.GOMAXPROCS(0) * 4
 	if maxConcurrency < 8 {
@@ -3641,111 +3639,98 @@ func stripPackage(outputDir string, buildExec *Executor) error {
 
 	// --- PHASE 1: Execute 'find' command via the Executor to get the file list ---
 
+	// Use find to locate files with any exec bit and then filter by ELF using `file`
+	// We keep the same approach but capture stdout into a buffer.
 	shellCommand := fmt.Sprintf(
-		"find %s -type f \\( -perm /u+x -o -perm /g+x -o -perm /o+x \\) -exec sh -c 'file -0 {} | grep -q ELF && echo {}' \\;",
+		"find %s -type f \\( -perm /u+x -o -perm /g+x -o -perm /o+x \\) -exec sh -c 'file -0 {} | grep -q ELF && printf \"%s\\n\" {}' \\;",
 		outputDir,
+		"%s",
 	)
 
-	// 1. Set up a buffer to capture the output of the find command.
 	var findOutput bytes.Buffer
 
-	// 2. Wrap the complex logic in 'sh -c'
 	findCmd := exec.Command("sh", "-c", shellCommand)
-
-	// Redirect find's Stdout to our buffer
 	findCmd.Stdout = &findOutput
-	// Ensure find's Stderr still goes to the system for debugging
 	findCmd.Stderr = os.Stderr
 
-	// 3. Run the find command using the Executor.
 	cPrintln(colInfo, "  -> Discovering stripable ELF files...")
 	if err := buildExec.Run(findCmd); err != nil {
 		return fmt.Errorf("failed to execute file discovery command (find/file filter): %w", err)
 	}
 
-	// --- PHASE 2: Process the collected output (now newline-separated, not null) ---
+	// --- PHASE 2: Process the collected output ---
 
-	// Because 'echo {}' is used, the paths are now separated by newlines,
-	// unless the file name itself contains a newline. For build systems, this is a safe assumption.
-	paths := strings.Split(strings.TrimSpace(findOutput.String()), "\n")
+	pathsRaw := strings.TrimSpace(findOutput.String())
+	if pathsRaw == "" {
+		// Nothing to strip
+		cPrintln(colInfo, "  -> No stripable ELF files found.")
+		return nil
+	}
+
+	paths := strings.Split(pathsRaw, "\n")
 
 	for _, path := range paths {
 		if path == "" {
 			continue
 		}
 
-		// Launch the stripping job
 		wg.Add(1)
 		concurrencyLimit <- struct{}{}
-
-		// capture local copy of path for goroutine
 		p := path
 
 		go func(p string) {
 			defer wg.Done()
 			defer func() { <-concurrencyLimit }()
-			// --- AMENDMENT START: Save and Restore Permissions ---
 
-			// 1. Get original permissions (using stat via the privileged Executor)
-			// stat -c %a gets the octal permissions (e.g., 555)
-			statCmd := exec.Command("sh", "-c", fmt.Sprintf("stat -c %%a %s", p))
+			// Save original permissions
+			statCmd := exec.Command("sh", "-c", fmt.Sprintf("stat -c %%a %q", p))
 			var permOut bytes.Buffer
 			statCmd.Stdout = &permOut
+			statCmd.Stderr = os.Stderr
 
-			// Note: Since 'p' might be in a root-owned directory, we MUST use buildExec.
 			if err := buildExec.Run(statCmd); err != nil {
-				errOnce.Do(func() {
-					firstError = fmt.Errorf("failed to stat original permissions for %s: %w", p, err)
-				})
-				fmt.Fprintf(os.Stderr, "Fatal Warning: failed to stat %s: %v. Skipping strip.\n", p, err)
+				// Log and skip this file; do not fail the whole run.
+				fmt.Fprintf(os.Stderr, "Warning: failed to stat permissions for %s: %v. Skipping this file.\n", p, err)
 				return
 			}
 			originalPerms := strings.TrimSpace(permOut.String())
+			if originalPerms == "" {
+				fmt.Fprintf(os.Stderr, "Warning: empty perms from stat for %s. Skipping this file.\n", p)
+				return
+			}
 
-			// 2. Defer the permission restoration (executed on function exit)
+			// Ensure we restore perms no matter what
 			defer func() {
-				// Restore original permissions
 				restoreCmd := exec.Command("chmod", originalPerms, p)
+				restoreCmd.Stderr = os.Stderr
 				if err := buildExec.Run(restoreCmd); err != nil {
-					fmt.Fprintf(os.Stderr, "CRITICAL WARNING: failed to restore permissions on %s to %s: %v\n", p, originalPerms, err)
-					// Do NOT return here, just log the failure.
+					fmt.Fprintf(os.Stderr, "Warning: failed to restore permissions on %s to %s: %v\n", p, originalPerms, err)
 				}
 			}()
 
-			// 3. Grant temporary write permission (`u+w`)
+			// Try to grant write permission
 			chmodWriteCmd := exec.Command("chmod", "u+w", p)
+			chmodWriteCmd.Stderr = os.Stderr
 			if err := buildExec.Run(chmodWriteCmd); err != nil {
-				errOnce.Do(func() {
-					firstError = fmt.Errorf("failed to grant write permission to %s: %w", p, err)
-				})
-				fmt.Fprintf(os.Stderr, "Fatal Warning: failed to chmod +w %s: %v. Skipping strip.\n", p, err)
+				fmt.Fprintf(os.Stderr, "Warning: failed to chmod +w %s: %v. Skipping strip for this file.\n", p, err)
 				return
 			}
-			// --- AMENDMENT END ---
-			fmt.Printf("  -> Stripping %s\n", p)
 
+			fmt.Printf("  -> Stripping %s\n", p)
 			stripCmd := exec.Command("strip", p)
-			// The strip command itself is executed with the Executor's privileges
+			stripCmd.Stderr = os.Stderr
 			if err := buildExec.Run(stripCmd); err != nil {
-				errOnce.Do(func() {
-					firstError = fmt.Errorf("failed to strip %s: %w", p, err)
-				})
-				// Use os.Stderr since the buildExec's Stderr is connected there
-				fmt.Fprintf(os.Stderr, "Warning: failed to strip %s: %v. Continuing.\n", p, err)
+				// Log as warning only. Do not mark the whole package as failed.
+				fmt.Fprintf(os.Stderr, "Warning: failed to strip %s: %v. Continuing with other files.\n", p, err)
+				return
 			}
 		}(p)
 	}
 
-	// If the buffer is not terminated by a null byte, the remaining data is ignored.
-	// This is safe as 'find -print0' guarantees a null delimiter for every path.
-
-	// --- PHASE 3: Wait for all strip jobs to complete ---
+	// Wait for all goroutines to finish
 	wg.Wait()
 
-	if firstError != nil {
-		return fmt.Errorf("stripping phase failed for %s: %w", outputDir, firstError)
-	}
-
+	// Do not return an error for per-file strip failures; discovery errors were returned earlier.
 	return nil
 }
 
