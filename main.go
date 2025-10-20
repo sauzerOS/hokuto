@@ -1070,17 +1070,20 @@ func verifyOrCreateChecksums(pkgName, pkgDir string, force bool) error {
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
-		// Skip local files (files that start with "files/")
-		if strings.HasPrefix(line, "files/") {
+		// Skip local files and VCS sources
+		if strings.HasPrefix(line, "files/") || strings.HasPrefix(line, "git+") {
 			continue
 		}
-		// Skip git sources (sources that start with "git+")
-		if strings.HasPrefix(line, "git+") {
-			continue
-		}
-		// Assume last field is the filename
+
 		parts := strings.Fields(line)
-		fname := filepath.Base(parts[len(parts)-1])
+		if len(parts) == 0 {
+			continue
+		}
+
+		// Always take the basename of the URL (first token).
+		// Ignore any second token (extraction dir hint).
+		url := parts[0]
+		fname := filepath.Base(url)
 		expectedFiles = append(expectedFiles, fname)
 	}
 
@@ -1789,7 +1792,11 @@ func generateManifest(outputDir, installedDir string, execCtx *Executor) error {
 
 	entries, err := listOutputFiles(outputDir, execCtx)
 	if err != nil {
-		return fmt.Errorf("failed to list output files: %v", err)
+		// fallback to RootExec
+		entries, err = listOutputFiles(outputDir, RootExec)
+		if err != nil {
+			return fmt.Errorf("failed to list output files: %v", err)
+		}
 	}
 
 	relManifest, err := filepath.Rel(outputDir, manifestFile)
@@ -3963,7 +3970,7 @@ func PostInstallTasks(e *Executor) error {
 }
 
 // build package
-func pkgBuild(pkgName string, cfg *Config, execCtx *Executor) error {
+func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool) error {
 
 	// Define the ANSI escape code format for setting the terminal title.
 	// \033]0; sets the title, and \a (bell character) terminates the sequence.
@@ -4066,77 +4073,103 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor) error {
 		return fmt.Errorf("build script not found: %v", err)
 	}
 
-	// Build environment
-	env := os.Environ()
-	defaults := map[string]string{
-		"AR":          "gcc-ar",
-		"CC":          "cc",
-		"CXX":         "c++",
-		"NM":          "gcc-nm",
-		"RANLIB":      "gcc-ranlib",
-		"CFLAGS":      "-O2 -march=x86-64 -mtune=generic -pipe -fPIC",
-		"CXXFLAGS":    "",
-		"LDFLAGS":     "",
-		"MAKEFLAGS":   fmt.Sprintf("-j%d", runtime.NumCPU()),
-		"RUSTFLAGS":   fmt.Sprintf("--remap-path-prefix=%s=.", buildDir),
-		"GOFLAGS":     "-trimpath -modcacherw",
-		"GOPATH":      filepath.Join(buildDir, "go"),
-		"HOKUTO_ROOT": cfg.Values["HOKUTO_ROOT"],
-		"TMPDIR":      currentTmpDir,
-	}
-
 	// 1. Define the base C/C++/LD flags
 	var defaultCFLAGS = "-O2 -march=x86-64 -mtune=generic -pipe -fPIC"
 	var defaultLDFLAGS = ""
 
-	// 2. Select the appropriate keys and default values based on cfg.DefaultLTO
-	var cflagsKey, cxxflagsKey, ldflagsKey string
+	// Build environment
+	env := os.Environ()
+	var defaults = map[string]string{}
 
-	if shouldLTO {
-		cflagsKey = "CFLAGS_LTO"
-		cxxflagsKey = "CXXFLAGS_LTO"
-		ldflagsKey = "LDFLAGS_LTO"
-		// Set LTO defaults if they are not defined in the configuration
-		// (You'd likely define these globally in your program)
-		defaults["CFLAGS"] = defaultCFLAGS + " -flto=auto"   // Example LTO flag
-		defaults["LDFLAGS"] = defaultLDFLAGS + " -flto=auto" // Example LTO flag
+	if bootstrap {
+		// --- Bootstrap environment (like the lfs user) ---
+		lfsRoot := cfg.Values["LFS"]
+		if lfsRoot == "" {
+			return fmt.Errorf("bootstrap mode requires LFS to be set in config")
+		}
+
+		defaults = map[string]string{
+			"LFS":         lfsRoot,
+			"LC_ALL":      "POSIX",
+			"LFS_TGT":     "x86_64-lfs-linux-gnu",
+			"LFS_TGT32":   "i686-lfs-linux-gnu",
+			"LFS_TGTX32":  "x86_64-lfs-linux-gnux32",
+			"PATH":        filepath.Join(lfsRoot, "tools/bin") + ":/usr/bin:/bin",
+			"MAKEFLAGS":   fmt.Sprintf("-j%d", runtime.NumCPU()),
+			"CONFIG_SITE": filepath.Join(lfsRoot, "usr/share/config.site"),
+			"HOKUTO_ROOT": lfsRoot,
+			"TMPDIR":      currentTmpDir,
+		}
 	} else {
-		cflagsKey = "CFLAGS"
-		cxxflagsKey = "CXXFLAGS"
-		ldflagsKey = "LDFLAGS"
-		defaults["CFLAGS"] = defaultCFLAGS
-		defaults["LDFLAGS"] = defaultLDFLAGS
+		// --- Normal build environment---
+		defaults = map[string]string{
+			"AR":          "gcc-ar",
+			"CC":          "cc",
+			"CXX":         "c++",
+			"NM":          "gcc-nm",
+			"RANLIB":      "gcc-ranlib",
+			"CFLAGS":      defaultCFLAGS, // Use the constant
+			"CXXFLAGS":    "",
+			"LDFLAGS":     defaultLDFLAGS, // Use the constant
+			"MAKEFLAGS":   fmt.Sprintf("-j%d", runtime.NumCPU()),
+			"RUSTFLAGS":   fmt.Sprintf("--remap-path-prefix=%s=.", buildDir),
+			"GOFLAGS":     "-trimpath -modcacherw",
+			"GOPATH":      filepath.Join(buildDir, "go"),
+			"HOKUTO_ROOT": cfg.Values["HOKUTO_ROOT"],
+			"TMPDIR":      currentTmpDir,
+		}
 	}
 
-	// 3. Set CXXFLAGS default based on CFLAGS if not set, regardless of LTO
-	defaults["CXXFLAGS"] = ""
+	// Only apply normal flag logic if not in bootstrap mode
+	if !bootstrap {
 
-	// 4. Override defaults with actual config values
-	// We only need to check the CFLAGS, CXXFLAGS, LDFLAGS keys now
-	// This ensures the correct, prioritized value from the config is used.
-	if val := cfg.Values[cflagsKey]; val != "" {
-		defaults["CFLAGS"] = val
-	}
-	if val := cfg.Values[cxxflagsKey]; val != "" {
-		defaults["CXXFLAGS"] = val
-	}
-	if val := cfg.Values[ldflagsKey]; val != "" {
-		defaults["LDFLAGS"] = val
+		// 2. Select the appropriate keys and default values based on cfg.DefaultLTO
+		var cflagsKey, cxxflagsKey, ldflagsKey string
+
+		if shouldLTO {
+			cflagsKey = "CFLAGS_LTO"
+			cxxflagsKey = "CXXFLAGS_LTO"
+			ldflagsKey = "LDFLAGS_LTO"
+			// Set LTO defaults if they are not defined in the configuration
+			// (You'd likely define these globally in your program)
+			defaults["CFLAGS"] = defaultCFLAGS + " -flto=auto"   // Example LTO flag
+			defaults["LDFLAGS"] = defaultLDFLAGS + " -flto=auto" // Example LTO flag
+		} else {
+			cflagsKey = "CFLAGS"
+			cxxflagsKey = "CXXFLAGS"
+			ldflagsKey = "LDFLAGS"
+			defaults["CFLAGS"] = defaultCFLAGS
+			defaults["LDFLAGS"] = defaultLDFLAGS
+		}
+
+		// 3. Set CXXFLAGS default based on CFLAGS if not set, regardless of LTO
+		defaults["CXXFLAGS"] = ""
+
+		// 4. Override defaults with actual config values
+		// We only need to check the CFLAGS, CXXFLAGS, LDFLAGS keys now
+		// This ensures the correct, prioritized value from the config is used.
+		if val := cfg.Values[cflagsKey]; val != "" {
+			defaults["CFLAGS"] = val
+		}
+		if val := cfg.Values[cxxflagsKey]; val != "" {
+			defaults["CXXFLAGS"] = val
+		}
+		if val := cfg.Values[ldflagsKey]; val != "" {
+			defaults["LDFLAGS"] = val
+		}
+
+		// The CXXFLAGS fallback logic must be applied AFTER CFLAGS is finalized.
+		// We must apply it before the final loop, as the final loop simply appends.
+		finalCXXFLAGS := defaults["CXXFLAGS"]
+		if finalCXXFLAGS == "" {
+			// Fallback to CFLAGS if CXXFLAGS is still empty
+			finalCXXFLAGS = defaults["CFLAGS"]
+		}
+		defaults["CXXFLAGS"] = finalCXXFLAGS // Update the map with the resolved value
 	}
 
-	// The CXXFLAGS fallback logic must be applied AFTER CFLAGS is finalized.
-	// We must apply it before the final loop, as the final loop simply appends.
-	finalCXXFLAGS := defaults["CXXFLAGS"]
-	if finalCXXFLAGS == "" {
-		// Fallback to CFLAGS if CXXFLAGS is still empty
-		finalCXXFLAGS = defaults["CFLAGS"]
-	}
-	defaults["CXXFLAGS"] = finalCXXFLAGS // Update the map with the resolved value
-
-	// 5. Final loop to assemble the environment array
-	for k, def := range defaults {
-		// k == "CXXFLAGS" logic is now simplified/removed from here because it was handled above.
-		env = append(env, fmt.Sprintf("%s=%s", k, def))
+	for k, v := range defaults {
+		env = append(env, fmt.Sprintf("%s=%s", k, v))
 	}
 
 	// Run build script
@@ -4407,7 +4440,7 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor) error {
 	// Build SUCCESSFUL: Set title to success status
 	finalTitle := fmt.Sprintf("✅ SUCCESS: %s", pkgName)
 	setTerminalTitle(finalTitle)
-
+	debugf("HOKUTO ROOT IS", rootDir)
 	return nil
 }
 
@@ -5668,6 +5701,322 @@ func pkgUninstall(pkgName string, cfg *Config, execCtx *Executor, force, yes boo
 	return nil
 }
 
+// executeMountCommand accepts the FULL destination path (e.g., /var/tmp/lfs/dev/tty)
+func (e *Executor) executeMountCommand(source, dest, fsType, options string, isBind bool) error {
+	args := []string{}
+
+	// Check if the destination is expected to be a device file.
+	// These must exist as a file, not a directory.
+	base := filepath.Base(source)
+	isDeviceFileBind := isBind && (base == "tty" || base == "console" || base == "null" || base == "ptmx" || base == "zero" || base == "full" || base == "random" || base == "urandom")
+	// NOTE: Added "ptmx", "zero", "full", "random", "urandom" to match typical essential device nodes.
+
+	if isDeviceFileBind {
+		// For device file binds:
+		// 1. Ensure the parent directory exists.
+		parentDir := filepath.Dir(dest)
+		if err := os.MkdirAll(parentDir, 0755); err != nil {
+			return fmt.Errorf("failed to create parent directory %s: %w", parentDir, err)
+		}
+
+		// 2. Create the file placeholder if it doesn't exist.
+		if _, err := os.Stat(dest); os.IsNotExist(err) {
+			if err := os.WriteFile(dest, []byte{}, 0644); err != nil {
+				return fmt.Errorf("failed to create device file placeholder %s: %w", dest, err)
+			}
+		}
+	} else {
+		// 1. Ensure the destination directory exists (for all non-device file mounts)
+		if err := os.MkdirAll(dest, 0755); err != nil {
+			return fmt.Errorf("failed to create destination directory %s: %w", dest, err)
+		}
+	}
+
+	// --- Rest of the logic remains the same (Bind/Type mounting logic) ---
+
+	if isBind {
+		if options == "--make-private" {
+			// ... (propagation logic remains the same) ...
+			// Omitted for brevity.
+			return nil
+		}
+		args = []string{source, dest, "--bind"}
+	} else {
+		args = append(args, source, dest)
+		if fsType != "" {
+			args = append(args, "-t", fsType)
+		}
+		if options != "" {
+			args = append(args, "-o", options)
+		}
+	}
+
+	cmd := exec.Command("mount", args...)
+	debugf("[INFO] Running mount: %s\n", strings.Join(cmd.Args, " "))
+
+	if err := e.Run(cmd); err != nil {
+		return fmt.Errorf("mount failed for %s to %s: %w", source, dest, err)
+	}
+	return nil
+}
+
+// UnmountFilesystems unmounts all given paths using the external 'umount -l'
+// command via e.Run() to ensure proper privilege escalation.
+func (e *Executor) UnmountFilesystems(paths []string) error {
+	var cleanupErrors []string
+
+	// Iterate backwards to safely unmount mounts within other mounts
+	for i := len(paths) - 1; i >= 0; i-- {
+		path := paths[i]
+
+		// Check if the path exists before attempting unmount
+		if _, err := os.Stat(path); os.IsNotExist(err) {
+			continue
+		}
+
+		debugf("[INFO] Unmounting: %s\n", path)
+
+		// Use external `umount -l` (lazy unmount)
+		cmdUnmount := exec.Command("umount", "-l", path)
+
+		// Execute the command via the privileged Executor
+		if err := e.Run(cmdUnmount); err != nil {
+			// Note: We avoid checking specific syscall errors (like EBUSY) here
+			// because the error comes from the external `umount` binary.
+			cleanupErrors = append(cleanupErrors, fmt.Sprintf("Failed to umount %s (via external umount): %v", path, err))
+		}
+	}
+
+	if len(cleanupErrors) > 0 {
+		return fmt.Errorf("multiple unmount errors occurred:\n%s", strings.Join(cleanupErrors, "\n"))
+	}
+	return nil
+}
+
+// BindMount creates the destination directory and performs a recursive bind mount
+// using the external 'mount' binary via e.Run() to ensure proper privilege escalation.
+func (e *Executor) BindMount(source, dest, options string) error {
+	// 1. Ensure the destination directory exists
+	if err := os.MkdirAll(dest, 0755); err != nil {
+		return fmt.Errorf("failed to create destination directory %s: %w", dest, err)
+	}
+
+	// 2. Perform the bind mount: `mount --bind source dest`
+	// We use an external command to trigger the privilege escalation via e.Run().
+	// Note: We use the '-o bind' option, which is equivalent to MS_BIND.
+	cmdBind := exec.Command("mount", "--bind", source, dest)
+
+	fmt.Printf("[INFO] Running: %s %s\n", "mount", strings.Join(cmdBind.Args, " "))
+	if err := e.Run(cmdBind); err != nil {
+		return fmt.Errorf("failed to perform bind mount of %s to %s: %w", source, dest, err)
+	}
+
+	// 3. Set mount propagation to MS_PRIVATE (using external mount command)
+	// This prevents chroot mount/unmount events from affecting the host.
+	// We use --make-rprivate to apply recursively and privately.
+	// We MUST run this as a separate command.
+	cmdPrivate := exec.Command("mount", "--make-rprivate", dest)
+
+	if err := e.Run(cmdPrivate); err != nil {
+		fmt.Printf("[WARNING] Could not set mount %s to private: %v\n", dest, err)
+		// This is a warning, not a fatal error, so we continue.
+	}
+
+	return nil
+}
+
+// ExecuteChroot executes the target command inside the chroot environment.
+// It relies on the external 'chroot' binary, which is automatically wrapped
+// with 'sudo' (if needed) and run via the Executor.Run method.
+func (e *Executor) ExecuteChroot(targetDir string, cmdArgs []string) (int, error) {
+
+	// Build systemd-run invocation that sets RootDirectory and runs the command directly.
+	// Do NOT call the external chroot binary when using RootDirectory.
+	suffix := fmt.Sprintf("%d-%d", os.Getpid(), time.Now().UnixNano())
+	unitName := "hokuto-chroot-" + filepath.Base(targetDir) + "-" + suffix
+	sdArgs := []string{
+		"systemd-run", "--pty",
+		"--setenv=TERM=xterm",
+		"--unit=" + unitName,
+		"--description=hokuto chroot " + targetDir,
+		"--property=RootDirectory=" + targetDir,
+		"--",
+	}
+	sdArgs = append(sdArgs, cmdArgs...) // cmdArgs are the command to run inside the chroot
+
+	// construct command and run via Executor
+	cmd := exec.CommandContext(e.Context, sdArgs[0], sdArgs[1:]...)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	if err := e.Run(cmd); err != nil {
+		return 1, fmt.Errorf("error running chroot via systemd-run: %w", err)
+	}
+	return 0, nil
+}
+
+// runChrootCommand encapsulates the chroot logic and GUARANTEES cleanup via defer.
+func runChrootCommand(args []string, execCtx *Executor) (exitCode int) {
+	// Set default exitCode to 1 (failure) in case we encounter errors before the chrooted command runs.
+	exitCode = 1
+
+	if len(args) < 1 {
+		fmt.Println("Usage: hokuto chroot <targetdir> [command...]")
+		return // Returns exitCode 1
+	}
+
+	targetDir := args[0]
+	var chrootCmd []string
+	if len(args) > 1 {
+		chrootCmd = args[1:]
+	} else {
+		// FIX: Add the interactive flag to prevent hangs on startup
+		chrootCmd = []string{"/bin/bash", "-i", "-l"}
+	}
+	// --- A. DEFERRED CLEANUP (CRITICAL STEP) ---
+	pathsToUnmount := []string{
+		// Reverse order of mounting, most nested first.
+		filepath.Join(targetDir, "tmp"),
+		filepath.Join(targetDir, "run"),
+		filepath.Join(targetDir, "dev/shm"),
+		filepath.Join(targetDir, "dev/pts"),
+		// Specific device files must be unmounted BEFORE /dev
+		filepath.Join(targetDir, "dev/tty"),
+		filepath.Join(targetDir, "dev/console"),
+		filepath.Join(targetDir, "dev/null"),
+		filepath.Join(targetDir, "dev"),
+		//filepath.Join(targetDir, "sys/firmware/efi/efivars"),
+		filepath.Join(targetDir, "sys"),
+		filepath.Join(targetDir, "proc"),
+	}
+
+	// Filter out paths that don't exist before deferring cleanup
+	existingPaths := []string{}
+	for _, p := range pathsToUnmount {
+		if _, err := os.Stat(p); err == nil {
+			existingPaths = append(existingPaths, p)
+		}
+	}
+
+	defer func() {
+		fmt.Println("\n[INFO] Starting chroot cleanup")
+		// Use the list of paths confirmed to exist
+		err := execCtx.UnmountFilesystems(existingPaths)
+		if err != nil {
+			// ... (error handling for cleanup) ...
+		} else {
+			fmt.Println("[INFO] Successfully unmounted all chroot filesystems.")
+		}
+	}()
+
+	// --- B. PREPARATION ---
+	isCriticalAtomic.Store(1)
+	defer isCriticalAtomic.Store(0)
+
+	fmt.Printf("[INFO] Setting up specialized mounts in %s \n", targetDir)
+
+	// Helper to reduce verbosity. m now sends the full destination path.
+	m := func(source, target string, fsType, options string, isBind bool) error {
+		// Construct the full destination path here once: /var/tmp/lfs + /proc = /var/tmp/lfs/proc
+		destPath := filepath.Join(targetDir, target)
+		return execCtx.executeMountCommand(source, destPath, fsType, options, isBind)
+	}
+	// NOTE: If any mount fails, the function returns, and the defer block executes.
+
+	// 1. /proc (proc)
+	if err := m("proc", "proc", "proc", "nosuid,noexec,nodev", false); err != nil {
+		fmt.Printf("[FATAL] Failed to mount /proc: %v\n", err)
+		return
+	}
+
+	// 2. /sys (sysfs)
+	if err := m("sys", "sys", "sysfs", "nosuid,noexec,nodev,ro", false); err != nil {
+		fmt.Printf("[FATAL] Failed to mount /sys: %v\n", err)
+		return
+	}
+
+	// 3. /sys/firmware/efi/efivars (Conditional mount)
+	efiVarsPath := filepath.Join(targetDir, "sys/firmware/efi/efivars")
+	if _, err := os.Stat(efiVarsPath); err == nil {
+		// ignore_error here, so we don't return on failure.
+		m("efivarfs", "sys/firmware/efi/efivars", "efivarfs", "nosuid,noexec,nodev", false)
+	}
+
+	// 4. /dev (devtmpfs) - CRITICAL for TTY/ioctl fix
+	if err := m("udev", "dev", "devtmpfs", "mode=0755,nosuid", false); err != nil {
+		fmt.Printf("[FATAL] Failed to mount /dev: %v\n", err)
+		return
+	}
+
+	// 5. /dev/pts (devpts)
+	if err := m("devpts", "dev/pts", "devpts", "mode=0620,gid=5,nosuid,noexec", false); err != nil {
+		fmt.Printf("[FATAL] Failed to mount /dev/pts: %v\n", err)
+		return
+	}
+
+	// 6. Bind mount essential TTY/device nodes (The ioctl fix)
+	if err := m("/dev/ptmx", "dev/ptmx", "", "", true); err != nil { // <-- This now correctly creates a file placeholder
+		fmt.Printf("[FATAL] Failed to bind /dev/ptmx: %v\n", err)
+		return
+	}
+	if err := m("/dev/tty", "dev/tty", "", "", true); err != nil {
+		fmt.Printf("[FATAL] Failed to bind /dev/tty: %v\n", err)
+		return
+	}
+	if err := m("/dev/console", "dev/console", "", "", true); err != nil {
+		fmt.Printf("[FATAL] Failed to bind /dev/console: %v\n", err)
+		return
+	}
+	if err := m("/dev/null", "dev/null", "", "", true); err != nil {
+		fmt.Printf("[FATAL] Failed to bind /dev/null: %v\n", err)
+		return
+	}
+
+	// 7. /dev/shm (tmpfs)
+	if err := m("shm", "dev/shm", "tmpfs", "mode=1777,nosuid,nodev", false); err != nil {
+		fmt.Printf("[FATAL] Failed to mount /dev/shm: %v\n", err)
+		return
+	}
+
+	// 8. /run (Bind mount with private propagation)
+	if err := m("/run", "run", "", "", true); err != nil {
+		fmt.Printf("[FATAL] Failed to bind /run: %v\n", err)
+		return
+	}
+	// Execute the propagation step separately
+	execCtx.executeMountCommand("", filepath.Join(targetDir, "run"), "", "--make-private", true)
+
+	// 9. /tmp (tmpfs)
+	if err := m("tmp", "tmp", "tmpfs", "mode=1777,strictatime,nodev,nosuid", false); err != nil {
+		fmt.Printf("[FATAL] Failed to mount /tmp: %v\n", err)
+		return
+	}
+
+	// --- C. CHROOT EXECUTION ---
+	fmt.Printf("[INFO] Executing command %v in chroot %s...\n", chrootCmd, targetDir)
+
+	finalCode, err := execCtx.ExecuteChroot(targetDir, chrootCmd)
+
+	// Check for errors during execution (not just non-zero exit code)
+	if err != nil {
+		// Handle the "No such file or directory" error specifically
+		if strings.Contains(err.Error(), "No such file or directory") {
+			fmt.Printf("[ERROR] Chroot command failure: The target executable '%s' was not found inside %s.\n", chrootCmd[0], targetDir)
+			// Set exitCode to 127 (standard for 'command not found')
+			exitCode = 127
+		} else {
+			fmt.Printf("[ERROR] Command failed inside chroot: %v\n", err)
+			exitCode = 1
+		}
+		return // Returns the updated exitCode. The defer will execute now.
+	}
+
+	// Success: return the exit code from the chrooted command.
+	exitCode = finalCode
+	return
+}
+
 // printHelp prints the commands table
 func printHelp() {
 	type cmdInfo struct {
@@ -5679,7 +6028,7 @@ func printHelp() {
 		{"version, --version", "", "Show hokuto version"},
 		{"list, ls", "[pkg]", "List installed packages; optional partial name to filter"},
 		{"checksum, c", "<pkg>", "Fetch sources and verify/create checksums for a package"},
-		{"build, b", "[options] <pkg> [...]", "Build package(s). Options: -a (auto-install) -v (verbose)"},
+		{"build, b", "[options] <pkg> [...]", "Build package(s). Options: -a (auto-install) -v (verbose) --bootstrap"},
 		{"install, i", "<tarball|pkg> [...]", "Install a built package tarball or named package"},
 		{"uninstall, r", "[options] <pkg> [...]", "Uninstall package(s). Options: -f (force) -y (yes)"},
 		{"update, u", "", "Update repository metadata and check for upgrades. Options: -v (verbose)"},
@@ -5687,6 +6036,7 @@ func printHelp() {
 		{"find, f", "<string>", "Search all manifests for a path containing the string"},
 		{"new, n", "<string>", "Create a new package "},
 		{"edit, e", "<string>", "Edit a package"},
+		{"chroot", "<targetdir> [command...]", "Enter chroot environment at targetdir; runs /bin/bash by default"},
 	}
 
 	color.Info.Println("hokuto commands")
@@ -5810,12 +6160,15 @@ func main() {
 		Context:         ctx,
 		ShouldRunAsRoot: true,
 	}
-
+	var exitCode int
 	switch os.Args[1] {
+	case "chroot":
+		// Call the new wrapper function that contains the defer logic
+		exitCode = runChrootCommand(os.Args[2:], RootExec)
 	case "version", "--version":
 		// Print version first
 		// HOKUTOVERSION (string for search)
-		fmt.Println("hokuto 0.2.24")
+		fmt.Println("hokuto 0.2.25")
 
 		// Try to pick and show a random embedded PNG from assets/
 		imgs, err := listEmbeddedImages()
@@ -5879,6 +6232,7 @@ func main() {
 		var idleBuild = buildCmd.Bool("i", false, "Set the build process and all child processes to idle (lowest) CPU/IO priority (nice -n 19).")
 		var verbose = buildCmd.Bool("v", false, "Enable verbose output (show build process output).")
 		var verboseLong = buildCmd.Bool("verbose", false, "Enable verbose output (show build process output).")
+		var bootstrap = buildCmd.Bool("bootstrap", false, "Enable bootstrap build mode")
 		// Parse the arguments specific to the "build" subcommand,
 		// starting from os.Args[2] (i.e., skipping "hokuto" and "build")
 		if err := buildCmd.Parse(os.Args[2:]); err != nil {
@@ -5899,6 +6253,23 @@ func main() {
 
 		// Set to non-critical (0 is default, but good to be explicit)
 		isCriticalAtomic.Store(0)
+
+		// --- CONDITIONAL OVERRIDE FOR HOKUTO_ROOT (NEW LOGIC) ---
+		if *bootstrap {
+			// 1. Get the LFS root path (assuming you have a way to access it, e.g., from config)
+			//    If 'lfsRoot' is defined in 'cfg.Values', retrieve it.
+			lfsRoot := cfg.Values["LFS"]
+
+			if lfsRoot == "" {
+				// Handle the error if LFS is required but not set
+				log.Fatalf("bootstrap mode requires LFS to be set in config")
+			}
+
+			// 2. Override HOKUTO_ROOT in the configuration map
+			cfg.Values["HOKUTO_ROOT"] = lfsRoot
+		}
+		// Call initConfig with the possibly modified config
+		initConfig(cfg)
 
 		// --- GLOBAL DEPENDENCY RESOLUTION & BINARY CHECK ---
 
@@ -6007,7 +6378,7 @@ func main() {
 			tarballPath := filepath.Join(BinDir, fmt.Sprintf("%s-%s.tar.zst", buildPkg, version))
 
 			fmt.Printf("--- Starting Build: %s (%s) ---\n", buildPkg, version)
-			if err := pkgBuild(buildPkg, cfg, UserExec); err != nil {
+			if err := pkgBuild(buildPkg, cfg, UserExec, *bootstrap); err != nil {
 				fmt.Fprintf(os.Stderr, "Fatal error building %s: %v\n", buildPkg, err)
 				os.Exit(1)
 			}
@@ -6320,5 +6691,7 @@ func main() {
 
 	default:
 		printHelp()
+		exitCode = 1
 	}
+	os.Exit(exitCode)
 }
