@@ -1050,7 +1050,7 @@ func hasB3sum() bool {
 
 func verifyOrCreateChecksums(pkgName, pkgDir string, force bool) error {
 	pkgSrcDir := filepath.Join(SourcesDir, pkgName)
-	checksumFile := filepath.Join(pkgDir, "checksums") // repo package dir
+	checksumFile := filepath.Join(pkgDir, "checksums")
 
 	existing := make(map[string]string)
 	if f, err := os.Open(checksumFile); err == nil {
@@ -1070,33 +1070,30 @@ func verifyOrCreateChecksums(pkgName, pkgDir string, force bool) error {
 		f.Close()
 	}
 
-	// Parse sources file to get expected files for this package version
+	// Parse sources file
 	sourceLines, err := os.ReadFile(filepath.Join(pkgDir, "sources"))
 	if err != nil {
 		return fmt.Errorf("cannot read sources file: %v", err)
 	}
 
 	var expectedFiles []string
+	urlMap := make(map[string]string) // fname -> url
 	for _, line := range strings.Split(string(sourceLines), "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
-		// Skip local files and VCS sources
 		if strings.HasPrefix(line, "files/") || strings.HasPrefix(line, "git+") {
 			continue
 		}
-
 		parts := strings.Fields(line)
 		if len(parts) == 0 {
 			continue
 		}
-
-		// Always take the basename of the URL (first token).
-		// Ignore any second token (extraction dir hint).
 		url := parts[0]
 		fname := filepath.Base(url)
 		expectedFiles = append(expectedFiles, fname)
+		urlMap[fname] = url
 	}
 
 	var summary []string
@@ -1104,6 +1101,7 @@ func verifyOrCreateChecksums(pkgName, pkgDir string, force bool) error {
 
 	for _, fname := range expectedFiles {
 		filePath := filepath.Join(pkgSrcDir, fname)
+		url := urlMap[fname]
 
 		hashValid := false
 		mismatch := false
@@ -1122,7 +1120,6 @@ func verifyOrCreateChecksums(pkgName, pkgDir string, force bool) error {
 					mismatch = true
 				}
 			} else {
-				// Native Go fallback
 				sum, err := blake3SumFile(filePath)
 				if err != nil {
 					return fmt.Errorf("failed to compute checksum: %v", err)
@@ -1136,10 +1133,8 @@ func verifyOrCreateChecksums(pkgName, pkgDir string, force bool) error {
 		}
 
 		if mismatch {
-			shouldRedownload := false
-			if force {
-				shouldRedownload = true
-			} else {
+			shouldRedownload := force
+			if !force {
 				fmt.Printf("Checksum mismatch for %s. Redownload and regenerate checksum? [y/N]: ", fname)
 				var response string
 				fmt.Scanln(&response)
@@ -1149,90 +1144,48 @@ func verifyOrCreateChecksums(pkgName, pkgDir string, force bool) error {
 			}
 
 			if shouldRedownload {
-				for _, line := range strings.Split(string(sourceLines), "\n") {
-					if strings.Contains(line, fname) {
-						line = strings.TrimSpace(line)
-						if line == "" || strings.HasPrefix(line, "#") {
-							continue
-						}
-						// Skip local files (files that start with "files/")
-						if strings.HasPrefix(line, "files/") {
-							continue
-						}
-						// Skip git sources (sources that start with "git+")
-						if strings.HasPrefix(line, "git+") {
-							continue
-						}
+				// stable cache key: hash only the URL
+				hashName := fmt.Sprintf("%s-%s", hashString(url), fname)
+				cachePath := filepath.Join(CacheStore, hashName)
 
-						hashName := fmt.Sprintf("%s-%s", hashString(line+fname), fname)
-						cachePath := filepath.Join(CacheStore, hashName)
+				_ = os.Remove(cachePath)
+				_ = os.Remove(filePath)
 
-						if _, err := os.Stat(cachePath); err == nil {
-							os.Remove(cachePath)
-						}
-						if _, err := os.Lstat(filePath); err == nil {
-							os.Remove(filePath)
-						}
-
-						if err := downloadFile(line, cachePath); err != nil {
-							return fmt.Errorf("failed to redownload %s: %v", fname, err)
-						}
-						if err := os.Symlink(cachePath, filePath); err != nil {
-							return fmt.Errorf("failed to symlink %s -> %s: %v", cachePath, filePath, err)
-						}
-
-						hashValid = false
-					}
+				if err := downloadFile(url, cachePath); err != nil {
+					return fmt.Errorf("failed to redownload %s: %v", fname, err)
 				}
+
+				// always recreate symlink
+				_ = os.Remove(filePath)
+				if err := os.Symlink(cachePath, filePath); err != nil {
+					return fmt.Errorf("failed to symlink %s -> %s: %v", cachePath, filePath, err)
+				}
+
+				hashValid = false
 			} else {
 				fmt.Printf("Skipping update for %s\n", fname)
-				if _, err := os.Lstat(filePath); err == nil {
-					os.Remove(filePath)
-				}
-				for _, line := range strings.Split(string(sourceLines), "\n") {
-					if strings.Contains(line, fname) {
-						line = strings.TrimSpace(line)
-						if line == "" || strings.HasPrefix(line, "#") {
-							continue
-						}
-						// Skip local files (files that start with "files/")
-						if strings.HasPrefix(line, "files/") {
-							continue
-						}
-						// Skip git sources (sources that start with "git+")
-						if strings.HasPrefix(line, "git+") {
-							continue
-						}
-						hashName := fmt.Sprintf("%s-%s", hashString(line+fname), fname)
-						cachePath := filepath.Join(CacheStore, hashName)
-						if _, err := os.Stat(cachePath); err == nil {
-							os.Remove(cachePath)
-						}
-					}
-				}
 				skipped = true
-				hashValid = false
 			}
 		}
 
 		if !hashValid {
 			if !skipped {
 				fmt.Printf("Updating checksum for %s\n", fname)
+				var sum string
 				if hasB3sum() {
 					cmd := exec.Command("b3sum", filePath)
 					out, err := cmd.Output()
 					if err != nil {
 						return fmt.Errorf("failed to compute checksum: %v", err)
 					}
-					sum := strings.Fields(string(out))[0]
-					updatedChecksums = append(updatedChecksums, fmt.Sprintf("%s  %s", sum, fname))
+					sum = strings.Fields(string(out))[0]
 				} else {
-					sum, err := blake3SumFile(filePath)
+					sum, err = blake3SumFile(filePath)
 					if err != nil {
 						return fmt.Errorf("failed to compute checksum: %v", err)
 					}
-					updatedChecksums = append(updatedChecksums, fmt.Sprintf("%s  %s", sum, fname))
 				}
+				updatedChecksums = append(updatedChecksums, fmt.Sprintf("%s  %s", sum, fname))
 				summary = append(summary, fmt.Sprintf("%s: updated", fname))
 			} else {
 				updatedChecksums = append(updatedChecksums, fmt.Sprintf("%s  %s", existing[fname], fname))
@@ -2134,104 +2087,6 @@ func extractTar(realPath, dest string) error {
 
 	return nil
 }
-
-// shouldStripTar inspects the tarball to check for a single top-level directory.
-// It uses a robust, one-pass algorithm that determines the required directory prefix
-// from the first entry and ensures all subsequent entries match it.
-/*func shouldStripTar(archive string) (bool, error) {
-	// --- Fast Path: Use system `tar` if available ---
-	if _, err := exec.LookPath("tar"); err == nil {
-		cmd := exec.Command("tar", "tf", archive)
-		var out bytes.Buffer
-		cmd.Stdout = &out
-		if err := cmd.Run(); err == nil {
-			lines := strings.Split(out.String(), "\n")
-			return analyzeTarballStream(lines), nil
-		}
-	}
-
-	// --- Fallback Path: Pure-Go reader ---
-	f, err := os.Open(archive)
-	if err != nil {
-		return false, fmt.Errorf("open archive: %w", err)
-	}
-	defer f.Close()
-
-	var r io.Reader = f
-	switch {
-	case strings.HasSuffix(archive, ".tar.zst"):
-		zr, err := zstd.NewReader(f)
-		if err != nil {
-			return false, fmt.Errorf("zstd reader: %w", err)
-		}
-		defer zr.Close()
-		r = zr
-	case strings.HasSuffix(archive, ".tar.gz"), strings.HasSuffix(archive, ".tgz"):
-		gr, err := pgzip.NewReader(f)
-		if err != nil {
-			return false, fmt.Errorf("gzip reader: %w", err)
-		}
-		defer gr.Close()
-		r = gr
-	case strings.HasSuffix(archive, ".tar.xz"):
-		xr, err := xz.NewReader(f)
-		if err != nil {
-			return false, fmt.Errorf("xz reader: %w", err)
-		}
-		r = xr
-	}
-
-	tr := tar.NewReader(r)
-	var lines []string
-	for {
-		hdr, err := tr.Next()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return false, fmt.Errorf("tar read error: %w", err)
-		}
-		lines = append(lines, hdr.Name)
-	}
-	return analyzeTarballStream(lines), nil
-}
-
-// analyzeTarballStream implements the robust, one-pass check.
-func analyzeTarballStream(paths []string) bool {
-	var commonPrefix string
-	foundFirstEntry := false
-
-	for _, path := range paths {
-		// Normalize path and skip junk entries.
-		path = strings.TrimSpace(path)
-		if path == "" || strings.Contains(path, "PaxHeader") || path == "." || path == "./" {
-			continue
-		}
-
-		if !foundFirstEntry {
-			// This is the first valid entry. It defines the required prefix.
-			// It must be a directory. We check this by looking for the first '/'.
-			slashIndex := strings.Index(path, "/")
-			if slashIndex <= 0 {
-				// This is a file at the root (e.g., "README") or a malformed path. Not strippable.
-				return false
-			}
-			commonPrefix = path[:slashIndex+1] // e.g., "linux-6.17.4/"
-			foundFirstEntry = true
-		} else {
-			// All subsequent entries must have the same prefix.
-			if !strings.HasPrefix(path, commonPrefix) {
-				// We found a file or directory that does not belong. Not strippable.
-				return false
-			}
-		}
-	}
-
-	// If we processed all entries and found no violations, it's strippable.
-	// `foundFirstEntry` will be false if the archive was empty or only contained junk.
-	return foundFirstEntry
-}
-*/
 
 // unpackTarballFallback extracts a .tar.zst into dest using pure-Go.
 func unpackTarballFallback(tarballPath, dest string) error {
