@@ -1943,6 +1943,71 @@ func copyDir(src, dst string) error {
 	return nil
 }
 
+// shouldStripTar inspects the tarball to check for a single top-level directory.
+func shouldStripTar(archive string) (bool, error) {
+	// Use 'tar tf' to list the contents quietly
+	cmd := exec.Command("tar", "tf", archive)
+
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	// Don't route stderr to os.Stderr, as we are inspecting the file, not extracting
+	// cmd.Stderr = os.Stderr // (Keep this commented out)
+
+	if err := cmd.Run(); err != nil {
+		// Tar failed to read or list the file.
+		return false, fmt.Errorf("tar tf failed: %w", err)
+	}
+
+	// The first entry determines the structure.
+	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+	if len(lines) == 0 || lines[0] == "" {
+		// Archive is empty or unreadable
+		return false, nil
+	}
+
+	firstEntry := lines[0]
+
+	// A typical top-level directory entry looks like "pkgname-version/".
+	// The path should contain a single slash and end with one.
+	// If the archive only contains one entry (the directory itself),
+	// we still rely on the first file entry.
+
+	// Check if the first entry suggests a top-level directory structure:
+	// 1. Must contain at least one slash.
+	// 2. The string before the first slash (the directory name) must match the rest of the entries.
+
+	parts := strings.Split(firstEntry, string(filepath.Separator))
+	if len(parts) < 2 {
+		// No slash means a file/folder is at the root (e.g., "file1.c"), so don't strip.
+		return false, nil
+	}
+
+	// The assumed top-level directory is the first part (e.g., "pkgname-version")
+	topDir := parts[0] + string(filepath.Separator)
+
+	// Now check all entries to ensure they ALL start with this path.
+	// We only need to check the first few non-directory entries for performance.
+	for i, line := range lines {
+		if i > 50 { // Check a reasonable number of entries (e.g., 50)
+			break
+		}
+
+		// If the entry is a directory itself (ends with /), skip it.
+		// NOTE: 'tar tf' output might not always include the trailing slash,
+		// but checking the prefix is more reliable.
+
+		// If any entry does NOT start with the top directory prefix, then files exist at the root.
+		if !strings.HasPrefix(line, topDir) {
+			// Found a file/folder that is NOT inside the assumed topDir.
+			// e.g., line is "file_at_root.c".
+			return false, nil
+		}
+	}
+
+	// All checked entries start with the same top directory prefix, so strip is needed.
+	return true, nil
+}
+
 // extractTar extracts a tar archive (with possible compression) to targetDir,
 // stripping the top-level directory while handling PAX headers and preserving timestamps.
 func extractTar(realPath, dest string) error {
@@ -1950,6 +2015,26 @@ func extractTar(realPath, dest string) error {
 	f, err := os.Open(realPath)
 	if err != nil {
 		return fmt.Errorf("failed to open archive %s: %w", realPath, err)
+	}
+	// Try system tar first
+	//Inspect the tarball to see if it has a single top-level directory
+
+	strip, err := shouldStripTar(realPath)
+	if err != nil {
+		// Non-fatal: record debug info so the variable 'err' is actually used.
+		debugf("shouldStripTar(%s) failed: %v\n", realPath, err)
+	}
+
+	args := []string{"xf", realPath, "-C", dest}
+
+	if strip {
+		args = append(args, "--strip-components=1")
+	}
+
+	if err := exec.Command("tar", args...).Run(); err == nil {
+		// Close the opened file before returning early.
+		_ = f.Close()
+		return nil
 	}
 	defer f.Close()
 
@@ -6492,7 +6577,7 @@ func main() {
 							cPrintf(colInfo, "Uninstalling %s...\n", dep)
 							if err := pkgUninstall(dep, cfg, RootExec, true, true); err != nil {
 								// Log warning but continue with installation
-								fmt.Fprintf(os.Stderr, "Warning: failed to uninstall %s: %v (continuing with installation)\n", dep, err)
+								debugf("Warning: failed to uninstall %s: %v (continuing with installation)\n", dep, err)
 							} else {
 								cPrintf(colSuccess, "%s uninstalled successfully.\n", dep)
 							}
@@ -6598,7 +6683,7 @@ func main() {
 					cPrintf(colInfo, "Uninstalling %s...\n", dep)
 					if err := pkgUninstall(dep, cfg, RootExec, true, true); err != nil {
 						// Log warning but continue with installation
-						fmt.Fprintf(os.Stderr, "Warning: failed to uninstall %s: %v (continuing with installation)\n", dep, err)
+						debugf("Warning: failed to uninstall %s: %v (continuing with installation)\n", dep, err)
 					} else {
 						cPrintf(colSuccess, "%s uninstalled successfully.\n", dep)
 					}
