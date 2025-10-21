@@ -180,9 +180,14 @@ func initConfig(cfg *Config) {
 		rootDir = "/"
 	}
 
+	CacheDir = cfg.Values["HOKUTO_CACHE_DIR"]
+	if CacheDir == "" {
+		CacheDir = "/var/cache/hokuto"
+	}
+
 	repoPaths = cfg.Values["HOKUTO_PATH"]
 	if repoPaths == "" {
-		log.Fatalf("Critical error: HOKUTO_PATH is not set in the configuration.")
+		log.Printf("Warning: HOKUTO_PATH is not set")
 	}
 
 	WantDebug = cfg.Values["HOKUTO_DEBUG"]
@@ -211,7 +216,6 @@ func initConfig(cfg *Config) {
 		cfg.DefaultLTO = true
 	}
 
-	CacheDir = "/var/cache/hokuto"
 	SourcesDir = CacheDir + "/sources"
 	BinDir = CacheDir + "/bin"
 	CacheStore = SourcesDir + "/_cache"
@@ -1986,105 +1990,246 @@ func copyDir(src, dst string) error {
 	return nil
 }
 
-// extractTar extracts a tarball into the destination directory.
-// It tries the system `tar` first, then falls back to pure-Go extraction
-// with support for gzip (parallel), zstd, xz, and bzip2.
-func extractTar(archive, dest string) error {
-	// 1. Inspect the tarball to see if it has a single top-level directory
-	strip, err := shouldStripTar(archive)
+// extractTar extracts a tar archive (with possible compression) to targetDir,
+// stripping the top-level directory while handling PAX headers and preserving timestamps.
+func extractTar(realPath, dest string) error {
+	// Open the archive file
+	f, err := os.Open(realPath)
 	if err != nil {
-		return fmt.Errorf("failed to inspect tarball %s: %w", archive, err)
-	}
-
-	// 2. Try system tar first
-	args := []string{"xf", archive, "-C", dest}
-	if strip {
-		args = append(args, "--strip-components=1")
-	}
-	if err := exec.Command("tar", args...).Run(); err == nil {
-		return nil
-	}
-
-	// 3. Fallback: internal extraction
-	f, err := os.Open(archive)
-	if err != nil {
-		return fmt.Errorf("failed to open archive: %w", err)
+		return fmt.Errorf("failed to open archive %s: %w", realPath, err)
 	}
 	defer f.Close()
 
+	// Determine the compression type based on file extension
 	var r io.Reader = f
 	switch {
-	case strings.HasSuffix(archive, ".tar.gz"), strings.HasSuffix(archive, ".tgz"):
-		gr, err := pgzip.NewReader(f)
+	case strings.HasSuffix(realPath, ".tar.gz") || strings.HasSuffix(realPath, ".tgz"):
+		gz, err := pgzip.NewReader(f)
 		if err != nil {
-			return fmt.Errorf("pgzip reader: %w", err)
+			return fmt.Errorf("failed to create gzip reader for %s: %w", realPath, err)
 		}
-		defer gr.Close()
-		r = gr
-	case strings.HasSuffix(archive, ".tar.zst"):
-		zr, err := zstd.NewReader(f)
-		if err != nil {
-			return fmt.Errorf("zstd reader: %w", err)
-		}
-		defer zr.Close()
-		r = zr
-	case strings.HasSuffix(archive, ".tar.xz"):
-		xr, err := xz.NewReader(f)
-		if err != nil {
-			return fmt.Errorf("xz reader: %w", err)
-		}
-		r = xr
-	case strings.HasSuffix(archive, ".tar.bz2"):
+		defer gz.Close()
+		r = gz
+	case strings.HasSuffix(realPath, ".tar.bz2"):
 		r = bzip2.NewReader(f)
+	case strings.HasSuffix(realPath, ".tar.xz"):
+		xz, err := xz.NewReader(f)
+		if err != nil {
+			return fmt.Errorf("failed to create xz reader for %s: %w", realPath, err)
+		}
+		r = xz
+	case strings.HasSuffix(realPath, ".tar.zst"):
+		zst, err := zstd.NewReader(f)
+		if err != nil {
+			return fmt.Errorf("failed to create zstd reader for %s: %w", realPath, err)
+		}
+		defer zst.Close()
+		r = zst
+	case strings.HasSuffix(realPath, ".tar"):
+		// No compression
+	default:
+		return fmt.Errorf("unsupported archive format: %s", realPath)
 	}
 
+	// Create tar reader
 	tr := tar.NewReader(r)
+
+	// Track the prefix for stripping (e.g., "linux-6.17.3/")
+	var prefix string
 	for {
 		hdr, err := tr.Next()
 		if err == io.EOF {
 			break
 		}
 		if err != nil {
-			return fmt.Errorf("tar read error: %w", err)
+			return fmt.Errorf("error reading tar header in %s: %w", realPath, err)
 		}
 
-		// Adjust path if stripping top-level directory
-		name := hdr.Name
-		if strip {
-			parts := strings.SplitN(name, string(os.PathSeparator), 2)
-			if len(parts) == 2 {
-				name = parts[1]
-			} else {
-				continue
+		// Skip PAX headers (global or per-file)
+		if hdr.Typeflag == tar.TypeXHeader || hdr.Typeflag == tar.TypeXGlobalHeader {
+			if _, err := io.Copy(io.Discard, tr); err != nil {
+				return fmt.Errorf("error skipping extended header data in %s: %w", realPath, err)
+			}
+			continue
+		}
+
+		// Set prefix on the first non-extended content entry (dir or regular file)
+		if prefix == "" && (hdr.Typeflag == tar.TypeDir || hdr.Typeflag == tar.TypeReg) {
+			slashIdx := strings.Index(hdr.Name, "/")
+			if slashIdx != -1 {
+				prefix = hdr.Name[:slashIdx+1] // e.g., "linux-6.17.3/"
+				debugf("Detected tar prefix for stripping: %s\n", prefix)
 			}
 		}
-		target := filepath.Join(dest, name)
 
+		// Apply stripping if prefix is set and matches
+		targetName := hdr.Name
+		if prefix != "" && strings.HasPrefix(targetName, prefix) {
+			targetName = strings.TrimPrefix(targetName, prefix)
+		}
+
+		// If the stripped name is empty (e.g., the top dir itself), skip it
+		if targetName == "" {
+			continue
+		}
+
+		// Compute full output path
+		targetPath := filepath.Join(dest, targetName)
+
+		// Create parent directories
+		if err := os.MkdirAll(filepath.Dir(targetPath), 0755); err != nil {
+			return fmt.Errorf("failed to create parent dir for %s: %w", targetPath, err)
+		}
+
+		// Handle based on entry type
 		switch hdr.Typeflag {
 		case tar.TypeDir:
-			if err := os.MkdirAll(target, os.FileMode(hdr.Mode)); err != nil {
-				return err
+			if err := os.MkdirAll(targetPath, os.FileMode(hdr.Mode)); err != nil {
+				return fmt.Errorf("failed to create dir %s: %w", targetPath, err)
+			}
+			// Set timestamp for directory
+			if err := os.Chtimes(targetPath, hdr.AccessTime, hdr.ModTime); err != nil {
+				return fmt.Errorf("failed to set times for dir %s: %w", targetPath, err)
 			}
 		case tar.TypeReg:
-			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
-				return err
-			}
-			out, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, os.FileMode(hdr.Mode))
+			outFile, err := os.OpenFile(targetPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, os.FileMode(hdr.Mode))
 			if err != nil {
-				return err
+				return fmt.Errorf("failed to create file %s: %w", targetPath, err)
 			}
-			if _, err := io.Copy(out, tr); err != nil {
-				out.Close()
-				return err
+			if _, err := io.Copy(outFile, tr); err != nil {
+				outFile.Close()
+				return fmt.Errorf("failed to write file %s: %w", targetPath, err)
 			}
-			out.Close()
+			outFile.Close()
+			// Set timestamp for file
+			if err := os.Chtimes(targetPath, hdr.AccessTime, hdr.ModTime); err != nil {
+				return fmt.Errorf("failed to set times for file %s: %w", targetPath, err)
+			}
 		case tar.TypeSymlink:
-			if err := os.Symlink(hdr.Linkname, target); err != nil && !os.IsExist(err) {
-				return err
+			if err := os.Symlink(hdr.Linkname, targetPath); err != nil && !os.IsExist(err) {
+				return fmt.Errorf("failed to create symlink %s -> %s: %w", targetPath, hdr.Linkname, err)
+			}
+			// Set timestamp for symlink using unix.Lutimes with Timeval
+			atime := unix.Timeval{
+				Sec:  hdr.AccessTime.Unix(),
+				Usec: int64(hdr.AccessTime.Nanosecond() / 1000), // Convert nanoseconds to microseconds
+			}
+			mtime := unix.Timeval{
+				Sec:  hdr.ModTime.Unix(),
+				Usec: int64(hdr.ModTime.Nanosecond() / 1000), // Convert nanoseconds to microseconds
+			}
+			if err := unix.Lutimes(targetPath, []unix.Timeval{atime, mtime}); err != nil {
+				debugf("Warning: failed to set times for symlink %s: %v (continuing)\n", targetPath, err)
+				// Don't fail on symlink time errors, as they may not be critical
+			}
+		default:
+			debugf("Skipping unsupported tar entry type %c: %s\n", hdr.Typeflag, hdr.Name)
+		}
+	}
+
+	// If no prefix was found, warn but don't fail (archive might not have a top dir)
+	if prefix == "" {
+		debugf("No top-level directory prefix found in %s; extracted without stripping\n", realPath)
+	}
+
+	return nil
+}
+
+// shouldStripTar inspects the tarball to check for a single top-level directory.
+// It uses a robust, one-pass algorithm that determines the required directory prefix
+// from the first entry and ensures all subsequent entries match it.
+func shouldStripTar(archive string) (bool, error) {
+	// --- Fast Path: Use system `tar` if available ---
+	if _, err := exec.LookPath("tar"); err == nil {
+		cmd := exec.Command("tar", "tf", archive)
+		var out bytes.Buffer
+		cmd.Stdout = &out
+		if err := cmd.Run(); err == nil {
+			lines := strings.Split(out.String(), "\n")
+			return analyzeTarballStream(lines), nil
+		}
+	}
+
+	// --- Fallback Path: Pure-Go reader ---
+	f, err := os.Open(archive)
+	if err != nil {
+		return false, fmt.Errorf("open archive: %w", err)
+	}
+	defer f.Close()
+
+	var r io.Reader = f
+	switch {
+	case strings.HasSuffix(archive, ".tar.zst"):
+		zr, err := zstd.NewReader(f)
+		if err != nil {
+			return false, fmt.Errorf("zstd reader: %w", err)
+		}
+		defer zr.Close()
+		r = zr
+	case strings.HasSuffix(archive, ".tar.gz"), strings.HasSuffix(archive, ".tgz"):
+		gr, err := pgzip.NewReader(f)
+		if err != nil {
+			return false, fmt.Errorf("gzip reader: %w", err)
+		}
+		defer gr.Close()
+		r = gr
+	case strings.HasSuffix(archive, ".tar.xz"):
+		xr, err := xz.NewReader(f)
+		if err != nil {
+			return false, fmt.Errorf("xz reader: %w", err)
+		}
+		r = xr
+	}
+
+	tr := tar.NewReader(r)
+	var lines []string
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return false, fmt.Errorf("tar read error: %w", err)
+		}
+		lines = append(lines, hdr.Name)
+	}
+	return analyzeTarballStream(lines), nil
+}
+
+// analyzeTarballStream implements the robust, one-pass check.
+func analyzeTarballStream(paths []string) bool {
+	var commonPrefix string
+	foundFirstEntry := false
+
+	for _, path := range paths {
+		// Normalize path and skip junk entries.
+		path = strings.TrimSpace(path)
+		if path == "" || strings.Contains(path, "PaxHeader") || path == "." || path == "./" {
+			continue
+		}
+
+		if !foundFirstEntry {
+			// This is the first valid entry. It defines the required prefix.
+			// It must be a directory. We check this by looking for the first '/'.
+			slashIndex := strings.Index(path, "/")
+			if slashIndex <= 0 {
+				// This is a file at the root (e.g., "README") or a malformed path. Not strippable.
+				return false
+			}
+			commonPrefix = path[:slashIndex+1] // e.g., "linux-6.17.4/"
+			foundFirstEntry = true
+		} else {
+			// All subsequent entries must have the same prefix.
+			if !strings.HasPrefix(path, commonPrefix) {
+				// We found a file or directory that does not belong. Not strippable.
+				return false
 			}
 		}
 	}
-	return nil
+
+	// If we processed all entries and found no violations, it's strippable.
+	// `foundFirstEntry` will be false if the archive was empty or only contained junk.
+	return foundFirstEntry
 }
 
 // unpackTarballFallback extracts a .tar.zst into dest using pure-Go.
@@ -2141,88 +2286,6 @@ func unpackTarballFallback(tarballPath, dest string) error {
 		}
 	}
 	return nil
-}
-
-// shouldStripTar inspects the tarball to check for a single top-level directory.
-// It tries system `tar tf` first, then falls back to pure-Go tar reader.
-func shouldStripTar(archive string) (bool, error) {
-	// --- Try system tar first ---
-	if _, err := exec.LookPath("tar"); err == nil {
-		cmd := exec.Command("tar", "tf", archive)
-		var out bytes.Buffer
-		cmd.Stdout = &out
-		if err := cmd.Run(); err == nil {
-			lines := strings.Split(strings.TrimSpace(out.String()), "\n")
-			return analyzeTarListing(lines), nil
-		}
-	}
-
-	// --- Fallback: pure-Go tar reader ---
-	f, err := os.Open(archive)
-	if err != nil {
-		return false, fmt.Errorf("open archive: %w", err)
-	}
-	defer f.Close()
-
-	var r io.Reader = f
-	switch {
-	case strings.HasSuffix(archive, ".tar.zst"):
-		zr, err := zstd.NewReader(f)
-		if err != nil {
-			return false, fmt.Errorf("zstd reader: %w", err)
-		}
-		defer zr.Close()
-		r = zr
-	case strings.HasSuffix(archive, ".tar.gz"), strings.HasSuffix(archive, ".tgz"):
-		gr, err := pgzip.NewReader(f)
-		if err != nil {
-			return false, fmt.Errorf("gzip reader: %w", err)
-		}
-		defer gr.Close()
-		r = gr
-	case strings.HasSuffix(archive, ".tar.xz"):
-		xr, err := xz.NewReader(f)
-		if err != nil {
-			return false, fmt.Errorf("xz reader: %w", err)
-		}
-		r = xr
-	}
-
-	tr := tar.NewReader(r)
-	var lines []string
-	for i := 0; i < 100; i++ { // read up to 100 entries
-		hdr, err := tr.Next()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return false, fmt.Errorf("tar read error: %w", err)
-		}
-		lines = append(lines, hdr.Name)
-	}
-	return analyzeTarListing(lines), nil
-}
-
-// analyzeTarListing checks whether all entries share a single top-level directory.
-func analyzeTarListing(lines []string) bool {
-	if len(lines) == 0 || lines[0] == "" {
-		return false
-	}
-	firstEntry := lines[0]
-	parts := strings.Split(firstEntry, string(filepath.Separator))
-	if len(parts) < 2 {
-		return false
-	}
-	topDir := parts[0] + string(filepath.Separator)
-	for i, line := range lines {
-		if i > 50 {
-			break
-		}
-		if !strings.HasPrefix(line, topDir) {
-			return false
-		}
-	}
-	return true
 }
 
 // createPackageTarball creates a .tar.zst archive of outputDir into BinDir.
@@ -6274,21 +6337,22 @@ func main() {
 				log.Fatalf("bootstrap mode requires LFS to be set in config")
 			}
 
-			// 2. Override HOKUTO_ROOT
+			// 2. Override HOKUTO_ROOT and cachedir
 			cfg.Values["HOKUTO_ROOT"] = lfsRoot
+			cfg.Values["HOKUTO_CACHE_DIR"] = filepath.Join(lfsRoot, "var/cache/hokuto")
 
-			// 3. Check for existing bootstrap dirs
+			// 1. Check for existing /repo/bootstrap
 			if fi, err := os.Stat("/repo/bootstrap"); err == nil && fi.IsDir() {
 				// Use pre-existing /repo/bootstrap
 				cfg.Values["HOKUTO_PATH"] = "/repo/bootstrap"
 				log.Printf("Using existing bootstrap repo at /repo/bootstrap")
 			} else {
-				// If /tmp/bootstrap already exists, just use it
-				if fi, err := os.Stat("/tmp/bootstrap"); err == nil && fi.IsDir() {
-					cfg.Values["HOKUTO_PATH"] = "/tmp/bootstrap"
-					log.Printf("Using existing bootstrap repo at /tmp/bootstrap")
+				// 2. Check for existing /tmp/repo/bootstrap
+				if fi, err := os.Stat("/tmp/repo/bootstrap"); err == nil && fi.IsDir() {
+					cfg.Values["HOKUTO_PATH"] = "/tmp/repo/bootstrap"
+					log.Printf("Using existing bootstrap repo at /tmp/repo/bootstrap")
 				} else {
-					// Need to download and unpack into /tmp/bootstrap
+					// Need to download and unpack into /tmp/repo
 					url := "https://github.com/sauzeros/bootstrap/releases/download/latest/bootstrap-repo.tar.xz"
 					tmpFile := filepath.Join(os.TempDir(), "bootstrap-repo.tar.xz")
 
