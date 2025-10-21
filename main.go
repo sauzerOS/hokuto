@@ -1944,8 +1944,9 @@ func copyDir(src, dst string) error {
 }
 
 // shouldStripTar inspects the tarball to check for a single top-level directory.
-func shouldStripTar(archive string) (bool, error) {
+/*func shouldStripTar(archive string) (bool, error) {
 	// Use 'tar tf' to list the contents quietly
+	debugf("Running strip check for tar extraction")
 	cmd := exec.Command("tar", "tf", archive)
 
 	var out bytes.Buffer
@@ -2006,6 +2007,53 @@ func shouldStripTar(archive string) (bool, error) {
 
 	// All checked entries start with the same top directory prefix, so strip is needed.
 	return true, nil
+}*/
+
+func shouldStripTar(archive string) (bool, error) {
+	debugf("Running strip check for tar extraction")
+
+	// Only list first 51 entries - much faster for large archives
+	cmd := exec.Command("sh", "-c", fmt.Sprintf("tar tf %s | head -n 51", archive))
+
+	var out bytes.Buffer
+	cmd.Stdout = &out
+
+	if err := cmd.Run(); err != nil {
+		// Tar failed to read or list the file.
+		return false, fmt.Errorf("tar tf failed: %w", err)
+	}
+
+	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+	if len(lines) == 0 || lines[0] == "" {
+		// Archive is empty
+		return false, nil
+	}
+
+	firstEntry := lines[0]
+
+	// Find the first slash position
+	slashIdx := strings.IndexByte(firstEntry, '/')
+	if slashIdx == -1 {
+		// No slash means a file/folder is at the root, so don't strip
+		return false, nil
+	}
+
+	// The assumed top-level directory (including the slash)
+	topDir := firstEntry[:slashIdx+1]
+
+	// Check all entries to ensure they start with topDir
+	for _, line := range lines[1:] {
+		if line == "" {
+			continue
+		}
+		if !strings.HasPrefix(line, topDir) {
+			// Found an entry not in the top directory
+			return false, nil
+		}
+	}
+
+	// All checked entries start with the same top directory prefix
+	return true, nil
 }
 
 // extractTar extracts a tar archive (with possible compression) to targetDir,
@@ -2024,16 +2072,17 @@ func extractTar(realPath, dest string) error {
 		// Non-fatal: record debug info so the variable 'err' is actually used.
 		debugf("shouldStripTar(%s) failed: %v\n", realPath, err)
 	}
-
+	debugf("strip check done \n")
 	args := []string{"xf", realPath, "-C", dest}
 
 	if strip {
 		args = append(args, "--strip-components=1")
 	}
-
+	debugf("extracting archive \n")
 	if err := exec.Command("tar", args...).Run(); err == nil {
 		// Close the opened file before returning early.
 		_ = f.Close()
+		debugf("Used system tar \n")
 		return nil
 	}
 	defer f.Close()
@@ -6164,27 +6213,24 @@ func main() {
 					}
 				} else {
 					// --- NON-CRITICAL PHASE: Graceful Cancellation ---
-					// This block runs ONLY when isCriticalAtomic.Load() != 1
-
 					fmt.Printf("\n[INFO] Received %v. Cancelling process gracefully...\n", sig)
 					cancel() // Cancel the context
 
-					// NEW: Give the command a moment to die and flush its buffers
-					// before proceeding to check for a second signal or exiting.
-					time.Sleep(100 * time.Millisecond) // Wait 100ms
+					// Give the command a moment to die and flush its buffers
+					time.Sleep(100 * time.Millisecond)
 
 					// Wait for a second signal for immediate exit
+					// NOTE: Don't check ctx.Done() here since we just cancelled it
 					select {
 					case <-sigs:
 						fmt.Println("\n[FATAL] Second interrupt received. Forcing immediate exit.")
 						os.Exit(130)
-					case <-ctx.Done():
-						return
-					case <-time.After(500 * time.Millisecond):
-						// Give the program a moment to shut down before exiting the goroutine
-						return
+					case <-time.After(2 * time.Second):
+						// Give more time for graceful shutdown (increased from 500ms to 2s)
+						fmt.Println("\n[INFO] Graceful shutdown timeout. Exiting.")
+						os.Exit(0)
 					}
-				} // <-- Correctly closed 'else' block
+				}
 
 			case <-ctx.Done():
 				return // Context cancelled from the main flow
