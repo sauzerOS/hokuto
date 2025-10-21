@@ -2138,7 +2138,7 @@ func extractTar(realPath, dest string) error {
 // shouldStripTar inspects the tarball to check for a single top-level directory.
 // It uses a robust, one-pass algorithm that determines the required directory prefix
 // from the first entry and ensures all subsequent entries match it.
-func shouldStripTar(archive string) (bool, error) {
+/*func shouldStripTar(archive string) (bool, error) {
 	// --- Fast Path: Use system `tar` if available ---
 	if _, err := exec.LookPath("tar"); err == nil {
 		cmd := exec.Command("tar", "tf", archive)
@@ -2231,6 +2231,7 @@ func analyzeTarballStream(paths []string) bool {
 	// `foundFirstEntry` will be false if the archive was empty or only contained junk.
 	return foundFirstEntry
 }
+*/
 
 // unpackTarballFallback extracts a .tar.zst into dest using pure-Go.
 func unpackTarballFallback(tarballPath, dest string) error {
@@ -2239,9 +2240,9 @@ func unpackTarballFallback(tarballPath, dest string) error {
 		return fmt.Errorf("open tarball: %w", err)
 	}
 	defer f.Close()
-
 	zr, err := zstd.NewReader(f)
 	if err != nil {
+
 		return fmt.Errorf("zstd reader: %w", err)
 	}
 	defer zr.Close()
@@ -6087,9 +6088,59 @@ func runChrootCommand(args []string, execCtx *Executor) (exitCode int) {
 	return
 }
 
-func isPyOrCythonPackage(name string) bool {
-	return name == "python" || strings.HasPrefix(name, "python-") ||
-		name == "cython" || strings.HasPrefix(name, "cython-")
+// getPackageDependenciesToUninstall returns a list of package names to uninstall
+// before installing the given package. For Python/Cython packages, it returns the
+// package name itself. For specific packages, it returns their associated dependencies.
+// Returns an empty slice if no uninstallation is needed.
+// This fixes issues with broken pip versions during upgrades and removes bootstrap packages when required.
+func getPackageDependenciesToUninstall(name string) []string {
+	switch name {
+	case "gcc":
+		return []string{"02-gcc-1", "20-gcc-2", "05-libstdc++"}
+	case "binutils":
+		return []string{"01-binutils-1", "19-binutils-2"}
+	case "linux-headers":
+		return []string{"03-linux-headers"}
+	case "glibc":
+		return []string{"04-glibc"}
+	case "m4":
+		return []string{"06-m4"}
+	case "ncurses":
+		return []string{"07-ncurses"}
+	case "bash":
+		return []string{"08-bash"}
+	case "coreutils":
+		return []string{"09-coreutils"}
+	case "diffutils":
+		return []string{"10-diffutils"}
+	case "file":
+		return []string{"11-file"}
+	case "findutils":
+		return []string{"12-findutils"}
+	case "gawk":
+		return []string{"13-gawk"}
+	case "grep":
+		return []string{"14-grep"}
+	case "gzip":
+		return []string{"15-gzip"}
+	case "make":
+		return []string{"16-make"}
+	case "patch":
+		return []string{"17-patch"}
+	case "sed":
+		return []string{"18-sed"}
+	case "hokuto":
+		return []string{"21-hokuto"}
+	case "nano":
+		return []string{"22-nano"}
+	case "python", "cython":
+		return []string{name}
+	default:
+		if strings.HasPrefix(name, "python-") || strings.HasPrefix(name, "cython-") {
+			return []string{name}
+		}
+		return nil // No dependencies to uninstall
+	}
 }
 
 // printHelp prints the commands table
@@ -6578,14 +6629,18 @@ func main() {
 					version, _ := getRepoVersion(finalPkg) // Re-get version (should not fail)
 					tarballPath := filepath.Join(BinDir, fmt.Sprintf("%s-%s.tar.zst", finalPkg, version))
 
-					// Check if package name is "python" or starts with "python-" or is "cython" or starts with "cython-" and uninstall first
-					if isPyOrCythonPackage(finalPkg) {
-						cPrintf(colInfo, "Package %s is a Python/Cython package, uninstalling existing version first...\n", finalPkg)
-						if err := pkgUninstall(finalPkg, cfg, RootExec, true, true); err != nil {
-							// Log warning but continue with installation
-							fmt.Fprintf(os.Stderr, "Warning: failed to uninstall existing %s: %v (continuing with installation)\n", finalPkg, err)
-						} else {
-							cPrintf(colSuccess, "Existing %s uninstalled successfully.\n", finalPkg)
+					// Check if package has dependencies to uninstall first
+					depsToUninstall := getPackageDependenciesToUninstall(finalPkg)
+					if len(depsToUninstall) > 0 {
+						cPrintf(colInfo, "Package %s requires uninstalling dependencies: %v\n", finalPkg, depsToUninstall)
+						for _, dep := range depsToUninstall {
+							cPrintf(colInfo, "Uninstalling %s...\n", dep)
+							if err := pkgUninstall(dep, cfg, RootExec, true, true); err != nil {
+								// Log warning but continue with installation
+								fmt.Fprintf(os.Stderr, "Warning: failed to uninstall %s: %v (continuing with installation)\n", dep, err)
+							} else {
+								cPrintf(colSuccess, "%s uninstalled successfully.\n", dep)
+							}
 						}
 					}
 
@@ -6680,14 +6735,18 @@ func main() {
 			}
 
 			// --- Installation Execution ---
-			// Check if package name is "python" or starts with "python-" or is "cython" or starts with "cython-" and uninstall first
-			if isPyOrCythonPackage(pkgName) {
-				cPrintf(colInfo, "Package %s is a Python/Cython package, uninstalling existing version first...\n", pkgName)
-				if err := pkgUninstall(pkgName, cfg, RootExec, true, true); err != nil {
-					// Log warning but continue with installation
-					fmt.Fprintf(os.Stderr, "Warning: failed to uninstall existing %s: %v (continuing with installation)\n", pkgName, err)
-				} else {
-					cPrintf(colSuccess, "Existing %s uninstalled successfully.\n", pkgName)
+			// Check if package has dependencies to uninstall first
+			depsToUninstall := getPackageDependenciesToUninstall(pkgName)
+			if len(depsToUninstall) > 0 {
+				cPrintf(colInfo, "Package %s requires uninstalling dependencies: %v\n", pkgName, depsToUninstall)
+				for _, dep := range depsToUninstall {
+					cPrintf(colInfo, "Uninstalling %s...\n", dep)
+					if err := pkgUninstall(dep, cfg, RootExec, true, true); err != nil {
+						// Log warning but continue with installation
+						fmt.Fprintf(os.Stderr, "Warning: failed to uninstall %s: %v (continuing with installation)\n", dep, err)
+					} else {
+						cPrintf(colSuccess, "%s uninstalled successfully.\n", dep)
+					}
 				}
 			}
 			cPrintf(colInfo, "Starting installation of %s from %s...\n", pkgName, tarballPath)
