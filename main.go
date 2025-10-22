@@ -6150,8 +6150,6 @@ func getPackageDependenciesToUninstall(name string) []string {
 		return []string{"07-ncurses"}
 	case "bash":
 		return []string{"08-bash"}
-	case "coreutils":
-		return []string{"09-coreutils"}
 	case "diffutils":
 		return []string{"10-diffutils"}
 	case "file":
