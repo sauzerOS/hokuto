@@ -6144,8 +6144,6 @@ func getPackageDependenciesToUninstall(name string) []string {
 		return []string{"01-binutils-1", "19-binutils-2"}
 	case "linux-headers":
 		return []string{"03-linux-headers"}
-	case "glibc":
-		return []string{"04-glibc"}
 	case "m4":
 		return []string{"06-m4"}
 	case "ncurses":
@@ -6681,14 +6679,14 @@ func main() {
 					// Check if package has dependencies to uninstall first
 					depsToUninstall := getPackageDependenciesToUninstall(finalPkg)
 					if len(depsToUninstall) > 0 {
-						cPrintf(colInfo, "Package %s requires uninstalling dependencies: %v\n", finalPkg, depsToUninstall)
+						debugf("Package %s requires uninstalling dependencies: %v\n", finalPkg, depsToUninstall)
 						for _, dep := range depsToUninstall {
-							cPrintf(colInfo, "Uninstalling %s...\n", dep)
+							debugf("Uninstalling %s...\n", dep)
 							if err := pkgUninstall(dep, cfg, RootExec, true, true); err != nil {
 								// Log warning but continue with installation
 								debugf("Warning: failed to uninstall %s: %v (continuing with installation)\n", dep, err)
 							} else {
-								cPrintf(colSuccess, "%s uninstalled successfully.\n", dep)
+								debugf("%s uninstalled successfully.\n", dep)
 							}
 						}
 					}
@@ -6787,14 +6785,14 @@ func main() {
 			// Check if package has dependencies to uninstall first
 			depsToUninstall := getPackageDependenciesToUninstall(pkgName)
 			if len(depsToUninstall) > 0 {
-				cPrintf(colInfo, "Package %s requires uninstalling dependencies: %v\n", pkgName, depsToUninstall)
+				debugf("Package %s requires uninstalling dependencies: %v\n", pkgName, depsToUninstall)
 				for _, dep := range depsToUninstall {
-					cPrintf(colInfo, "Uninstalling %s...\n", dep)
+					debugf("Uninstalling %s...\n", dep)
 					if err := pkgUninstall(dep, cfg, RootExec, true, true); err != nil {
 						// Log warning but continue with installation
 						debugf("Warning: failed to uninstall %s: %v (continuing with installation)\n", dep, err)
 					} else {
-						cPrintf(colSuccess, "%s uninstalled successfully.\n", dep)
+						debugf("%s uninstalled successfully.\n", dep)
 					}
 				}
 			}
