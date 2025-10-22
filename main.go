@@ -1301,16 +1301,6 @@ func prepareSources(pkgName, pkgDir, buildDir string, execCtx *Executor) error {
 	// Assuming CacheDir, SourcesDir, Executor, etc. are available in scope.
 	srcDir := filepath.Join(CacheDir, "sources", pkgName)
 
-	// Clear buildDir
-	// We clear the whole directory and then recreate it to ensure a clean start.
-	rmCmd := exec.Command("rm", "-rf", buildDir)
-	if err := execCtx.Run(rmCmd); err != nil {
-		return fmt.Errorf("failed to clear build dir %s: %v", buildDir, err)
-	}
-	if err := os.MkdirAll(buildDir, 0o755); err != nil {
-		return fmt.Errorf("failed to create build dir %s: %v", buildDir, err)
-	}
-
 	// Read sources list
 	sourcesFile := filepath.Join(pkgDir, "sources")
 	sourcesData, err := os.ReadFile(sourcesFile)
@@ -4071,7 +4061,16 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool) er
 	buildDir := filepath.Join(pkgTmpDir, "build")
 	outputDir := filepath.Join(pkgTmpDir, "output")
 
-	// Create build/output dirs (non-root, inside TMPDIR)
+	// First try to cleanup pkgTmpDir with Go's os.RemoveAll
+	if err := os.RemoveAll(pkgTmpDir); err != nil {
+		// If that fails, fall back to system rm -rf with rootExec
+		rmCmd := exec.Command("rm", "-rf", pkgTmpDir)
+		if err2 := RootExec.Run(rmCmd); err2 != nil {
+			return fmt.Errorf("failed to clean pkgTmpDir %s: %v (fallback also failed: %v)", pkgTmpDir, err, err2)
+		}
+	}
+
+	// Rereate build/output dirs (non-root, inside TMPDIR)
 	for _, dir := range []string{buildDir, outputDir, logDir} {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return fmt.Errorf("failed to create dir %s: %v", dir, err)
@@ -4573,10 +4572,15 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 	outputDir := filepath.Join(pkgTmpDir, "output")
 	logDir := filepath.Join(pkgTmpDir, "log")
 
-	// Clean and re-create build/output dirs
+	// First try to cleanup pkgTmpDir with Go's os.RemoveAll
 	if err := os.RemoveAll(pkgTmpDir); err != nil {
-		return fmt.Errorf("failed to clean pkg tmp dir %s: %v", pkgTmpDir, err)
+		// If that fails, fall back to system rm -rf with rootExec
+		rmCmd := exec.Command("rm", "-rf", pkgTmpDir)
+		if err2 := RootExec.Run(rmCmd); err2 != nil {
+			return fmt.Errorf("failed to clean pkgTmpDir %s: %v (fallback also failed: %v)", pkgTmpDir, err, err2)
+		}
 	}
+
 	for _, dir := range []string{buildDir, outputDir, logDir} {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return fmt.Errorf("failed to create dir %s: %v", dir, err)
@@ -5933,29 +5937,42 @@ func (e *Executor) BindMount(source, dest, options string) error {
 // It relies on the external 'chroot' binary, which is automatically wrapped
 // with 'sudo' (if needed) and run via the Executor.Run method.
 func (e *Executor) ExecuteChroot(targetDir string, cmdArgs []string) (int, error) {
+	// First check if systemd-run is available
+	_, err := exec.LookPath("systemd-run")
+	if err == nil {
+		// Build systemd-run invocation that sets RootDirectory and runs the command directly.
+		suffix := fmt.Sprintf("%d-%d", os.Getpid(), time.Now().UnixNano())
+		unitName := "hokuto-chroot-" + filepath.Base(targetDir) + "-" + suffix
+		sdArgs := []string{
+			"systemd-run", "--pty",
+			"--setenv=TERM=xterm",
+			"--unit=" + unitName,
+			"--description=hokuto chroot " + targetDir,
+			"--property=RootDirectory=" + targetDir,
+			"--",
+		}
+		sdArgs = append(sdArgs, cmdArgs...)
 
-	// Build systemd-run invocation that sets RootDirectory and runs the command directly.
-	// Do NOT call the external chroot binary when using RootDirectory.
-	suffix := fmt.Sprintf("%d-%d", os.Getpid(), time.Now().UnixNano())
-	unitName := "hokuto-chroot-" + filepath.Base(targetDir) + "-" + suffix
-	sdArgs := []string{
-		"systemd-run", "--pty",
-		"--setenv=TERM=xterm",
-		"--unit=" + unitName,
-		"--description=hokuto chroot " + targetDir,
-		"--property=RootDirectory=" + targetDir,
-		"--",
+		cmd := exec.CommandContext(e.Context, sdArgs[0], sdArgs[1:]...)
+		cmd.Stdin = os.Stdin
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+
+		if err := e.Run(cmd); err != nil {
+			return 1, fmt.Errorf("error running chroot via systemd-run: %w", err)
+		}
+		return 0, nil
 	}
-	sdArgs = append(sdArgs, cmdArgs...) // cmdArgs are the command to run inside the chroot
 
-	// construct command and run via Executor
-	cmd := exec.CommandContext(e.Context, sdArgs[0], sdArgs[1:]...)
+	// Fallback: use traditional chroot if systemd-run is not found
+	chrootArgs := append([]string{targetDir}, cmdArgs...)
+	cmd := exec.CommandContext(e.Context, "chroot", chrootArgs...)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 
 	if err := e.Run(cmd); err != nil {
-		return 1, fmt.Errorf("error running chroot via systemd-run: %w", err)
+		return 1, fmt.Errorf("error running chroot fallback: %w", err)
 	}
 	return 0, nil
 }
@@ -6181,7 +6198,7 @@ func printHelp() {
 		{"version, --version", "", "Show hokuto version"},
 		{"list, ls", "[pkg]", "List installed packages; optional partial name to filter"},
 		{"checksum, c", "<pkg>", "Fetch sources and verify/create checksums for a package"},
-		{"build, b", "[options] <pkg> [...]", "Build package(s). Options: -a (auto-install) -v (verbose) -i (idle) -ii (superidle) --bootstrap"},
+		{"build, b", "[options] <pkg> [...]", "Build package(s). Options: -a (auto-install) -v (verbose) -i (idle) -ii (superidle) --bootstrap <dir"},
 		{"install, i", "<tarball|pkg> [...]", "Install a built package tarball or named package"},
 		{"uninstall, r", "[options] <pkg> [...]", "Uninstall package(s). Options: -f (force) -y (yes)"},
 		{"update, u", "", "Update repository metadata and check for upgrades. Options: -v (verbose)"},
@@ -6395,6 +6412,7 @@ func main() {
 		var verbose = buildCmd.Bool("v", false, "Enable verbose output (show build process output).")
 		var verboseLong = buildCmd.Bool("verbose", false, "Enable verbose output (show build process output).")
 		var bootstrap = buildCmd.Bool("bootstrap", false, "Enable bootstrap build mode")
+		var bootstrapDir = buildCmd.String("bootstrap-dir", "", "Specify the bootstrap directory (used with --bootstrap)")
 		// Parse the arguments specific to the "build" subcommand,
 		// starting from os.Args[2] (i.e., skipping "hokuto" and "build")
 		if err := buildCmd.Parse(os.Args[2:]); err != nil {
@@ -6412,6 +6430,19 @@ func main() {
 			buildPriority = "normal"
 		}
 		Verbose = *verbose || *verboseLong
+
+		// Handle bootstrap logic
+		if *bootstrap {
+			if *bootstrapDir == "" {
+				fmt.Fprintln(os.Stderr, "Error: --bootstrap requires --bootstrap-dir to be specified")
+				os.Exit(1)
+			}
+			if cfg.Values == nil {
+				cfg.Values = make(map[string]string)
+			}
+			cfg.Values["LFS"] = *bootstrapDir
+		}
+
 		// The positional arguments (package names) are now in buildCmd.Args()
 		packagesToProcess := buildCmd.Args()
 		if len(packagesToProcess) < 1 {
@@ -6426,6 +6457,7 @@ func main() {
 
 		// --- CONDITIONAL OVERRIDE FOR HOKUTO_ROOT ---
 		if *bootstrap {
+
 			// 1. Get the LFS root path
 			lfsRoot := cfg.Values["LFS"]
 			if lfsRoot == "" {
