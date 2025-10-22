@@ -227,9 +227,10 @@ func initConfig(cfg *Config) {
 // Executor provides a consistent interface for executing commands,
 // abstracting away the privilege escalation (sudo) logic.
 type Executor struct {
-	Context         context.Context // The context to use for cancellation
-	ShouldRunAsRoot bool            // ShouldRunAsRoot specifies whether the command MUST be executed with root privileges.
-	sudoPrimed      bool
+	Context           context.Context // The context to use for cancellation
+	ShouldRunAsRoot   bool            // ShouldRunAsRoot specifies whether the command MUST be executed with root privileges.
+	ApplyIdlePriority bool            // NEW: Apply nice -n 19 to this specific command
+	sudoPrimed        bool
 }
 
 // Update the constructor/factory function for Executor
@@ -322,24 +323,25 @@ func (e *Executor) Run(cmd *exec.Cmd) error {
 	// --- Phase 2: build the final command ---
 	var finalCmd *exec.Cmd
 
-	// Start with the base command and arguments
+	// 2a. Determine the base command and args to execute
 	basePath := cmd.Path
-	// 2a. Apply IDLE/NICENESS wrapper first (nice -n 19)
-	if setIdlePriority { // global variable checked here
-		// Prepend 'nice -n 19' to the command.
-		// The new command becomes `nice` and its arguments are the nice flags + the original command.
-		baseArgs := append([]string{"-n", "19", basePath}, cmd.Args[1:]...)
+	baseArgs := cmd.Args[1:] // Original arguments (excluding Args[0] which is usually the program name)
+
+	// 2b. Apply IDLE/NICENESS wrapper if requested
+	if e.ApplyIdlePriority {
+		// Wrap: nice -n 19 <basePath> <baseArgs...>
+		baseArgs = append([]string{"-n", "19", basePath}, baseArgs...)
 		basePath = "nice"
-		cmd.Args = append([]string{basePath}, baseArgs...)
 	}
 
-	// 2b. Apply SUDO wrapper if needed
+	// 2c. Apply SUDO wrapper if needed
 	if e.ShouldRunAsRoot && os.Geteuid() != 0 {
-		// use -E only so sudo reads its own tty and uses our cached ticket
-		args := append([]string{"-E", cmd.Path}, cmd.Args[1:]...)
+		// sudo -E <basePath> <baseArgs...>
+		args := append([]string{"-E", basePath}, baseArgs...)
 		finalCmd = exec.CommandContext(e.Context, "sudo", args...)
 	} else {
-		finalCmd = exec.CommandContext(e.Context, cmd.Path, cmd.Args[1:]...)
+		// <basePath> <baseArgs...>
+		finalCmd = exec.CommandContext(e.Context, basePath, baseArgs...)
 	}
 
 	// preserve or inherit the environment
@@ -4309,8 +4311,15 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool) er
 		}
 	}()
 
+	// NEW: Create a special executor for the build script that applies idle priority
+	buildScriptExec := &Executor{
+		Context:           buildExec.Context,
+		ShouldRunAsRoot:   buildExec.ShouldRunAsRoot,
+		ApplyIdlePriority: setIdlePriority, // Use the global flag here
+	}
+
 	// Run the build. Use runErr (single variable) to capture the result.
-	if err := buildExec.Run(cmd); err != nil {
+	if err := buildScriptExec.Run(cmd); err != nil {
 		runErr = fmt.Errorf("build failed: %w", err)
 	}
 
@@ -4758,7 +4767,7 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 
 	// --- Start interactive build with elapsed timer ---
 	// Set initial title
-	setTerminalTitle(fmt.Sprintf("[HOKUTO REBUILD] Starting %s...", pkgName))
+	setTerminalTitle(fmt.Sprintf("Rebuilding %s...", pkgName))
 
 	// --- Start interactive build with elapsed timer ---
 	// time started at beginning of function
@@ -4791,8 +4800,14 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 		}
 	}()
 
+	// NEW: Create a special executor for the build script that applies idle priority
+	buildScriptExec := &Executor{
+		Context:           buildExec.Context,
+		ShouldRunAsRoot:   buildExec.ShouldRunAsRoot,
+		ApplyIdlePriority: setIdlePriority, // Use the global flag here
+	}
 	// Run the build. Use runErr (single variable) to capture the result.
-	if err := buildExec.Run(cmd); err != nil {
+	if err := buildScriptExec.Run(cmd); err != nil {
 		runErr = fmt.Errorf("build failed: %w", err)
 	}
 
