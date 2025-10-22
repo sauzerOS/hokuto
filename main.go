@@ -59,7 +59,9 @@ var (
 	WantLTO         string
 	newPackageDir   string
 	idleUpdate      bool
+	superidleUpdate bool
 	setIdlePriority bool
+	buildPriority   string
 	ConfigFile      = "/etc/hokuto.conf"
 	// Global executors (declared, to be assigned in main)
 	UserExec *Executor
@@ -3348,6 +3350,9 @@ func pkgBuildAll(packages []string) error {
 		if idleUpdate {
 			args = append(args, "-i")
 		}
+		if superidleUpdate {
+			args = append(args, "-ii")
+		}
 		args = append(args, pkg)
 
 		cmd := exec.Command("hokuto", args...)
@@ -4181,20 +4186,21 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool) er
 			"TMPDIR":      currentTmpDir,
 		}
 
-		// If idle priority is set, use half the number of CPU cores for Make.
-		if setIdlePriority {
+		// Based on the priority, override the defaults for cores and signal the wrapper.
+		switch buildPriority {
+		case "idle":
 			numCores := runtime.NumCPU() / 2
 			if numCores < 1 {
 				numCores = 1
 			}
-			// 1. Override MAKEFLAGS for GNU Make
 			defaults["MAKEFLAGS"] = fmt.Sprintf("-j%d", numCores)
-
-			// 2. Set CMAKE_BUILD_PARALLEL_LEVEL for CMake
 			defaults["CMAKE_BUILD_PARALLEL_LEVEL"] = fmt.Sprintf("%d", numCores)
-
-			// 3. THIS IS THE KEY: Set the environment variable to activate the meson/ninja wrappers
-			defaults["HOKUTO_IDLE_PRIORITY"] = "1"
+			defaults["HOKUTO_BUILD_PRIORITY"] = "idle" // Set variable for wrapper
+		case "superidle":
+			numCores := 1
+			defaults["MAKEFLAGS"] = fmt.Sprintf("-j%d", numCores)
+			defaults["CMAKE_BUILD_PARALLEL_LEVEL"] = fmt.Sprintf("%d", numCores)
+			defaults["HOKUTO_BUILD_PRIORITY"] = "superidle" // Set variable for wrapper
 		}
 	}
 
@@ -4656,20 +4662,21 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 		"TMPDIR":      currentTmpDir,
 	}
 
-	// If idle priority is set, use half the number of CPU cores for Make.
-	if setIdlePriority {
+	// Based on the priority, override the defaults for cores and signal the wrapper.
+	switch buildPriority {
+	case "idle":
 		numCores := runtime.NumCPU() / 2
 		if numCores < 1 {
 			numCores = 1
 		}
-		// 1. Override MAKEFLAGS for GNU Make
 		defaults["MAKEFLAGS"] = fmt.Sprintf("-j%d", numCores)
-
-		// 2. Set CMAKE_BUILD_PARALLEL_LEVEL for CMake
 		defaults["CMAKE_BUILD_PARALLEL_LEVEL"] = fmt.Sprintf("%d", numCores)
-
-		// 3. THIS IS THE KEY: Set the environment variable to activate the meson/ninja wrappers
-		defaults["HOKUTO_IDLE_PRIORITY"] = "1"
+		defaults["HOKUTO_BUILD_PRIORITY"] = "idle" // Set variable for wrapper
+	case "superidle":
+		numCores := 1
+		defaults["MAKEFLAGS"] = fmt.Sprintf("-j%d", numCores)
+		defaults["CMAKE_BUILD_PARALLEL_LEVEL"] = fmt.Sprintf("%d", numCores)
+		defaults["HOKUTO_BUILD_PRIORITY"] = "superidle" // Set variable for wrapper
 	}
 
 	// Prepend oldLibsDir to PATH and LD_LIBRARY_PATH for tools run by the Executor
@@ -6190,7 +6197,7 @@ func printHelp() {
 		{"version, --version", "", "Show hokuto version"},
 		{"list, ls", "[pkg]", "List installed packages; optional partial name to filter"},
 		{"checksum, c", "<pkg>", "Fetch sources and verify/create checksums for a package"},
-		{"build, b", "[options] <pkg> [...]", "Build package(s). Options: -a (auto-install) -v (verbose) --bootstrap"},
+		{"build, b", "[options] <pkg> [...]", "Build package(s). Options: -a (auto-install) -v (verbose) -i (idle) -ii (superidle) --bootstrap"},
 		{"install, i", "<tarball|pkg> [...]", "Install a built package tarball or named package"},
 		{"uninstall, r", "[options] <pkg> [...]", "Uninstall package(s). Options: -f (force) -y (yes)"},
 		{"update, u", "", "Update repository metadata and check for upgrades. Options: -v (verbose)"},
@@ -6388,7 +6395,8 @@ func main() {
 		// 1. Initialize a FlagSet for the "build" subcommand
 		buildCmd := flag.NewFlagSet("build", flag.ExitOnError)
 		var autoInstall = buildCmd.Bool("a", false, "Automatically install the package(s) after successful build without prompting.")
-		var idleBuild = buildCmd.Bool("i", false, "Set the build process and all child processes to idle (lowest) CPU/IO priority (nice -n 19).")
+		var idleBuild = buildCmd.Bool("i", false, "Use half cpu cores and lowest niceness for build process.")
+		var superidleBuild = buildCmd.Bool("ii", false, "Use one cpu core and lowest niceness for build process.")
 		var verbose = buildCmd.Bool("v", false, "Enable verbose output (show build process output).")
 		var verboseLong = buildCmd.Bool("verbose", false, "Enable verbose output (show build process output).")
 		var bootstrap = buildCmd.Bool("bootstrap", false, "Enable bootstrap build mode")
@@ -6399,7 +6407,15 @@ func main() {
 			os.Exit(1)
 		}
 		// Set the global variables based on the parsed flags
-		setIdlePriority = *idleBuild
+		// Determine the build priority. Super idle takes precedence over idle.
+
+		if *superidleBuild {
+			buildPriority = "superidle"
+		} else if *idleBuild {
+			buildPriority = "idle"
+		} else {
+			buildPriority = "normal"
+		}
 		Verbose = *verbose || *verboseLong
 		// The positional arguments (package names) are now in buildCmd.Args()
 		packagesToProcess := buildCmd.Args()
@@ -6860,6 +6876,9 @@ func main() {
 		for _, a := range os.Args[2:] {
 			if a == "-i" || a == "--idle" {
 				idleUpdate = true
+			}
+			if a == "-ii" || a == "--superidle" {
+				superidleUpdate = true
 			}
 			if a == "-v" || a == "--verbose" {
 				Verbose = true
