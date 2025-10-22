@@ -4180,6 +4180,22 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool) er
 			"HOKUTO_ROOT": cfg.Values["HOKUTO_ROOT"],
 			"TMPDIR":      currentTmpDir,
 		}
+
+		// If idle priority is set, use half the number of CPU cores for Make.
+		if setIdlePriority {
+			numCores := runtime.NumCPU() / 2
+			if numCores < 1 {
+				numCores = 1
+			}
+			// 1. Override MAKEFLAGS for GNU Make
+			defaults["MAKEFLAGS"] = fmt.Sprintf("-j%d", numCores)
+
+			// 2. Set CMAKE_BUILD_PARALLEL_LEVEL for CMake
+			defaults["CMAKE_BUILD_PARALLEL_LEVEL"] = fmt.Sprintf("%d", numCores)
+
+			// 3. THIS IS THE KEY: Set the environment variable to activate the meson/ninja wrappers
+			defaults["HOKUTO_IDLE_PRIORITY"] = "1"
+		}
 	}
 
 	// Only apply normal flag logic if not in bootstrap mode
@@ -4638,6 +4654,22 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 		"GOPATH":      filepath.Join(buildDir, "go"),
 		"HOKUTO_ROOT": rootDir,
 		"TMPDIR":      currentTmpDir,
+	}
+
+	// If idle priority is set, use half the number of CPU cores for Make.
+	if setIdlePriority {
+		numCores := runtime.NumCPU() / 2
+		if numCores < 1 {
+			numCores = 1
+		}
+		// 1. Override MAKEFLAGS for GNU Make
+		defaults["MAKEFLAGS"] = fmt.Sprintf("-j%d", numCores)
+
+		// 2. Set CMAKE_BUILD_PARALLEL_LEVEL for CMake
+		defaults["CMAKE_BUILD_PARALLEL_LEVEL"] = fmt.Sprintf("%d", numCores)
+
+		// 3. THIS IS THE KEY: Set the environment variable to activate the meson/ninja wrappers
+		defaults["HOKUTO_IDLE_PRIORITY"] = "1"
 	}
 
 	// Prepend oldLibsDir to PATH and LD_LIBRARY_PATH for tools run by the Executor
