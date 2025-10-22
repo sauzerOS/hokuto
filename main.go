@@ -35,7 +35,6 @@ import (
 	"github.com/klauspost/pgzip"
 	"github.com/ulikunitz/xz"
 	"golang.org/x/sys/unix"
-	"golang.org/x/term"
 	"lukechampine.com/blake3"
 )
 
@@ -226,6 +225,86 @@ func initConfig(cfg *Config) {
 
 }
 
+// needsRootPrivileges checks if any of the requested operations require root
+func needsRootPrivileges(args []string) bool {
+	if len(args) < 1 {
+		return false
+	}
+
+	cmd := args[0]
+
+	// Commands that require root privileges
+	rootCommands := map[string]bool{
+		"build":     true,
+		"b":         true,
+		"install":   true,
+		"i":         true,
+		"uninstall": true,
+		"remove":    true,
+		"r":         true,
+		"update":    true,
+		"u":         true,
+		"chroot":    true,
+	}
+
+	if rootCommands[cmd] {
+		return true
+	}
+
+	// Check if build command has auto-install flag
+	if cmd == "build" || cmd == "b" {
+		for _, arg := range args[1:] {
+			if arg == "-a" {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
+// authenticateOnce performs a single authentication check at program start
+func authenticateOnce() error {
+	if os.Geteuid() == 0 {
+		return nil // Already root
+	}
+
+	// Try run0 first
+	/*if _, err := exec.LookPath("run0"); err == nil {
+		// run0 uses polkit - test with a simple command
+		cmd := exec.Command("run0", "true")
+		cmd.Stdin = os.Stdin
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		if err := cmd.Run(); err != nil {
+			return fmt.Errorf("run0 authentication failed: %w", err)
+		}
+		cPrintln(colInfo, "Authenticated via run0")
+		return nil
+	}*/
+
+	// Fallback to sudo
+	cmd := exec.Command("sudo", "-v")
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("sudo authentication failed: %w", err)
+	}
+
+	// Start keep-alive goroutine for sudo
+	go func() {
+		ticker := time.NewTicker(4 * time.Minute)
+		defer ticker.Stop()
+		for range ticker.C {
+			exec.Command("sudo", "-nv").Run()
+		}
+	}()
+
+	cPrintln(colInfo, "Authenticated via sudo")
+	return nil
+}
+
 // Executor provides a consistent interface for executing commands,
 // abstracting away the privilege escalation (sudo) logic.
 type Executor struct {
@@ -241,65 +320,24 @@ func NewExecutor(ctx context.Context /* other params */) *Executor {
 	return &Executor{Context: ctx}
 }
 
-// ensureSudo only prompts for a password if sudo really needs one.
-// 1. If we’re root or root‐mode isn’t required, do nothing.
-// 2. If we've already primed, try “sudo -v” (interactive on expiry).
-// 3. Otherwise, run “sudo -n -v” (noninteractive); if it succeeds, no password is needed.
-// 4. If that fails, open /dev/tty, read the password, then run “sudo -S -v” to prime.
+// ensureSudo is now a no-op since authentication happens once at startup
 func (e *Executor) ensureSudo() error {
-	// no elevation needed if we’re already root or ShouldRunAsRoot is false
 	if os.Geteuid() == 0 || !e.ShouldRunAsRoot {
 		return nil
 	}
 
-	// if we’ve primed before, refresh the timestamp (may re‐prompt if expired)
-	if e.sudoPrimed {
-		refresh := exec.CommandContext(e.Context, "sudo", "-v")
-		refresh.Stdin = os.Stdin
-		refresh.Stdout = os.Stdout
-		refresh.Stderr = os.Stderr
-		if err := refresh.Run(); err == nil {
-			return nil
-		}
-		// expired or error: clear flag and fall through to interactive prompt
-		e.sudoPrimed = false
-	} else {
-		// try noninteractive validation: succeeds if nopasswd or timestamp still valid
-		check := exec.CommandContext(e.Context, "sudo", "-n", "-v")
-		check.Stdout = io.Discard
-		check.Stderr = io.Discard
-		if err := check.Run(); err == nil {
-			e.sudoPrimed = true
-			return nil
-		}
-		// noninteractive check failed: sudo needs a password
+	// Authentication already done at startup
+	// Just validate it's still valid
+	if _, err := exec.LookPath("run0"); err == nil {
+		// run0 handles its own session management
+		return nil
 	}
 
-	// interactive password prompt via the real tty
-	tty, err := os.Open("/dev/tty")
-	if err != nil {
-		return fmt.Errorf("cannot open /dev/tty: %w", err)
-	}
-	defer tty.Close()
-
-	fmt.Fprint(os.Stderr, "Enter sudo password: ")
-	pass, err := term.ReadPassword(int(tty.Fd()))
-	fmt.Fprintln(os.Stderr)
-	if err != nil {
-		return fmt.Errorf("reading sudo password: %w", err)
-	}
-
-	// prime sudo’s timestamp cache
-	prime := exec.CommandContext(e.Context, "sudo", "-S", "-v")
-	prime.Stdin = strings.NewReader(string(pass) + "\n")
-	prime.Stdout = os.Stdout
-	prime.Stderr = os.Stderr
-	if err := prime.Run(); err != nil {
-		return fmt.Errorf("sudo validation failed: %w", err)
-	}
-
-	e.sudoPrimed = true
-	return nil
+	// For sudo, just do a non-interactive check
+	check := exec.CommandContext(e.Context, "sudo", "-nv")
+	check.Stdout = io.Discard
+	check.Stderr = io.Discard
+	return check.Run()
 }
 
 // Run executes the given command, elevating via sudo -E only when needed.
@@ -317,7 +355,7 @@ func (e *Executor) Run(cmd *exec.Cmd) error {
 		cmd.Stderr = os.Stderr
 	}
 
-	// --- Phase 1: maybe prime sudo ---
+	// --- Phase 1: maybe check privilege ---
 	if err := e.ensureSudo(); err != nil {
 		return err
 	}
@@ -325,25 +363,43 @@ func (e *Executor) Run(cmd *exec.Cmd) error {
 	// --- Phase 2: build the final command ---
 	var finalCmd *exec.Cmd
 
-	// 2a. Determine the base command and args to execute
 	basePath := cmd.Path
-	baseArgs := cmd.Args[1:] // Original arguments (excluding Args[0] which is usually the program name)
+	baseArgs := cmd.Args[1:]
 
 	// 2b. Apply IDLE/NICENESS wrapper if requested
 	if e.ApplyIdlePriority {
-		// Wrap: nice -n 19 <basePath> <baseArgs...>
 		baseArgs = append([]string{"-n", "19", basePath}, baseArgs...)
 		basePath = "nice"
 	}
 
-	// 2c. Apply SUDO wrapper if needed
+	// 2c. Apply privilege wrapper if needed
 	if e.ShouldRunAsRoot && os.Geteuid() != 0 {
-		// sudo -E <basePath> <baseArgs...>
-		args := append([]string{"-E", basePath}, baseArgs...)
-		finalCmd = exec.CommandContext(e.Context, "sudo", args...)
+		// Try run0 first (preferred)
+		/*if _, err := exec.LookPath("run0"); err == nil {
+			args := []string{}
+
+			// Set working directory if specified
+			if cmd.Dir != "" {
+				args = append(args, "--working-directory="+cmd.Dir)
+			}
+
+			args = append(args, basePath)
+			args = append(args, baseArgs...)
+			finalCmd = exec.CommandContext(e.Context, "run0", args...)
+
+			// Don't set Dir since we used --working-directory
+			finalCmd.Dir = ""
+		} else {*/
+		// Fallback to sudo -E
+		{
+
+			args := append([]string{"-E", basePath}, baseArgs...)
+			finalCmd = exec.CommandContext(e.Context, "sudo", args...)
+			finalCmd.Dir = cmd.Dir
+		}
 	} else {
-		// <basePath> <baseArgs...>
 		finalCmd = exec.CommandContext(e.Context, basePath, baseArgs...)
+		finalCmd.Dir = cmd.Dir
 	}
 
 	// preserve or inherit the environment
@@ -353,13 +409,12 @@ func (e *Executor) Run(cmd *exec.Cmd) error {
 		finalCmd.Env = os.Environ()
 	}
 
-	// carry over working dir and stdio
-	finalCmd.Dir = cmd.Dir
+	// carry over stdio
 	finalCmd.Stdin = cmd.Stdin
 	finalCmd.Stdout = cmd.Stdout
 	finalCmd.Stderr = cmd.Stderr
 
-	// --- Phase 3: isolate process group for context‐based cleanup ---
+	// --- Phase 3: isolate process group for context-based cleanup ---
 	finalCmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
 	// --- Phase 4: start and watch for cancel ---
@@ -1948,71 +2003,6 @@ func copyDir(src, dst string) error {
 }
 
 // shouldStripTar inspects the tarball to check for a single top-level directory.
-/*func shouldStripTar(archive string) (bool, error) {
-	// Use 'tar tf' to list the contents quietly
-	debugf("Running strip check for tar extraction")
-	cmd := exec.Command("tar", "tf", archive)
-
-	var out bytes.Buffer
-	cmd.Stdout = &out
-	// Don't route stderr to os.Stderr, as we are inspecting the file, not extracting
-	// cmd.Stderr = os.Stderr // (Keep this commented out)
-
-	if err := cmd.Run(); err != nil {
-		// Tar failed to read or list the file.
-		return false, fmt.Errorf("tar tf failed: %w", err)
-	}
-
-	// The first entry determines the structure.
-	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
-	if len(lines) == 0 || lines[0] == "" {
-		// Archive is empty or unreadable
-		return false, nil
-	}
-
-	firstEntry := lines[0]
-
-	// A typical top-level directory entry looks like "pkgname-version/".
-	// The path should contain a single slash and end with one.
-	// If the archive only contains one entry (the directory itself),
-	// we still rely on the first file entry.
-
-	// Check if the first entry suggests a top-level directory structure:
-	// 1. Must contain at least one slash.
-	// 2. The string before the first slash (the directory name) must match the rest of the entries.
-
-	parts := strings.Split(firstEntry, string(filepath.Separator))
-	if len(parts) < 2 {
-		// No slash means a file/folder is at the root (e.g., "file1.c"), so don't strip.
-		return false, nil
-	}
-
-	// The assumed top-level directory is the first part (e.g., "pkgname-version")
-	topDir := parts[0] + string(filepath.Separator)
-
-	// Now check all entries to ensure they ALL start with this path.
-	// We only need to check the first few non-directory entries for performance.
-	for i, line := range lines {
-		if i > 50 { // Check a reasonable number of entries (e.g., 50)
-			break
-		}
-
-		// If the entry is a directory itself (ends with /), skip it.
-		// NOTE: 'tar tf' output might not always include the trailing slash,
-		// but checking the prefix is more reliable.
-
-		// If any entry does NOT start with the top directory prefix, then files exist at the root.
-		if !strings.HasPrefix(line, topDir) {
-			// Found a file/folder that is NOT inside the assumed topDir.
-			// e.g., line is "file_at_root.c".
-			return false, nil
-		}
-	}
-
-	// All checked entries start with the same top directory prefix, so strip is needed.
-	return true, nil
-}*/
-
 func shouldStripTar(archive string) (bool, error) {
 	debugf("Running strip check for tar extraction")
 
@@ -6311,7 +6301,15 @@ func main() {
 	mergeEnvOverrides(cfg)
 	initConfig(cfg)
 
-	// This ensures both executors have the valid cancellation context (ctx).
+	// 5. CHECK IF ROOT PRIVILEGES ARE NEEDED
+	if needsRootPrivileges(os.Args[1:]) {
+		if err := authenticateOnce(); err != nil {
+			fmt.Fprintf(os.Stderr, "Authentication failed: %v\n", err)
+			os.Exit(1)
+		}
+	}
+
+	// 6. INITIALIZE EXECUTORS
 	UserExec = &Executor{
 		Context:         ctx,
 		ShouldRunAsRoot: false,
@@ -6320,7 +6318,10 @@ func main() {
 		Context:         ctx,
 		ShouldRunAsRoot: true,
 	}
+
+	// 7. MAIN LOGIC
 	var exitCode int
+
 	switch os.Args[1] {
 	case "chroot":
 		// Call the new wrapper function that contains the defer logic
