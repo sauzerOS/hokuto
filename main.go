@@ -6170,8 +6170,6 @@ func getPackageDependenciesToUninstall(name string) []string {
 		return []string{"18-sed"}
 	case "hokuto":
 		return []string{"21-hokuto"}
-	case "nano":
-		return []string{"22-nano"}
 	case "python", "cython":
 		return []string{name}
 	default:
