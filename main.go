@@ -2720,13 +2720,31 @@ func rsyncStaging(stagingDir, rootDir string, execCtx *Executor) error {
 	return nil
 }
 
-// copyTree recursively copies files from src to dst, preserving mode, symlinks, timestamps, and xattrs.
+// CopyTree copies the contents of src (must end with trailing separator or not) into dst.
+// It preserves directories, symlinks, hardlinks, FIFOs, device nodes, file modes,
+// uid/gid, timestamps, and xattrs where supported.
 func copyTree(src, dst string) error {
-	return filepath.Walk(src, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
+	src = filepath.Clean(src)
+	dst = filepath.Clean(dst)
+
+	// Ensure dst exists
+	if err := os.MkdirAll(dst, 0o755); err != nil {
+		return fmt.Errorf("mkdirall dst: %w", err)
+	}
+
+	// Map to track hardlinks: (dev,ino) -> first target path
+	type inodeKey struct {
+		Dev uint64
+		Ino uint64
+	}
+	links := make(map[inodeKey]string)
+
+	// Walk the tree using WalkDir to avoid following symlinks
+	return filepath.WalkDir(src, func(p string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
 		}
-		rel, err := filepath.Rel(src, path)
+		rel, err := filepath.Rel(src, p)
 		if err != nil {
 			return err
 		}
@@ -2735,98 +2753,241 @@ func copyTree(src, dst string) error {
 		}
 		target := filepath.Join(dst, rel)
 
-		switch {
-		case info.Mode().IsDir():
-			return os.MkdirAll(target, info.Mode())
-		case info.Mode()&os.ModeSymlink != 0:
-			return copySymlink(path, target)
-		case info.Mode().IsRegular():
-			return copyFile2(path, target, info)
+		// Use Lstat to inspect without following symlinks
+		info, err := os.Lstat(p)
+		if err != nil {
+			return err
 		}
+		st, ok := info.Sys().(*syscall.Stat_t)
+		if !ok {
+			return fmt.Errorf("failed to get raw stat for %s", p)
+		}
+		key := inodeKey{Dev: uint64(st.Dev), Ino: uint64(st.Ino)}
+
+		mode := info.Mode()
+
+		switch {
+		case mode.IsDir():
+			// create directory if missing; do not set ownership/mode yet
+			if err := os.MkdirAll(target, mode.Perm()); err != nil {
+				return err
+			}
+		case mode&os.ModeSymlink != 0:
+			// copy symlink
+			linkTarget, err := os.Readlink(p)
+			if err != nil {
+				return err
+			}
+			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+				return err
+			}
+			_ = os.Remove(target)
+			if err := os.Symlink(linkTarget, target); err != nil {
+				return err
+			}
+		case mode.IsRegular():
+			// handle hardlink: if we've seen same (dev,ino) before, create hardlink
+			if prev, seen := links[key]; seen {
+				// try to create hardlink; if fails, fallback to copy
+				if err := os.Link(prev, target); err == nil {
+					// success linking; nothing more to do now
+				} else {
+					if err := copyFileContents(p, target, mode.Perm()); err != nil {
+						return err
+					}
+				}
+			} else {
+				if err := copyFileContents(p, target, mode.Perm()); err != nil {
+					return err
+				}
+				links[key] = target
+			}
+		case mode&os.ModeNamedPipe != 0:
+			// FIFO
+			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+				return err
+			}
+			if err := unix.Mkfifo(target, uint32(mode.Perm())); err != nil && err != unix.EEXIST {
+				return err
+			}
+		case mode&os.ModeDevice != 0:
+			// device node (character or block)
+			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+				return err
+			}
+			// derive device type and rdev
+			var devMode uint32
+			if mode&os.ModeCharDevice != 0 {
+				devMode = unix.S_IFCHR
+			} else {
+				devMode = unix.S_IFBLK
+			}
+			devMode |= uint32(mode.Perm())
+			// use st.Rdev for major/minor
+			rdev := st.Rdev
+			major := unix.Major(uint64(rdev))
+			minor := unix.Minor(uint64(rdev))
+			dev := int((major << 8) | minor)
+			if err := unix.Mknod(target, devMode, dev); err != nil && err != unix.EEXIST {
+				return err
+			}
+		default:
+			// skip sockets and other special files
+			// sockets in archive are rare; skip with no error
+			return nil
+		}
+
+		// After content creation, set ownership (use Lchown to avoid following symlinks)
+		if err := unix.Lchown(target, int(st.Uid), int(st.Gid)); err != nil && err != unix.EPERM {
+			// if EPERM (non-root), ignore; otherwise fail
+			if err != unix.EPERM {
+				return fmt.Errorf("lchown %s: %w", target, err)
+			}
+		}
+
+		// For non-symlinks, set file mode (including suid/sgid) now
+		if mode&os.ModeSymlink == 0 {
+			if err := os.Chmod(target, mode.Perm()); err != nil {
+				// ignore permission errors on non-root, but surface others
+				if !os.IsPermission(err) {
+					return err
+				}
+			}
+		}
+
+		// Preserve timestamps using utimensat (symlink-safe)
+		var ts [2]unix.Timespec
+		ts[0] = unix.NsecToTimespec(st.Atim.Nano())
+		ts[1] = unix.NsecToTimespec(st.Mtim.Nano())
+		atFlags := 0
+		// do not follow symlinks
+		atFlags |= unix.AT_SYMLINK_NOFOLLOW
+		if err := unix.UtimesNanoAt(unix.AT_FDCWD, target, ts[:], atFlags); err != nil && err != unix.EOPNOTSUPP {
+			// if not supported, ignore on platforms that don't support utimensat for symlinks
+			// but return other errors
+			if err != nil {
+				return fmt.Errorf("utimesnanoat %s: %w", target, err)
+			}
+		}
+
+		// Copy xattrs (use l-prefixed variants if target is symlink)
+		isSymlink := mode&os.ModeSymlink != 0
+		if err := copyXattrs(p, target, isSymlink); err != nil {
+			// xattr failure is non-fatal in many cases; surface only unexpected errors
+			// continue on EINVAL/ENOTSUP/EPERM if not root
+			if err != unix.ENOTSUP && err != unix.EPERM && err != unix.EACCES {
+				return fmt.Errorf("copy xattrs %s -> %s: %w", p, target, err)
+			}
+		}
+
 		return nil
 	})
 }
 
-func copyFile2(src, dst string, info os.FileInfo) error {
+func copyFileContents(src, dst string, perm fs.FileMode) error {
+	// ensure parent
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		return err
+	}
+
 	in, err := os.Open(src)
 	if err != nil {
 		return err
 	}
 	defer in.Close()
 
-	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-		return err
-	}
-	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, info.Mode())
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, perm)
 	if err != nil {
 		return err
 	}
+	// Use io.Copy which will use sendfile on supported platforms
 	if _, err := io.Copy(out, in); err != nil {
 		out.Close()
 		return err
 	}
-	out.Close()
-
-	// Preserve timestamps
-	if stat, ok := info.Sys().(*syscall.Stat_t); ok {
-		times := []syscall.Timespec{stat.Atim, stat.Mtim}
-		_ = syscall.UtimesNano(dst, times)
+	if err := out.Sync(); err != nil {
+		out.Close()
+		return err
 	}
-	// Preserve xattrs
-	_ = copyXattrs(src, dst)
+	if err := out.Close(); err != nil {
+		return err
+	}
 	return nil
 }
 
-func copySymlink(src, dst string) error {
-	target, err := os.Readlink(src)
+// copyXattrs copies extended attributes from src to dst.
+// If isSymlink is true, uses the l-prefixed variants to operate on the link itself.
+func copyXattrs(src, dst string, isSymlink bool) error {
+	var (
+		listFunc func(string, []byte) (int, error)
+		getFunc  func(string, string, []byte) (int, error)
+		setFunc  func(string, string, []byte, int) error
+	)
+	if isSymlink {
+		listFunc = unix.Llistxattr
+		getFunc = unix.Lgetxattr
+		setFunc = unix.Lsetxattr
+	} else {
+		listFunc = unix.Listxattr
+		getFunc = unix.Getxattr
+		setFunc = unix.Setxattr
+	}
+
+	// first get required size
+	size, err := listFunc(src, nil)
 	if err != nil {
+		// no xattrs or not supported
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-		return err
-	}
-	os.Remove(dst)
-	if err := os.Symlink(target, dst); err != nil {
-		return err
-	}
-	_ = copyXattrs(src, dst)
-	return nil
-}
-
-func copyXattrs(src, dst string) error {
-	size, err := unix.Listxattr(src, nil)
-	if err != nil || size == 0 {
+	if size == 0 {
 		return nil
 	}
 	buf := make([]byte, size)
-	read, err := unix.Listxattr(src, buf)
+	n, err := listFunc(src, buf)
 	if err != nil {
-		return nil
+		return err
 	}
-	names := buf[:read]
-	for _, name := range splitNullTerminated(names) {
-		val := make([]byte, 64*1024)
-		n, err := unix.Getxattr(src, name, val)
-		if err != nil {
-			continue
-		}
-		_ = unix.Setxattr(dst, name, val[:n], 0)
-	}
-	return nil
-}
-
-func splitNullTerminated(b []byte) []string {
-	var out []string
+	buf = buf[:n]
+	// parse null-terminated list
 	start := 0
-	for i, c := range b {
-		if c == 0 {
+	for i := 0; i < len(buf); i++ {
+		if buf[i] == 0 {
 			if i > start {
-				out = append(out, string(b[start:i]))
+				name := string(buf[start:i])
+				// get attribute size
+				// attempt to get with a buffer that grows if necessary
+				var val []byte
+				const chunk = 64 * 1024
+				for cap(val) < 1 || true {
+					if len(val) == 0 {
+						val = make([]byte, chunk)
+					} else {
+						val = make([]byte, cap(val)+chunk)
+					}
+					rlen, gerr := getFunc(src, name, val)
+					if gerr == nil {
+						val = val[:rlen]
+						if serr := setFunc(dst, name, val, 0); serr != nil {
+							// ignore some errors (e.g., not supported for symlink) but return serious ones
+							if serr != unix.ENOTSUP && serr != unix.EPERM && serr != unix.EACCES {
+								return serr
+							}
+						}
+						break
+					} else {
+						// EINVAL/ERANGE may mean buffer was too small, continue; other errors break
+						if gerr == unix.ERANGE {
+							continue
+						}
+						// attribute disappeared or not allowed: ignore and continue
+						break
+					}
+				}
 			}
 			start = i + 1
 		}
 	}
-	return out
+	return nil
 }
 
 // executePostInstall runs the post-install script for pkgName if present.
@@ -3418,6 +3579,118 @@ func checkForUpgrades() error {
 	return nil
 }
 
+// getPackageDependenciesForward recursively collects all dependencies for a package
+// in forward order (as they appear in depends files).
+// Duplicates are only allowed for "gcc" - all other packages are added once.
+// This is used with the --alldeps flag to rebuild everything including duplicates.
+func getPackageDependenciesForward(pkgName string) ([]string, error) {
+	var result []string
+	seen := make(map[string]bool)       // Track non-gcc packages to avoid duplicates
+	inProgress := make(map[string]bool) // Track packages currently being processed to prevent infinite recursion
+
+	// Helper function for recursive traversal
+	var collectDeps func(string) error
+	collectDeps = func(currentPkg string) error {
+		// Check if we're already processing this package (prevents infinite recursion)
+		if inProgress[currentPkg] {
+			return nil
+		}
+
+		// Mark as in-progress
+		inProgress[currentPkg] = true
+		defer func() {
+			// Unmark when done (allows gcc to be processed multiple times in different branches)
+			delete(inProgress, currentPkg)
+		}()
+		// --- Find the Package Source Directory (pkgDir) ---
+		paths := strings.Split(repoPaths, ":")
+		var pkgDir string
+		var found bool
+
+		for _, repoPath := range paths {
+			repoPath = strings.TrimSpace(repoPath)
+			if repoPath == "" {
+				continue
+			}
+			currentPkgDir := filepath.Join(repoPath, currentPkg)
+			if info, err := os.Stat(currentPkgDir); err == nil && info.IsDir() {
+				pkgDir = currentPkgDir
+				found = true
+				break
+			}
+		}
+
+		if !found {
+			return fmt.Errorf("package source not found in any repository path for %s", currentPkg)
+		}
+
+		// --- Parse the depends file ---
+		dependencies, err := parseDependsFile(pkgDir)
+		if err != nil {
+			return fmt.Errorf("failed to parse dependencies for %s: %w", currentPkg, err)
+		}
+
+		// --- Recursively collect dependencies in forward order ---
+		for _, dep := range dependencies {
+			depName := dep.Name
+
+			// Safety check: a package cannot depend on itself
+			if depName == currentPkg {
+				continue
+			}
+
+			// Version constraint checking (same as resolveMissingDeps)
+			if dep.Op != "" && isPackageInstalled(depName) {
+				if installedVer, ok := getInstalledVersion(depName); ok {
+					if !versionSatisfies(installedVer, dep.Op, dep.Version) {
+						switch dep.Op {
+						case "<=":
+							return fmt.Errorf("error %s version %s or lower required for build (installed %s)", depName, dep.Version, installedVer)
+						case ">=":
+							return fmt.Errorf("error %s version %s or higher required for build (installed %s)", depName, dep.Version, installedVer)
+						case "==":
+							return fmt.Errorf("error %s version exactly %s required for build (installed %s)", depName, dep.Version, installedVer)
+						case "<":
+							return fmt.Errorf("error %s version lower than %s required for build (installed %s)", depName, dep.Version, installedVer)
+						case ">":
+							return fmt.Errorf("error %s version greater than %s required for build (installed %s)", depName, dep.Version, installedVer)
+						default:
+							return fmt.Errorf("error %s version constraint %s%s not satisfied (installed %s)", depName, dep.Op, dep.Version, installedVer)
+						}
+					}
+				}
+			}
+
+			// Recursively collect dependencies of this dependency
+			if err := collectDeps(depName); err != nil {
+				return err
+			}
+
+			// Add the dependency itself AFTER its dependencies (forward order)
+			// Special handling: gcc can be added multiple times, all others only once
+			if depName == "gcc" {
+				// Always add gcc, allowing duplicates
+				result = append(result, depName)
+			} else {
+				// For non-gcc packages, only add if not seen before
+				if !seen[depName] {
+					seen[depName] = true
+					result = append(result, depName)
+				}
+			}
+		}
+
+		return nil
+	}
+
+	// Start the recursive collection
+	if err := collectDeps(pkgName); err != nil {
+		return nil, err
+	}
+
+	return result, nil
+}
+
 // resolveMissingDeps recursively finds all missing dependencies for a package.
 // It assumes cfg is passed in, as it's needed for the recursive call.
 func resolveMissingDeps(pkgName string, processed map[string]bool, missing *[]string) error {
@@ -3666,7 +3939,7 @@ func compareVersions(a, b string) int {
 // stripPackage recursively walks outputDir and runs the 'strip' command on every executable file found,
 // executing the stripping concurrently to maximize speed.
 func stripPackage(outputDir string, buildExec *Executor) error {
-	debugf("Stripping executables in parallel in: %s\n", outputDir)
+	cPrintf(colInfo, "Stripping executables in parallel in: %s\n", outputDir)
 
 	var wg sync.WaitGroup
 
@@ -3689,7 +3962,7 @@ func stripPackage(outputDir string, buildExec *Executor) error {
 	findCmd.Stdout = &findOutput
 	findCmd.Stderr = os.Stderr
 
-	cPrintln(colInfo, "  -> Discovering stripable ELF files...")
+	debugf("  -> Discovering stripable ELF files...")
 	if err := buildExec.Run(findCmd); err != nil {
 		return fmt.Errorf("failed to execute file discovery command (find/file filter): %w", err)
 	}
@@ -3728,7 +4001,7 @@ func stripPackage(outputDir string, buildExec *Executor) error {
 			statCmd.Stderr = os.Stderr
 
 			if err := buildExec.Run(statCmd); err != nil {
-				fmt.Fprintf(os.Stderr, "Warning: failed to stat permissions for %s: %v. Skipping this file.\n", p, err)
+				debugf("Warning: failed to stat permissions for %s: %v. Skipping this file.\n", p, err)
 				failedMu.Lock()
 				failedFiles = append(failedFiles, p)
 				failedMu.Unlock()
@@ -3736,7 +4009,7 @@ func stripPackage(outputDir string, buildExec *Executor) error {
 			}
 			originalPerms := strings.TrimSpace(permOut.String())
 			if originalPerms == "" {
-				fmt.Fprintf(os.Stderr, "Warning: empty perms from stat for %s. Skipping this file.\n", p)
+				debugf("Warning: empty perms from stat for %s. Skipping this file.\n", p)
 				failedMu.Lock()
 				failedFiles = append(failedFiles, p)
 				failedMu.Unlock()
@@ -3748,7 +4021,7 @@ func stripPackage(outputDir string, buildExec *Executor) error {
 				restoreCmd := exec.Command("chmod", originalPerms, p)
 				restoreCmd.Stderr = os.Stderr
 				if err := buildExec.Run(restoreCmd); err != nil {
-					fmt.Fprintf(os.Stderr, "Warning: failed to restore permissions on %s to %s: %v\n", p, originalPerms, err)
+					debugf("Warning: failed to restore permissions on %s to %s: %v\n", p, originalPerms, err)
 				}
 			}()
 
@@ -3756,19 +4029,19 @@ func stripPackage(outputDir string, buildExec *Executor) error {
 			chmodWriteCmd := exec.Command("chmod", "u+w", p)
 			chmodWriteCmd.Stderr = os.Stderr
 			if err := buildExec.Run(chmodWriteCmd); err != nil {
-				fmt.Fprintf(os.Stderr, "Warning: failed to chmod +w %s: %v. Skipping strip for this file.\n", p, err)
+				debugf("Warning: failed to chmod +w %s: %v. Skipping strip for this file.\n", p, err)
 				failedMu.Lock()
 				failedFiles = append(failedFiles, p)
 				failedMu.Unlock()
 				return
 			}
 
-			fmt.Printf("  -> Stripping %s\n", p)
+			debugf("  -> Stripping %s\n", p)
 			stripCmd := exec.Command("strip", p)
 			stripCmd.Stderr = os.Stderr
 			if err := buildExec.Run(stripCmd); err != nil {
 				// Log as warning only. Do not mark the whole package as failed.
-				fmt.Fprintf(os.Stderr, "Warning: failed to strip %s: %v. Continuing with other files.\n", p, err)
+				debugf("Warning: failed to strip %s: %v. Continuing with other files.\n", p, err)
 				failedMu.Lock()
 				failedFiles = append(failedFiles, p)
 				failedMu.Unlock()
@@ -5800,8 +6073,6 @@ func pkgUninstall(pkgName string, cfg *Config, execCtx *Executor, force, yes boo
 	return nil
 }
 
-// handleBuildCommand encapsulates all the logic for the "build" command.
-// It accepts command-line arguments as a slice of strings.
 func handleBuildCommand(args []string, cfg *Config) {
 	// 1. Initialize a FlagSet for the "build" subcommand
 	buildCmd := flag.NewFlagSet("build", flag.ExitOnError)
@@ -5812,6 +6083,7 @@ func handleBuildCommand(args []string, cfg *Config) {
 	var verboseLong = buildCmd.Bool("verbose", false, "Enable verbose output (show build process output).")
 	var bootstrap = buildCmd.Bool("bootstrap", false, "Enable bootstrap build mode")
 	var bootstrapDir = buildCmd.String("bootstrap-dir", "", "Specify the bootstrap directory (used with --bootstrap)")
+	var allDeps = buildCmd.Bool("alldeps", false, "Force build all dependencies (no binary packages used)")
 
 	// Parse the arguments specific to the "build" subcommand
 	if err := buildCmd.Parse(args); err != nil {
@@ -5977,79 +6249,140 @@ func handleBuildCommand(args []string, cfg *Config) {
 	}
 
 	// 2. Resolve dependencies for ALL requested packages
-	for _, pkgName := range packagesToProcess {
-		fmt.Printf("Resolving dependencies for target package %s...\n", pkgName)
+	var packagesToBuildFromDeps []string
 
-		// NOTE: resolveMissingDeps must be able to handle being called multiple times
-		// and update masterProcessed and masterMissingDeps correctly, acting like a global resolver.
-		if err := resolveMissingDeps(pkgName, masterProcessed, &masterMissingDeps); err != nil {
-			fmt.Fprintf(os.Stderr, "Error resolving dependencies for %s: %v\n", pkgName, err)
-			os.Exit(1)
+	if *allDeps {
+		// When --alldeps is active, build dependencies in forward order (as they appear in depends file)
+		// and allow duplicates to be rebuilt
+		fmt.Println("--alldeps flag set: building all dependencies in order with duplicates allowed")
+
+		for _, pkgName := range packagesToProcess {
+			fmt.Printf("Resolving dependencies for target package %s...\n", pkgName)
+
+			// Get dependencies in forward order (as they appear in depends file)
+			deps, err := getPackageDependenciesForward(pkgName)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error resolving dependencies for %s: %v\n", pkgName, err)
+				os.Exit(1)
+			}
+
+			// Add all dependencies (including duplicates) followed by the package itself
+			packagesToBuildFromDeps = append(packagesToBuildFromDeps, deps...)
+			packagesToBuildFromDeps = append(packagesToBuildFromDeps, pkgName)
 		}
+	} else {
+		// Normal mode: use existing dependency resolution (reverse order, no duplicates)
+		for _, pkgName := range packagesToProcess {
+			fmt.Printf("Resolving dependencies for target package %s...\n", pkgName)
+
+			// NOTE: resolveMissingDeps must be able to handle being called multiple times
+			// and update masterProcessed and masterMissingDeps correctly, acting like a global resolver.
+			if err := resolveMissingDeps(pkgName, masterProcessed, &masterMissingDeps); err != nil {
+				fmt.Fprintf(os.Stderr, "Error resolving dependencies for %s: %v\n", pkgName, err)
+				os.Exit(1)
+			}
+		}
+		packagesToBuildFromDeps = masterMissingDeps
 	}
 
-	// masterMissingDeps now contains the union of all missing packages (dependencies + targets) in reverse build order.
-	packagesToBuild := masterMissingDeps
 	var finalPackagesToBuild []string
 
 	// 3. BINARY CHECK AND USER PROMPT LOGIC (for all collected packages)
-	for _, depPkg := range packagesToBuild {
-		version, err := getRepoVersion(depPkg)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Fatal error: could not determine version for %s: %v\n", depPkg, err)
-			os.Exit(1)
-		}
-		tarballPath := filepath.Join(BinDir, fmt.Sprintf("%s-%s.tar.zst", depPkg, version))
+	// When --alldeps is set, skip binary check entirely and force build everything
+	if *allDeps {
+		// All packages will be built, no filtering needed
+		finalPackagesToBuild = packagesToBuildFromDeps
+	} else {
+		for _, depPkg := range packagesToBuildFromDeps {
+			version, err := getRepoVersion(depPkg)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Fatal error: could not determine version for %s: %v\n", depPkg, err)
+				os.Exit(1)
+			}
+			tarballPath := filepath.Join(BinDir, fmt.Sprintf("%s-%s.tar.zst", depPkg, version))
 
-		// Only consider using a binary if it is NOT one of the user-requested target packages
-		if !targetPackages[depPkg] {
-			if _, err := os.Stat(tarballPath); err == nil {
-				// Binary exists
-				fmt.Printf("Dependency '%s' is not installed, but a built binary (%s) is available.\n", depPkg, filepath.Base(tarballPath))
+			// Only consider using a binary if it is NOT one of the user-requested target packages
+			if !targetPackages[depPkg] {
+				if _, err := os.Stat(tarballPath); err == nil {
+					// Binary exists
+					fmt.Printf("Dependency '%s' is not installed, but a built binary (%s) is available.\n", depPkg, filepath.Base(tarballPath))
 
-				// PROMPT: Do you want to use the pre-built binary?
-				if !getUserConfirmation(fmt.Sprintf("Do you want to use the available binary package for dependency %s? (Y/n) ", depPkg)) {
-					fmt.Printf("User chose to build %s.\n", depPkg)
-					finalPackagesToBuild = append(finalPackagesToBuild, depPkg)
-				} else {
-					fmt.Printf("Using available binary for %s. Installing...\n", depPkg)
-					// Immediate install of dependency binary
-					isCriticalAtomic.Store(1)
-					if err := pkgInstall(tarballPath, depPkg, cfg, RootExec); err != nil {
+					// PROMPT: Do you want to use the pre-built binary?
+					if !getUserConfirmation(fmt.Sprintf("Do you want to use the available binary package for dependency %s? (Y/n) ", depPkg)) {
+						fmt.Printf("User chose to build %s.\n", depPkg)
+						finalPackagesToBuild = append(finalPackagesToBuild, depPkg)
+					} else {
+						fmt.Printf("Using available binary for %s. Installing...\n", depPkg)
+						// Check if package has dependencies to uninstall first
+						depsToUninstall := getPackageDependenciesToUninstall(depPkg)
+						if len(depsToUninstall) > 0 {
+							debugf("Package %s requires uninstalling dependencies: %v\n", depPkg, depsToUninstall)
+							for _, dep := range depsToUninstall {
+								debugf("Uninstalling %s...\n", dep)
+								if err := pkgUninstall(dep, cfg, RootExec, true, true); err != nil {
+									// Log warning but continue with installation
+									debugf("Warning: failed to uninstall %s: %v (continuing with installation)\n", dep, err)
+								} else {
+									debugf("%s uninstalled successfully.\n", dep)
+								}
+							}
+						}
+						// Immediate install of dependency binary
+						isCriticalAtomic.Store(1)
+						if err := pkgInstall(tarballPath, depPkg, cfg, RootExec); err != nil {
+							isCriticalAtomic.Store(0)
+							fmt.Fprintf(os.Stderr, "Fatal error installing binary %s: %v\n", depPkg, err)
+							os.Exit(1)
+						}
 						isCriticalAtomic.Store(0)
-						fmt.Fprintf(os.Stderr, "Fatal error installing binary %s: %v\n", depPkg, err)
-						os.Exit(1)
+						fmt.Printf("Dependency %s installed successfully from binary.\n", depPkg)
+						// This package is installed and won't be built, so skip adding to finalPackagesToBuild
 					}
-					isCriticalAtomic.Store(0)
-					fmt.Printf("Dependency %s installed successfully from binary.\n", depPkg)
-					// This package is installed and won't be built, so skip adding to finalPackagesToBuild
+				} else {
+					// No binary found, must build
+					finalPackagesToBuild = append(finalPackagesToBuild, depPkg)
 				}
 			} else {
-				// No binary found, must build
+				// User-requested target package that was also missing, always proceed to build
 				finalPackagesToBuild = append(finalPackagesToBuild, depPkg)
 			}
-		} else {
-			// User-requested target package, always proceed to build
-			finalPackagesToBuild = append(finalPackagesToBuild, depPkg)
 		}
 	}
 
 	// Update the final list of packages to actually build
-	packagesToBuild = finalPackagesToBuild
+	packagesToBuild := finalPackagesToBuild
 
-	// --- FINAL LIST CHECK AND SORTING ---
+	// --- NEW LOGIC START ---
+	// This block ensures that all packages the user explicitly requested are
+	// included in the final build list, forcing a rebuild if they are already installed.
 
-	// Check for the rebuild-only case for packages that were originally requested
-	if len(packagesToBuild) == 0 {
-		if len(masterMissingDeps) == 0 {
-			// If masterMissingDeps was initially empty, the user wants a rebuild of all targets
-			fmt.Printf("All packages and dependencies are already installed. Rebuilding target package(s).\n")
-			packagesToBuild = packagesToProcess // Set to the original requested list
-		} else {
-			// All required packages were installed from available binaries. Nothing left to do.
-			fmt.Printf("All required packages are installed (many from available binaries). No build needed.\n")
-			os.Exit(0)
+	// Skip this logic when --alldeps is active since all packages are already in the list
+	if !*allDeps {
+		// Create a quick lookup map of what's already in the build queue
+		// to prevent adding duplicates.
+		alreadyInBuildList := make(map[string]bool)
+		for _, pkg := range packagesToBuild {
+			alreadyInBuildList[pkg] = true
 		}
+
+		// Iterate through the original user request and add any target packages
+		// that aren't already in the build list.
+		for _, targetPkg := range packagesToProcess {
+			if !alreadyInBuildList[targetPkg] {
+				// This package was not "missing", but the user wants to rebuild it.
+				fmt.Printf("Package '%s' is already installed. Adding to queue for a forced rebuild.\n", targetPkg)
+				packagesToBuild = append(packagesToBuild, targetPkg)
+			}
+		}
+	}
+	// --- NEW LOGIC END ---
+
+	// --- FINAL LIST CHECK ---
+
+	// If after all dependency resolution and user requests, there's nothing to build, exit.
+	if len(packagesToBuild) == 0 {
+		fmt.Printf("All required packages are installed and no rebuild was requested. Nothing to do.\n")
+		os.Exit(0)
 	}
 
 	fmt.Printf("The following packages will be built in order: %s\n", strings.Join(packagesToBuild, ", "))
@@ -6075,10 +6408,25 @@ func handleBuildCommand(args []string, cfg *Config) {
 			os.Exit(1)
 		}
 
-		// --- STEP 3C: Install (Dependencies are installed immediately) ---
+		// --- STEP 3C: Install (Dependencies are installed immediately when --alldeps is set) ---
 		if !targetPackages[buildPkg] { // If it's *not* a target package (i.e., it's a dependency)
-			// Install dependencies immediately
+			// Install dependencies immediately (always auto-install when --alldeps is set)
 			isCriticalAtomic.Store(1)
+
+			// Check if dependency has dependencies to uninstall first
+			depsToUninstall := getPackageDependenciesToUninstall(buildPkg)
+			if len(depsToUninstall) > 0 {
+				debugf("Package %s requires uninstalling dependencies: %v\n", buildPkg, depsToUninstall)
+				for _, dep := range depsToUninstall {
+					debugf("Uninstalling %s...\n", dep)
+					if err := pkgUninstall(dep, cfg, RootExec, true, true); err != nil {
+						// Log warning but continue with installation
+						debugf("Warning: failed to uninstall %s: %v (continuing with installation)\n", dep, err)
+					} else {
+						debugf("%s uninstalled successfully.\n", dep)
+					}
+				}
+			}
 			if err := pkgInstall(tarballPath, buildPkg, cfg, RootExec); err != nil {
 				isCriticalAtomic.Store(0)
 				fmt.Fprintf(os.Stderr, "Fatal error installing dependency %s: %v\n", buildPkg, err)
@@ -6495,8 +6843,6 @@ func getPackageDependenciesToUninstall(name string) []string {
 		return []string{"10-diffutils"}
 	case "file":
 		return []string{"11-file"}
-	case "findutils":
-		return []string{"12-findutils"}
 	case "gawk":
 		return []string{"13-gawk"}
 	case "grep":
@@ -6532,7 +6878,7 @@ func printHelp() {
 		{"version, --version", "", "Show hokuto version"},
 		{"list, ls", "[pkg]", "List installed packages; optional partial name to filter"},
 		{"checksum, c", "<pkg>", "Fetch sources and verify/create checksums for a package"},
-		{"build, b", "[options] <pkg> [...]", "Build package(s). Options: -a (auto-install) -v (verbose) -i (idle) -ii (superidle)"},
+		{"build, b", "[options] <pkg> [...]", "Build package(s). Options: -a (auto-install) -v (verbose) -i (idle) -ii (superidle) --alldeps (build+install pkg deps)"},
 		{"install, i", "<tarball|pkg> [...]", "Install a built package tarball or named package"},
 		{"uninstall, r", "[options] <pkg> [...]", "Uninstall package(s). Options: -f (force) -y (yes)"},
 		{"update, u", "", "Update repository metadata and check for upgrades. Options: -v (verbose)"},
@@ -6716,26 +7062,38 @@ func main() {
 
 	case "checksum", "c":
 		force := false
-		pkg := ""
 
 		if len(os.Args) < 3 {
-			fmt.Println("Usage: hokuto checksum <pkgname> [-f]")
+			fmt.Println("Usage: hokuto checksum <pkg1> [<pkg2> ...] [-f]")
 			return
 		}
 
-		// Check for optional -f flag (must be the 3rd argument if it exists)
-		if len(os.Args) == 4 && os.Args[3] == "-f" {
+		// Collect args after the command
+		args := os.Args[2:]
+
+		// If last argument is -f, enable force and drop it from package list
+		if len(args) > 0 && args[len(args)-1] == "-f" {
 			force = true
-			pkg = os.Args[2]
-		} else if len(os.Args) == 3 {
-			pkg = os.Args[2]
-		} else {
-			fmt.Println("Usage: hokuto checksum <pkgname> [-f]")
+			args = args[:len(args)-1]
+		}
+
+		if len(args) == 0 {
+			fmt.Println("Usage: hokuto checksum <pkg1> [<pkg2> ...] [-f]")
 			return
 		}
 
-		if err := hokutoChecksum(pkg, force); err != nil {
-			fmt.Println("Error:", err)
+		// args now contains one or more package names
+		var overallErr error
+		for _, pkg := range args {
+			if err := hokutoChecksum(pkg, force); err != nil {
+				fmt.Printf("Error for %s: %v\n", pkg, err)
+				overallErr = err
+				// continue to process remaining packages
+			}
+		}
+
+		if overallErr != nil {
+			os.Exit(1)
 		}
 
 	case "build", "b":
