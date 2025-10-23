@@ -1107,160 +1107,151 @@ func hasB3sum() bool {
 	return err == nil
 }
 
+// verifyOrCreateChecksums checks source file integrity, prompting the user for action on mismatch.
 func verifyOrCreateChecksums(pkgName, pkgDir string, force bool) error {
 	pkgSrcDir := filepath.Join(SourcesDir, pkgName)
 	checksumFile := filepath.Join(pkgDir, "checksums")
 
+	// Create source directory if it doesn't exist
+	if err := os.MkdirAll(pkgSrcDir, 0755); err != nil {
+		return fmt.Errorf("failed to create package source directory: %v", err)
+	}
+
+	// Load existing checksums into a map for quick lookup
 	existing := make(map[string]string)
 	if f, err := os.Open(checksumFile); err == nil {
 		scanner := bufio.NewScanner(f)
 		for scanner.Scan() {
-			line := strings.TrimSpace(scanner.Text())
-			if line == "" {
-				continue
-			}
-			parts := strings.Fields(line)
+			parts := strings.Fields(strings.TrimSpace(scanner.Text()))
 			if len(parts) >= 2 {
-				existing[parts[1]] = parts[0]
-			} else {
-				existing["single"] = parts[0]
+				existing[parts[1]] = parts[0] // map[filename] = checksum
 			}
 		}
 		f.Close()
 	}
 
-	// Parse sources file
-	sourceLines, err := os.ReadFile(filepath.Join(pkgDir, "sources"))
+	// Parse the 'sources' file to know which files to check
+	sourceData, err := os.ReadFile(filepath.Join(pkgDir, "sources"))
 	if err != nil {
 		return fmt.Errorf("cannot read sources file: %v", err)
 	}
 
 	var expectedFiles []string
-	urlMap := make(map[string]string) // fname -> url
-	for _, line := range strings.Split(string(sourceLines), "\n") {
+	urlMap := make(map[string]string) // map[filename] -> url
+	for _, line := range strings.Split(string(sourceData), "\n") {
 		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		if strings.HasPrefix(line, "files/") || strings.HasPrefix(line, "git+") {
+		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, "files/") || strings.HasPrefix(line, "git+") {
 			continue
 		}
 		parts := strings.Fields(line)
-		if len(parts) == 0 {
-			continue
+		if len(parts) > 0 {
+			url := parts[0]
+			fname := filepath.Base(url)
+			expectedFiles = append(expectedFiles, fname)
+			urlMap[fname] = url
 		}
-		url := parts[0]
-		fname := filepath.Base(url)
-		expectedFiles = append(expectedFiles, fname)
-		urlMap[fname] = url
 	}
 
 	var summary []string
-	var updatedChecksums []string
+	var finalChecksums []string
 
 	for _, fname := range expectedFiles {
 		filePath := filepath.Join(pkgSrcDir, fname)
 		url := urlMap[fname]
 
-		hashValid := false
-		mismatch := false
-		skipped := false
+		currentSum, sumExists := existing[fname]
+		isHashValid := false
 
-		if force {
-			fmt.Printf("Force-redownloading and updating checksum for %s\n", fname)
-			mismatch = true
-		} else if oldSum, ok := existing[fname]; ok {
+		// 1. VERIFY: Check the hash if it exists and we aren't forcing a refresh.
+		if sumExists && !force {
+			// Prefer the external `b3sum` command if available.
 			if hasB3sum() {
 				cmd := exec.Command("b3sum", "-c")
-				cmd.Stdin = strings.NewReader(fmt.Sprintf("%s  %s\n", oldSum, filePath))
-				if err := cmd.Run(); err == nil {
-					hashValid = true
-				} else {
-					mismatch = true
+				cmd.Stdin = strings.NewReader(fmt.Sprintf("%s  %s\n", currentSum, filePath))
+				if cmd.Run() == nil {
+					isHashValid = true
 				}
 			} else {
+				// Fallback to internal blake3 calculation.
 				sum, err := blake3SumFile(filePath)
-				if err != nil {
-					return fmt.Errorf("failed to compute checksum: %v", err)
-				}
-				if sum == oldSum {
-					hashValid = true
-				} else {
-					mismatch = true
+				if err == nil && sum == currentSum {
+					isHashValid = true
 				}
 			}
 		}
 
-		if mismatch {
-			shouldRedownload := force
-			if !force {
-				fmt.Printf("Checksum mismatch for %s. Redownload and regenerate checksum? [y/N]: ", fname)
-				var response string
-				fmt.Scanln(&response)
-				if strings.ToLower(strings.TrimSpace(response)) == "y" {
-					shouldRedownload = true
-				}
+		// 2. DECIDE: If hash is valid, we're done with this file.
+		if isHashValid {
+			finalChecksums = append(finalChecksums, fmt.Sprintf("%s  %s", currentSum, fname))
+			summary = append(summary, fmt.Sprintf("%s: ok", fname))
+			continue
+		}
+
+		// 3. ACT: If we're here, the hash is invalid, missing, or we're in `force` mode.
+		// We must now decide whether to keep the local file or redownload it.
+		shouldRedownload := force
+		actionSummary := "updated"
+
+		if !force {
+			prompt := "Checksum mismatch for %s. (K)eep local file, (r)edownload file? [K/r]: "
+			if !sumExists {
+				prompt = "No checksum for %s. (K)eep local file, (r)edownload file? [K/r]: "
 			}
-
-			if shouldRedownload {
-				// stable cache key: hash only the URL
-				hashName := fmt.Sprintf("%s-%s", hashString(url), fname)
-				cachePath := filepath.Join(CacheStore, hashName)
-
-				_ = os.Remove(cachePath)
-				_ = os.Remove(filePath)
-
-				if err := downloadFile(url, cachePath); err != nil {
-					return fmt.Errorf("failed to redownload %s: %v", fname, err)
-				}
-
-				// always recreate symlink
-				_ = os.Remove(filePath)
-				if err := os.Symlink(cachePath, filePath); err != nil {
-					return fmt.Errorf("failed to symlink %s -> %s: %v", cachePath, filePath, err)
-				}
-
-				hashValid = false
-			} else {
-				fmt.Printf("Skipping update for %s\n", fname)
-				skipped = true
+			fmt.Printf(prompt, fname)
+			var response string
+			fmt.Scanln(&response)
+			if strings.ToLower(strings.TrimSpace(response)) == "r" {
+				shouldRedownload = true
 			}
 		}
 
-		if !hashValid {
-			if !skipped {
-				fmt.Printf("Updating checksum for %s\n", fname)
-				var sum string
-				if hasB3sum() {
-					cmd := exec.Command("b3sum", filePath)
-					out, err := cmd.Output()
-					if err != nil {
-						return fmt.Errorf("failed to compute checksum: %v", err)
-					}
-					sum = strings.Fields(string(out))[0]
-				} else {
-					sum, err = blake3SumFile(filePath)
-					if err != nil {
-						return fmt.Errorf("failed to compute checksum: %v", err)
-					}
-				}
-				updatedChecksums = append(updatedChecksums, fmt.Sprintf("%s  %s", sum, fname))
-				summary = append(summary, fmt.Sprintf("%s: updated", fname))
-			} else {
-				updatedChecksums = append(updatedChecksums, fmt.Sprintf("%s  %s", existing[fname], fname))
-				summary = append(summary, fmt.Sprintf("%s: mismatch (skipped)", fname))
+		if shouldRedownload {
+			fmt.Printf("Redownloading %s...\n", fname)
+			actionSummary = "redownloaded and updated"
+			hashName := fmt.Sprintf("%s-%s", hashString(url), fname)
+			cachePath := filepath.Join(CacheStore, hashName)
+
+			_ = os.Remove(cachePath)
+			_ = os.Remove(filePath)
+
+			if err := downloadFile(url, cachePath); err != nil {
+				return fmt.Errorf("failed to redownload %s: %v", fname, err)
+			}
+			// Recreate the symlink from the cache to the sources directory.
+			if err := os.Symlink(cachePath, filePath); err != nil {
+				return fmt.Errorf("failed to symlink %s -> %s: %v", cachePath, filePath, err)
 			}
 		} else {
-			updatedChecksums = append(updatedChecksums, fmt.Sprintf("%s  %s", existing[fname], fname))
-			summary = append(summary, fmt.Sprintf("%s: ok", fname))
+			fmt.Printf("Keeping existing local file for %s.\n", fname)
 		}
+
+		// 4. RECALCULATE: Generate the new checksum for the file now on disk.
+		fmt.Printf("Updating checksum for %s...\n", fname)
+		var newSum string
+		var calcErr error
+		if hasB3sum() {
+			out, err := exec.Command("b3sum", filePath).Output()
+			if err != nil {
+				return fmt.Errorf("b3sum failed for %s: %v", fname, err)
+			}
+			newSum = strings.Fields(string(out))[0]
+		} else {
+			newSum, calcErr = blake3SumFile(filePath)
+			if calcErr != nil {
+				return fmt.Errorf("failed to compute checksum for %s: %v", fname, calcErr)
+			}
+		}
+
+		finalChecksums = append(finalChecksums, fmt.Sprintf("%s  %s", newSum, fname))
+		summary = append(summary, fmt.Sprintf("%s: %s", fname, actionSummary))
 	}
 
-	if err := os.WriteFile(checksumFile, []byte(strings.Join(updatedChecksums, "\n")+"\n"), 0o644); err != nil {
+	// 5. FINALIZE: Write the new checksum file and print the summary report.
+	if err := os.WriteFile(checksumFile, []byte(strings.Join(finalChecksums, "\n")+"\n"), 0644); err != nil {
 		return fmt.Errorf("failed to write checksums file: %v", err)
 	}
 
-	fmt.Printf("Checksums summary for %s:\n", pkgName)
+	fmt.Printf("\nChecksums summary for %s:\n", pkgName)
 	for _, s := range summary {
 		fmt.Println(" -", s)
 	}
@@ -5809,6 +5800,349 @@ func pkgUninstall(pkgName string, cfg *Config, execCtx *Executor, force, yes boo
 	return nil
 }
 
+// handleBuildCommand encapsulates all the logic for the "build" command.
+// It accepts command-line arguments as a slice of strings.
+func handleBuildCommand(args []string, cfg *Config) {
+	// 1. Initialize a FlagSet for the "build" subcommand
+	buildCmd := flag.NewFlagSet("build", flag.ExitOnError)
+	var autoInstall = buildCmd.Bool("a", false, "Automatically install the package(s) after successful build without prompting.")
+	var idleBuild = buildCmd.Bool("i", false, "Use half cpu cores and lowest niceness for build process.")
+	var superidleBuild = buildCmd.Bool("ii", false, "Use one cpu core and lowest niceness for build process.")
+	var verbose = buildCmd.Bool("v", false, "Enable verbose output (show build process output).")
+	var verboseLong = buildCmd.Bool("verbose", false, "Enable verbose output (show build process output).")
+	var bootstrap = buildCmd.Bool("bootstrap", false, "Enable bootstrap build mode")
+	var bootstrapDir = buildCmd.String("bootstrap-dir", "", "Specify the bootstrap directory (used with --bootstrap)")
+
+	// Parse the arguments specific to the "build" subcommand
+	if err := buildCmd.Parse(args); err != nil {
+		fmt.Fprintf(os.Stderr, "Error parsing build flags: %v\n", err)
+		os.Exit(1)
+	}
+	// Set the global variables based on the parsed flags
+	// Determine the build priority. Super idle takes precedence over idle.
+
+	if *superidleBuild {
+		buildPriority = "superidle"
+	} else if *idleBuild {
+		buildPriority = "idle"
+	} else {
+		buildPriority = "normal"
+	}
+	Verbose = *verbose || *verboseLong
+
+	// Handle bootstrap logic
+	if *bootstrap {
+		if *bootstrapDir == "" {
+			fmt.Fprintln(os.Stderr, "Error: --bootstrap requires --bootstrap-dir to be specified")
+			os.Exit(1)
+		}
+		if cfg.Values == nil {
+			cfg.Values = make(map[string]string)
+		}
+		cfg.Values["LFS"] = *bootstrapDir
+	}
+
+	// The positional arguments (package names) are now in buildCmd.Args()
+	packagesToProcess := buildCmd.Args()
+	if len(packagesToProcess) < 1 {
+		fmt.Println("Usage: hokuto build [options] <package> [package...]")
+		fmt.Println("Options:")
+		buildCmd.PrintDefaults()
+		os.Exit(1)
+	}
+
+	// Set to non-critical (0 is default, but good to be explicit)
+	isCriticalAtomic.Store(0)
+
+	// --- CONDITIONAL OVERRIDE FOR HOKUTO_ROOT ---
+	if *bootstrap {
+
+		// 1. Get the LFS root path
+		lfsRoot := cfg.Values["LFS"]
+		if lfsRoot == "" {
+			log.Fatalf("bootstrap mode requires LFS to be set in config")
+		}
+
+		// 2. Override HOKUTO_ROOT and cachedir
+		cfg.Values["HOKUTO_ROOT"] = lfsRoot
+		cfg.Values["HOKUTO_CACHE_DIR"] = filepath.Join(lfsRoot, "var/cache/hokuto")
+
+		// 1. Check for existing /repo/bootstrap
+		if fi, err := os.Stat("/repo/bootstrap"); err == nil && fi.IsDir() {
+			// Use pre-existing /repo/bootstrap
+			cfg.Values["HOKUTO_PATH"] = "/repo/bootstrap"
+			log.Printf("Using existing bootstrap repo at /repo/bootstrap")
+		} else {
+			// 2. Check for existing /tmp/repo/bootstrap
+			if fi, err := os.Stat("/tmp/repo/bootstrap"); err == nil && fi.IsDir() {
+				cfg.Values["HOKUTO_PATH"] = "/tmp/repo/bootstrap"
+				log.Printf("Using existing bootstrap repo at /tmp/repo/bootstrap")
+			} else {
+				// Need to download and unpack into /tmp/repo
+				url := "https://github.com/sauzeros/bootstrap/releases/download/latest/bootstrap-repo.tar.xz"
+				tmpFile := filepath.Join(os.TempDir(), "bootstrap-repo.tar.xz")
+
+				log.Printf("Downloading bootstrap repo from %s ...", url)
+				resp, err := http.Get(url)
+				if err != nil {
+					log.Fatalf("failed to download bootstrap repo: %v", err)
+				}
+				defer resp.Body.Close()
+
+				out, err := os.Create(tmpFile)
+				if err != nil {
+					log.Fatalf("failed to create temp file: %v", err)
+				}
+				if _, err := io.Copy(out, resp.Body); err != nil {
+					out.Close()
+					log.Fatalf("failed to save bootstrap archive: %v", err)
+				}
+				out.Close()
+
+				// Unpack into /tmp/repo
+				log.Printf("Unpacking bootstrap repo into /tmp/repo ...")
+
+				extractDir := filepath.Join(os.TempDir(), "repo")
+				if err := os.MkdirAll(extractDir, 0o755); err != nil {
+					log.Fatalf("failed to create extract dir %s: %v", extractDir, err)
+				}
+
+				f, err := os.Open(tmpFile)
+				if err != nil {
+					log.Fatalf("failed to open downloaded archive: %v", err)
+				}
+				defer f.Close()
+
+				xzr, err := xz.NewReader(f)
+				if err != nil {
+					log.Fatalf("failed to create xz reader: %v", err)
+				}
+
+				tr := tar.NewReader(xzr)
+				for {
+					hdr, err := tr.Next()
+					if err == io.EOF {
+						break
+					}
+					if err != nil {
+						log.Fatalf("error reading tar: %v", err)
+					}
+
+					target := filepath.Join(extractDir, hdr.Name)
+
+					switch hdr.Typeflag {
+					case tar.TypeDir:
+						if err := os.MkdirAll(target, os.FileMode(hdr.Mode)); err != nil {
+							log.Fatalf("failed to create dir %s: %v", target, err)
+						}
+					case tar.TypeReg:
+						if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+							log.Fatalf("failed to create parent dir: %v", err)
+						}
+						outFile, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, os.FileMode(hdr.Mode))
+						if err != nil {
+							log.Fatalf("failed to create file %s: %v", target, err)
+						}
+						if _, err := io.Copy(outFile, tr); err != nil {
+							outFile.Close()
+							log.Fatalf("failed to write file %s: %v", target, err)
+						}
+						outFile.Close()
+					case tar.TypeSymlink:
+						if err := os.Symlink(hdr.Linkname, target); err != nil && !os.IsExist(err) {
+							log.Fatalf("failed to create symlink %s -> %s: %v", target, hdr.Linkname, err)
+						}
+					}
+				}
+
+				log.Printf("Bootstrap repo unpacked successfully into /tmp/repo")
+				cfg.Values["HOKUTO_PATH"] = "/tmp/repo/bootstrap"
+			}
+		}
+	}
+	// Call initConfig with the possibly modified config
+	initConfig(cfg)
+
+	// --- GLOBAL DEPENDENCY RESOLUTION & BINARY CHECK ---
+
+	// masterMissingDeps will hold all unique packages needed across all requested builds (in reverse build order)
+	var masterMissingDeps []string
+	// masterProcessed tracks all dependencies across all packages to avoid duplicates and loops
+	masterProcessed := make(map[string]bool)
+
+	// Track which packages the user explicitly requested (to defer final install)
+	targetPackages := make(map[string]bool)
+	for _, pkg := range packagesToProcess {
+		targetPackages[pkg] = true
+	}
+
+	// 2. Resolve dependencies for ALL requested packages
+	for _, pkgName := range packagesToProcess {
+		fmt.Printf("Resolving dependencies for target package %s...\n", pkgName)
+
+		// NOTE: resolveMissingDeps must be able to handle being called multiple times
+		// and update masterProcessed and masterMissingDeps correctly, acting like a global resolver.
+		if err := resolveMissingDeps(pkgName, masterProcessed, &masterMissingDeps); err != nil {
+			fmt.Fprintf(os.Stderr, "Error resolving dependencies for %s: %v\n", pkgName, err)
+			os.Exit(1)
+		}
+	}
+
+	// masterMissingDeps now contains the union of all missing packages (dependencies + targets) in reverse build order.
+	packagesToBuild := masterMissingDeps
+	var finalPackagesToBuild []string
+
+	// 3. BINARY CHECK AND USER PROMPT LOGIC (for all collected packages)
+	for _, depPkg := range packagesToBuild {
+		version, err := getRepoVersion(depPkg)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Fatal error: could not determine version for %s: %v\n", depPkg, err)
+			os.Exit(1)
+		}
+		tarballPath := filepath.Join(BinDir, fmt.Sprintf("%s-%s.tar.zst", depPkg, version))
+
+		// Only consider using a binary if it is NOT one of the user-requested target packages
+		if !targetPackages[depPkg] {
+			if _, err := os.Stat(tarballPath); err == nil {
+				// Binary exists
+				fmt.Printf("Dependency '%s' is not installed, but a built binary (%s) is available.\n", depPkg, filepath.Base(tarballPath))
+
+				// PROMPT: Do you want to use the pre-built binary?
+				if !getUserConfirmation(fmt.Sprintf("Do you want to use the available binary package for dependency %s? (Y/n) ", depPkg)) {
+					fmt.Printf("User chose to build %s.\n", depPkg)
+					finalPackagesToBuild = append(finalPackagesToBuild, depPkg)
+				} else {
+					fmt.Printf("Using available binary for %s. Installing...\n", depPkg)
+					// Immediate install of dependency binary
+					isCriticalAtomic.Store(1)
+					if err := pkgInstall(tarballPath, depPkg, cfg, RootExec); err != nil {
+						isCriticalAtomic.Store(0)
+						fmt.Fprintf(os.Stderr, "Fatal error installing binary %s: %v\n", depPkg, err)
+						os.Exit(1)
+					}
+					isCriticalAtomic.Store(0)
+					fmt.Printf("Dependency %s installed successfully from binary.\n", depPkg)
+					// This package is installed and won't be built, so skip adding to finalPackagesToBuild
+				}
+			} else {
+				// No binary found, must build
+				finalPackagesToBuild = append(finalPackagesToBuild, depPkg)
+			}
+		} else {
+			// User-requested target package, always proceed to build
+			finalPackagesToBuild = append(finalPackagesToBuild, depPkg)
+		}
+	}
+
+	// Update the final list of packages to actually build
+	packagesToBuild = finalPackagesToBuild
+
+	// --- FINAL LIST CHECK AND SORTING ---
+
+	// Check for the rebuild-only case for packages that were originally requested
+	if len(packagesToBuild) == 0 {
+		if len(masterMissingDeps) == 0 {
+			// If masterMissingDeps was initially empty, the user wants a rebuild of all targets
+			fmt.Printf("All packages and dependencies are already installed. Rebuilding target package(s).\n")
+			packagesToBuild = packagesToProcess // Set to the original requested list
+		} else {
+			// All required packages were installed from available binaries. Nothing left to do.
+			fmt.Printf("All required packages are installed (many from available binaries). No build needed.\n")
+			os.Exit(0)
+		}
+	}
+
+	fmt.Printf("The following packages will be built in order: %s\n", strings.Join(packagesToBuild, ", "))
+	// If idle priority is set, inform the user
+	if setIdlePriority {
+		cPrintf(colWarn, "NOTE: Build process niceness set to IDLE (nice -n 19).\n")
+	}
+
+	// --- EXECUTION OF BUILD LOOP ---
+	var builtTargetPackages []string // Track the target packages that were successfully built
+	for _, buildPkg := range packagesToBuild {
+		// ... (Steps 3A, 3B - Get Version, Build) ...
+		version, err := getRepoVersion(buildPkg)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Fatal error: could not determine version for %s: %v\n", buildPkg, err)
+			os.Exit(1)
+		}
+		tarballPath := filepath.Join(BinDir, fmt.Sprintf("%s-%s.tar.zst", buildPkg, version))
+
+		fmt.Printf("--- Starting Build: %s (%s) ---\n", buildPkg, version)
+		if err := pkgBuild(buildPkg, cfg, UserExec, *bootstrap); err != nil {
+			fmt.Fprintf(os.Stderr, "Fatal error building %s: %v\n", buildPkg, err)
+			os.Exit(1)
+		}
+
+		// --- STEP 3C: Install (Dependencies are installed immediately) ---
+		if !targetPackages[buildPkg] { // If it's *not* a target package (i.e., it's a dependency)
+			// Install dependencies immediately
+			isCriticalAtomic.Store(1)
+			if err := pkgInstall(tarballPath, buildPkg, cfg, RootExec); err != nil {
+				isCriticalAtomic.Store(0)
+				fmt.Fprintf(os.Stderr, "Fatal error installing dependency %s: %v\n", buildPkg, err)
+				os.Exit(1)
+			}
+			isCriticalAtomic.Store(0)
+			fmt.Printf("Dependency %s installed successfully.\n", buildPkg)
+		} else {
+			// If it's a target package, defer install and save its name
+			builtTargetPackages = append(builtTargetPackages, buildPkg)
+			debugf("Target package %s built successfully. Installation deferred.\n", buildPkg)
+		}
+	}
+
+	// --- FINAL INSTALL PROMPT ---
+	if len(builtTargetPackages) > 0 {
+		// Note: The prompt/auto-install applies to ALL built target packages
+		shouldInstall := *autoInstall
+		if !shouldInstall {
+			// Prompt user once for all built target packages
+			targetsList := strings.Join(builtTargetPackages, ", ")
+			shouldInstall = getUserConfirmation(fmt.Sprintf("Build finished. Do you want to install the following package(s): %s? (Y/n) ", targetsList))
+		}
+
+		if shouldInstall {
+			// Loop and install all successfully built target packages
+			for _, finalPkg := range builtTargetPackages {
+				version, _ := getRepoVersion(finalPkg) // Re-get version (should not fail)
+				tarballPath := filepath.Join(BinDir, fmt.Sprintf("%s-%s.tar.zst", finalPkg, version))
+
+				// Check if package has dependencies to uninstall first
+				depsToUninstall := getPackageDependenciesToUninstall(finalPkg)
+				if len(depsToUninstall) > 0 {
+					debugf("Package %s requires uninstalling dependencies: %v\n", finalPkg, depsToUninstall)
+					for _, dep := range depsToUninstall {
+						debugf("Uninstalling %s...\n", dep)
+						if err := pkgUninstall(dep, cfg, RootExec, true, true); err != nil {
+							// Log warning but continue with installation
+							debugf("Warning: failed to uninstall %s: %v (continuing with installation)\n", dep, err)
+						} else {
+							debugf("%s uninstalled successfully.\n", dep)
+						}
+					}
+				}
+
+				cPrintf(colInfo, "Starting installation of target package %s...\n", finalPkg)
+				isCriticalAtomic.Store(1)
+				if err := pkgInstall(tarballPath, finalPkg, cfg, RootExec); err != nil {
+					isCriticalAtomic.Store(0)
+					fmt.Fprintf(os.Stderr, "Fatal error installing final package %s: %v\n", finalPkg, err)
+					os.Exit(1)
+				}
+				isCriticalAtomic.Store(0)
+				cPrintf(colSuccess, "Package %s installed successfully.\n", finalPkg)
+			}
+		} else {
+			fmt.Printf("Installation of target packages skipped by user. Built packages remain in %s.\n", BinDir)
+		}
+	}
+
+	// Clean up or exit after a successful run
+	os.Exit(0)
+}
+
 // executeMountCommand accepts the FULL destination path (e.g., /var/tmp/lfs/dev/tty)
 func (e *Executor) executeMountCommand(source, dest, fsType, options string, isBind bool) error {
 	args := []string{}
@@ -6198,7 +6532,7 @@ func printHelp() {
 		{"version, --version", "", "Show hokuto version"},
 		{"list, ls", "[pkg]", "List installed packages; optional partial name to filter"},
 		{"checksum, c", "<pkg>", "Fetch sources and verify/create checksums for a package"},
-		{"build, b", "[options] <pkg> [...]", "Build package(s). Options: -a (auto-install) -v (verbose) -i (idle) -ii (superidle) --bootstrap <dir"},
+		{"build, b", "[options] <pkg> [...]", "Build package(s). Options: -a (auto-install) -v (verbose) -i (idle) -ii (superidle)"},
 		{"install, i", "<tarball|pkg> [...]", "Install a built package tarball or named package"},
 		{"uninstall, r", "[options] <pkg> [...]", "Uninstall package(s). Options: -f (force) -y (yes)"},
 		{"update, u", "", "Update repository metadata and check for upgrades. Options: -v (verbose)"},
@@ -6206,6 +6540,7 @@ func printHelp() {
 		{"find, f", "<string>", "Search all manifests for a path containing the string"},
 		{"new, n", "<string>", "Create a new package "},
 		{"edit, e", "<string>", "Edit a package"},
+		{"bootstrap", "<targetdir>", "Build a minimal sauzeros rootfs"},
 		{"chroot", "<targetdir> [command...]", "Enter chroot environment at targetdir; runs /bin/bash by default"},
 	}
 
@@ -6404,339 +6739,31 @@ func main() {
 		}
 
 	case "build", "b":
-		// 1. Initialize a FlagSet for the "build" subcommand
-		buildCmd := flag.NewFlagSet("build", flag.ExitOnError)
-		var autoInstall = buildCmd.Bool("a", false, "Automatically install the package(s) after successful build without prompting.")
-		var idleBuild = buildCmd.Bool("i", false, "Use half cpu cores and lowest niceness for build process.")
-		var superidleBuild = buildCmd.Bool("ii", false, "Use one cpu core and lowest niceness for build process.")
-		var verbose = buildCmd.Bool("v", false, "Enable verbose output (show build process output).")
-		var verboseLong = buildCmd.Bool("verbose", false, "Enable verbose output (show build process output).")
-		var bootstrap = buildCmd.Bool("bootstrap", false, "Enable bootstrap build mode")
-		var bootstrapDir = buildCmd.String("bootstrap-dir", "", "Specify the bootstrap directory (used with --bootstrap)")
-		// Parse the arguments specific to the "build" subcommand,
-		// starting from os.Args[2] (i.e., skipping "hokuto" and "build")
-		if err := buildCmd.Parse(os.Args[2:]); err != nil {
-			fmt.Fprintf(os.Stderr, "Error parsing build flags: %v\n", err)
+		handleBuildCommand(os.Args[2:], cfg)
+
+	case "bootstrap":
+		// 1. Verify that the bootstrap directory is provided.
+		if len(os.Args) < 3 {
+			fmt.Fprintln(os.Stderr, "Usage: hokuto bootstrap <bootstrap-dir>")
+			fmt.Fprintln(os.Stderr, "Error: Missing required argument: <bootstrap-dir>")
 			os.Exit(1)
 		}
-		// Set the global variables based on the parsed flags
-		// Determine the build priority. Super idle takes precedence over idle.
+		bootstrapDirArg := os.Args[2]
 
-		if *superidleBuild {
-			buildPriority = "superidle"
-		} else if *idleBuild {
-			buildPriority = "idle"
-		} else {
-			buildPriority = "normal"
-		}
-		Verbose = *verbose || *verboseLong
-
-		// Handle bootstrap logic
-		if *bootstrap {
-			if *bootstrapDir == "" {
-				fmt.Fprintln(os.Stderr, "Error: --bootstrap requires --bootstrap-dir to be specified")
-				os.Exit(1)
-			}
-			if cfg.Values == nil {
-				cfg.Values = make(map[string]string)
-			}
-			cfg.Values["LFS"] = *bootstrapDir
+		// 2. Construct the arguments to pass to the build handler.
+		// This effectively translates `hokuto bootstrap /mnt/lfs` into
+		// `hokuto build --bootstrap --bootstrap-dir /mnt/lfs bootstrap`.
+		buildArgs := []string{
+			"--bootstrap",
+			"--bootstrap-dir",
+			bootstrapDirArg,
+			"bootstrap", // The specific package to build in bootstrap mode.
 		}
 
-		// The positional arguments (package names) are now in buildCmd.Args()
-		packagesToProcess := buildCmd.Args()
-		if len(packagesToProcess) < 1 {
-			fmt.Println("Usage: hokuto build [options] <package> [package...]")
-			fmt.Println("Options:")
-			buildCmd.PrintDefaults()
-			os.Exit(1)
-		}
+		fmt.Printf("Starting bootstrap process in directory: %s\n", bootstrapDirArg)
 
-		// Set to non-critical (0 is default, but good to be explicit)
-		isCriticalAtomic.Store(0)
-
-		// --- CONDITIONAL OVERRIDE FOR HOKUTO_ROOT ---
-		if *bootstrap {
-
-			// 1. Get the LFS root path
-			lfsRoot := cfg.Values["LFS"]
-			if lfsRoot == "" {
-				log.Fatalf("bootstrap mode requires LFS to be set in config")
-			}
-
-			// 2. Override HOKUTO_ROOT and cachedir
-			cfg.Values["HOKUTO_ROOT"] = lfsRoot
-			cfg.Values["HOKUTO_CACHE_DIR"] = filepath.Join(lfsRoot, "var/cache/hokuto")
-
-			// 1. Check for existing /repo/bootstrap
-			if fi, err := os.Stat("/repo/bootstrap"); err == nil && fi.IsDir() {
-				// Use pre-existing /repo/bootstrap
-				cfg.Values["HOKUTO_PATH"] = "/repo/bootstrap"
-				log.Printf("Using existing bootstrap repo at /repo/bootstrap")
-			} else {
-				// 2. Check for existing /tmp/repo/bootstrap
-				if fi, err := os.Stat("/tmp/repo/bootstrap"); err == nil && fi.IsDir() {
-					cfg.Values["HOKUTO_PATH"] = "/tmp/repo/bootstrap"
-					log.Printf("Using existing bootstrap repo at /tmp/repo/bootstrap")
-				} else {
-					// Need to download and unpack into /tmp/repo
-					url := "https://github.com/sauzeros/bootstrap/releases/download/latest/bootstrap-repo.tar.xz"
-					tmpFile := filepath.Join(os.TempDir(), "bootstrap-repo.tar.xz")
-
-					log.Printf("Downloading bootstrap repo from %s ...", url)
-					resp, err := http.Get(url)
-					if err != nil {
-						log.Fatalf("failed to download bootstrap repo: %v", err)
-					}
-					defer resp.Body.Close()
-
-					out, err := os.Create(tmpFile)
-					if err != nil {
-						log.Fatalf("failed to create temp file: %v", err)
-					}
-					if _, err := io.Copy(out, resp.Body); err != nil {
-						out.Close()
-						log.Fatalf("failed to save bootstrap archive: %v", err)
-					}
-					out.Close()
-
-					// Unpack into /tmp
-					log.Printf("Unpacking bootstrap repo into /tmp ...")
-					f, err := os.Open(tmpFile)
-					if err != nil {
-						log.Fatalf("failed to open downloaded archive: %v", err)
-					}
-					defer f.Close()
-
-					xzr, err := xz.NewReader(f)
-					if err != nil {
-						log.Fatalf("failed to create xz reader: %v", err)
-					}
-
-					tr := tar.NewReader(xzr)
-					for {
-						hdr, err := tr.Next()
-						if err == io.EOF {
-							break
-						}
-						if err != nil {
-							log.Fatalf("error reading tar: %v", err)
-						}
-
-						target := filepath.Join(os.TempDir(), hdr.Name)
-						switch hdr.Typeflag {
-						case tar.TypeDir:
-							if err := os.MkdirAll(target, os.FileMode(hdr.Mode)); err != nil {
-								log.Fatalf("failed to create dir %s: %v", target, err)
-							}
-						case tar.TypeReg:
-							if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
-								log.Fatalf("failed to create parent dir: %v", err)
-							}
-							outFile, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, os.FileMode(hdr.Mode))
-							if err != nil {
-								log.Fatalf("failed to create file %s: %v", target, err)
-							}
-							if _, err := io.Copy(outFile, tr); err != nil {
-								outFile.Close()
-								log.Fatalf("failed to write file %s: %v", target, err)
-							}
-							outFile.Close()
-						case tar.TypeSymlink:
-							if err := os.Symlink(hdr.Linkname, target); err != nil && !os.IsExist(err) {
-								log.Fatalf("failed to create symlink %s -> %s: %v", target, hdr.Linkname, err)
-							}
-						default:
-							// skip other types
-						}
-					}
-
-					log.Printf("Bootstrap repo unpacked successfully into /tmp")
-					cfg.Values["HOKUTO_PATH"] = "/tmp/bootstrap"
-				}
-			}
-		}
-		// Call initConfig with the possibly modified config
-		initConfig(cfg)
-
-		// --- GLOBAL DEPENDENCY RESOLUTION & BINARY CHECK ---
-
-		// masterMissingDeps will hold all unique packages needed across all requested builds (in reverse build order)
-		var masterMissingDeps []string
-		// masterProcessed tracks all dependencies across all packages to avoid duplicates and loops
-		masterProcessed := make(map[string]bool)
-
-		// Track which packages the user explicitly requested (to defer final install)
-		targetPackages := make(map[string]bool)
-		for _, pkg := range packagesToProcess {
-			targetPackages[pkg] = true
-		}
-
-		// 2. Resolve dependencies for ALL requested packages
-		for _, pkgName := range packagesToProcess {
-			fmt.Printf("Resolving dependencies for target package %s...\n", pkgName)
-
-			// NOTE: resolveMissingDeps must be able to handle being called multiple times
-			// and update masterProcessed and masterMissingDeps correctly, acting like a global resolver.
-			if err := resolveMissingDeps(pkgName, masterProcessed, &masterMissingDeps); err != nil {
-				fmt.Fprintf(os.Stderr, "Error resolving dependencies for %s: %v\n", pkgName, err)
-				os.Exit(1)
-			}
-		}
-
-		// masterMissingDeps now contains the union of all missing packages (dependencies + targets) in reverse build order.
-		packagesToBuild := masterMissingDeps
-		var finalPackagesToBuild []string
-
-		// 3. BINARY CHECK AND USER PROMPT LOGIC (for all collected packages)
-		for _, depPkg := range packagesToBuild {
-			version, err := getRepoVersion(depPkg)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Fatal error: could not determine version for %s: %v\n", depPkg, err)
-				os.Exit(1)
-			}
-			tarballPath := filepath.Join(BinDir, fmt.Sprintf("%s-%s.tar.zst", depPkg, version))
-
-			// Only consider using a binary if it is NOT one of the user-requested target packages
-			if !targetPackages[depPkg] {
-				if _, err := os.Stat(tarballPath); err == nil {
-					// Binary exists
-					fmt.Printf("Dependency '%s' is not installed, but a built binary (%s) is available.\n", depPkg, filepath.Base(tarballPath))
-
-					// PROMPT: Do you want to use the pre-built binary?
-					if !getUserConfirmation(fmt.Sprintf("Do you want to use the available binary package for dependency %s? (Y/n) ", depPkg)) {
-						fmt.Printf("User chose to build %s.\n", depPkg)
-						finalPackagesToBuild = append(finalPackagesToBuild, depPkg)
-					} else {
-						fmt.Printf("Using available binary for %s. Installing...\n", depPkg)
-						// Immediate install of dependency binary
-						isCriticalAtomic.Store(1)
-						if err := pkgInstall(tarballPath, depPkg, cfg, RootExec); err != nil {
-							isCriticalAtomic.Store(0)
-							fmt.Fprintf(os.Stderr, "Fatal error installing binary %s: %v\n", depPkg, err)
-							os.Exit(1)
-						}
-						isCriticalAtomic.Store(0)
-						fmt.Printf("Dependency %s installed successfully from binary.\n", depPkg)
-						// This package is installed and won't be built, so skip adding to finalPackagesToBuild
-					}
-				} else {
-					// No binary found, must build
-					finalPackagesToBuild = append(finalPackagesToBuild, depPkg)
-				}
-			} else {
-				// User-requested target package, always proceed to build
-				finalPackagesToBuild = append(finalPackagesToBuild, depPkg)
-			}
-		}
-
-		// Update the final list of packages to actually build
-		packagesToBuild = finalPackagesToBuild
-
-		// --- FINAL LIST CHECK AND SORTING ---
-
-		// Check for the rebuild-only case for packages that were originally requested
-		if len(packagesToBuild) == 0 {
-			if len(masterMissingDeps) == 0 {
-				// If masterMissingDeps was initially empty, the user wants a rebuild of all targets
-				fmt.Printf("All packages and dependencies are already installed. Rebuilding target package(s).\n")
-				packagesToBuild = packagesToProcess // Set to the original requested list
-			} else {
-				// All required packages were installed from available binaries. Nothing left to do.
-				fmt.Printf("All required packages are installed (many from available binaries). No build needed.\n")
-				os.Exit(0)
-			}
-		}
-
-		fmt.Printf("The following packages will be built in order: %s\n", strings.Join(packagesToBuild, ", "))
-		// If idle priority is set, inform the user
-		if setIdlePriority {
-			cPrintf(colWarn, "NOTE: Build process niceness set to IDLE (nice -n 19).\n")
-		}
-
-		// --- EXECUTION OF BUILD LOOP ---
-		var builtTargetPackages []string // Track the target packages that were successfully built
-		for _, buildPkg := range packagesToBuild {
-			// ... (Steps 3A, 3B - Get Version, Build) ...
-			version, err := getRepoVersion(buildPkg)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Fatal error: could not determine version for %s: %v\n", buildPkg, err)
-				os.Exit(1)
-			}
-			tarballPath := filepath.Join(BinDir, fmt.Sprintf("%s-%s.tar.zst", buildPkg, version))
-
-			fmt.Printf("--- Starting Build: %s (%s) ---\n", buildPkg, version)
-			if err := pkgBuild(buildPkg, cfg, UserExec, *bootstrap); err != nil {
-				fmt.Fprintf(os.Stderr, "Fatal error building %s: %v\n", buildPkg, err)
-				os.Exit(1)
-			}
-
-			// --- STEP 3C: Install (Dependencies are installed immediately) ---
-			if !targetPackages[buildPkg] { // If it's *not* a target package (i.e., it's a dependency)
-				// Install dependencies immediately
-				isCriticalAtomic.Store(1)
-				if err := pkgInstall(tarballPath, buildPkg, cfg, RootExec); err != nil {
-					isCriticalAtomic.Store(0)
-					fmt.Fprintf(os.Stderr, "Fatal error installing dependency %s: %v\n", buildPkg, err)
-					os.Exit(1)
-				}
-				isCriticalAtomic.Store(0)
-				fmt.Printf("Dependency %s installed successfully.\n", buildPkg)
-			} else {
-				// If it's a target package, defer install and save its name
-				builtTargetPackages = append(builtTargetPackages, buildPkg)
-				debugf("Target package %s built successfully. Installation deferred.\n", buildPkg)
-			}
-		}
-
-		// --- FINAL INSTALL PROMPT ---
-		if len(builtTargetPackages) > 0 {
-			// Note: The prompt/auto-install applies to ALL built target packages
-			shouldInstall := *autoInstall
-			if !shouldInstall {
-				// Prompt user once for all built target packages
-				targetsList := strings.Join(builtTargetPackages, ", ")
-				shouldInstall = getUserConfirmation(fmt.Sprintf("Build finished. Do you want to install the following package(s): %s? (Y/n) ", targetsList))
-			}
-
-			if shouldInstall {
-				// Loop and install all successfully built target packages
-				for _, finalPkg := range builtTargetPackages {
-					version, _ := getRepoVersion(finalPkg) // Re-get version (should not fail)
-					tarballPath := filepath.Join(BinDir, fmt.Sprintf("%s-%s.tar.zst", finalPkg, version))
-
-					// Check if package has dependencies to uninstall first
-					depsToUninstall := getPackageDependenciesToUninstall(finalPkg)
-					if len(depsToUninstall) > 0 {
-						debugf("Package %s requires uninstalling dependencies: %v\n", finalPkg, depsToUninstall)
-						for _, dep := range depsToUninstall {
-							debugf("Uninstalling %s...\n", dep)
-							if err := pkgUninstall(dep, cfg, RootExec, true, true); err != nil {
-								// Log warning but continue with installation
-								debugf("Warning: failed to uninstall %s: %v (continuing with installation)\n", dep, err)
-							} else {
-								debugf("%s uninstalled successfully.\n", dep)
-							}
-						}
-					}
-
-					cPrintf(colInfo, "Starting installation of target package %s...\n", finalPkg)
-					isCriticalAtomic.Store(1)
-					if err := pkgInstall(tarballPath, finalPkg, cfg, RootExec); err != nil {
-						isCriticalAtomic.Store(0)
-						fmt.Fprintf(os.Stderr, "Fatal error installing final package %s: %v\n", finalPkg, err)
-						os.Exit(1)
-					}
-					isCriticalAtomic.Store(0)
-					cPrintf(colSuccess, "Package %s installed successfully.\n", finalPkg)
-				}
-			} else {
-				fmt.Printf("Installation of target packages skipped by user. Built packages remain in %s.\n", BinDir)
-			}
-		}
-
-		// Clean up or exit after a successful run
-		os.Exit(0)
+		// 3. Call the generic build handler with the constructed arguments.
+		handleBuildCommand(buildArgs, cfg)
 
 	case "install", "i":
 		// Get all arguments after "hokuto" and "install"
