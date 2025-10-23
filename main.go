@@ -237,6 +237,7 @@ func needsRootPrivileges(args []string) bool {
 	rootCommands := map[string]bool{
 		"build":     true,
 		"b":         true,
+		"bootstrap": true,
 		"install":   true,
 		"i":         true,
 		"uninstall": true,
@@ -877,7 +878,7 @@ func downloadFile(url, destFile string) error {
 
 	// --- Fallback 1: Try aria2c ---
 	if _, err := exec.LookPath("aria2c"); err == nil {
-		cmd := exec.Command("aria2c", "-x", "4", "-s", "4", "-d", CacheStore, "-o", destFile, url)
+		cmd := exec.Command("aria2c", "-d", CacheStore, "-o", destFile, url)
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
 		if err := cmd.Run(); err == nil {
