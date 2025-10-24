@@ -321,24 +321,47 @@ func NewExecutor(ctx context.Context /* other params */) *Executor {
 	return &Executor{Context: ctx}
 }
 
-// ensureSudo is now a no-op since authentication happens once at startup
+// runInteractiveCommand executes a command, ensuring it's attached to the TTY for interactive prompts.
+// It does not use process group isolation, making it suitable for commands like `sudo -v`.
+func runInteractiveCommand(ctx context.Context, name string, arg ...string) error {
+	cmd := exec.CommandContext(ctx, name, arg...)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
+}
+
+// ensureSudo checks if the sudo ticket is still valid and re-prompts if necessary.
+// It handles interactive re-authentication by running `sudo -v` with a proper TTY
+// if the non-interactive check `sudo -nv` fails.
+// No action needed if we are already root or the command doesn't require root.
 func (e *Executor) ensureSudo() error {
 	if os.Geteuid() == 0 || !e.ShouldRunAsRoot {
 		return nil
 	}
+	// 1. First, perform a non-interactive check (`sudo -nv`) to see if the ticket is still valid.
+	// This is fast and avoids any user interaction if the ticket is fresh.
+	checkCmd := exec.CommandContext(e.Context, "sudo", "-nv")
+	checkCmd.Stdout = io.Discard
+	checkCmd.Stderr = io.Discard
 
-	// Authentication already done at startup
-	// Just validate it's still valid
-	if _, err := exec.LookPath("run0"); err == nil {
-		// run0 handles its own session management
+	if err := checkCmd.Run(); err == nil {
+		// Success (exit code 0): The sudo ticket is valid. Nothing more to do.
 		return nil
 	}
 
-	// For sudo, just do a non-interactive check
-	check := exec.CommandContext(e.Context, "sudo", "-nv")
-	check.Stdout = io.Discard
-	check.Stderr = io.Discard
-	return check.Run()
+	// Non-interactive check failed — the ticket has likely expired.
+	// We must now re-authenticate interactively using `sudo -v`.
+	cPrintln(colWarn, "Sudo ticket has expired. Re-authenticating...")
+
+	// Use a dedicated interactive runner that does NOT set a new process group.
+	// This ensures `sudo` can correctly access the TTY for password input.
+	if err := runInteractiveCommand(e.Context, "sudo", "-v"); err != nil {
+		return fmt.Errorf("sudo re-authentication failed: %w", err)
+	}
+
+	cPrintln(colInfo, "Re-authenticated via sudo successfully.")
+	return nil
 }
 
 // Run executes the given command, elevating via sudo -E only when needed.
@@ -5290,6 +5313,32 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 }
 
 func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor) error {
+
+	// Special handling for glibc: direct extraction without staging or checks
+	if pkgName == "glibc" {
+		cPrintf(colInfo, "Installing glibc using direct extraction method...\n")
+
+		// Use system tar if available
+		if _, err := exec.LookPath("tar"); err == nil {
+			args := []string{"xvf", tarballPath, "-C", rootDir}
+			tarCmd := exec.Command("tar", args...)
+			tarCmd.Stdout = os.Stdout
+			tarCmd.Stderr = os.Stderr
+
+			if err := execCtx.Run(tarCmd); err != nil {
+				return fmt.Errorf("failed to extract glibc tarball: %v", err)
+			}
+			cPrintf(colSuccess, "glibc installed successfully via direct extraction.\n")
+			return nil
+		}
+
+		// Fallback to Go implementation if tar not available
+		if err := unpackTarballFallback(tarballPath, rootDir); err != nil {
+			return fmt.Errorf("failed to unpack glibc tarball (fallback): %v", err)
+		}
+		cPrintf(colSuccess, "glibc installed successfully via direct extraction (fallback).\n")
+		return nil
+	}
 
 	stagingDir := filepath.Join(tmpDir, pkgName, "staging")
 	pkgTmpDir := filepath.Join(tmpDir, pkgName)
