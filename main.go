@@ -4547,7 +4547,7 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool) er
 	}
 	defer logFile.Close() // Ensure the log file is closed when the function exits
 
-	cmd := exec.Command(buildScript, outputDir, version)
+	cmd := exec.Command(buildScript, outputDir, version, pkgName)
 	cmd.Dir = buildDir
 	cmd.Env = env
 
@@ -5071,7 +5071,7 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 	}
 	defer logFile.Close() // Ensure the log file is closed when the function exits
 
-	cmd := exec.Command(buildScript, outputDir, version)
+	cmd := exec.Command(buildScript, outputDir, version, pkgName)
 	cmd.Dir = buildDir
 	cmd.Env = env
 
