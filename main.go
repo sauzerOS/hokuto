@@ -312,7 +312,7 @@ type Executor struct {
 	Context           context.Context // The context to use for cancellation
 	ShouldRunAsRoot   bool            // ShouldRunAsRoot specifies whether the command MUST be executed with root privileges.
 	ApplyIdlePriority bool            // NEW: Apply nice -n 19 to this specific command
-	sudoPrimed        bool
+	Interactive       bool            // Interactive indicates whether the command may prompt the user
 }
 
 // Update the constructor/factory function for Executor
@@ -439,23 +439,30 @@ func (e *Executor) Run(cmd *exec.Cmd) error {
 	finalCmd.Stderr = cmd.Stderr
 
 	// --- Phase 3: isolate process group for context-based cleanup ---
-	finalCmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if !e.Interactive {
+		finalCmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	}
 
 	// --- Phase 4: start and watch for cancel ---
 	if err := finalCmd.Start(); err != nil {
 		return fmt.Errorf("failed to start command: %w", err)
 	}
-	pgid := finalCmd.Process.Pid
 
-	done := make(chan struct{})
-	defer close(done)
-	go func() {
-		select {
-		case <-e.Context.Done():
-			syscall.Kill(-pgid, syscall.SIGKILL)
-		case <-done:
-		}
-	}()
+	// Conditionally manage cancellation. If interactive, let CommandContext handle it.
+	// Otherwise, manage the entire process group.
+	if !e.Interactive {
+		pgid := finalCmd.Process.Pid
+
+		done := make(chan struct{})
+		defer close(done)
+		go func() {
+			select {
+			case <-e.Context.Done():
+				syscall.Kill(-pgid, syscall.SIGKILL)
+			case <-done:
+			}
+		}()
+	}
 
 	// --- Phase 5: wait and return ---
 	if waitErr := finalCmd.Wait(); waitErr != nil {
@@ -4357,11 +4364,21 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool) er
 	if _, err := os.Stat(asRootFile); err == nil {
 		needsRootBuild = true
 	}
+
+	//Check for an 'interactive' file to control build mode ---
+	interactiveFile := filepath.Join(pkgDir, "interactive")
+	needsInteractiveBuild := false
+	if _, err := os.Stat(interactiveFile); err == nil {
+		needsInteractiveBuild = true
+		debugf("Local 'interactive' file found in %s. Enabling interactive build mode.\n", pkgDir)
+	}
+
 	// 2. CLONE AND SELECT EXECUTOR
 	// Create a new Executor instance for the build phase.
 	buildExec := &Executor{
-		Context:         execCtx.Context, // Inherit the main cancellation context
-		ShouldRunAsRoot: needsRootBuild,  // Set the privilege based on 'asroot' file
+		Context:         execCtx.Context,       // Inherit the main cancellation context
+		ShouldRunAsRoot: needsRootBuild,        // Set the privilege based on 'asroot' file
+		Interactive:     needsInteractiveBuild, // SET INTERACTIVE MODE
 	}
 	// Download sources if required
 	if err := hokutoChecksum(pkgName, false); err != nil {
@@ -4547,8 +4564,9 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool) er
 	var consoleOutputWriter io.Writer = os.Stdout
 	var consoleErrorWriter io.Writer = os.Stderr
 
-	if !Debug && !Verbose {
-		// If not in debug mode and not verbose, suppress console output by discarding it.
+	// For interactive builds, we always want console output.
+	// For non-interactive, respect Debug/Verbose flags.
+	if !buildExec.Interactive && !Debug && !Verbose {
 		consoleOutputWriter = io.Discard
 		consoleErrorWriter = io.Discard
 	}
@@ -4562,56 +4580,60 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool) er
 	cmd.Stdout = io.MultiWriter(stdoutWriters...)
 	cmd.Stderr = io.MultiWriter(stderrWriters...)
 
-	// --- Start interactive build with elapsed timer ---
-	// Set initial title
-	setTerminalTitle(fmt.Sprintf("Starting %s...", pkgName))
-
-	// time started at beginning of function
-	doneCh := make(chan struct{})
-	var runErr error
-	var runWg sync.WaitGroup
-	runWg.Add(1)
-
-	go func() {
-		defer runWg.Done()
-		ticker := time.NewTicker(time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ticker.C:
-				elapsed := time.Since(startTime).Truncate(time.Second)
-				title := fmt.Sprintf("%s... elapsed: %s", pkgName, elapsed)
-				setTerminalTitle(title)
-				// carriage return to update the same line; may appear as repeated lines in some logs
-				colInfo.Printf("-> Building %s ... elapsed: %s\r", pkgName, elapsed)
-			case <-doneCh:
-				// clear line and return
-				fmt.Print("\r")
-				return
-			case <-buildExec.Context.Done():
-				// cancelled — stop updating
-				return
-			}
-		}
-	}()
+	var runErr error // Use a single error variable for both paths
 
 	// NEW: Create a special executor for the build script that applies idle priority
 	buildScriptExec := &Executor{
 		Context:           buildExec.Context,
 		ShouldRunAsRoot:   buildExec.ShouldRunAsRoot,
 		ApplyIdlePriority: setIdlePriority, // Use the global flag here
+		Interactive:       buildExec.Interactive,
 	}
 
-	// Run the build. Use runErr (single variable) to capture the result.
-	if err := buildScriptExec.Run(cmd); err != nil {
-		runErr = fmt.Errorf("build failed: %w", err)
+	if !buildExec.Interactive {
+		// --- NON-INTERACTIVE PATH: Run with timer and title updates ---
+		setTerminalTitle(fmt.Sprintf("Starting %s...", pkgName))
+		doneCh := make(chan struct{})
+		var runWg sync.WaitGroup
+		runWg.Add(1)
+
+		go func() {
+			defer runWg.Done()
+			ticker := time.NewTicker(time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ticker.C:
+					elapsed := time.Since(startTime).Truncate(time.Second)
+					title := fmt.Sprintf("%s... elapsed: %s", pkgName, elapsed)
+					setTerminalTitle(title)
+					colInfo.Printf("-> Building %s ... elapsed: %s\r", pkgName, elapsed)
+				case <-doneCh:
+					fmt.Print("\r")
+					return
+				case <-buildExec.Context.Done():
+					return
+				}
+			}
+		}()
+
+		// Run the build.
+		if err := buildScriptExec.Run(cmd); err != nil {
+			runErr = fmt.Errorf("build failed: %w", err)
+		}
+
+		// Stop ticker goroutine and wait.
+		close(doneCh)
+		runWg.Wait()
+
+	} else {
+		// --- INTERACTIVE PATH: Run directly without any timers or title updates ---
+		// This gives the child process exclusive control of the terminal.
+		if err := buildScriptExec.Run(cmd); err != nil {
+			runErr = fmt.Errorf("build failed: %w", err)
+		}
 	}
 
-	// stop ticker goroutine and wait
-	close(doneCh)
-	runWg.Wait()
-
-	// Check the single runErr variable (compiler knows it may be non-nil)
 	if runErr != nil {
 		cPrintf(colError, "\nBuild failed for %s: %v\n", pkgName, runErr)
 		finalTitle := fmt.Sprintf("❌ FAILED: %s", pkgName)
@@ -4866,9 +4888,19 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 	if _, err := os.Stat(asRootFile); err == nil {
 		needsRootBuild = true
 	}
+
+	//Check for an 'interactive' file to control build mode ---
+	interactiveFile := filepath.Join(pkgDir, "interactive")
+	needsInteractiveBuild := false
+	if _, err := os.Stat(interactiveFile); err == nil {
+		needsInteractiveBuild = true
+		debugf("Local 'interactive' file found in %s. Enabling interactive build mode.\n", pkgDir)
+	}
+
 	buildExec := &Executor{
 		Context:         execCtx.Context,
 		ShouldRunAsRoot: needsRootBuild,
+		Interactive:     needsInteractiveBuild,
 	}
 
 	// Download sources if required
@@ -5056,8 +5088,9 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 	var consoleOutputWriter io.Writer = os.Stdout
 	var consoleErrorWriter io.Writer = os.Stderr
 
-	if !Debug && !Verbose {
-		// If not in debug mode and not verbose, suppress console output by discarding it.
+	// For interactive builds, we always want console output.
+	// For non-interactive, respect Debug/Verbose flags.
+	if !buildExec.Interactive && !Debug && !Verbose {
 		consoleOutputWriter = io.Discard
 		consoleErrorWriter = io.Discard
 	}
@@ -5071,55 +5104,57 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 	cmd.Stdout = io.MultiWriter(stdoutWriters...)
 	cmd.Stderr = io.MultiWriter(stderrWriters...)
 
-	// --- Start interactive build with elapsed timer ---
-	// Set initial title
-	setTerminalTitle(fmt.Sprintf("Rebuilding %s...", pkgName))
-
-	// --- Start interactive build with elapsed timer ---
-	// time started at beginning of function
-	doneCh := make(chan struct{})
-	var runErr error
-	var runWg sync.WaitGroup
-	runWg.Add(1)
-
-	go func() {
-		defer runWg.Done()
-		ticker := time.NewTicker(time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ticker.C:
-				elapsed := time.Since(startTime).Truncate(time.Second)
-				// update terminal title
-				title := fmt.Sprintf("[HOKUTO REBUILD] %s... elapsed: %s", pkgName, elapsed)
-				setTerminalTitle(title)
-				// carriage return to update the same line; may appear as repeated lines in some logs
-				colInfo.Printf(" Building %s ... elapsed: %s\r", pkgName, elapsed)
-			case <-doneCh:
-				// clear line and return
-				fmt.Print("\r")
-				return
-			case <-buildExec.Context.Done():
-				// cancelled — stop updating
-				return
-			}
-		}
-	}()
+	var runErr error // Use a single error variable for both paths
 
 	// NEW: Create a special executor for the build script that applies idle priority
 	buildScriptExec := &Executor{
 		Context:           buildExec.Context,
 		ShouldRunAsRoot:   buildExec.ShouldRunAsRoot,
 		ApplyIdlePriority: setIdlePriority, // Use the global flag here
-	}
-	// Run the build. Use runErr (single variable) to capture the result.
-	if err := buildScriptExec.Run(cmd); err != nil {
-		runErr = fmt.Errorf("build failed: %w", err)
+		Interactive:       buildExec.Interactive,
 	}
 
-	// stop ticker goroutine and wait
-	close(doneCh)
-	runWg.Wait()
+	if !buildExec.Interactive {
+		// --- NON-INTERACTIVE PATH: Run with timer and title updates ---
+		setTerminalTitle(fmt.Sprintf("Rebuilding %s...", pkgName))
+		doneCh := make(chan struct{})
+		var runWg sync.WaitGroup
+		runWg.Add(1)
+
+		go func() {
+			defer runWg.Done()
+			ticker := time.NewTicker(time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ticker.C:
+					elapsed := time.Since(startTime).Truncate(time.Second)
+					title := fmt.Sprintf("Rebuild %s... elapsed: %s", pkgName, elapsed)
+					setTerminalTitle(title)
+					colInfo.Printf(" Building %s ... elapsed: %s\r", pkgName, elapsed)
+				case <-doneCh:
+					fmt.Print("\r")
+					return
+				case <-buildExec.Context.Done():
+					return
+				}
+			}
+		}()
+
+		// Run the build.
+		if err := buildScriptExec.Run(cmd); err != nil {
+			runErr = fmt.Errorf("build failed: %w", err)
+		}
+
+		// Stop ticker goroutine and wait.
+		close(doneCh)
+		runWg.Wait()
+	} else {
+		// --- INTERACTIVE PATH: Run directly without timers or title updates ---
+		if err := buildScriptExec.Run(cmd); err != nil {
+			runErr = fmt.Errorf("build failed: %w", err)
+		}
+	}
 
 	// Check the single runErr variable (compiler knows it may be non-nil)
 	if runErr != nil {
