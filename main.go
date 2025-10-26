@@ -246,6 +246,7 @@ func needsRootPrivileges(args []string) bool {
 		"update":    true,
 		"u":         true,
 		"chroot":    true,
+		"cleanup":   true,
 	}
 
 	if rootCommands[cmd] {
@@ -6948,51 +6949,138 @@ func getPackageDependenciesToUninstall(name string) []string {
 	}
 }
 
+// handleCleanupCommand handles the 'cleanup' subcommand
+func handleCleanupCommand(args []string) error {
+	cleanupCmd := flag.NewFlagSet("cleanup", flag.ExitOnError)
+	cleanSources := cleanupCmd.Bool("sources", false, "Remove all cached source files.")
+	cleanBins := cleanupCmd.Bool("bins", false, "Remove all built binary packages.")
+	cleanAll := cleanupCmd.Bool("all", false, "Remove both sources and binaries.")
+
+	if err := cleanupCmd.Parse(args); err != nil {
+		return err // Should not happen with flag.ExitOnError
+	}
+
+	// If no flags are provided, show help and exit
+	if !*cleanSources && !*cleanBins && !*cleanAll {
+		fmt.Println("Usage: hokuto cleanup [flag]")
+		fmt.Println("You must specify what to clean up. Use one of the following flags:")
+		cleanupCmd.PrintDefaults()
+		return nil
+	}
+
+	// If -all is used, it implies both sources and bins
+	if *cleanAll {
+		*cleanSources = true
+		*cleanBins = true
+	}
+
+	if *cleanSources {
+		cPrintf(colWarn, "This will permanently delete the source cache at %s.\n", SourcesDir)
+		if askForConfirmation("Are you sure you want to proceed?") {
+			cPrintf(colInfo, "Removing source cache directory: %s\n", SourcesDir)
+			rmCmd := exec.Command("rm", "-rf", SourcesDir)
+			if err := RootExec.Run(rmCmd); err != nil {
+				return fmt.Errorf("failed to remove source cache: %w", err)
+			}
+			cPrintln(colSuccess, "Source cache removed successfully.")
+		} else {
+			cPrintln(colNote, "Cleanup of source cache canceled.")
+		}
+	}
+
+	if *cleanBins {
+		cPrintf(colWarn, "This will permanently delete all built binary packages at %s.\n", BinDir)
+		if askForConfirmation("Are you sure you want to proceed?") {
+			cPrintf(colInfo, "Removing binary cache directory: %s\n", BinDir)
+			rmCmd := exec.Command("rm", "-rf", BinDir)
+			if err := RootExec.Run(rmCmd); err != nil {
+				return fmt.Errorf("failed to remove binary cache: %w", err)
+			}
+			cPrintln(colSuccess, "Binary cache removed successfully.")
+		} else {
+			cPrintln(colNote, "Cleanup of binary cache canceled.")
+		}
+	}
+
+	return nil
+}
+
 // printHelp prints the commands table
 func printHelp() {
+	// General Usage Header
+	color.Bold.Println("Usage: hokuto <command> [arguments...]")
+	fmt.Println()
+	color.Info.Println("Available Commands:")
+
 	type cmdInfo struct {
 		Cmd  string
 		Args string
 		Desc string
 	}
+	// Restore detailed descriptions including command-specific options
 	cmds := []cmdInfo{
-		{"version, --version", "", "Show hokuto version"},
-		{"list, ls", "[pkg]", "List installed packages; optional partial name to filter"},
-		{"checksum, c", "<pkg>", "Fetch sources and verify/create checksums for a package"},
-		{"build, b", "[options] <pkg> [...]", "Build package(s). Options: -a (auto-install) -v (verbose) -i (idle) -ii (superidle) --alldeps (build+install pkg deps)"},
-		{"install, i", "<tarball|pkg> [...]", "Install a built package tarball or named package"},
-		{"uninstall, r", "[options] <pkg> [...]", "Uninstall package(s). Options: -f (force) -y (yes)"},
-		{"update, u", "", "Update repository metadata and check for upgrades. Options: -v (verbose)"},
-		{"manifest, m", "<pkg>", "Show manifest file entries (files only) for a package"},
-		{"find, f", "<string>", "Search all manifests for a path containing the string"},
-		{"new, n", "<string>", "Create a new package "},
-		{"edit, e", "<string>", "Edit a package"},
-		{"bootstrap", "<targetdir>", "Build a minimal sauzeros rootfs"},
-		{"chroot", "<targetdir> [command...]", "Enter chroot environment at targetdir; runs /bin/bash by default"},
+		{"version, --version", "", "Show hokuto version and information"},
+		{"list, ls", "[pkg]", "List installed packages, optionally filter by name"},
+		{"checksum, c", "<pkg>", "Fetch sources and generate checksum file for a package. -f (force redwonload of sources)"},
+		{"build, b", "<pkg...>", "Build package(s). -a (auto-install), -i (half cpu cores), -ii (one cpu core), --alldeps"},
+		{"install, i", "<pkg...>", "Install pre-built packages from the binary cache or a specified .tar.zst file"},
+		{"uninstall, r", "<pkg...>", "Uninstall package(s). -f (force), -y (skip confirmation)"},
+		{"update, u", "[options]", "Update repositories and check for upgrades. Options: -i (half cpu cores), -ii (one cpu core)"},
+		{"manifest, m", "<pkg>", "Show the file list for an installed package"},
+		{"find, f", "<query>", "Find which package matches query string"},
+		{"new, n", "<pkg>", "Create a new package skeleton"},
+		{"edit, e", "<pkg>", "Edit a package's build files. -a (edit all files)"},
+		{"bootstrap", "<dir>", "Build a bootstrap rootfs in target directory"},
+		{"chroot", "<dir> [cmd...]", "Enter chroot and run command (default: /bin/bash)"},
+		{"cleanup", "[options]", "Clean up cache directories. -sources, -bins, -all"},
 	}
 
-	color.Info.Println("hokuto commands")
-	color.Info.Println(strings.Repeat("-", 32))
-
-	leftColWidth := 32
+	// --- Dynamic Padding Logic ---
+	// 1. Find the longest usage string to calculate the ideal width for the first column.
+	maxLen := 0
 	for _, c := range cmds {
-		left := c.Cmd
+		length := len(c.Cmd) + len(c.Args)
 		if c.Args != "" {
-			color.Bold.Printf("  %s ", c.Cmd)
-			color.Cyan.Printf("%s", c.Args)
-			left = c.Cmd + " " + c.Args
-		} else {
-			color.Bold.Printf("  %s", c.Cmd)
+			length++ // Account for the space
 		}
-		pad := leftColWidth - len(left)
+		if length > maxLen {
+			maxLen = length
+		}
+	}
+	// The final column width is the longest command plus some buffer space.
+	columnWidth := maxLen + 4
+
+	// 2. Print the formatted list with calculated padding.
+	for _, c := range cmds {
+		// This will hold the uncolored string to measure its length for padding
+		var usageString string
+		if c.Args != "" {
+			usageString = fmt.Sprintf("  %s %s", c.Cmd, c.Args)
+		} else {
+			usageString = fmt.Sprintf("  %s", c.Cmd)
+		}
+
+		// Print the colored command and arguments
+		fmt.Print("  ") // Indent
+		color.Bold.Print(c.Cmd)
+		if c.Args != "" {
+			fmt.Print(" ")
+			color.Cyan.Print(c.Args)
+		}
+
+		// Calculate the necessary padding and print it
+		pad := columnWidth - len(usageString)
 		if pad < 1 {
 			pad = 1
 		}
 		fmt.Print(strings.Repeat(" ", pad))
+
+		// Print the description
 		color.Info.Println(c.Desc)
 	}
 
-	color.Info.Println("\nRun 'hokuto <command> --help' for more details where available.")
+	fmt.Println()
+	color.Info.Println("Run 'hokuto <command> --help' for more details on a specific command.")
 }
 
 // Entry point
@@ -7105,6 +7193,12 @@ func main() {
 	case "chroot":
 		// Call the new wrapper function that contains the defer logic
 		exitCode = runChrootCommand(os.Args[2:], RootExec)
+
+	case "cleanup":
+		if err := handleCleanupCommand(os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "Cleanup failed: %v\n", err)
+			os.Exit(1)
+		}
 	case "version", "--version":
 		// Print version first
 		// HOKUTOVERSION (string for search)
