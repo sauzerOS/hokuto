@@ -942,143 +942,6 @@ func newHttpClient() (*http.Client, error) {
 }
 
 // downloadFile downloads a URL into the hokuto cache.
-// It attempts to use 'curl' (with colorization via a Go-native pipe), then 'wget2',
-// and finally falls back to a native Go HTTP implementation.
-func downloadFileOK(url, destFile string) error {
-
-	// 1. Ensure the cache directory exists
-	if err := os.MkdirAll(CacheStore, 0o755); err != nil {
-		return fmt.Errorf("failed to create cache directory %s: %w", CacheStore, err)
-	}
-
-	// 2. Prepare the destination path
-	destFile = filepath.Base(destFile) // Ensure we only have the filename
-	absPath := filepath.Join(CacheStore, destFile)
-
-	debugf("Downloading %s -> %s\n", url, absPath)
-
-	// --- Primary Choice: Try curl with Go-native colorization ---
-	if _, err := exec.LookPath("curl"); err == nil {
-		// Base arguments for curl:
-		// -L: Follow redirects.
-		// --fail: Fail silently (no HTML output) on server errors.
-		// -o: Write output to file.
-		// -#: Render a simple progress bar.
-		curlArgs := []string{"-L", "--fail", "-o", absPath, "-#"}
-		curlArgs = append(curlArgs, url)
-
-		cmd := exec.Command("curl", curlArgs...)
-
-		// --- THE FIX: Go-Native Pipe Processing ---
-		// We capture stderr, where curl prints its progress bar.
-		stderrPipe, err := cmd.StderrPipe()
-		if err != nil {
-			cmd.Stderr = os.Stderr
-		}
-		cmd.Stdout = os.Stdout
-
-		// Start the command.
-		if err := cmd.Start(); err != nil {
-			return fmt.Errorf("failed to start curl: %w", err)
-		}
-
-		// If the pipe was created successfully, start the colorizing goroutine.
-		if stderrPipe != nil {
-			go func() {
-				// Create a reader to process the pipe output.
-				reader := bufio.NewReader(stderrPipe)
-				// ANSI color codes
-				blue := "\x1b[" + color.Blue.Code() + "m"
-				reset := "\x1b[0m"
-
-				for {
-					// Read everything up to the next carriage return '\r'.
-					// This is how curl updates its progress bar on a single line.
-					lineBytes, err := reader.ReadBytes('\r')
-					if len(lineBytes) > 0 {
-						line := string(lineBytes)
-						// Check if the line is a curl progress bar (starts with '#').
-						if strings.HasPrefix(strings.TrimSpace(line), "#") {
-							// Print the colored progress bar. The original '\r' is preserved in 'line'.
-							fmt.Fprintf(os.Stderr, "%s%s%s", blue, line, reset)
-						} else {
-							// If it's not a progress bar (e.g., an error message), print it as is.
-							fmt.Fprint(os.Stderr, line)
-						}
-					}
-					if err != nil {
-						// The pipe is closed (EOF) or an error occurred. Exit the loop.
-						break
-					}
-				}
-			}()
-		}
-
-		// Wait for the curl command to finish.
-		if err := cmd.Wait(); err != nil {
-			debugf("\ncurl failed, falling back to wget2")
-			// Fall through to the next download method.
-		} else {
-			debugf("\nDownload successful with curl.")
-			return nil // Success
-		}
-	} else {
-		debugf("curl not found, trying wget2")
-	}
-
-	// --- Fallback 1: Try wget  ---
-	if _, err := exec.LookPath("wget"); err == nil {
-		args := []string{"-nv", "-O", absPath}
-		args = append(args, url)
-
-		cmd := exec.Command("wget2", args...)
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-		if err := cmd.Run(); err == nil {
-			debugf("\nDownload successful with wget2.")
-			return nil // Success
-		}
-		debugf("\nwget2 failed, falling back to native Go HTTP client")
-	} else {
-		debugf("wget2 not found, using native Go HTTP client")
-	}
-
-	// --- Fallback 2: Native Go HTTP Client ---
-	client, err := newHttpClient()
-	if err != nil {
-		return fmt.Errorf("failed to create http client: %w", err)
-	}
-
-	// Create the destination file
-	out, err := os.Create(absPath)
-	if err != nil {
-		return fmt.Errorf("failed to create destination file %s: %w", absPath, err)
-	}
-	defer out.Close()
-
-	// Perform the GET request
-	resp, err := client.Get(url)
-	if err != nil {
-		return fmt.Errorf("native http get failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	// Check for a successful status code
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("download failed with status: %s", resp.Status)
-	}
-
-	// Stream the body to the file
-	_, err = io.Copy(out, resp.Body)
-	if err != nil {
-		return fmt.Errorf("failed to write to destination file: %w", err)
-	}
-
-	debugf("Download successful with native Go HTTP client.")
-	return nil
-}
-
-// downloadFile downloads a URL into the hokuto cache.
 func downloadFile(originalURL, finalURL, destFile string) error {
 	// If a GNU mirror is being used for this download, print the info message exactly once.
 	if originalURL != finalURL {
@@ -1231,6 +1094,13 @@ func fetchSources(pkgName, pkgDir string, processGit bool) error {
 		var origFilename, hashName, cachePath, linkPath string
 
 		rawSourceURL := strings.Fields(line)[0]
+
+		// --- FIX START: Skip local files defined with the 'files/' prefix ---
+		if strings.HasPrefix(rawSourceURL, "files/") {
+			debugf("Skipping local source file: %s\n", rawSourceURL)
+			continue
+		}
+		// --- FIX END ---
 
 		// --- Mirror and Git Logic ---
 		if strings.HasPrefix(rawSourceURL, "git+") {
@@ -1789,7 +1659,7 @@ func generateLibDeps(outputDir, libdepsFile string, execCtx *Executor) error {
 			// 2. Run ldd to find dependencies (using the package's determined execution context)
 			lddCmd := exec.Command("ldd", file)
 			lddCmd.Stdout = &lddOut
-			lddCmd.Stderr = os.Stderr // pipe errors to our stderr
+			lddCmd.Stderr = io.Discard // discard error
 
 			if err := execCtx.Run(lddCmd); err != nil {
 				// If ldd fails (e.g., cannot find dependencies), skip this file
@@ -2253,6 +2123,7 @@ func shouldStripTar(archive string) (bool, error) {
 
 	var out bytes.Buffer
 	cmd.Stdout = &out
+	cmd.Stderr = io.Discard
 
 	if err := cmd.Run(); err != nil {
 		// Tar failed to read or list the file.
@@ -4205,8 +4076,11 @@ func stripPackage(outputDir string, buildExec *Executor) error {
 
 	// --- PHASE 1: Execute 'find' command via the Executor to get the file list ---
 
+	//Redirect stderr of the inner 'file' command to /dev/null ---
+	// This prevents messages like "not a dynamic executable" from printing to the console
+	// unless verbose/debug mode is active.
 	shellCommand := fmt.Sprintf(
-		"find %s -type f \\( -perm /u+x -o -perm /g+x -o -perm /o+x \\) -exec sh -c 'file -0 {} | grep -q ELF && printf \"%%s\\n\" {}' \\;",
+		"find %s -type f \\( -perm /u+x -o -perm /g+x -o -perm /o+x \\) -exec sh -c 'file -0 {} 2>/dev/null | grep -q ELF && printf \"%%s\\n\" {}' \\;",
 		outputDir,
 	)
 
@@ -4214,7 +4088,13 @@ func stripPackage(outputDir string, buildExec *Executor) error {
 
 	findCmd := exec.Command("sh", "-c", shellCommand)
 	findCmd.Stdout = &findOutput
-	findCmd.Stderr = os.Stderr
+	// In non-verbose mode, we don't want to see find's own errors (e.g., permission denied).
+	// In verbose mode, we let them pass through.
+	if !Verbose && !Debug {
+		findCmd.Stderr = io.Discard
+	} else {
+		findCmd.Stderr = os.Stderr
+	}
 
 	debugf("  -> Discovering stripable ELF files")
 	if err := buildExec.Run(findCmd); err != nil {
@@ -4225,7 +4105,7 @@ func stripPackage(outputDir string, buildExec *Executor) error {
 
 	pathsRaw := strings.TrimSpace(findOutput.String())
 	if pathsRaw == "" {
-		cPrintln(colInfo, "  -> No stripable ELF files found.")
+		debugf("-> No stripable ELF files found.")
 		return nil
 	}
 
