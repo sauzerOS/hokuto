@@ -5,7 +5,6 @@ go 1.25.1
 require (
 	github.com/gookit/color v1.6.0
 	github.com/klauspost/compress v1.18.0
-	golang.org/x/term v0.35.0
 )
 
 require github.com/klauspost/cpuid/v2 v2.0.9 // indirect
