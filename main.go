@@ -82,8 +82,7 @@ var (
 	colError   = color.Error
 	colSuccess = color.HEX("#1976D2")
 	colArrow   = color.HEX("#FFEB3B")
-
-	colNote = color.Tag("notice")
+	colNote    = color.Tag("notice")
 )
 
 // color-compatible printer interface (works with *color.Theme and *color.Style)
@@ -1169,6 +1168,8 @@ func fetchSources(pkgName, pkgDir string, processGit bool) error {
 		cachePath = filepath.Join(CacheStore, hashName)
 
 		if _, err := os.Stat(cachePath); os.IsNotExist(err) {
+			colArrow.Print("-> ")
+			colSuccess.Printf("Fetching source: %s\n", origFilename)
 			if err := downloadFile(originalSourceURL, substitutedURL, cachePath); err != nil {
 				return fmt.Errorf("failed to download %s: %v", substitutedURL, err)
 			}
@@ -1325,7 +1326,8 @@ func verifyOrCreateChecksums(pkgName, pkgDir string, force bool) error {
 			if !sumExists {
 				prompt = "No checksum for %s. (K)eep local file, (r)edownload file? [K/r]: "
 			}
-			fmt.Printf(prompt, fname)
+			colArrow.Print("-> ")
+			colSuccess.Printf(prompt, fname)
 			var response string
 			fmt.Scanln(&response)
 			if strings.ToLower(strings.TrimSpace(response)) == "r" {
@@ -1352,7 +1354,8 @@ func verifyOrCreateChecksums(pkgName, pkgDir string, force bool) error {
 				return fmt.Errorf("failed to symlink %s -> %s: %v", cachePath, filePath, err)
 			}
 		} else {
-			fmt.Printf("Keeping existing local file for %s.\n", fname)
+			colArrow.Print("-> ")
+			colSuccess.Printf("Keeping existing local file for %s.\n", fname)
 		}
 
 		// 4. RECALCULATE: Generate the new checksum for the file now on disk.
@@ -2863,7 +2866,29 @@ func rsyncStaging(stagingDir, rootDir string, execCtx *Executor) error {
 		}
 	}
 
-	// --- Fallback: Use internal Go tar implementation ---
+	// --- Fallback: Try system tar pipe ---
+	if _, err := exec.LookPath("tar"); err == nil {
+		// This command creates an archive of the source and pipes it directly to an extraction command.
+		// It's efficient and handles all permissions correctly when run via the executor.
+		tarPipeCmdStr := fmt.Sprintf("tar -c -C %s . | tar -x -C %s", shellEscape(stagingPath), shellEscape(rootDir))
+		cmd := exec.Command("sh", "-c", tarPipeCmdStr)
+		cmd.Stderr = os.Stderr // Show potential errors from the shell or tar commands.
+
+		debugf("Attempting to sync with system tar pipe: %s\n", tarPipeCmdStr)
+		if err := execCtx.Run(cmd); err == nil {
+			// Success! Clean up and return.
+			rmCmd := exec.Command("rm", "-rf", stagingDir)
+			if err := execCtx.Run(rmCmd); err != nil {
+				fmt.Fprintf(os.Stderr, "warning: failed to remove staging dir %s: %v\n", stagingDir, err)
+			}
+			return nil
+		}
+		debugf("System tar pipe failed, falling back to internal Go implementation.\n")
+	} else {
+		debugf("System tar not found, falling back to internal Go implementation.\n")
+	}
+
+	// --- Fallback 2: Use internal Go tar implementation ---
 	// This is resilient to broken system tools during updates
 	debugf("rsync not available, using internal Go tar fallback\n")
 
@@ -4075,21 +4100,14 @@ func stripPackage(outputDir string, buildExec *Executor) error {
 	concurrencyLimit := make(chan struct{}, maxConcurrency)
 
 	// --- PHASE 1: Execute 'find' command via the Executor to get the file list ---
-
-	//Redirect stderr of the inner 'file' command to /dev/null ---
-	// This prevents messages like "not a dynamic executable" from printing to the console
-	// unless verbose/debug mode is active.
 	shellCommand := fmt.Sprintf(
 		"find %s -type f \\( -perm /u+x -o -perm /g+x -o -perm /o+x \\) -exec sh -c 'file -0 {} 2>/dev/null | grep -q ELF && printf \"%%s\\n\" {}' \\;",
 		outputDir,
 	)
 
 	var findOutput bytes.Buffer
-
 	findCmd := exec.Command("sh", "-c", shellCommand)
 	findCmd.Stdout = &findOutput
-	// In non-verbose mode, we don't want to see find's own errors (e.g., permission denied).
-	// In verbose mode, we let them pass through.
 	if !Verbose && !Debug {
 		findCmd.Stderr = io.Discard
 	} else {
@@ -4102,16 +4120,13 @@ func stripPackage(outputDir string, buildExec *Executor) error {
 	}
 
 	// --- PHASE 2: Process the collected output ---
-
 	pathsRaw := strings.TrimSpace(findOutput.String())
 	if pathsRaw == "" {
 		debugf("-> No stripable ELF files found.")
 		return nil
 	}
-
 	paths := strings.Split(pathsRaw, "\n")
 
-	// Track per-file failures but do not make them fatal
 	var failedMu sync.Mutex
 	var failedFiles []string
 
@@ -4128,11 +4143,19 @@ func stripPackage(outputDir string, buildExec *Executor) error {
 			defer wg.Done()
 			defer func() { <-concurrencyLimit }()
 
+			// --- MODIFICATION START ---
+			// Define the stderr writer once based on global flags.
+			var stderrWriter io.Writer = os.Stderr
+			if !Debug && !Verbose {
+				stderrWriter = io.Discard
+			}
+			// --- MODIFICATION END ---
+
 			// Save original permissions
 			statCmd := exec.Command("sh", "-c", fmt.Sprintf("stat -c %%a %q", p))
 			var permOut bytes.Buffer
 			statCmd.Stdout = &permOut
-			statCmd.Stderr = os.Stderr
+			statCmd.Stderr = stderrWriter // Use the conditional writer
 
 			if err := buildExec.Run(statCmd); err != nil {
 				debugf("Warning: failed to stat permissions for %s: %v. Skipping this file.\n", p, err)
@@ -4153,7 +4176,7 @@ func stripPackage(outputDir string, buildExec *Executor) error {
 			// Ensure we restore perms no matter what
 			defer func() {
 				restoreCmd := exec.Command("chmod", originalPerms, p)
-				restoreCmd.Stderr = os.Stderr
+				restoreCmd.Stderr = stderrWriter // Use the conditional writer
 				if err := buildExec.Run(restoreCmd); err != nil {
 					debugf("Warning: failed to restore permissions on %s to %s: %v\n", p, originalPerms, err)
 				}
@@ -4161,7 +4184,7 @@ func stripPackage(outputDir string, buildExec *Executor) error {
 
 			// Try to grant write permission
 			chmodWriteCmd := exec.Command("chmod", "u+w", p)
-			chmodWriteCmd.Stderr = os.Stderr
+			chmodWriteCmd.Stderr = stderrWriter // Use the conditional writer
 			if err := buildExec.Run(chmodWriteCmd); err != nil {
 				debugf("Warning: failed to chmod +w %s: %v. Skipping strip for this file.\n", p, err)
 				failedMu.Lock()
@@ -4172,7 +4195,7 @@ func stripPackage(outputDir string, buildExec *Executor) error {
 
 			debugf("  -> Stripping %s\n", p)
 			stripCmd := exec.Command("strip", p)
-			stripCmd.Stderr = os.Stderr
+			stripCmd.Stderr = stderrWriter // Use the conditional writer
 			if err := buildExec.Run(stripCmd); err != nil {
 				// Log as warning only. Do not mark the whole package as failed.
 				debugf("Warning: failed to strip %s: %v. Continuing with other files.\n", p, err)
@@ -4188,7 +4211,7 @@ func stripPackage(outputDir string, buildExec *Executor) error {
 
 	if len(failedFiles) > 0 {
 		// Provide an informational summary but do not fail the whole build.
-		fmt.Fprintf(os.Stderr, "Warning: some files failed to be stripped (%d). See above for details. Continuing.\n", len(failedFiles))
+		debugf("Warning: some files failed to be stripped (%d). See above for details. Continuing.\n", len(failedFiles))
 	}
 
 	return nil
@@ -4519,7 +4542,7 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool) er
 		return fmt.Errorf("failed to fetch sources: %v", err)
 	}
 
-	// Perform a strict, non-interactive checksum verification.
+	// Perform checksum verification.
 	if err := verifyOrCreateChecksums(pkgName, pkgDir, false); err != nil {
 		return fmt.Errorf("source verification failed: %w", err)
 	}
@@ -4533,7 +4556,8 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool) er
 	shouldStrip := cfg.DefaultStrip
 	noStripFile := filepath.Join(pkgDir, "nostrip")
 	if _, err := os.Stat(noStripFile); err == nil {
-		cPrintf(colInfo, "Local 'nostrip' file found in %s. Disabling stripping.\n", pkgDir)
+		colArrow.Print("-> ")
+		colSuccess.Printf("Disabling stripping.\n")
 		shouldStrip = false // Override the global setting for this package only
 	}
 
@@ -4541,7 +4565,8 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool) er
 	shouldLTO := cfg.DefaultLTO
 	noLTOFile := filepath.Join(pkgDir, "nolto")
 	if _, err := os.Stat(noLTOFile); err == nil {
-		cPrintf(colInfo, "Local 'nolto' file found in %s. Disabling LTO.\n", pkgDir)
+		colArrow.Print("-> ")
+		colSuccess.Printf("Disabling LTO.\n")
 		shouldLTO = false // Override the global setting for this package only
 	}
 
@@ -6117,7 +6142,7 @@ func pkgUninstall(pkgName string, cfg *Config, execCtx *Executor, force, yes boo
 	// 5. Confirm with user unless 'yes' is set
 	if !yes {
 		colArrow.Print("-> ")
-		colSuccess.Printf("About to remove package %s and %d file(s). Continue? [Y/n]: ", pkgName, fileCount)
+		color.Danger.Printf("About to remove package %s and %d file(s). Continue? [Y/n]: ", pkgName, fileCount)
 		var answer string
 		fmt.Scanln(&answer)
 		answer = strings.ToLower(strings.TrimSpace(answer))
@@ -6379,12 +6404,14 @@ func handleBuildCommand(args []string, cfg *Config) {
 		if fi, err := os.Stat("/repo/bootstrap"); err == nil && fi.IsDir() {
 			// Use pre-existing /repo/bootstrap
 			cfg.Values["HOKUTO_PATH"] = "/repo/bootstrap"
-			log.Printf("Using existing bootstrap repo at /repo/bootstrap")
+			colArrow.Print("-> ")
+			colSuccess.Println("Using existing bootstrap repo at /repo/bootstrap")
 		} else {
 			// 2. Check for existing /tmp/repo/bootstrap
 			if fi, err := os.Stat("/tmp/repo/bootstrap"); err == nil && fi.IsDir() {
 				cfg.Values["HOKUTO_PATH"] = "/tmp/repo/bootstrap"
-				log.Printf("Using existing bootstrap repo at /tmp/repo/bootstrap")
+				colArrow.Print("-> ")
+				colSuccess.Println("Using existing bootstrap repo at /tmp/repo/bootstrap")
 			} else {
 				// Need to download and unpack into /tmp/repo
 				url := "https://github.com/sauzeros/bootstrap/releases/download/latest/bootstrap-repo.tar.xz"
@@ -6646,7 +6673,7 @@ func handleBuildCommand(args []string, cfg *Config) {
 		tarballPath := filepath.Join(BinDir, fmt.Sprintf("%s-%s.tar.zst", buildPkg, version))
 
 		colArrow.Print("-> ")
-		colSuccess.Printf("Starting Build: %s (%s)\n", buildPkg, version)
+		colSuccess.Printf("Starting build: %s (%s)\n", buildPkg, version)
 		if err := pkgBuild(buildPkg, cfg, UserExec, *bootstrap); err != nil {
 			colArrow.Print("-> ")
 			colError.Printf("Fatal error building %s: %v\n", buildPkg, err)
@@ -7470,8 +7497,8 @@ func main() {
 			bootstrapDirArg,
 			"bootstrap", // The specific package to build in bootstrap mode.
 		}
-
-		fmt.Printf("Starting bootstrap process in directory: %s\n", bootstrapDirArg)
+		colArrow.Print("-> ")
+		colSuccess.Printf("Starting bootstrap process in directory: %s\n", bootstrapDirArg)
 
 		// 3. Call the generic build handler with the constructed arguments.
 		handleBuildCommand(buildArgs, cfg)
