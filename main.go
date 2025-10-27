@@ -7,6 +7,7 @@ import (
 	"compress/bzip2"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"embed"
 	"flag"
 	"fmt"
@@ -67,6 +68,8 @@ var (
 	RootExec *Executor
 	//go:embed assets/*.png
 	embeddedImages embed.FS
+	//go:embed assets/ca-bundle.crt
+	embeddedAssets embed.FS
 )
 
 // color helpers
@@ -892,6 +895,39 @@ func editPackage(pkgName string, openAll bool) error {
 	return cmd.Run()
 }
 
+// newHttpClient creates and returns an http.Client.
+// It tries to use the system's CA certificates first. If that fails, it falls
+// back to the ca-bundle.crt file embedded in the application binary.
+func newHttpClient() (*http.Client, error) {
+	// 1. Try to load the system's default set of trusted CAs.
+	rootCAs, err := x509.SystemCertPool()
+	if err != nil {
+		cPrintf(colWarn, "Warning: Could not load system CA certificates: %v\n", err)
+		cPrintf(colInfo, "=> Attempting to use bundled CA certificate as a fallback.\n")
+
+		// 2. Fallback: If system pool fails, create a new pool from the embedded asset.
+		rootCAs = x509.NewCertPool()
+		certs, err := embeddedAssets.ReadFile("assets/ca-bundle.crt")
+		if err != nil {
+			return nil, fmt.Errorf("failed to read embedded ca-bundle.crt: %w."+
+				" Please ensure the file exists in the 'assets' directory before compiling", err)
+		}
+
+		if ok := rootCAs.AppendCertsFromPEM(certs); !ok {
+			return nil, fmt.Errorf("failed to parse bundled CA certificates. The file may be invalid")
+		}
+	}
+
+	// 3. Configure the TLS client to use the selected pool of trusted CAs.
+	tlsConfig := &tls.Config{
+		RootCAs: rootCAs,
+	}
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.TLSClientConfig = tlsConfig
+
+	return &http.Client{Transport: transport}, nil
+}
+
 // downloadFile downloads a URL into the hokuto cache.
 // It attempts to use 'aria2c', then 'curl', and finally falls back to a native
 // Go HTTP implementation that ignores SSL certificate errors.
@@ -938,10 +974,10 @@ func downloadFile(url, destFile string) error {
 	// --- Fallback 3: Native Go HTTP Client ---
 	// This is the most robust fallback, with no external dependencies.
 	// It's configured to skip TLS certificate verification.
-	transport := &http.Transport{
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+	client, err := newHttpClient()
+	if err != nil {
+		return fmt.Errorf("failed to create http client: %w", err)
 	}
-	client := &http.Client{Transport: transport}
 
 	// Create the destination file
 	out, err := os.Create(absPath)
@@ -970,6 +1006,7 @@ func downloadFile(url, destFile string) error {
 
 	fmt.Println("Download successful with native Go HTTP client.")
 	return nil
+
 }
 
 // Fetch sources (HTTP/FTP + Git)
@@ -7364,7 +7401,7 @@ func main() {
 
 				// 3. Check if the pre-built tarball exists
 				if _, err := os.Stat(tarballPath); err != nil {
-					fmt.Fprintf(os.Stderr, "Error: Built package tarball not found for %s at %s. You must 'hokuto build' it first.\n", pkgName, tarballPath)
+					cPrintf(colWarn, "Error: Package tarball not found for %s at %s.\n", pkgName, tarballPath)
 					allSucceeded = false
 					continue
 				}
