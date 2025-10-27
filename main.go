@@ -44,27 +44,28 @@ import (
 var isCriticalAtomic atomic.Int32
 
 var (
-	rootDir         string
-	CacheDir        string
-	SourcesDir      string
-	BinDir          string
-	CacheStore      string
-	Installed       string
-	repoPaths       string
-	tmpDir          string
-	WantStrip       string
-	WantDebug       string
-	Debug           bool
-	Verbose         bool
-	WantLTO         string
-	newPackageDir   string
-	idleUpdate      bool
-	superidleUpdate bool
-	setIdlePriority bool
-	buildPriority   string
-	ConfigFile      = "/etc/hokuto.conf"
-	gnuMirrorURL    string
-	gnuOriginalURL  = "https://ftp.gnu.org/gnu"
+	rootDir              string
+	CacheDir             string
+	SourcesDir           string
+	BinDir               string
+	CacheStore           string
+	Installed            string
+	repoPaths            string
+	tmpDir               string
+	WantStrip            string
+	WantDebug            string
+	Debug                bool
+	Verbose              bool
+	WantLTO              string
+	newPackageDir        string
+	idleUpdate           bool
+	superidleUpdate      bool
+	setIdlePriority      bool
+	buildPriority        string
+	ConfigFile           = "/etc/hokuto.conf"
+	gnuMirrorURL         string
+	gnuOriginalURL       = "https://ftp.gnu.org/gnu"
+	gnuMirrorMessageOnce sync.Once
 	// Global executors (declared, to be assigned in main)
 	UserExec *Executor
 	RootExec *Executor
@@ -79,8 +80,10 @@ var (
 	colInfo    = color.Info // style provided by gookit/color
 	colWarn    = color.Warn
 	colError   = color.Error
-	colSuccess = color.Blue
-	colNote    = color.Tag("notice")
+	colSuccess = color.HEX("#1976D2")
+	colArrow   = color.HEX("#FFEB3B")
+
+	colNote = color.Tag("notice")
 )
 
 // color-compatible printer interface (works with *color.Theme and *color.Style)
@@ -225,7 +228,7 @@ func initConfig(cfg *Config) {
 	// Load the GNU mirror URL if it's set in the config
 	if mirror, exists := cfg.Values["GNU_MIRROR"]; exists && mirror != "" {
 		gnuMirrorURL = strings.TrimRight(mirror, "/") // Remove trailing slash if present
-		cPrintf(colInfo, "=> Using GNU mirror: %s\n", gnuMirrorURL)
+		debugf("=> Using GNU mirror: %s\n", gnuMirrorURL)
 	}
 
 	SourcesDir = CacheDir + "/sources"
@@ -314,7 +317,9 @@ func authenticateOnce() error {
 		}
 	}()
 
-	cPrintln(colInfo, "Authenticated via sudo")
+	//cPrintln(colNote, "-> Authenticated via sudo")
+	colArrow.Print("-> ")
+	colSuccess.Println("Authenticated via sudo")
 	return nil
 }
 
@@ -364,15 +369,16 @@ func (e *Executor) ensureSudo() error {
 
 	// Non-interactive check failed — the ticket has likely expired.
 	// We must now re-authenticate interactively using `sudo -v`.
-	cPrintln(colWarn, "Sudo ticket has expired. Re-authenticating...")
+	colArrow.Print("-> ")
+	colSuccess.Println("Sudo ticket has expired. Re-authenticating")
 
 	// Use a dedicated interactive runner that does NOT set a new process group.
 	// This ensures `sudo` can correctly access the TTY for password input.
 	if err := runInteractiveCommand(e.Context, "sudo", "-v"); err != nil {
 		return fmt.Errorf("sudo re-authentication failed: %w", err)
 	}
-
-	cPrintln(colInfo, "Re-authenticated via sudo successfully.")
+	colArrow.Print("-> ")
+	colSuccess.Println("Re-authenticated via sudo successfully.")
 	return nil
 }
 
@@ -587,10 +593,9 @@ func listPackages(searchTerm string) error {
 	// Step 3: Handle the case where no packages were found after filtering.
 	if len(pkgsToShow) == 0 {
 		if searchTerm != "" {
-			return fmt.Errorf("no packages found matching: %s", searchTerm)
+			colArrow.Print("-> ")
+			colSuccess.Printf("No packages found matching: %s\n", searchTerm)
 		}
-		// This handles the case where there are no packages installed at all.
-		fmt.Println("No packages installed.")
 		return nil
 	}
 
@@ -937,9 +942,10 @@ func newHttpClient() (*http.Client, error) {
 }
 
 // downloadFile downloads a URL into the hokuto cache.
-// It attempts to use 'aria2c', then 'curl', and finally falls back to a native
-// Go HTTP implementation that ignores SSL certificate errors.
-func downloadFile(url, destFile string) error {
+// It attempts to use 'curl' (with colorization via a Go-native pipe), then 'wget2',
+// and finally falls back to a native Go HTTP implementation.
+func downloadFileOK(url, destFile string) error {
+
 	// 1. Ensure the cache directory exists
 	if err := os.MkdirAll(CacheStore, 0o755); err != nil {
 		return fmt.Errorf("failed to create cache directory %s: %w", CacheStore, err)
@@ -949,39 +955,95 @@ func downloadFile(url, destFile string) error {
 	destFile = filepath.Base(destFile) // Ensure we only have the filename
 	absPath := filepath.Join(CacheStore, destFile)
 
-	cPrintf(color.Info, "Downloading %s -> %s\n", url, absPath)
+	debugf("Downloading %s -> %s\n", url, absPath)
 
-	// --- Fallback 1: Try aria2c ---
-	if _, err := exec.LookPath("aria2c"); err == nil {
-		cmd := exec.Command("aria2c", "-d", CacheStore, "-o", destFile, url)
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-		if err := cmd.Run(); err == nil {
-			fmt.Println("Download successful with aria2c.")
-			return nil // Success
-		}
-		fmt.Println("aria2c failed, falling back to curl...")
-	} else {
-		fmt.Println("aria2c not found, trying curl...")
-	}
-
-	// --- Fallback 2: Try curl ---
+	// --- Primary Choice: Try curl with Go-native colorization ---
 	if _, err := exec.LookPath("curl"); err == nil {
-		cmd := exec.Command("curl", "--fail", "-L", "-o", absPath, url)
+		// Base arguments for curl:
+		// -L: Follow redirects.
+		// --fail: Fail silently (no HTML output) on server errors.
+		// -o: Write output to file.
+		// -#: Render a simple progress bar.
+		curlArgs := []string{"-L", "--fail", "-o", absPath, "-#"}
+		curlArgs = append(curlArgs, url)
+
+		cmd := exec.Command("curl", curlArgs...)
+
+		// --- THE FIX: Go-Native Pipe Processing ---
+		// We capture stderr, where curl prints its progress bar.
+		stderrPipe, err := cmd.StderrPipe()
+		if err != nil {
+			cmd.Stderr = os.Stderr
+		}
+		cmd.Stdout = os.Stdout
+
+		// Start the command.
+		if err := cmd.Start(); err != nil {
+			return fmt.Errorf("failed to start curl: %w", err)
+		}
+
+		// If the pipe was created successfully, start the colorizing goroutine.
+		if stderrPipe != nil {
+			go func() {
+				// Create a reader to process the pipe output.
+				reader := bufio.NewReader(stderrPipe)
+				// ANSI color codes
+				blue := "\x1b[" + color.Blue.Code() + "m"
+				reset := "\x1b[0m"
+
+				for {
+					// Read everything up to the next carriage return '\r'.
+					// This is how curl updates its progress bar on a single line.
+					lineBytes, err := reader.ReadBytes('\r')
+					if len(lineBytes) > 0 {
+						line := string(lineBytes)
+						// Check if the line is a curl progress bar (starts with '#').
+						if strings.HasPrefix(strings.TrimSpace(line), "#") {
+							// Print the colored progress bar. The original '\r' is preserved in 'line'.
+							fmt.Fprintf(os.Stderr, "%s%s%s", blue, line, reset)
+						} else {
+							// If it's not a progress bar (e.g., an error message), print it as is.
+							fmt.Fprint(os.Stderr, line)
+						}
+					}
+					if err != nil {
+						// The pipe is closed (EOF) or an error occurred. Exit the loop.
+						break
+					}
+				}
+			}()
+		}
+
+		// Wait for the curl command to finish.
+		if err := cmd.Wait(); err != nil {
+			debugf("\ncurl failed, falling back to wget2")
+			// Fall through to the next download method.
+		} else {
+			debugf("\nDownload successful with curl.")
+			return nil // Success
+		}
+	} else {
+		debugf("curl not found, trying wget2")
+	}
+
+	// --- Fallback 1: Try wget  ---
+	if _, err := exec.LookPath("wget"); err == nil {
+		args := []string{"-nv", "-O", absPath}
+		args = append(args, url)
+
+		cmd := exec.Command("wget2", args...)
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
 		if err := cmd.Run(); err == nil {
-			fmt.Println("Download successful with curl.")
+			debugf("\nDownload successful with wget2.")
 			return nil // Success
 		}
-		fmt.Println("curl failed, falling back to native Go HTTP client...")
+		debugf("\nwget2 failed, falling back to native Go HTTP client")
 	} else {
-		fmt.Println("curl not found, using native Go HTTP client...")
+		debugf("wget2 not found, using native Go HTTP client")
 	}
 
-	// --- Fallback 3: Native Go HTTP Client ---
-	// This is the most robust fallback, with no external dependencies.
-	// It's configured to skip TLS certificate verification.
+	// --- Fallback 2: Native Go HTTP Client ---
 	client, err := newHttpClient()
 	if err != nil {
 		return fmt.Errorf("failed to create http client: %w", err)
@@ -1012,17 +1074,131 @@ func downloadFile(url, destFile string) error {
 		return fmt.Errorf("failed to write to destination file: %w", err)
 	}
 
-	fmt.Println("Download successful with native Go HTTP client.")
+	debugf("Download successful with native Go HTTP client.")
 	return nil
-
 }
 
+// downloadFile downloads a URL into the hokuto cache.
+func downloadFile(originalURL, finalURL, destFile string) error {
+	// If a GNU mirror is being used for this download, print the info message exactly once.
+	if originalURL != finalURL {
+		gnuMirrorMessageOnce.Do(func() {
+			colArrow.Print("-> ")
+			colSuccess.Printf("Using GNU mirror: %s\n", gnuMirrorURL)
+		})
+	}
+
+	// 1. Ensure the cache directory exists
+	if err := os.MkdirAll(CacheStore, 0o755); err != nil {
+		return fmt.Errorf("failed to create cache directory %s: %w", CacheStore, err)
+	}
+
+	// 2. Prepare the destination path
+	destFile = filepath.Base(destFile) // Ensure we only have the filename
+	absPath := filepath.Join(CacheStore, destFile)
+
+	debugf("Downloading %s -> %s\n", finalURL, absPath)
+
+	// --- Primary Choice: Try curl with Go-native colorization ---
+	if _, err := exec.LookPath("curl"); err == nil {
+		curlArgs := []string{"-L", "--fail", "-o", absPath, "-#"}
+		curlArgs = append(curlArgs, finalURL) // Use the final URL for the download
+		cmd := exec.Command("curl", curlArgs...)
+
+		stderrPipe, err := cmd.StderrPipe()
+		if err != nil {
+			cmd.Stderr = os.Stderr
+		}
+		cmd.Stdout = os.Stdout
+
+		if err := cmd.Start(); err != nil {
+			return fmt.Errorf("failed to start curl: %w", err)
+		}
+
+		if stderrPipe != nil {
+			go func() {
+				reader := bufio.NewReader(stderrPipe)
+				blue := "\x1b[" + color.Blue.Code() + "m"
+				reset := "\x1b[0m"
+				for {
+					lineBytes, err := reader.ReadBytes('\r')
+					if len(lineBytes) > 0 {
+						line := string(lineBytes)
+						if strings.HasPrefix(strings.TrimSpace(line), "#") {
+							fmt.Fprintf(os.Stderr, "%s%s%s", blue, line, reset)
+						} else {
+							fmt.Fprint(os.Stderr, line)
+						}
+					}
+					if err != nil {
+						break
+					}
+				}
+			}()
+		}
+
+		if err := cmd.Wait(); err != nil {
+			debugf("\ncurl failed, falling back to wget")
+		} else {
+			debugf("\nDownload successful with curl.")
+			return nil
+		}
+	} else {
+		debugf("curl not found, trying wget")
+	}
+
+	// --- Fallback 1: Try wget ---
+	if _, err := exec.LookPath("wget"); err == nil {
+		args := []string{"-nv", "-O", absPath}
+		args = append(args, finalURL) // Use the final URL for the download
+		cmd := exec.Command("wget", args...)
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		if err := cmd.Run(); err == nil {
+			debugf("\nDownload successful with wget.")
+			return nil
+		}
+		debugf("\nwget failed, falling back to native Go HTTP client")
+	} else {
+		debugf("wget not found, using native Go HTTP client")
+	}
+
+	// --- Fallback 2: Native Go HTTP Client ---
+	client, err := newHttpClient()
+	if err != nil {
+		return fmt.Errorf("failed to create http client: %w", err)
+	}
+
+	out, err := os.Create(absPath)
+	if err != nil {
+		return fmt.Errorf("failed to create destination file %s: %w", absPath, err)
+	}
+	defer out.Close()
+
+	resp, err := client.Get(finalURL) // Use the final URL for the download
+	if err != nil {
+		return fmt.Errorf("native http get failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("download failed with status: %s", resp.Status)
+	}
+
+	_, err = io.Copy(out, resp.Body)
+	if err != nil {
+		return fmt.Errorf("failed to write to destination file: %w", err)
+	}
+
+	debugf("Download successful with native Go HTTP client.")
+	return nil
+}
+
+// applyGnuMirror checks if a URL is a canonical GNU URL and replaces it with the
 // user-configured mirror if one is set. It returns the (potentially modified) URL.
 func applyGnuMirror(originalURL string) string {
 	if gnuMirrorURL != "" && strings.HasPrefix(originalURL, gnuOriginalURL) {
-		mirroredURL := strings.Replace(originalURL, gnuOriginalURL, gnuMirrorURL, 1)
-		debugf("Redirecting GNU URL: %s -> %s\n", originalURL, mirroredURL)
-		return mirroredURL
+		return strings.Replace(originalURL, gnuOriginalURL, gnuMirrorURL, 1)
 	}
 	return originalURL
 }
@@ -1050,33 +1226,30 @@ func fetchSources(pkgName, pkgDir string, processGit bool) error {
 			continue
 		}
 
-		parts := strings.SplitN(line, " ", 2)
-		sourceURL := parts[0]
+		// Declare all loop-scoped variables here.
+		var parts []string
+		var origFilename, hashName, cachePath, linkPath string
 
-		sourceURL = applyGnuMirror(sourceURL)
+		rawSourceURL := strings.Fields(line)[0]
 
-		// Skip local files
-		if strings.HasPrefix(sourceURL, "files/") {
-			continue
-		}
-		// Git repo handling
-		if strings.HasPrefix(sourceURL, "git+") {
-			// Skip git processing if disabled (checksum)
+		// --- Mirror and Git Logic ---
+		if strings.HasPrefix(rawSourceURL, "git+") {
+			// If we are not supposed to process git repos (e.g., in 'checksum' command), skip.
 			if !processGit {
-				cPrintf(colNote, "Skipping git repository for this operation: %s\n", sourceURL)
+				debugf("Skipping git repository for this operation: %s\n", rawSourceURL)
 				continue
 			}
-			gitURL := strings.TrimPrefix(sourceURL, "git+")
+			// ... (rest of the existing, correct git logic) ...
+			gitURL := strings.TrimPrefix(rawSourceURL, "git+")
 			ref := ""
 			if strings.Contains(gitURL, "#") {
 				subParts := strings.SplitN(gitURL, "#", 2)
 				gitURL = subParts[0]
 				ref = subParts[1]
 			}
-			parts := strings.Split(strings.TrimSuffix(gitURL, ".git"), "/")
+			parts = strings.Split(strings.TrimSuffix(gitURL, ".git"), "/")
 			repoName := parts[len(parts)-1]
-			destPath := filepath.Join(pkgLinkDir, repoName) // destPath is where the repo is cloned
-
+			destPath := filepath.Join(pkgLinkDir, repoName)
 			if _, err := os.Stat(destPath); os.IsNotExist(err) {
 				cPrintf(colInfo, "Cloning git repository %s into %s\n", gitURL, destPath)
 				cmd := exec.Command("git", "clone", gitURL, destPath)
@@ -1091,15 +1264,10 @@ func fetchSources(pkgName, pkgDir string, processGit bool) error {
 				cmd.Stderr = os.Stderr
 				cmd.Run()
 			}
-
-			// Disable detached HEAD advice
 			exec.Command("git", "-C", destPath, "config", "advice.detachedHead", "false").Run()
-
 			if ref != "" {
-				// Ref check logic remains the same
 				checkBranch := exec.Command("git", "-C", destPath, "rev-parse", "--verify", "refs/heads/"+ref)
 				if err := checkBranch.Run(); err == nil {
-					// branch → checkout + pull
 					cmd := exec.Command("git", "-C", destPath, "checkout", ref)
 					cmd.Stdout = os.Stdout
 					cmd.Stderr = os.Stderr
@@ -1109,7 +1277,6 @@ func fetchSources(pkgName, pkgDir string, processGit bool) error {
 					cmd.Stderr = os.Stderr
 					cmd.Run()
 				} else {
-					// tag/commit → checkout only
 					cmd := exec.Command("git", "-C", destPath, "checkout", ref)
 					cmd.Stdout = os.Stdout
 					cmd.Stderr = os.Stderr
@@ -1117,28 +1284,29 @@ func fetchSources(pkgName, pkgDir string, processGit bool) error {
 				}
 			}
 			cPrintf(colInfo, "Git repository ready: %s\n", destPath)
-			continue
+			continue // End git block
 		}
 
-		// HTTP/FTP sources
-		// Use sourceURL instead of line
-		parts = strings.Split(sourceURL, "/")
-		origFilename := parts[len(parts)-1]
+		// --- HTTP/FTP Source Logic ---
+		originalSourceURL := rawSourceURL
+		substitutedURL := applyGnuMirror(originalSourceURL)
 
-		// The hash should only be based on the URL, not the external parameter.
-		hashName := fmt.Sprintf("%s-%s", hashString(sourceURL), origFilename)
-		cachePath := filepath.Join(CacheStore, hashName)
+		parts = strings.Split(originalSourceURL, "/")
+		origFilename = parts[len(parts)-1]
+
+		// The hash for the cache MUST be based on the original, canonical URL.
+		hashName = fmt.Sprintf("%s-%s", hashString(originalSourceURL), origFilename)
+		cachePath = filepath.Join(CacheStore, hashName)
 
 		if _, err := os.Stat(cachePath); os.IsNotExist(err) {
-			if err := downloadFile(sourceURL, cachePath); err != nil {
-				return fmt.Errorf("failed to download %s: %v", sourceURL, err)
+			if err := downloadFile(originalSourceURL, substitutedURL, cachePath); err != nil {
+				return fmt.Errorf("failed to download %s: %v", substitutedURL, err)
 			}
 		} else {
-			cPrintf(colInfo, "Already in cache: %s\n", cachePath)
+			debugf("Already in cache: %s\n", cachePath)
 		}
 
-		// --- Linked file is created using the original filename from the URL ---
-		linkPath := filepath.Join(pkgLinkDir, origFilename)
+		linkPath = filepath.Join(pkgLinkDir, origFilename)
 		if _, err := os.Lstat(linkPath); err == nil {
 			os.Remove(linkPath)
 		}
@@ -1246,9 +1414,8 @@ func verifyOrCreateChecksums(pkgName, pkgDir string, force bool) error {
 
 	for _, fname := range expectedFiles {
 		filePath := filepath.Join(pkgSrcDir, fname)
-		url := urlMap[fname]
-		//apply gnu mirror if set
-		url = applyGnuMirror(url)
+		originalURL := urlMap[fname]
+		substitutedURL := applyGnuMirror(originalURL)
 
 		currentSum, sumExists := existing[fname]
 		isHashValid := false
@@ -1297,18 +1464,20 @@ func verifyOrCreateChecksums(pkgName, pkgDir string, force bool) error {
 		}
 
 		if shouldRedownload {
-			fmt.Printf("Redownloading %s...\n", fname)
-			actionSummary = "redownloaded and updated"
-			hashName := fmt.Sprintf("%s-%s", hashString(url), fname)
+			colArrow.Print("-> ")
+			colSuccess.Printf("Downloading %s\n", fname)
+			actionSummary = "Updated"
+
+			// The hash for the cache MUST be based on the original, canonical URL.
+			hashName := fmt.Sprintf("%s-%s", hashString(originalURL), fname)
 			cachePath := filepath.Join(CacheStore, hashName)
 
 			_ = os.Remove(cachePath)
 			_ = os.Remove(filePath)
 
-			if err := downloadFile(url, cachePath); err != nil {
+			if err := downloadFile(originalURL, substitutedURL, cachePath); err != nil {
 				return fmt.Errorf("failed to redownload %s: %v", fname, err)
 			}
-			// Recreate the symlink from the cache to the sources directory.
 			if err := os.Symlink(cachePath, filePath); err != nil {
 				return fmt.Errorf("failed to symlink %s -> %s: %v", cachePath, filePath, err)
 			}
@@ -1317,7 +1486,7 @@ func verifyOrCreateChecksums(pkgName, pkgDir string, force bool) error {
 		}
 
 		// 4. RECALCULATE: Generate the new checksum for the file now on disk.
-		fmt.Printf("Updating checksum for %s...\n", fname)
+		debugf("-> Updating checksum for %s\n", fname)
 		var newSum string
 		var calcErr error
 		if hasB3sum() {
@@ -1342,9 +1511,10 @@ func verifyOrCreateChecksums(pkgName, pkgDir string, force bool) error {
 		return fmt.Errorf("failed to write checksums file: %v", err)
 	}
 
-	fmt.Printf("\nChecksums summary for %s:\n", pkgName)
+	debugf("-> Checksums summary for %s:\n", pkgName)
 	for _, s := range summary {
-		fmt.Println(" -", s)
+		colArrow.Print("-> ")
+		colSuccess.Println("Checksum", s)
 	}
 
 	return nil
@@ -2363,7 +2533,8 @@ func createPackageTarball(pkgName, pkgVer, outputDir string, execCtx *Executor) 
 		tarCmd := exec.Command("tar", args...)
 		debugf("Creating package tarball with system tar: %s\n", tarballPath)
 		if err := execCtx.Run(tarCmd); err == nil {
-			cPrintf(colInfo, "Package tarball created successfully: %s\n", tarballPath)
+			colArrow.Print("-> ")
+			colSuccess.Println("Package tarball created successfully")
 			return nil
 		}
 		// fall through to internal if tar fails
@@ -3406,10 +3577,11 @@ func updateRepos() {
 			uniqueRepoDirs[repoDir] = struct{}{}
 		}
 	}
-
-	cPrintln(colInfo, "Unique repositories to update:")
+	colArrow.Print("-> ")
+	colSuccess.Println("Unique repositories to update:")
 	for dir := range uniqueRepoDirs {
-		fmt.Printf("- %s\n", dir)
+		colArrow.Print("-> ")
+		colSuccess.Printf("%s\n", dir)
 
 		// 3. Execute 'git pull' in each unique directory
 		// We use dir as the working directory for 'git pull'
@@ -3422,7 +3594,8 @@ func updateRepos() {
 		if err != nil {
 			fmt.Printf("Error pulling repo %s: %v\nOutput:\n%s\n", dir, err, strings.TrimSpace(string(output)))
 		} else {
-			cPrintf(colInfo, "Successfully pulled repo %s\nOutput:\n%s\n", dir, strings.TrimSpace(string(output)))
+			colArrow.Print("-> ")
+			colSuccess.Printf("Successfully pulled repo %s\nOutput:\n%s\n", dir, strings.TrimSpace(string(output)))
 		}
 	}
 }
@@ -3552,7 +3725,8 @@ func pkgBuildAll(packages []string) error {
 	var failed []string
 
 	for _, pkg := range packages {
-		fmt.Printf("\n--> Executing pkgBuild for: %s\n", pkg)
+		colArrow.Print("\n-> ")
+		colSuccess.Printf("Executing pkgBuild for: %s\n", pkg)
 
 		args := []string{"build", "-a"}
 		if idleUpdate {
@@ -3569,12 +3743,13 @@ func pkgBuildAll(packages []string) error {
 		cmd.Stderr = os.Stderr
 
 		if err := cmd.Run(); err != nil {
-			fmt.Fprintf(os.Stderr, "pkgBuild failed for %s: %v\n", pkg, err)
+			colArrow.Print("-> ")
+			color.Danger.Printf("pkgBuild failed for %s: %v\n", pkg, err)
 			failed = append(failed, pkg)
 			continue
 		}
-
-		cPrintln(colSuccess, "Build+Install completed successfully.")
+		colArrow.Print("-> ")
+		colSuccess.Println("Build+Install completed successfully.")
 	}
 
 	if len(failed) > 0 {
@@ -3586,7 +3761,8 @@ func pkgBuildAll(packages []string) error {
 
 // checkForUpgrades is the main function for the upgrade logic.
 func checkForUpgrades() error {
-	cPrintln(colInfo, "--- Checking for Package Upgrades ---")
+	colArrow.Print("-> ")
+	colSuccess.Println("Checking for Package Upgrades")
 
 	// 1. Get list of installed packages
 	output, err := getInstalledPackageOutput("")
@@ -3607,7 +3783,7 @@ func checkForUpgrades() error {
 		repoVersion, repoRevision, err := getRepoVersion2(name)
 		if err != nil {
 			// Log error but continue to the next package
-			fmt.Printf("Warning: Could not get repo version for %s: %v\n", name, err)
+			debugf("Warning: Could not get repo version for %s: %v\n", name, err)
 			continue
 		}
 
@@ -3629,7 +3805,8 @@ func checkForUpgrades() error {
 
 	// 3. Handle upgrade list
 	if len(upgradeList) == 0 {
-		cPrintln(colSuccess, "No packages to upgrade.")
+		colArrow.Print("-> ")
+		colSuccess.Println("No packages to upgrade.")
 		return nil
 	}
 
@@ -3645,7 +3822,7 @@ func checkForUpgrades() error {
 	}
 
 	// 4. Prompt user for upgrade
-	if askForConfirmation("Do you want to upgrade these packages?") {
+	if askForConfirmation(colInfo, "Do you want to upgrade these packages?") {
 		// 5. Execute pkgBuild
 		return pkgBuildAll(pkgNames)
 	} else {
@@ -4015,7 +4192,8 @@ func compareVersions(a, b string) int {
 // stripPackage recursively walks outputDir and runs the 'strip' command on every executable file found,
 // executing the stripping concurrently to maximize speed.
 func stripPackage(outputDir string, buildExec *Executor) error {
-	cPrintf(colInfo, "Stripping executables in parallel in: %s\n", outputDir)
+	colArrow.Print("-> ")
+	colSuccess.Println("Stripping executables in parallel")
 
 	var wg sync.WaitGroup
 
@@ -4038,7 +4216,7 @@ func stripPackage(outputDir string, buildExec *Executor) error {
 	findCmd.Stdout = &findOutput
 	findCmd.Stderr = os.Stderr
 
-	debugf("  -> Discovering stripable ELF files...")
+	debugf("  -> Discovering stripable ELF files")
 	if err := buildExec.Run(findCmd); err != nil {
 		return fmt.Errorf("failed to execute file discovery command (find/file filter): %w", err)
 	}
@@ -4213,14 +4391,19 @@ type fileMetadata struct {
 	B3Sum   string
 }
 
-// userprompt for install after build
-func getUserConfirmation(prompt string) bool {
+// getUserConfirmation prompts the user and accepts 'y' or 'n'.
+// It can print the prompt with a specific color style if p is not nil.
+func getUserConfirmation(p colorPrinter, format string, a ...any) bool {
 	reader := bufio.NewReader(os.Stdin)
+	prompt := fmt.Sprintf(format, a...) // Create the final prompt string first
+
 	for {
-		fmt.Print(prompt)
+		// Use cPrintf to print the prompt. It handles the nil case automatically.
+		cPrintf(p, "%s", prompt)
+
 		input, _ := reader.ReadString('\n')
 		input = strings.TrimSpace(strings.ToLower(input))
-		if input == "y" || input == "" {
+		if input == "y" || input == "" { // Default to 'yes' on Enter
 			return true
 		}
 		if input == "n" {
@@ -4230,13 +4413,23 @@ func getUserConfirmation(prompt string) bool {
 	}
 }
 
-func askForConfirmation(prompt string) bool {
+// askForConfirmation prompts the user and defaults to 'yes'.
+// It can print the prompt with a specific color style if p is not nil.
+func askForConfirmation(p colorPrinter, format string, a ...any) bool {
 	reader := bufio.NewReader(os.Stdin)
+	// First, create the main part of the prompt using the provided arguments.
+	mainPrompt := fmt.Sprintf(format, a...)
+	// Then, create the final, full prompt string.
+	fullPrompt := fmt.Sprintf("%s [Y/n]: ", mainPrompt)
+
 	for {
-		fmt.Printf("%s [Y/n]: ", prompt)
+		// Use our existing cPrintf helper to print the prompt with the desired color.
+		// cPrintf will handle the case where 'p' is nil and print without color.
+		cPrintf(p, "%s", fullPrompt)
+
 		response, err := reader.ReadString('\n')
 		if err != nil {
-			return false
+			return false // On error (like Ctrl+D), default to "no"
 		}
 
 		response = strings.ToLower(strings.TrimSpace(response))
@@ -4307,7 +4500,8 @@ func findOwnerPackage(filePath string) (string, error) {
 // PostInstallTasks runs common system cache updates after package installs.
 // Call with RootExec:  if err := PostInstallTasks(RootExec); err != nil { ... }
 func PostInstallTasks(e *Executor) error {
-	cPrintln(colWarn, "Executing post-install tasks")
+	colArrow.Print("-> ")
+	colSuccess.Println("Executing post-install tasks")
 	tasks := []struct {
 		name string
 		args []string
@@ -4602,7 +4796,7 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool) er
 	}
 
 	// Run build script
-	cPrintf(colInfo, "Building %s (version %s) in %s, install to %s (root=%v)\n",
+	debugf("Building %s (version %s) in %s, install to %s (root=%v)\n",
 		pkgName, version, buildDir, outputDir, buildExec)
 
 	// 1. Define the log file path
@@ -4658,7 +4852,7 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool) er
 
 	if !buildExec.Interactive {
 		// --- NON-INTERACTIVE PATH: Run with timer and title updates ---
-		setTerminalTitle(fmt.Sprintf("Starting %s...", pkgName))
+		setTerminalTitle(fmt.Sprintf("Starting %s", pkgName))
 		doneCh := make(chan struct{})
 		var runWg sync.WaitGroup
 		runWg.Add(1)
@@ -4671,9 +4865,10 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool) er
 				select {
 				case <-ticker.C:
 					elapsed := time.Since(startTime).Truncate(time.Second)
-					title := fmt.Sprintf("%s... elapsed: %s", pkgName, elapsed)
+					title := fmt.Sprintf("%s elapsed: %s", pkgName, elapsed)
 					setTerminalTitle(title)
-					colInfo.Printf("-> Building %s ... elapsed: %s\r", pkgName, elapsed)
+					colArrow.Print("-> ")
+					colSuccess.Printf("Building %s elapsed: %s\r", pkgName, elapsed)
 				case <-doneCh:
 					fmt.Print("\r")
 					return
@@ -4701,7 +4896,8 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool) er
 	}
 
 	if runErr != nil {
-		cPrintf(colError, "\nBuild failed for %s: %v\n", pkgName, runErr)
+		colArrow.Print("-> ")
+		color.Danger.Printf("Build failed for %s: %v\n", pkgName, runErr)
 		finalTitle := fmt.Sprintf("❌ FAILED: %s", pkgName)
 		setTerminalTitle(finalTitle)
 
@@ -4729,7 +4925,7 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool) er
 
 	// success
 	elapsed := time.Since(startTime).Truncate(time.Second)
-	cPrintf(colSuccess, "\n%s built successfully in %s, output in %s\n", pkgName, elapsed, outputDir)
+	debugf("\n%s built successfully in %s, output in %s\n", pkgName, elapsed, outputDir)
 
 	// Create /var/db/hokuto/installed/<pkgName> inside the staging outputDir
 	installedDir := filepath.Join(outputDir, "var", "db", "hokuto", "installed", pkgName)
@@ -5187,7 +5383,7 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 
 	if !buildExec.Interactive {
 		// --- NON-INTERACTIVE PATH: Run with timer and title updates ---
-		setTerminalTitle(fmt.Sprintf("Rebuilding %s...", pkgName))
+		setTerminalTitle(fmt.Sprintf("Rebuilding %s", pkgName))
 		doneCh := make(chan struct{})
 		var runWg sync.WaitGroup
 		runWg.Add(1)
@@ -5200,9 +5396,9 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 				select {
 				case <-ticker.C:
 					elapsed := time.Since(startTime).Truncate(time.Second)
-					title := fmt.Sprintf("Rebuild %s... elapsed: %s", pkgName, elapsed)
+					title := fmt.Sprintf("Rebuild %s elapsed: %s", pkgName, elapsed)
 					setTerminalTitle(title)
-					colInfo.Printf(" Building %s ... elapsed: %s\r", pkgName, elapsed)
+					colInfo.Printf(" Building %s  elapsed: %s\r", pkgName, elapsed)
 				case <-doneCh:
 					fmt.Print("\r")
 					return
@@ -5259,7 +5455,7 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 
 	// success
 	elapsed := time.Since(startTime).Truncate(time.Second)
-	cPrintf(colSuccess, "\n%s built successfully in %s, output in %s\n", pkgName, elapsed, outputDir)
+	cPrintf(colNote, "\n%s built successfully in %s, output in %s\n", pkgName, elapsed, outputDir)
 
 	// Create /var/db/hokuto/installed/<pkgName> inside the staging outputDir
 	installedDir := filepath.Join(outputDir, "var", "db", "hokuto", "installed", pkgName)
@@ -5293,7 +5489,7 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 			return fmt.Errorf("build failed during stripping phase for %s: %w", pkgName, err)
 		}
 	} else {
-		cPrintf(colInfo, "Skipping binary stripping for %s (NoStrip is true).\n", pkgName)
+		debugf("Skipping binary stripping for %s (NoStrip is true).\n", pkgName)
 	}
 
 	// Copy version file from pkgDir
@@ -5394,7 +5590,7 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 		return fmt.Errorf("failed to generate manifest: %v", err)
 	}
 
-	cPrintf(colSuccess, "%s rebuilt successfully, output in %s\n", pkgName, outputDir)
+	cPrintf(colNote, "%s rebuilt successfully, output in %s\n", pkgName, outputDir)
 	//Set title to success status
 	finalTitle := fmt.Sprintf("✅ SUCCESS: %s", pkgName)
 	setTerminalTitle(finalTitle)
@@ -5407,7 +5603,8 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor) err
 
 	// Special handling for glibc: direct extraction without staging or checks
 	if pkgName == "glibc" {
-		cPrintf(colInfo, "Installing glibc using direct extraction method...\n")
+		colArrow.Print("-> ")
+		colSuccess.Println("Installing glibc using direct extraction method")
 
 		var extractErr error
 
@@ -5420,13 +5617,15 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor) err
 
 			extractErr = execCtx.Run(tarCmd)
 			if extractErr == nil {
-				cPrintf(colSuccess, "glibc installed successfully via direct extraction.\n")
+				colArrow.Print("-> ")
+				colSuccess.Println("glibc installed successfully via direct extraction.")
 			}
 		} else {
 			// Fallback to Go implementation if tar not available
 			extractErr = unpackTarballFallback(tarballPath, rootDir)
 			if extractErr == nil {
-				cPrintf(colSuccess, "glibc installed successfully via direct extraction (fallback).\n")
+				colArrow.Print("-> ")
+				colSuccess.Println("glibc installed successfully via direct extraction (fallback).")
 			}
 		}
 
@@ -5436,7 +5635,8 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor) err
 
 		// Always run post-install hook for glibc
 		if err := executePostInstall(pkgName, rootDir, execCtx); err != nil {
-			fmt.Printf("warning: post-install for %s returned error: %v\n", pkgName, err)
+			colArrow.Print("-> ")
+			color.Danger.Printf("post-install for %s returned error: %v\n", pkgName, err)
 		}
 
 		return nil
@@ -5869,7 +6069,8 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor) err
 
 		// 8b. Perform rebuild
 		if performRebuild {
-			cPrintln(colInfo, "Starting rebuild of affected packages...")
+			colArrow.Print("-> ")
+			colSuccess.Println("Starting rebuild of affected packages")
 			for _, pkg := range affectedList {
 				cPrintf(colInfo, "\n--- Rebuilding %s ---\n", pkg)
 
@@ -5888,7 +6089,7 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor) err
 					if err := execCtx.Run(rmCmd); err != nil {
 						fmt.Fprintf(os.Stderr, "failed to cleanup rebuild tmpdirs for %s: %v\n", pkg, err)
 					}
-					cPrintf(colSuccess, "Rebuild of %s finished and installed.\n", pkg)
+					cPrintf(colNote, "Rebuild of %s finished and installed.\n", pkg)
 				}
 			}
 		}
@@ -6035,7 +6236,8 @@ func pkgUninstall(pkgName string, cfg *Config, execCtx *Executor, force, yes boo
 
 	// 5. Confirm with user unless 'yes' is set
 	if !yes {
-		cPrintf(colWarn, "About to remove package %s and %d file(s). Continue? [Y/n]: ", pkgName, fileCount)
+		colArrow.Print("-> ")
+		colSuccess.Printf("About to remove package %s and %d file(s). Continue? [Y/n]: ", pkgName, fileCount)
 		var answer string
 		fmt.Scanln(&answer)
 		answer = strings.ToLower(strings.TrimSpace(answer))
@@ -6126,7 +6328,8 @@ func pkgUninstall(pkgName string, cfg *Config, execCtx *Executor, force, yes boo
 
 		if err := execCtx.Run(rmCmd); err != nil {
 			// If batch removal fails, try individual removals
-			fmt.Printf("Batch removal failed, trying individual removals...\n")
+			colArrow.Print("-> ")
+			colSuccess.Println("Batch removal failed, trying individual removals")
 			for _, file := range filesToRemove {
 				rmCmd := exec.Command("rm", "-f", file)
 				if err := execCtx.Run(rmCmd); err != nil {
@@ -6136,7 +6339,8 @@ func pkgUninstall(pkgName string, cfg *Config, execCtx *Executor, force, yes boo
 				}
 			}
 		} else {
-			fmt.Printf("Removed %d files\n", len(filesToRemove))
+			colArrow.Print("-> ")
+			colSuccess.Printf("Removed %d files\n", len(filesToRemove))
 		}
 	}
 
@@ -6305,8 +6509,8 @@ func handleBuildCommand(args []string, cfg *Config) {
 				// Need to download and unpack into /tmp/repo
 				url := "https://github.com/sauzeros/bootstrap/releases/download/latest/bootstrap-repo.tar.xz"
 				tmpFile := filepath.Join(os.TempDir(), "bootstrap-repo.tar.xz")
-
-				log.Printf("Downloading bootstrap repo from %s ...", url)
+				colArrow.Print("-> ")
+				colSuccess.Printf("Downloading bootstrap repo from %s\n", url)
 				resp, err := http.Get(url)
 				if err != nil {
 					log.Fatalf("failed to download bootstrap repo: %v", err)
@@ -6324,7 +6528,8 @@ func handleBuildCommand(args []string, cfg *Config) {
 				out.Close()
 
 				// Unpack into /tmp/repo
-				log.Printf("Unpacking bootstrap repo into /tmp/repo ...")
+				colArrow.Print("-> ")
+				colSuccess.Println("Unpacking bootstrap repo into /tmp/repo")
 
 				extractDir := filepath.Join(os.TempDir(), "repo")
 				if err := os.MkdirAll(extractDir, 0o755); err != nil {
@@ -6409,7 +6614,8 @@ func handleBuildCommand(args []string, cfg *Config) {
 		fmt.Println("--alldeps flag set: building all dependencies in order with duplicates allowed")
 
 		for _, pkgName := range packagesToProcess {
-			fmt.Printf("Resolving dependencies for target package %s...\n", pkgName)
+			colArrow.Print("-> ")
+			colSuccess.Println("Resolving dependencies for target package %s", pkgName)
 
 			// Get dependencies in forward order (as they appear in depends file)
 			deps, err := getPackageDependenciesForward(pkgName)
@@ -6425,7 +6631,8 @@ func handleBuildCommand(args []string, cfg *Config) {
 	} else {
 		// Normal mode: use existing dependency resolution (reverse order, no duplicates)
 		for _, pkgName := range packagesToProcess {
-			fmt.Printf("Resolving dependencies for target package %s...\n", pkgName)
+			colArrow.Print("-> ")
+			colSuccess.Printf("Resolving dependencies for target package %s\n", pkgName)
 
 			// NOTE: resolveMissingDeps must be able to handle being called multiple times
 			// and update masterProcessed and masterMissingDeps correctly, acting like a global resolver.
@@ -6460,17 +6667,18 @@ func handleBuildCommand(args []string, cfg *Config) {
 					fmt.Printf("Dependency '%s' is not installed, but a built binary (%s) is available.\n", depPkg, filepath.Base(tarballPath))
 
 					// PROMPT: Do you want to use the pre-built binary?
-					if !getUserConfirmation(fmt.Sprintf("Do you want to use the available binary package for dependency %s? (Y/n) ", depPkg)) {
+					if !getUserConfirmation(colNote, "-> Do you want to use the available binary package for dependency %s? (Y/n) ", depPkg) {
 						fmt.Printf("User chose to build %s.\n", depPkg)
 						finalPackagesToBuild = append(finalPackagesToBuild, depPkg)
 					} else {
-						fmt.Printf("Using available binary for %s. Installing...\n", depPkg)
+						colArrow.Print("-> ")
+						colSuccess.Printf("Using available binary for %s. Installing\n", depPkg)
 						// Check if package has dependencies to uninstall first
 						depsToUninstall := getPackageDependenciesToUninstall(depPkg)
 						if len(depsToUninstall) > 0 {
 							debugf("Package %s requires uninstalling dependencies: %v\n", depPkg, depsToUninstall)
 							for _, dep := range depsToUninstall {
-								debugf("Uninstalling %s...\n", dep)
+								debugf("Uninstalling %s\n", dep)
 								if err := pkgUninstall(dep, cfg, RootExec, true, true); err != nil {
 									// Log warning but continue with installation
 									debugf("Warning: failed to uninstall %s: %v (continuing with installation)\n", dep, err)
@@ -6487,7 +6695,8 @@ func handleBuildCommand(args []string, cfg *Config) {
 							os.Exit(1)
 						}
 						isCriticalAtomic.Store(0)
-						fmt.Printf("Dependency %s installed successfully from binary.\n", depPkg)
+						colArrow.Print("-> ")
+						colSuccess.Printf("Dependency %s installed successfully from binary.\n", depPkg)
 						// This package is installed and won't be built, so skip adding to finalPackagesToBuild
 					}
 				} else {
@@ -6522,7 +6731,8 @@ func handleBuildCommand(args []string, cfg *Config) {
 		for _, targetPkg := range packagesToProcess {
 			if !alreadyInBuildList[targetPkg] {
 				// This package was not "missing", but the user wants to rebuild it.
-				fmt.Printf("Package '%s' is already installed. Adding to queue for a forced rebuild.\n", targetPkg)
+				colArrow.Print("-> ")
+				colSuccess.Printf("Package '%s' is already installed. Adding to queue for a forced rebuild.\n", targetPkg)
 				packagesToBuild = append(packagesToBuild, targetPkg)
 			}
 		}
@@ -6537,7 +6747,8 @@ func handleBuildCommand(args []string, cfg *Config) {
 		os.Exit(0)
 	}
 
-	fmt.Printf("The following packages will be built in order: %s\n", strings.Join(packagesToBuild, ", "))
+	colArrow.Print("-> ")
+	colSuccess.Printf("The following packages will be built in order: %s\n", strings.Join(packagesToBuild, ", "))
 	// If idle priority is set, inform the user
 	if setIdlePriority {
 		cPrintf(colWarn, "NOTE: Build process niceness set to IDLE (nice -n 19).\n")
@@ -6554,9 +6765,11 @@ func handleBuildCommand(args []string, cfg *Config) {
 		}
 		tarballPath := filepath.Join(BinDir, fmt.Sprintf("%s-%s.tar.zst", buildPkg, version))
 
-		fmt.Printf("--- Starting Build: %s (%s) ---\n", buildPkg, version)
+		colArrow.Print("-> ")
+		colSuccess.Printf("Starting Build: %s (%s)\n", buildPkg, version)
 		if err := pkgBuild(buildPkg, cfg, UserExec, *bootstrap); err != nil {
-			fmt.Fprintf(os.Stderr, "Fatal error building %s: %v\n", buildPkg, err)
+			colArrow.Print("-> ")
+			colError.Printf("Fatal error building %s: %v\n", buildPkg, err)
 			os.Exit(1)
 		}
 
@@ -6570,7 +6783,7 @@ func handleBuildCommand(args []string, cfg *Config) {
 			if len(depsToUninstall) > 0 {
 				debugf("Package %s requires uninstalling dependencies: %v\n", buildPkg, depsToUninstall)
 				for _, dep := range depsToUninstall {
-					debugf("Uninstalling %s...\n", dep)
+					debugf("Uninstalling %s\n", dep)
 					if err := pkgUninstall(dep, cfg, RootExec, true, true); err != nil {
 						// Log warning but continue with installation
 						debugf("Warning: failed to uninstall %s: %v (continuing with installation)\n", dep, err)
@@ -6585,7 +6798,8 @@ func handleBuildCommand(args []string, cfg *Config) {
 				os.Exit(1)
 			}
 			isCriticalAtomic.Store(0)
-			fmt.Printf("Dependency %s installed successfully.\n", buildPkg)
+			colArrow.Print("-> ")
+			colSuccess.Printf("Dependency %s installed successfully.\n", buildPkg)
 		} else {
 			// If it's a target package, defer install and save its name
 			builtTargetPackages = append(builtTargetPackages, buildPkg)
@@ -6600,7 +6814,7 @@ func handleBuildCommand(args []string, cfg *Config) {
 		if !shouldInstall {
 			// Prompt user once for all built target packages
 			targetsList := strings.Join(builtTargetPackages, ", ")
-			shouldInstall = getUserConfirmation(fmt.Sprintf("Build finished. Do you want to install the following package(s): %s? (Y/n) ", targetsList))
+			shouldInstall = getUserConfirmation(colWarn, "-> Do you want to install the following package(s): %s (Y/n) ", targetsList)
 		}
 
 		if shouldInstall {
@@ -6614,7 +6828,7 @@ func handleBuildCommand(args []string, cfg *Config) {
 				if len(depsToUninstall) > 0 {
 					debugf("Package %s requires uninstalling dependencies: %v\n", finalPkg, depsToUninstall)
 					for _, dep := range depsToUninstall {
-						debugf("Uninstalling %s...\n", dep)
+						debugf("Uninstalling %s\n", dep)
 						if err := pkgUninstall(dep, cfg, RootExec, true, true); err != nil {
 							// Log warning but continue with installation
 							debugf("Warning: failed to uninstall %s: %v (continuing with installation)\n", dep, err)
@@ -6623,8 +6837,8 @@ func handleBuildCommand(args []string, cfg *Config) {
 						}
 					}
 				}
-
-				cPrintf(colInfo, "Starting installation of target package %s...\n", finalPkg)
+				colArrow.Print("-> ")
+				colSuccess.Printf("Starting installation of target package %s\n", finalPkg)
 				isCriticalAtomic.Store(1)
 				if err := pkgInstall(tarballPath, finalPkg, cfg, RootExec); err != nil {
 					isCriticalAtomic.Store(0)
@@ -6632,10 +6846,11 @@ func handleBuildCommand(args []string, cfg *Config) {
 					os.Exit(1)
 				}
 				isCriticalAtomic.Store(0)
-				cPrintf(colSuccess, "Package %s installed successfully.\n", finalPkg)
+				colArrow.Print("-> ")
+				colSuccess.Printf("Package %s installed successfully.\n", finalPkg)
 			}
 		} else {
-			fmt.Printf("Installation of target packages skipped by user. Built packages remain in %s.\n", BinDir)
+			debugf("Installation of target packages skipped by user. Built packages remain in %s.\n", BinDir)
 		}
 	}
 
@@ -6748,7 +6963,7 @@ func (e *Executor) BindMount(source, dest, options string) error {
 	// Note: We use the '-o bind' option, which is equivalent to MS_BIND.
 	cmdBind := exec.Command("mount", "--bind", source, dest)
 
-	fmt.Printf("[INFO] Running: %s %s\n", "mount", strings.Join(cmdBind.Args, " "))
+	debugf("[INFO] Running: %s %s\n", "mount", strings.Join(cmdBind.Args, " "))
 	if err := e.Run(cmdBind); err != nil {
 		return fmt.Errorf("failed to perform bind mount of %s to %s: %w", source, dest, err)
 	}
@@ -6855,13 +7070,15 @@ func runChrootCommand(args []string, execCtx *Executor) (exitCode int) {
 	}
 
 	defer func() {
-		fmt.Println("\n[INFO] Starting chroot cleanup")
+		colArrow.Print("-> ")
+		colSuccess.Println("Starting chroot cleanup")
 		// Use the list of paths confirmed to exist
 		err := execCtx.UnmountFilesystems(existingPaths)
 		if err != nil {
 			// ... (error handling for cleanup) ...
 		} else {
-			fmt.Println("[INFO] Successfully unmounted all chroot filesystems.")
+			colArrow.Print("-> ")
+			colSuccess.Println("Successfully unmounted all chroot filesystems.")
 		}
 	}()
 
@@ -6869,7 +7086,7 @@ func runChrootCommand(args []string, execCtx *Executor) (exitCode int) {
 	isCriticalAtomic.Store(1)
 	defer isCriticalAtomic.Store(0)
 
-	fmt.Printf("[INFO] Setting up specialized mounts in %s \n", targetDir)
+	debugf("[INFO] Setting up specialized mounts in %s \n", targetDir)
 
 	// Helper to reduce verbosity. m now sends the full destination path.
 	m := func(source, target string, fsType, options string, isBind bool) error {
@@ -6949,7 +7166,8 @@ func runChrootCommand(args []string, execCtx *Executor) (exitCode int) {
 	}
 
 	// --- C. CHROOT EXECUTION ---
-	fmt.Printf("[INFO] Executing command %v in chroot %s...\n", chrootCmd, targetDir)
+	colArrow.Print("-> ")
+	colSuccess.Printf("Executing command %v in chroot %s\n", chrootCmd, targetDir)
 
 	finalCode, err := execCtx.ExecuteChroot(targetDir, chrootCmd)
 
@@ -7045,30 +7263,35 @@ func handleCleanupCommand(args []string) error {
 	}
 
 	if *cleanSources {
-		cPrintf(colWarn, "This will permanently delete the source cache at %s.\n", SourcesDir)
-		if askForConfirmation("Are you sure you want to proceed?") {
-			cPrintf(colInfo, "Removing source cache directory: %s\n", SourcesDir)
+		colArrow.Print("-> ")
+		cPrintf(colWarn, "Deleting sources cache at %s.\n", SourcesDir)
+		if askForConfirmation(colArrow, "Are you sure you want to proceed?") {
+			debugf("Removing source cache directory: %s\n", SourcesDir)
 			rmCmd := exec.Command("rm", "-rf", SourcesDir)
 			if err := RootExec.Run(rmCmd); err != nil {
 				return fmt.Errorf("failed to remove source cache: %w", err)
 			}
-			cPrintln(colSuccess, "Source cache removed successfully.")
+			colArrow.Print("-> ")
+			colSuccess.Println("Source cache removed successfully.")
 		} else {
-			cPrintln(colNote, "Cleanup of source cache canceled.")
+			colArrow.Print("-> ")
+			colSuccess.Println("Cleanup of source cache canceled.")
 		}
 	}
 
 	if *cleanBins {
 		cPrintf(colWarn, "This will permanently delete all built binary packages at %s.\n", BinDir)
-		if askForConfirmation("Are you sure you want to proceed?") {
-			cPrintf(colInfo, "Removing binary cache directory: %s\n", BinDir)
+		if askForConfirmation(colArrow, "Are you sure you want to proceed?") {
+			debugf("Removing binary cache directory: %s\n", BinDir)
 			rmCmd := exec.Command("rm", "-rf", BinDir)
 			if err := RootExec.Run(rmCmd); err != nil {
 				return fmt.Errorf("failed to remove binary cache: %w", err)
 			}
-			cPrintln(colSuccess, "Binary cache removed successfully.")
+			colArrow.Print("-> ")
+			colSuccess.Println("Binary cache removed successfully.")
 		} else {
-			cPrintln(colNote, "Cleanup of binary cache canceled.")
+			colArrow.Print("-> ")
+			colSuccess.Println("Cleanup of binary cache canceled.")
 		}
 	}
 
@@ -7173,12 +7396,14 @@ func main() {
 			case sig := <-sigs:
 				if isCriticalAtomic.Load() == 1 {
 					// --- CRITICAL PHASE: Block 1st signal, force exit on 2nd ---
-					fmt.Printf("\n[WARNING] Critical operation in progress (e.g., install). Press Ctrl+C AGAIN to force exit NOW.\n")
+					colArrow.Print("\n-> ")
+					colError.Printf("Critical operation in progress (e.g., install). Press Ctrl+C AGAIN to force exit NOW.\n")
 
 					// Wait for a second signal or a short delay
 					select {
 					case <-sigs:
-						fmt.Println("\n[FATAL] Forced immediate exit.")
+						colArrow.Print("\n-> ")
+						colError.Printf("Forced immediate exit.")
 						os.Exit(130) // Common exit code for SIGINT
 					case <-time.After(5 * time.Second):
 						// If no second signal, continue waiting for the loop to repeat
@@ -7188,7 +7413,8 @@ func main() {
 					}
 				} else {
 					// --- NON-CRITICAL PHASE: Graceful Cancellation ---
-					fmt.Printf("\n[INFO] Received %v. Cancelling process gracefully...\n", sig)
+					colArrow.Print("\n-> ")
+					color.Danger.Printf("Received %v. Cancelling process gracefully\n", sig)
 					cancel() // Cancel the context
 
 					// Give the command a moment to die and flush its buffers
@@ -7198,11 +7424,13 @@ func main() {
 					// NOTE: Don't check ctx.Done() here since we just cancelled it
 					select {
 					case <-sigs:
-						fmt.Println("\n[FATAL] Second interrupt received. Forcing immediate exit.")
+						colArrow.Print("\n-> ")
+						color.Danger.Printf("Second interrupt received. Forcing immediate exit.")
 						os.Exit(130)
 					case <-time.After(2 * time.Second):
 						// Give more time for graceful shutdown (increased from 500ms to 2s)
-						fmt.Println("\n[INFO] Graceful shutdown timeout. Exiting.")
+						colArrow.Print("\n-> ")
+						color.Danger.Printf("Graceful shutdown timeout. Exiting.")
 						os.Exit(0)
 					}
 				}
@@ -7387,7 +7615,7 @@ func main() {
 		for _, arg := range args {
 			var tarballPath, pkgName string
 
-			cPrintf(colInfo, "Processing argument: %s\n", arg)
+			debugf("Processing argument: %s\n", arg)
 
 			if strings.HasSuffix(arg, ".tar.zst") {
 				// Direct tarball path
@@ -7446,7 +7674,7 @@ func main() {
 			if len(depsToUninstall) > 0 {
 				debugf("Package %s requires uninstalling dependencies: %v\n", pkgName, depsToUninstall)
 				for _, dep := range depsToUninstall {
-					debugf("Uninstalling %s...\n", dep)
+					debugf("Uninstalling %s\n", dep)
 					if err := pkgUninstall(dep, cfg, RootExec, true, true); err != nil {
 						// Log warning but continue with installation
 						debugf("Warning: failed to uninstall %s: %v (continuing with installation)\n", dep, err)
@@ -7455,7 +7683,8 @@ func main() {
 					}
 				}
 			}
-			cPrintf(colInfo, "Starting installation of %s from %s...\n", pkgName, tarballPath)
+			colArrow.Print("-> ")
+			colSuccess.Printf("Installing %s from %s\n", pkgName, tarballPath)
 
 			if err := pkgInstall(tarballPath, pkgName, cfg, RootExec); err != nil {
 				fmt.Fprintf(os.Stderr, "Error installing package %s: %v\n", pkgName, err)
@@ -7463,8 +7692,8 @@ func main() {
 				// Continue to the next package
 				continue
 			}
-
-			cPrintf(colSuccess, "Package %s installed successfully.\n", pkgName)
+			colArrow.Print("-> ")
+			colSuccess.Printf("Package %s installed successfully.\n", pkgName)
 		}
 
 		if !allSucceeded {
@@ -7509,16 +7738,19 @@ func main() {
 		// Loop through all provided packages and attempt to uninstall each one
 		allSucceeded := true
 		for _, pkgName := range packagesToUninstall {
-			cPrintf(colInfo, "Attempting to uninstall package: %s\n", pkgName)
+			colArrow.Print("-> ")
+			colSuccess.Printf("Attempting to uninstall package: %s\n", pkgName)
 
 			// The pkgUninstall function must be updated to accept the final flag values
 			if err := pkgUninstall(pkgName, cfg, RootExec, effectiveForce, effectiveYes); err != nil {
-				fmt.Fprintf(os.Stderr, "Error uninstalling %s: %v\n", pkgName, err)
+				colArrow.Print("-> ")
+				color.Light.Printf("Error uninstalling %s: %v\n", pkgName, err)
 				allSucceeded = false
 				// Continue to the next package instead of os.Exit(1) immediately
 				// This allows for partial success if one package fails but others succeed.
 			} else {
-				cPrintf(colSuccess, "Package %s removed\n", pkgName)
+				colArrow.Print("-> ")
+				colSuccess.Printf("Package %s removed\n", pkgName)
 			}
 		}
 
