@@ -9,3 +9,6 @@ git push origin v1.0 --force
 
 # Add a release on github
 gh release create v0.2 hokuto-v0.2.tar.xz --title hokuto v0.2 --notes hokuto v0.2 release
+
+# Update a release
+gh release upload v0.2.26 hokuto-v0.2.26.tar.xz --clobber
