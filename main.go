@@ -63,6 +63,8 @@ var (
 	setIdlePriority bool
 	buildPriority   string
 	ConfigFile      = "/etc/hokuto.conf"
+	gnuMirrorURL    string
+	gnuOriginalURL  = "https://ftp.gnu.org/gnu"
 	// Global executors (declared, to be assigned in main)
 	UserExec *Executor
 	RootExec *Executor
@@ -218,6 +220,12 @@ func initConfig(cfg *Config) {
 	WantLTO := cfg.Values["HOKUTO_LTO"]
 	if WantLTO == "1" {
 		cfg.DefaultLTO = true
+	}
+
+	// Load the GNU mirror URL if it's set in the config
+	if mirror, exists := cfg.Values["GNU_MIRROR"]; exists && mirror != "" {
+		gnuMirrorURL = strings.TrimRight(mirror, "/") // Remove trailing slash if present
+		cPrintf(colInfo, "=> Using GNU mirror: %s\n", gnuMirrorURL)
 	}
 
 	SourcesDir = CacheDir + "/sources"
@@ -1009,8 +1017,18 @@ func downloadFile(url, destFile string) error {
 
 }
 
+// user-configured mirror if one is set. It returns the (potentially modified) URL.
+func applyGnuMirror(originalURL string) string {
+	if gnuMirrorURL != "" && strings.HasPrefix(originalURL, gnuOriginalURL) {
+		mirroredURL := strings.Replace(originalURL, gnuOriginalURL, gnuMirrorURL, 1)
+		debugf("Redirecting GNU URL: %s -> %s\n", originalURL, mirroredURL)
+		return mirroredURL
+	}
+	return originalURL
+}
+
 // Fetch sources (HTTP/FTP + Git)
-func fetchSources(pkgName, pkgDir string, _ bool) error {
+func fetchSources(pkgName, pkgDir string, processGit bool) error {
 	data, err := os.ReadFile(filepath.Join(pkgDir, "sources"))
 	if err != nil {
 		return fmt.Errorf("could not read sources file: %v", err)
@@ -1032,20 +1050,22 @@ func fetchSources(pkgName, pkgDir string, _ bool) error {
 			continue
 		}
 
-		// --- NEW: Split the line into source URL and potential extra parameter ---
 		parts := strings.SplitN(line, " ", 2)
 		sourceURL := parts[0]
-		// The second part (parts[1]) is the parameter to ignore here (e.g., "mpv-old").
-		// --------------------------------------------------------------------------
+
+		sourceURL = applyGnuMirror(sourceURL)
 
 		// Skip local files
 		if strings.HasPrefix(sourceURL, "files/") {
 			continue
 		}
-		// Note: Patches/ are typically handled in prepareSources, not fetched.
-
+		// Git repo handling
 		if strings.HasPrefix(sourceURL, "git+") {
-			// Git repo handling
+			// Skip git processing if disabled (checksum)
+			if !processGit {
+				cPrintf(colNote, "Skipping git repository for this operation: %s\n", sourceURL)
+				continue
+			}
 			gitURL := strings.TrimPrefix(sourceURL, "git+")
 			ref := ""
 			if strings.Contains(gitURL, "#") {
@@ -1227,6 +1247,8 @@ func verifyOrCreateChecksums(pkgName, pkgDir string, force bool) error {
 	for _, fname := range expectedFiles {
 		filePath := filepath.Join(pkgSrcDir, fname)
 		url := urlMap[fname]
+		//apply gnu mirror if set
+		url = applyGnuMirror(url)
 
 		currentSum, sumExists := existing[fname]
 		isHashValid := false
@@ -1346,7 +1368,7 @@ func hokutoChecksum(pkgName string, force bool) error {
 		return fmt.Errorf("package %s not found in HOKUTO_PATH", pkgName)
 	}
 
-	if err := fetchSources(pkgName, pkgDir, force); err != nil {
+	if err := fetchSources(pkgName, pkgDir, false); err != nil {
 		return fmt.Errorf("error fetching sources: %v", err)
 	}
 	if err := verifyOrCreateChecksums(pkgName, pkgDir, force); err != nil {
@@ -4418,10 +4440,16 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool) er
 		ShouldRunAsRoot: needsRootBuild,        // Set the privilege based on 'asroot' file
 		Interactive:     needsInteractiveBuild, // SET INTERACTIVE MODE
 	}
-	// Download sources if required
-	if err := hokutoChecksum(pkgName, false); err != nil {
+	// Fetch all sources for the build, including git repositories.
+	if err := fetchSources(pkgName, pkgDir, true); err != nil {
 		return fmt.Errorf("failed to fetch sources: %v", err)
 	}
+
+	// Perform a strict, non-interactive checksum verification.
+	if err := verifyOrCreateChecksums(pkgName, pkgDir, false); err != nil {
+		return fmt.Errorf("source verification failed: %w", err)
+	}
+
 	// Prepare sources in build directory
 	if err := prepareSources(pkgName, pkgDir, buildDir, buildExec); err != nil {
 		return fmt.Errorf("failed to prepare sources: %v", err)
@@ -4941,9 +4969,14 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 		Interactive:     needsInteractiveBuild,
 	}
 
-	// Download sources if required
-	if err := hokutoChecksum(pkgName, false); err != nil {
+	// Fetch all sources for the build, including git repositories.
+	if err := fetchSources(pkgName, pkgDir, true); err != nil {
 		return fmt.Errorf("failed to fetch sources: %v", err)
+	}
+
+	// Perform a strict, non-interactive checksum verification.
+	if err := verifyOrCreateChecksums(pkgName, pkgDir, false); err != nil {
+		return fmt.Errorf("source verification failed: %w", err)
 	}
 	// Prepare sources
 	if err := prepareSources(pkgName, pkgDir, buildDir, buildExec); err != nil {
