@@ -6061,17 +6061,27 @@ func pkgUninstall(pkgName string, cfg *Config, execCtx *Executor, force, yes boo
 		if line == "" {
 			continue
 		}
-		// Split into path and optional checksum
-		pathInManifest := line
+		// Use strings.Fields for robust parsing ---
+		pathInManifest := ""
 		expectedSum := ""
+
 		if strings.HasSuffix(line, "/") {
-			// directory entry, no checksum
+			// This is a directory entry
+			pathInManifest = line
 		} else {
-			parts := strings.SplitN(line, "  ", 2)
-			pathInManifest = parts[0]
-			if len(parts) > 1 {
-				expectedSum = strings.TrimSpace(parts[1])
+			// Use strings.Fields() to robustly handle any amount of whitespace
+			fields := strings.Fields(line)
+			if len(fields) > 0 {
+				pathInManifest = fields[0]
 			}
+			if len(fields) > 1 {
+				expectedSum = fields[1]
+			}
+		}
+
+		// If after parsing, path is empty, it was a malformed line.
+		if pathInManifest == "" {
+			continue
 		}
 
 		// Absolute path on disk
