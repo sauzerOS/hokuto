@@ -1327,7 +1327,7 @@ func verifyOrCreateChecksums(pkgName, pkgDir string, force bool) error {
 				prompt = "No checksum for %s. (K)eep local file, (r)edownload file? [K/r]: "
 			}
 			colArrow.Print("-> ")
-			colSuccess.Printf(prompt, fname)
+			colWarn.Printf(prompt, fname)
 			var response string
 			fmt.Scanln(&response)
 			if strings.ToLower(strings.TrimSpace(response)) == "r" {
@@ -2865,16 +2865,15 @@ func rsyncStaging(stagingDir, rootDir string, execCtx *Executor) error {
 			return nil
 		}
 	}
+	// --- Fallback 1: Try system cp -aT ---
+	if _, err := exec.LookPath("cp"); err == nil {
+		// The `cp -aT` command is a safer alternative to the tar pipe.
+		// -a preserves links, permissions, and ownership.
+		// -T prevents `cp` from creating a subdirectory inside rootDir.
+		cmd := exec.Command("cp", "-aT", stagingPath, rootDir)
+		cmd.Stderr = os.Stderr // Show potential errors.
 
-	// --- Fallback: Try system tar pipe ---
-	if _, err := exec.LookPath("tar"); err == nil {
-		// This command creates an archive of the source and pipes it directly to an extraction command.
-		// It's efficient and handles all permissions correctly when run via the executor.
-		tarPipeCmdStr := fmt.Sprintf("tar -c -C %s . | tar -x -C %s", shellEscape(stagingPath), shellEscape(rootDir))
-		cmd := exec.Command("sh", "-c", tarPipeCmdStr)
-		cmd.Stderr = os.Stderr // Show potential errors from the shell or tar commands.
-
-		debugf("Attempting to sync with system tar pipe: %s\n", tarPipeCmdStr)
+		debugf("Attempting to sync with 'cp -aT %s %s'\n", stagingPath, rootDir)
 		if err := execCtx.Run(cmd); err == nil {
 			// Success! Clean up and return.
 			rmCmd := exec.Command("rm", "-rf", stagingDir)
@@ -2883,9 +2882,9 @@ func rsyncStaging(stagingDir, rootDir string, execCtx *Executor) error {
 			}
 			return nil
 		}
-		debugf("System tar pipe failed, falling back to internal Go implementation.\n")
+		debugf("System 'cp -aT' failed, falling back to internal Go implementation.\n")
 	} else {
-		debugf("System tar not found, falling back to internal Go implementation.\n")
+		debugf("System 'cp' not found, falling back to internal Go implementation.\n")
 	}
 
 	// --- Fallback 2: Use internal Go tar implementation ---
