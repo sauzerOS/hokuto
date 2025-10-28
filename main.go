@@ -908,29 +908,20 @@ func editPackage(pkgName string, openAll bool) error {
 }
 
 // newHttpClient creates and returns an http.Client.
-// It tries to use the system's CA certificates first. If that fails, it falls
-// back to the ca-bundle.crt file embedded in the application binary.
 func newHttpClient() (*http.Client, error) {
-	// 1. Try to load the system's default set of trusted CAs.
-	rootCAs, err := x509.SystemCertPool()
+	// Create a new pool from the embedded asset.
+	rootCAs := x509.NewCertPool()
+	certs, err := embeddedAssets.ReadFile("assets/ca-bundle.crt")
 	if err != nil {
-		cPrintf(colWarn, "Warning: Could not load system CA certificates: %v\n", err)
-		cPrintf(colInfo, "=> Attempting to use bundled CA certificate as a fallback.\n")
-
-		// 2. Fallback: If system pool fails, create a new pool from the embedded asset.
-		rootCAs = x509.NewCertPool()
-		certs, err := embeddedAssets.ReadFile("assets/ca-bundle.crt")
-		if err != nil {
-			return nil, fmt.Errorf("failed to read embedded ca-bundle.crt: %w."+
-				" Please ensure the file exists in the 'assets' directory before compiling", err)
-		}
-
-		if ok := rootCAs.AppendCertsFromPEM(certs); !ok {
-			return nil, fmt.Errorf("failed to parse bundled CA certificates. The file may be invalid")
-		}
+		return nil, fmt.Errorf("failed to read embedded ca-bundle.crt: %w."+
+			" Please ensure the file exists in the 'assets' directory before compiling", err)
 	}
 
-	// 3. Configure the TLS client to use the selected pool of trusted CAs.
+	if ok := rootCAs.AppendCertsFromPEM(certs); !ok {
+		return nil, fmt.Errorf("failed to parse bundled CA certificates. The file may be invalid")
+	}
+
+	// Configure the TLS client to use the selected pool of trusted CAs.
 	tlsConfig := &tls.Config{
 		RootCAs: rootCAs,
 	}
@@ -2488,8 +2479,8 @@ func createPackageTarball(pkgName, pkgVer, outputDir string, execCtx *Executor) 
 	if err != nil {
 		return fmt.Errorf("failed to add files to tarball: %v", err)
 	}
-
-	cPrintf(colInfo, "Package tarball created successfully (internal): %s\n", tarballPath)
+	colArrow.Print("-> ")
+	colSuccess.Printf("Package tarball created successfully: %s\n", tarballPath)
 	return nil
 }
 
