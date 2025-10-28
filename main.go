@@ -9,6 +9,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"embed"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -66,6 +67,7 @@ var (
 	gnuMirrorURL         string
 	gnuOriginalURL       = "https://ftp.gnu.org/gnu"
 	gnuMirrorMessageOnce sync.Once
+	errPackageNotFound   = errors.New("package not found")
 	// Global executors (declared, to be assigned in main)
 	UserExec *Executor
 	RootExec *Executor
@@ -594,12 +596,14 @@ func listPackages(searchTerm string) error {
 		if searchTerm != "" {
 			colArrow.Print("-> ")
 			colSuccess.Printf("No packages found matching: %s\n", searchTerm)
+			// --- MODIFICATION: Return the specific sentinel error ---
+			return errPackageNotFound
 		}
 		return nil
 	}
 
 	// Step 4: Print the information for the final list of packages.
-	// Format: "<name> <version> <revision>    <buildtime>"
+	// ... (rest of the function is unchanged)
 	for _, p := range pkgsToShow {
 		versionFile := filepath.Join(Installed, p, "version")
 		versionInfo := "unknown"
@@ -7431,13 +7435,23 @@ func main() {
 			fmt.Fprintln(os.Stderr, "error displaying image:", err)
 		}
 
+		// ...
 	case "list", "ls":
 		pkg := ""
 		if len(os.Args) >= 3 {
 			pkg = os.Args[2]
 		}
 		if err := listPackages(pkg); err != nil {
-			fmt.Println("Error:", err)
+			// --- MODIFICATION: Check for our specific error ---
+			// If it's the "not found" error, we know the friendly message was
+			// already printed, so we just set the exit code and do nothing else.
+			if errors.Is(err, errPackageNotFound) {
+				exitCode = 1
+			} else {
+				// For any other unexpected error, print it.
+				fmt.Fprintln(os.Stderr, "Error:", err)
+				exitCode = 1
+			}
 		}
 
 	case "checksum", "c":
