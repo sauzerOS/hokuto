@@ -33,6 +33,7 @@ import (
 	"time"
 
 	"github.com/gookit/color"
+	"github.com/klauspost/compress/zip"
 	"github.com/klauspost/compress/zstd"
 	"github.com/klauspost/pgzip"
 	"github.com/ulikunitz/xz"
@@ -1416,6 +1417,64 @@ func hokutoChecksum(pkgName string, force bool) error {
 	return nil
 }
 
+// unzipGo extracts a zip archive using a native Go library.
+// It includes a security check to prevent path traversal attacks (Zip Slip).
+func unzipGo(src, dest string) error {
+	r, err := zip.OpenReader(src)
+	if err != nil {
+		return err
+	}
+	defer r.Close()
+
+	dest, err = filepath.Abs(dest)
+	if err != nil {
+		return err
+	}
+
+	for _, f := range r.File {
+		fpath := filepath.Join(dest, f.Name)
+
+		// Security Check: Prevent Zip Slip path traversal attacks.
+		// Ensure the file path is within the destination directory.
+		if !strings.HasPrefix(fpath, dest+string(os.PathSeparator)) {
+			return fmt.Errorf("illegal file path in archive: %s", f.Name)
+		}
+
+		if f.FileInfo().IsDir() {
+			if err := os.MkdirAll(fpath, os.ModePerm); err != nil {
+				return err
+			}
+			continue
+		}
+
+		if err := os.MkdirAll(filepath.Dir(fpath), os.ModePerm); err != nil {
+			return err
+		}
+
+		outFile, err := os.OpenFile(fpath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, f.Mode())
+		if err != nil {
+			return err
+		}
+
+		rc, err := f.Open()
+		if err != nil {
+			outFile.Close()
+			return err
+		}
+
+		_, err = io.Copy(outFile, rc)
+
+		// Close files inside the loop to avoid holding too many file descriptors.
+		outFile.Close()
+		rc.Close()
+
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // prepareSources copies and extracts sources into the build directory
 func prepareSources(pkgName, pkgDir, buildDir string, execCtx *Executor) error {
 	// Assuming CacheDir, SourcesDir, Executor, etc. are available in scope.
@@ -1571,12 +1630,22 @@ func prepareSources(pkgName, pkgDir, buildDir string, execCtx *Executor) error {
 				return fmt.Errorf("failed to extract tar %s into %s: %v", relPath, targetDir, err)
 			}
 		case strings.HasSuffix(realPath, ".zip"):
-			// Extraction goes into targetDir (buildDir or buildDir/subdir)
-			cmd := exec.Command("unzip", "-q", "-o", realPath, "-d", targetDir)
-			cmd.Stdout = os.Stdout
-			cmd.Stderr = os.Stderr
-			if err := cmd.Run(); err != nil {
-				return fmt.Errorf("failed to unzip %s into %s: %v", relPath, targetDir, err)
+			// Check if the "unzip" command is available in the system's PATH.
+			unzipPath, err := exec.LookPath("unzip")
+			if err == nil {
+				// If "unzip" is found, use it for extraction.
+				cmd := exec.Command(unzipPath, "-q", "-o", realPath, "-d", targetDir)
+				cmd.Stdout = os.Stdout
+				cmd.Stderr = os.Stderr
+				if err := cmd.Run(); err != nil {
+					return fmt.Errorf("failed to unzip %s into %s: %v", relPath, targetDir, err)
+				}
+			} else {
+				// If "unzip" is not found, fall back to the internal Go zip library.
+				debugf("unzip command not found, using internal extractor for %s\n", relPath)
+				if err := unzipGo(realPath, targetDir); err != nil {
+					return fmt.Errorf("internal unzip of %s into %s failed: %v", relPath, targetDir, err)
+				}
 			}
 		default:
 			// Copy file (e.g., patches/, simple local files)
