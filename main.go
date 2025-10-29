@@ -1305,31 +1305,45 @@ func verifyOrCreateChecksums(pkgName, pkgDir string, force bool) error {
 			}
 		}
 
-		// 2. DECIDE: If hash is valid, we're done with this file.
-		if isHashValid {
+		// 2. DECIDE & ACT: Determine what to do based on checksum validity.
+		if isHashValid && !force {
+			// Case A: Hash is valid and we are not forcing. Everything is OK.
 			finalChecksums = append(finalChecksums, fmt.Sprintf("%s  %s", currentSum, fname))
 			summary = append(summary, fmt.Sprintf("%s: ok", fname))
 			continue
 		}
 
-		// 3. ACT: If we're here, the hash is invalid, missing, or we're in `force` mode.
-		// We must now decide whether to keep the local file or redownload it.
-		shouldRedownload := force
-		actionSummary := "updated"
+		// If we are here, the hash is either invalid, missing, or we are forcing an update.
+		var shouldRedownload bool
+		var actionSummary string
 
-		if !force {
-			prompt := "Checksum mismatch for %s. (K)eep local file, (r)edownload file? [K/r]: "
-			if !sumExists {
-				prompt = "No checksum for %s. (K)eep local file, (r)edownload file? [K/r]: "
-			}
+		if force {
+			// Case B: Force mode is enabled. Always redownload.
+			shouldRedownload = true
+			actionSummary = "Updated (forced)"
+		} else if sumExists && !isHashValid {
+			// Case C: A checksum exists, but it MISMATCHES. Prompt the user for action.
 			colArrow.Print("-> ")
-			colWarn.Printf(prompt, fname)
+			colWarn.Printf("Checksum mismatch for %s. (K)eep local file, (r)edownload file? [K/r]: ", fname)
 			var response string
 			fmt.Scanln(&response)
 			if strings.ToLower(strings.TrimSpace(response)) == "r" {
 				shouldRedownload = true
+				actionSummary = "Updated (redownloaded)"
+			} else {
+				shouldRedownload = false
+				actionSummary = "Updated (kept local)"
 			}
+		} else {
+			// Case D: No checksum exists and not in force mode.
+			// Automatically keep the local file and generate a new checksum. NO PROMPT.
+			shouldRedownload = false
+			actionSummary = "Generated"
+			colArrow.Print("-> ")
+			colSuccess.Printf("No checksum for %s, generating from local file.\n", fname)
 		}
+
+		// 3. PERFORM REDOWNLOAD (if decided in the logic above)
 
 		if shouldRedownload {
 			colArrow.Print("-> ")
