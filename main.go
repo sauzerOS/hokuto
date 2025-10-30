@@ -3683,52 +3683,8 @@ func parsePackageList(output []byte) (map[string]Package, error) {
 	return packages, scanner.Err()
 }
 
-// pkgBuildAll executes the 'pkgBuild' command for a list of packages.
-func pkgBuildAll(packages []string) error {
-	if len(packages) == 0 {
-		fmt.Println("No packages to build.")
-		return nil
-	}
-
-	var failed []string
-
-	for _, pkg := range packages {
-		colArrow.Print("\n-> ")
-		colSuccess.Printf("Executing pkgBuild for: %s\n", pkg)
-
-		args := []string{"build", "-a"}
-		if idleUpdate {
-			args = append(args, "-i")
-		}
-		if superidleUpdate {
-			args = append(args, "-ii")
-		}
-		args = append(args, pkg)
-
-		cmd := exec.Command("hokuto", args...)
-		cmd.Stdin = os.Stdin
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-
-		if err := cmd.Run(); err != nil {
-			colArrow.Print("-> ")
-			color.Danger.Printf("pkgBuild failed for %s: %v\n", pkg, err)
-			failed = append(failed, pkg)
-			continue
-		}
-		colArrow.Print("-> ")
-		colSuccess.Println("Build+Install completed successfully.")
-	}
-
-	if len(failed) > 0 {
-		return fmt.Errorf("some packages failed: %s", strings.Join(failed, ", "))
-	}
-
-	return nil
-}
-
 // checkForUpgrades is the main function for the upgrade logic.
-func checkForUpgrades() error {
+func checkForUpgrades(ctx context.Context, cfg *Config) error {
 	colArrow.Print("-> ")
 	colSuccess.Println("Checking for Package Upgrades")
 
@@ -3790,11 +3746,47 @@ func checkForUpgrades() error {
 	}
 
 	// 4. Prompt user for upgrade
-	if askForConfirmation(colWarn, "Do you want to upgrade these packages?") {
-		// 5. Execute pkgBuild
-		return pkgBuildAll(pkgNames)
-	} else {
+	if !askForConfirmation(colWarn, "Do you want to upgrade these packages?") {
 		cPrintln(colNote, "Upgrade canceled by user.")
+		return nil
+	}
+
+	// --- REFACTORED BUILD AND INSTALL LOGIC ---
+	var failedPackages []string
+
+	for _, pkgName := range pkgNames {
+		colArrow.Print("\n-> ")
+		colSuccess.Printf("Executing update for: %s\n", pkgName)
+
+		// A. Directly call pkgBuild within the current process
+		// We pass UserExec because pkgBuild itself creates the appropriate
+		// privileged or unprivileged build-specific executor.
+		if err := pkgBuild(pkgName, cfg, UserExec, false); err != nil {
+			color.Danger.Printf("Build failed for %s: %v\n", pkgName, err)
+			failedPackages = append(failedPackages, pkgName)
+			continue // <<< IMPORTANT: Move to the next package on failure
+		}
+
+		// B. If build is successful, install the package
+		version, _ := getRepoVersion(pkgName)
+		tarballPath := filepath.Join(BinDir, fmt.Sprintf("%s-%s.tar.zst", pkgName, version))
+
+		// Set critical section for the installation phase
+		isCriticalAtomic.Store(1)
+		handlePreInstallUninstall(pkgName, cfg, RootExec)
+		if err := pkgInstall(tarballPath, pkgName, cfg, RootExec); err != nil {
+			isCriticalAtomic.Store(0) // Unset on failure
+			color.Danger.Printf("Installation failed for %s: %v\n", pkgName, err)
+			failedPackages = append(failedPackages, pkgName)
+			continue
+		}
+		isCriticalAtomic.Store(0) // Unset on success
+		colArrow.Print("-> ")
+		colSuccess.Println("Update and install completed successfully.")
+	}
+
+	if len(failedPackages) > 0 {
+		return fmt.Errorf("some packages failed to update: %s", strings.Join(failedPackages, ", "))
 	}
 
 	return nil
@@ -7937,19 +7929,31 @@ func main() {
 		}
 
 	case "update", "u":
-		// check for -i and -v in the arguments for the update command
-		// os.Args layout: [program, "update", ...flags...]
-		for _, a := range os.Args[2:] {
-			if a == "-i" || a == "--idle" {
-				idleUpdate = true
-			}
-			if a == "-ii" || a == "--superidle" {
-				superidleUpdate = true
-			}
-			if a == "-v" || a == "--verbose" {
-				Verbose = true
-			}
+		// --- FIX: Use a proper FlagSet to parse arguments and set buildPriority ---
+		updateCmd := flag.NewFlagSet("update", flag.ExitOnError)
+		var idleBuild = updateCmd.Bool("i", false, "Use half CPU cores and lowest niceness for build process.")
+		var superidleBuild = updateCmd.Bool("ii", false, "Use one CPU core and lowest niceness for build process.")
+		var verbose = updateCmd.Bool("v", false, "Enable verbose output.")
+		// Add long flags for consistency
+		var idleBuildLong = updateCmd.Bool("idle", false, "Use half CPU cores and lowest niceness for build process.")
+		var superidleBuildLong = updateCmd.Bool("superidle", false, "Use one CPU core and lowest niceness for build process.")
+		var verboseLong = updateCmd.Bool("verbose", false, "Enable verbose output.")
+
+		if err := updateCmd.Parse(os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "Error parsing update flags: %v\n", err)
+			os.Exit(1)
 		}
+
+		// Set the global variables that pkgBuild() reads
+		if *superidleBuild || *superidleBuildLong {
+			buildPriority = "superidle"
+		} else if *idleBuild || *idleBuildLong {
+			buildPriority = "idle"
+		} else {
+			buildPriority = "normal"
+		}
+		Verbose = *verbose || *verboseLong
+		// --- END FIX ---
 
 		updateRepos()
 
@@ -7957,7 +7961,7 @@ func main() {
 			fmt.Fprintf(os.Stderr, "post-remove tasks completed with warnings: %v\n", err)
 		}
 
-		if err := checkForUpgrades(); err != nil {
+		if err := checkForUpgrades(ctx, cfg); err != nil {
 			fmt.Fprintf(os.Stderr, "Upgrade process failed: %v\n", err)
 			os.Exit(1)
 		}
