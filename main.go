@@ -7332,6 +7332,24 @@ func handleCleanupCommand(args []string) error {
 	return nil
 }
 
+// checkPackageExactMatch checks if a package with the exact name is installed.
+// Returns true only if the package directory exists with an exact name match.
+// This is designed for use in build scripts: exit 0 = found, exit 1 = not found.
+func checkPackageExactMatch(pkgName string) bool {
+	// Construct the exact path for this package
+	pkgPath := filepath.Join(Installed, pkgName)
+
+	// Check if it exists and is a directory
+	info, err := os.Stat(pkgPath)
+	if err != nil {
+		// Does not exist or error accessing it
+		return false
+	}
+
+	// Verify it's actually a directory
+	return info.IsDir()
+}
+
 // printHelp prints the commands table
 func printHelp() {
 	// General Usage Header
@@ -7575,6 +7593,22 @@ func main() {
 				fmt.Fprintln(os.Stderr, "Error:", err)
 				exitCode = 1
 			}
+		}
+
+	case "check":
+		if len(os.Args) < 3 {
+			fmt.Println("Usage: hokuto check <pkgname>")
+			os.Exit(1)
+		}
+		pkgName := os.Args[2]
+
+		// Perform exact match check
+		if checkPackageExactMatch(pkgName) {
+			// Package found - silent success, exit 0
+			os.Exit(0)
+		} else {
+			// Package not found - silent failure, exit 1
+			os.Exit(1)
 		}
 
 	case "checksum", "c":
