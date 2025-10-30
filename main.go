@@ -13,7 +13,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"io/fs"
 	"log"
 	"math/rand"
 	"net/http"
@@ -1676,7 +1675,6 @@ func prepareSources(pkgName, pkgDir, buildDir string, execCtx *Executor) error {
 	return nil
 }
 
-// generateLibDeps scans ELF files in outputDir and writes their shared library dependencies to libdepsFile
 func generateLibDeps(outputDir, libdepsFile string, execCtx *Executor) error {
 	ignorePatterns := []string{
 		"ld-*", "libc.so*", "libm.so*", "libpthread.so*", "libdl.so*",
@@ -1694,22 +1692,27 @@ func generateLibDeps(outputDir, libdepsFile string, execCtx *Executor) error {
 		return false
 	}
 
-	// Collect executable files
-	var files []string
-	filepath.WalkDir(outputDir, func(path string, d fs.DirEntry, err error) error {
-		if err != nil || d.IsDir() {
-			return nil
-		}
-		info, err := d.Info()
-		if err != nil {
-			return nil
-		}
-		// Only consider files with executable permission
-		if info.Mode()&0111 != 0 {
-			files = append(files, path)
-		}
+	// --- FIX: Use a privileged 'find' command to discover executable files ---
+	var findOutput bytes.Buffer
+	// Find files (-type f) with at least one executable bit set (-perm /111)
+	findCmd := exec.Command("find", outputDir, "-type", "f", "-perm", "/111")
+	findCmd.Stdout = &findOutput
+	findCmd.Stderr = io.Discard
+
+	// Must use a privileged executor to find root-owned files
+	if err := execCtx.Run(findCmd); err != nil {
+		return fmt.Errorf("failed to execute find command to locate executables: %w", err)
+	}
+
+	files := strings.Fields(findOutput.String())
+	if len(files) == 0 {
+		debugf("No executable files found in %s\n", outputDir)
+		// Write an empty libdeps file and return successfully
+		_ = os.WriteFile(libdepsFile, []byte{}, 0644)
 		return nil
-	})
+	}
+
+	debugf("Found %d executable files to check for dependencies.\n", len(files))
 
 	type result struct{ libs []string }
 	numWorkers := runtime.NumCPU()
@@ -1722,35 +1725,30 @@ func generateLibDeps(outputDir, libdepsFile string, execCtx *Executor) error {
 		for file := range fileCh {
 			var fileOut, lddOut bytes.Buffer
 
-			// 1. Check if file is an ELF binary (using the package's determined execution context)
-			cmdFile := exec.Command("file", "--brief", "--mime-type", file)
+			// 1. Check if file is an ELF binary (must use a privileged executor)
+			cmdFile := exec.Command("file", "--brief", file)
 			cmdFile.Stdout = &fileOut
-			cmdFile.Stderr = os.Stderr // pipe errors to our stderr
+			cmdFile.Stderr = io.Discard
 
 			if err := execCtx.Run(cmdFile); err != nil {
-				// If 'file' fails (e.g., access denied, not found), skip this file
 				continue
 			}
 
-			if !(strings.Contains(fileOut.String(), "application/x-executable") ||
-				strings.Contains(fileOut.String(), "application/x-sharedlib")) {
+			if !strings.Contains(fileOut.String(), "ELF") {
 				continue
 			}
 
-			// 2. Run ldd to find dependencies (using the package's determined execution context)
+			// 2. Run ldd to find dependencies (must use a privileged executor)
 			lddCmd := exec.Command("ldd", file)
 			lddCmd.Stdout = &lddOut
-			lddCmd.Stderr = io.Discard // discard error
+			lddCmd.Stderr = io.Discard
 
 			if err := execCtx.Run(lddCmd); err != nil {
-				// If ldd fails (e.g., cannot find dependencies), skip this file
 				continue
 			}
 
 			var libs []string
 			scanner := bufio.NewScanner(bytes.NewReader(lddOut.Bytes()))
-			// ... (rest of the ldd output parsing logic remains the same) ...
-
 			for scanner.Scan() {
 				line := scanner.Text()
 				parts := strings.Fields(line)
@@ -1790,105 +1788,103 @@ func generateLibDeps(outputDir, libdepsFile string, execCtx *Executor) error {
 		}
 	}
 
-	tmpFile := filepath.Join(os.TempDir(), filepath.Base(libdepsFile)+".tmp")
-
-	// write temp file as user
-	f, err := os.Create(tmpFile)
-	if err != nil {
-		return err
-	}
+	// Create a sorted slice for deterministic output
+	sortedLibs := make([]string, 0, len(seen))
 	for lib := range seen {
-		f.WriteString(lib + "\n")
+		sortedLibs = append(sortedLibs, lib)
 	}
-	f.Close()
+	sort.Strings(sortedLibs)
 
-	// 1. Determine if this step is necessary (i.e., if we ran as root)
-	if execCtx.ShouldRunAsRoot {
-		// This step is mandatory IF we ran as root (because the build output files are now root-owned)
-		chownCmd := exec.Command("chown", "0:0", tmpFile)
-
-		// The command is expected to succeed here, so we treat failure as a fatal issue.
-		if err := execCtx.Run(chownCmd); err != nil {
-			return fmt.Errorf("failed to chown temp libdeps (via Executor): %v", err)
-		}
-	} else {
-		// If the Executor is unprivileged, the files are already user-owned (not root),
-		// and attempting to chown 0:0 would fail, so we skip it entirely.
-		// This is the correct behavior for unprivileged builds.
-	}
-
-	// move into place
-	mvCmd := exec.Command("mv", "--force", tmpFile, libdepsFile)
-	if err := execCtx.Run(mvCmd); err != nil {
-		return fmt.Errorf("failed to move libdeps into place (via Executor): %v", err)
+	// Write the final file (as user is fine, since it's in the staging dir)
+	if err := os.WriteFile(libdepsFile, []byte(strings.Join(sortedLibs, "\n")+"\n"), 0644); err != nil {
+		return err
 	}
 
 	debugf("Library dependencies written to %s (%d deps)\n", libdepsFile, len(seen))
 	return nil
 }
 
-func generateDepends(pkgName, pkgDir, outputDir, rootDir string, execCtx *Executor) error {
+func generateDepends(pkgName, pkgDir, outputDir, rootDir string) error {
 	installedDir := filepath.Join(outputDir, "var", "db", "hokuto", "installed", pkgName)
-	libdepsFile := filepath.Join(installedDir, "libdeps")
 	dependsFile := filepath.Join(installedDir, "depends")
 
-	// Read libdeps
-	libdepsData, err := os.ReadFile(libdepsFile)
-	if err != nil {
-		return fmt.Errorf("failed to read libdeps: %v", err)
-	}
-	libdeps := strings.Fields(string(libdepsData))
-	if len(libdeps) == 0 {
-		return nil
-	}
-
+	// --- FIX START: Initialize depSet at the beginning ---
 	depSet := make(map[string]struct{})
 
-	// Scan all installed packages for matching libs
-	dbRoot := filepath.Join(rootDir, "var", "db", "hokuto", "installed")
-	entries, err := os.ReadDir(dbRoot)
-	if err != nil {
-		return fmt.Errorf("failed to read installed db at %s: %v", dbRoot, err)
-	}
+	// --- Part 1: Process automatically detected library dependencies ---
+	libdepsFile := filepath.Join(installedDir, "libdeps")
+	if libdepsData, err := os.ReadFile(libdepsFile); err == nil {
+		libdeps := strings.Fields(string(libdepsData))
+		if len(libdeps) > 0 {
+			// Scan all installed packages for matching libs
+			dbRoot := filepath.Join(rootDir, "var", "db", "hokuto", "installed")
 
-	for _, e := range entries {
-		if !e.IsDir() {
-			continue
-		}
-		otherPkg := e.Name()
-		if otherPkg == pkgName {
-			continue
-		}
+			entries, err := os.ReadDir(dbRoot)
+			if err != nil {
+				return fmt.Errorf("failed to read installed db at %s: %v", dbRoot, err)
+			}
 
-		manifestFile := filepath.Join(dbRoot, otherPkg, "manifest")
-		data, err := os.ReadFile(manifestFile)
-		if err != nil {
-			continue
-		}
-		lines := strings.Split(string(data), "\n")
+			for _, e := range entries {
+				if !e.IsDir() {
+					continue
+				}
+				otherPkg := e.Name()
+				if otherPkg == pkgName {
+					continue
+				}
 
-		for _, lib := range libdeps {
-			for _, line := range lines {
-				if strings.HasSuffix(line, lib) {
-					depSet[otherPkg] = struct{}{}
-					break
+				manifestFile := filepath.Join(dbRoot, otherPkg, "manifest")
+				data, err := os.ReadFile(manifestFile)
+				if err != nil {
+					continue
+				}
+				lines := strings.Split(string(data), "\n")
+
+				for _, lib := range libdeps {
+					for _, line := range lines {
+						// --- FIX: Isolate the path from the checksum/placeholder ---
+						// Split the line by whitespace. The path is always the first part.
+						fields := strings.Fields(line)
+						if len(fields) == 0 {
+							// Skip empty or malformed lines
+							continue
+						}
+						pathInManifest := fields[0]
+
+						// Now, check the suffix of the path, not the whole line.
+						if strings.HasSuffix(pathInManifest, lib) {
+							depSet[otherPkg] = struct{}{}
+							break // Found the owner, move to the next library
+						}
+					}
 				}
 			}
 		}
 	}
+	// --- End of Part 1 ---
 
-	// Merge repo depends file if it exists
+	// --- Part 2: Merge manually specified dependencies from the repo file ---
 	repoDepends := filepath.Join(pkgDir, "depends")
 	if data, err := os.ReadFile(repoDepends); err == nil {
 		for _, line := range strings.Split(string(data), "\n") {
 			line = strings.TrimSpace(line)
-			if line != "" {
-				depSet[line] = struct{}{}
+			if line != "" && !strings.HasPrefix(line, "#") {
+				// Use the existing token parser to extract just the package name.
+				name, _, _, _, _ := parseDepToken(line)
+				if name != "" {
+					depSet[name] = struct{}{}
+				}
 			}
 		}
 	}
+	// --- End of Part 2 ---
 
-	// Prepare depends content
+	// --- FIX: Only exit now if there are truly no dependencies to write ---
+	if len(depSet) == 0 {
+		return nil
+	}
+
+	// --- Part 3: Write the final, combined depends file ---
 	var deps []string
 	for dep := range depSet {
 		deps = append(deps, dep)
@@ -1896,18 +1892,12 @@ func generateDepends(pkgName, pkgDir, outputDir, rootDir string, execCtx *Execut
 	sort.Strings(deps)
 	content := strings.Join(deps, "\n")
 
-	// Write depends file
-	writeCmd := exec.Command("sh", "-c", fmt.Sprintf("echo %s > %s", shellEscape(content), shellEscape(dependsFile)))
-	if err := execCtx.Run(writeCmd); err != nil {
+	debugf("Writing depends for %s: %s\n", pkgName, content)
+	if err := os.WriteFile(dependsFile, []byte(content+"\n"), 0644); err != nil {
 		return fmt.Errorf("failed to write depends: %v", err)
 	}
 
 	return nil
-}
-
-// shellEscape escapes content for safe use in shell commands
-func shellEscape(s string) string {
-	return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'"
 }
 
 // isDirectoryPrivileged uses the Executor to check if a path is a directory.
@@ -3800,7 +3790,7 @@ func checkForUpgrades() error {
 	}
 
 	// 4. Prompt user for upgrade
-	if askForConfirmation(colInfo, "Do you want to upgrade these packages?") {
+	if askForConfirmation(colWarn, "Do you want to upgrade these packages?") {
 		// 5. Execute pkgBuild
 		return pkgBuildAll(pkgNames)
 	} else {
@@ -4593,6 +4583,7 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool) er
 	// Define the ANSI escape code format for setting the terminal title.
 	// \033]0; sets the title, and \a (bell character) terminates the sequence.
 	const setTitleFormat = "\033]0;%s\a"
+	debugf("INFO RUNNING pkgBuild function")
 
 	// Helper function to set the title in the TTY.
 	setTerminalTitle := func(title string) {
@@ -4948,16 +4939,24 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool) er
 		// Path to the build log (we created this earlier as logFile)
 		logPath := filepath.Join(logDir, "build-log.txt")
 
-		// Launch a tail -n 200 -f so the user can view the last 200 lines and follow live.
-		// Connect stdin/stdout/stderr so the user can Ctrl-C to exit the tail.
-		tailCmd := exec.Command("tail", "-n", "50", "-f", logPath)
-		tailCmd.Stdin = os.Stdin
-		tailCmd.Stdout = os.Stdout
-		tailCmd.Stderr = os.Stderr
-
-		// Run tail via the same Executor so privilege behavior and context cancellation are honored.
-		// Ignore tail errors (user may Ctrl-C to exit); we only return the original build error.
-		_ = buildExec.Run(tailCmd)
+		// If interactive, let user follow the log; otherwise show last N lines and continue.
+		if buildExec.Interactive {
+			tailCmd := exec.Command("tail", "-n", "50", "-f", logPath)
+			tailCmd.Stdin = os.Stdin
+			tailCmd.Stdout = os.Stdout
+			tailCmd.Stderr = os.Stderr
+			// Run tail via the same Executor so privilege behavior and context cancellation are honored.
+			_ = buildExec.Run(tailCmd)
+		} else {
+			// Non-interactive: just print the last 50 lines and don't block.
+			tailOnce := exec.Command("tail", "-n", "50", logPath)
+			// Do NOT attach Stdin for non-interactive mode (avoid blocking).
+			tailOnce.Stdout = os.Stdout
+			tailOnce.Stderr = os.Stderr
+			// Run without buildExec.Run so behavior is consistent even if ShouldRunAsRoot=false.
+			// But still respect context/privilege: use buildExec.Run if desired; it's okay either way.
+			_ = buildExec.Run(tailOnce)
+		}
 
 		return runErr
 	}
@@ -4983,7 +4982,7 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool) er
 	}
 
 	// Generate depends
-	if err := generateDepends(pkgName, pkgDir, outputDir, rootDir, buildExec); err != nil {
+	if err := generateDepends(pkgName, pkgDir, outputDir, rootDir); err != nil {
 		return fmt.Errorf("failed to generate depends: %v", err)
 	}
 	debugf("Depends written to %s\n", filepath.Join(installedDir, "depends"))
@@ -5106,8 +5105,9 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool) er
 
 	// Cleanup tmpdirs
 	if Debug {
-		fmt.Fprintf(os.Stderr, "INFO: Skipping cleanup of %s due to HOKUTO_DEBUG=1\n", pkgTmpDir)
+		debugf("INFO: Skipping cleanup of %s due to HOKUTO_DEBUG=1\n", pkgTmpDir)
 	} else {
+		debugf("INFO: Cleaning up pkgTmpDir: %s\n", pkgTmpDir)
 		rmCmd := exec.Command("rm", "-rf", pkgTmpDir)
 		if err := RootExec.Run(rmCmd); err != nil {
 			fmt.Fprintf(os.Stderr, "failed to cleanup build tmpdirs: %v\n", err)
@@ -5506,14 +5506,14 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 
 	// Generate libdeps
 	libdepsFile := filepath.Join(installedDir, "libdeps")
-	if err := generateLibDeps(outputDir, libdepsFile, buildExec); err != nil {
+	if err := generateLibDeps(outputDir, libdepsFile, RootExec); err != nil {
 		fmt.Printf("Warning: failed to generate libdeps: %v\n", err)
 	} else {
 		debugf("Library dependencies written to %s\n", libdepsFile)
 	}
 
 	// Generate depends
-	if err := generateDepends(pkgName, pkgDir, outputDir, rootDir, buildExec); err != nil {
+	if err := generateDepends(pkgName, pkgDir, outputDir, rootDir); err != nil {
 		return fmt.Errorf("failed to generate depends: %v", err)
 	}
 	debugf("Depends written to %s\n", filepath.Join(installedDir, "depends"))
@@ -6651,6 +6651,7 @@ func handleBuildCommand(args []string, cfg *Config) {
 			colSuccess.Printf("[Build] Building: %s\n", pkgName)
 			if err := pkgBuild(pkgName, cfg, UserExec, *bootstrap); err != nil {
 				failedBuilds[pkgName] = err
+				colArrow.Print("-> ")
 				color.Danger.Printf("Fatal build failure for %s: %v\n", pkgName, err)
 				break
 			}
@@ -6744,7 +6745,7 @@ func handleBuildCommand(args []string, cfg *Config) {
 		}
 		fmt.Println()
 
-		failedPass1, targetsPass1 := executeBuildPass(initialPlan, "Initial Pass", false, cfg, bootstrap)
+		failedPass1, targetsPass1 := executeBuildPass(initialPlan, "Initial Pass", false, cfg, bootstrap, userRequestedMap)
 		failedBuilds = failedPass1
 
 		var packagesToRebuild []string
@@ -6771,7 +6772,7 @@ func handleBuildCommand(args []string, cfg *Config) {
 				colArrow.Print("-> ")
 				colSuccess.Printf("Rebuild order: %s\n", strings.Join(rebuildPlan.Order, " -> "))
 				fmt.Println()
-				failedPass2, _ := executeBuildPass(rebuildPlan, "Rebuild Pass", true, cfg, bootstrap)
+				failedPass2, _ := executeBuildPass(rebuildPlan, "Rebuild Pass", true, cfg, bootstrap, rebuildRequestMap)
 				for k, v := range failedPass2 {
 					failedBuilds[k] = v
 				}
@@ -6804,22 +6805,20 @@ func handleBuildCommand(args []string, cfg *Config) {
 	}
 
 	// --- Final Report ---
-	fmt.Println("\n" + strings.Repeat("=", 30))
-	color.Bold.Println("         Build Summary")
-	fmt.Println(strings.Repeat("=", 30))
 	if len(failedBuilds) == 0 {
 		colArrow.Print("-> ")
 		colSuccess.Println("All packages built and installed successfully.")
 		os.Exit(0)
 	}
-	color.Danger.Println("\nFailed or Blocked Packages:")
+	color.Danger.Print("-> ")
+	color.Danger.Println("Failed or Blocked Packages:")
 	var failedKeys []string
 	for k := range failedBuilds {
 		failedKeys = append(failedKeys, k)
 	}
 	sort.Strings(failedKeys)
 	for _, pkg := range failedKeys {
-		fmt.Printf("  - %-20s: %v\n", pkg, failedBuilds[pkg])
+		color.Debug.Printf("  - %-20s: %v\n", pkg, failedBuilds[pkg])
 	}
 	fmt.Println()
 	os.Exit(1)
@@ -6827,19 +6826,7 @@ func handleBuildCommand(args []string, cfg *Config) {
 
 // executeBuildPass is a new helper required by the refactoring above.
 // Add this function to your main.go file.
-func executeBuildPass(plan *BuildPlan, passName string, installAllTargets bool, cfg *Config, bootstrap *bool) (map[string]error, []string) {
-	userRequestedMap := make(map[string]bool)
-	// We need to know which packages were user-requested to defer installation.
-	// This is a simplified way; in a larger app, you'd pass this map down.
-	// For now, we assume that if installAllTargets is false, it's the initial pass.
-	if !installAllTargets {
-		// This is a heuristic. A more robust solution would pass the original user request map.
-		for _, pkg := range plan.Order {
-			if !isPackageInstalled(pkg) { // A rough way to guess user targets
-				userRequestedMap[pkg] = true
-			}
-		}
-	}
+func executeBuildPass(plan *BuildPlan, passName string, installAllTargets bool, cfg *Config, bootstrap *bool, userRequestedMap map[string]bool) (map[string]error, []string) {
 
 	toBuild := plan.Order
 	failed := make(map[string]error)
@@ -6873,6 +6860,7 @@ func executeBuildPass(plan *BuildPlan, passName string, installAllTargets bool, 
 			if err := pkgBuild(pkgName, cfg, UserExec, *bootstrap); err != nil {
 				failed[pkgName] = err
 				color.Danger.Printf("Build failed for %s: %v\n\n", pkgName, err)
+				continue
 			} else {
 				progressThisPass = true
 				if installAllTargets || !userRequestedMap[pkgName] {
