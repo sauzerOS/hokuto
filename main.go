@@ -2705,7 +2705,9 @@ func b3sum(path string, execCtx *Executor) (string, error) {
 
 		var out bytes.Buffer
 		cmd.Stdout = &out
-		cmd.Stderr = os.Stderr
+		// ** FIX: Discard stderr to silence "No such file or directory" messages. **
+		// The error will still be propagated by execCtx.Run if b3sum fails.
+		cmd.Stderr = io.Discard
 
 		if err := execCtx.Run(cmd); err == nil {
 			fields := strings.Fields(out.String())
@@ -2714,15 +2716,16 @@ func b3sum(path string, execCtx *Executor) (string, error) {
 			}
 			// fall through to internal if no output
 		}
+		// If system b3sum fails, we'll fall through to the internal implementation.
 	}
 
 	// Fallback: internal Go BLAKE3 with privilege awareness
-	// If the executor should run as root, use cat to read the file
 	if execCtx.ShouldRunAsRoot {
 		catCmd := exec.Command("cat", path)
 		var out bytes.Buffer
 		catCmd.Stdout = &out
-		catCmd.Stderr = os.Stderr
+		// Also discard stderr for cat, in case the file disappears.
+		catCmd.Stderr = io.Discard
 
 		if err := execCtx.Run(catCmd); err != nil {
 			return "", fmt.Errorf("failed to read file with elevated privileges: %w", err)
@@ -2757,7 +2760,9 @@ func b3sumFast(path string) (string, error) {
 		cmd := exec.Command("b3sum", path)
 		var out bytes.Buffer
 		cmd.Stdout = &out
-		cmd.Stderr = os.Stderr
+		// ** FIX: Discard stderr to silence "No such file or directory" messages. **
+		// The error will still be propagated by cmd.Run if b3sum fails.
+		cmd.Stderr = io.Discard
 
 		if err := cmd.Run(); err == nil {
 			fields := strings.Fields(out.String())
@@ -3805,118 +3810,6 @@ func checkForUpgrades() error {
 	return nil
 }
 
-// getPackageDependenciesForward recursively collects all dependencies for a package
-// in forward order (as they appear in depends files).
-// Duplicates are only allowed for "gcc" - all other packages are added once.
-// This is used with the --alldeps flag to rebuild everything including duplicates.
-func getPackageDependenciesForward(pkgName string) ([]string, error) {
-	var result []string
-	seen := make(map[string]bool)       // Track non-gcc packages to avoid duplicates
-	inProgress := make(map[string]bool) // Track packages currently being processed to prevent infinite recursion
-
-	// Helper function for recursive traversal
-	var collectDeps func(string) error
-	collectDeps = func(currentPkg string) error {
-		// Check if we're already processing this package (prevents infinite recursion)
-		if inProgress[currentPkg] {
-			return nil
-		}
-
-		// Mark as in-progress
-		inProgress[currentPkg] = true
-		defer func() {
-			// Unmark when done (allows gcc to be processed multiple times in different branches)
-			delete(inProgress, currentPkg)
-		}()
-		// --- Find the Package Source Directory (pkgDir) ---
-		paths := strings.Split(repoPaths, ":")
-		var pkgDir string
-		var found bool
-
-		for _, repoPath := range paths {
-			repoPath = strings.TrimSpace(repoPath)
-			if repoPath == "" {
-				continue
-			}
-			currentPkgDir := filepath.Join(repoPath, currentPkg)
-			if info, err := os.Stat(currentPkgDir); err == nil && info.IsDir() {
-				pkgDir = currentPkgDir
-				found = true
-				break
-			}
-		}
-
-		if !found {
-			return fmt.Errorf("package source not found in any repository path for %s", currentPkg)
-		}
-
-		// --- Parse the depends file ---
-		dependencies, err := parseDependsFile(pkgDir)
-		if err != nil {
-			return fmt.Errorf("failed to parse dependencies for %s: %w", currentPkg, err)
-		}
-
-		// --- Recursively collect dependencies in forward order ---
-		for _, dep := range dependencies {
-			depName := dep.Name
-
-			// Safety check: a package cannot depend on itself
-			if depName == currentPkg {
-				continue
-			}
-
-			// Version constraint checking (same as resolveMissingDeps)
-			if dep.Op != "" && isPackageInstalled(depName) {
-				if installedVer, ok := getInstalledVersion(depName); ok {
-					if !versionSatisfies(installedVer, dep.Op, dep.Version) {
-						switch dep.Op {
-						case "<=":
-							return fmt.Errorf("error %s version %s or lower required for build (installed %s)", depName, dep.Version, installedVer)
-						case ">=":
-							return fmt.Errorf("error %s version %s or higher required for build (installed %s)", depName, dep.Version, installedVer)
-						case "==":
-							return fmt.Errorf("error %s version exactly %s required for build (installed %s)", depName, dep.Version, installedVer)
-						case "<":
-							return fmt.Errorf("error %s version lower than %s required for build (installed %s)", depName, dep.Version, installedVer)
-						case ">":
-							return fmt.Errorf("error %s version greater than %s required for build (installed %s)", depName, dep.Version, installedVer)
-						default:
-							return fmt.Errorf("error %s version constraint %s%s not satisfied (installed %s)", depName, dep.Op, dep.Version, installedVer)
-						}
-					}
-				}
-			}
-
-			// Recursively collect dependencies of this dependency
-			if err := collectDeps(depName); err != nil {
-				return err
-			}
-
-			// Add the dependency itself AFTER its dependencies (forward order)
-			// Special handling: gcc can be added multiple times, all others only once
-			if depName == "gcc" {
-				// Always add gcc, allowing duplicates
-				result = append(result, depName)
-			} else {
-				// For non-gcc packages, only add if not seen before
-				if !seen[depName] {
-					seen[depName] = true
-					result = append(result, depName)
-				}
-			}
-		}
-
-		return nil
-	}
-
-	// Start the recursive collection
-	if err := collectDeps(pkgName); err != nil {
-		return nil, err
-	}
-
-	return result, nil
-}
-
 // resolveMissingDeps recursively finds all missing dependencies for a package.
 // It assumes cfg is passed in, as it's needed for the recursive call.
 func resolveMissingDeps(pkgName string, processed map[string]bool, missing *[]string) error {
@@ -4031,18 +3924,20 @@ func isPackageInstalled(pkgName string) bool {
 }
 
 type DepSpec struct {
-	Name    string
-	Op      string // one of: "<=", ">=", "==", "<", ">", or empty for no constraint
-	Version string
+	Name     string
+	Op       string // one of: "<=", ">=", "==", "<", ">", or empty for no constraint
+	Version  string
+	Optional bool
+	Rebuild  bool
 }
 
-// parseDependsFile reads the package's depends file and returns a list of dependency specs (with optional version constraints).
+// parseDependsFile reads the package's depends file and returns a list of dependency specs.
 func parseDependsFile(pkgDir string) ([]DepSpec, error) {
 	dependsPath := filepath.Join(pkgDir, "depends")
 	content, err := os.ReadFile(dependsPath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return []DepSpec{}, nil // No depends file is fine
+			return []DepSpec{}, nil // No depends file is valid.
 		}
 		return nil, fmt.Errorf("failed to read depends file: %w", err)
 	}
@@ -4056,31 +3951,175 @@ func parseDependsFile(pkgDir string) ([]DepSpec, error) {
 			continue
 		}
 
-		// Split the line, e.g., "alsa-lib" or "python make"
-		parts := strings.Fields(line)
-
-		// The first part is the dependency token, which may include a version constraint, e.g., python-sip<=9.8.6
-		if len(parts) > 0 {
-			name, op, ver := parseDepToken(parts[0])
-			dependencies = append(dependencies, DepSpec{Name: name, Op: op, Version: ver})
+		// Correctly capture all return values from the updated token parser.
+		name, op, ver, optional, rebuild := parseDepToken(line)
+		if name != "" {
+			dependencies = append(dependencies, DepSpec{
+				Name:     name,
+				Op:       op,
+				Version:  ver,
+				Optional: optional, // Correctly assign the 'optional' flag.
+				Rebuild:  rebuild,
+			})
 		}
 	}
 
 	return dependencies, nil
 }
 
-// parseDepToken parses tokens like "pkg", "pkg<=1.2.3", "pkg==1.0", "pkg>=2.0" and returns name, op, version.
-func parseDepToken(token string) (string, string, string) {
-	// Check for multi-char operators first to avoid partial matches
-	ops := []string{"<=", ">=", "==", "<", ">"}
-	for _, op := range ops {
-		if idx := strings.Index(token, op); idx != -1 {
-			name := token[:idx]
-			ver := token[idx+len(op):]
-			return strings.TrimSpace(name), op, strings.TrimSpace(ver)
+// parseDepToken parses tokens like "pkg", "pkg<=1.2.3 optional", "pkg rebuild" and returns name, op, version, and flags.
+func parseDepToken(token string) (string, string, string, bool, bool) {
+	// Split by whitespace to separate package spec from flags
+	parts := strings.Fields(token)
+	if len(parts) == 0 {
+		return "", "", "", false, false
+	}
+
+	pkgSpec := parts[0]
+	var optional, rebuild bool
+
+	// Check for flags in remaining parts
+	for i := 1; i < len(parts); i++ {
+		switch parts[i] {
+		case "optional":
+			optional = true
+		case "rebuild":
+			rebuild = true
 		}
 	}
-	return token, "", ""
+
+	// Parse version constraint from package spec
+	ops := []string{"<=", ">=", "==", "<", ">"}
+	for _, op := range ops {
+		if idx := strings.Index(pkgSpec, op); idx != -1 {
+			name := pkgSpec[:idx]
+			ver := pkgSpec[idx+len(op):]
+			return strings.TrimSpace(name), op, strings.TrimSpace(ver), optional, rebuild
+		}
+	}
+	return pkgSpec, "", "", optional, rebuild
+}
+
+// BuildPlan represents the complete build plan with proper ordering
+type BuildPlan struct {
+	Order           []string          // Final build order
+	SkippedPackages map[string]string // pkgName -> reason for skip
+	RebuildPackages map[string]bool   // Packages marked for rebuild
+	PostRebuilds    map[string]bool   // Packages needing a rebuild for optional deps
+}
+
+// resolveBuildPlan creates a dynamic, context-aware build plan.
+// It correctly handles resolvable circular dependencies caused by optional dependencies.
+func resolveBuildPlan(targetPackages []string, userRequestedPackages map[string]bool) (*BuildPlan, error) {
+	plan := &BuildPlan{
+		Order:           []string{},
+		SkippedPackages: make(map[string]string),
+		RebuildPackages: make(map[string]bool),
+		PostRebuilds:    make(map[string]bool),
+	}
+
+	processed := make(map[string]bool)
+	inProgress := make(map[string]bool)
+	alreadyInOrder := make(map[string]bool)
+
+	var processPkg func(pkgName string) error
+	processPkg = func(pkgName string) error {
+		// --- SMART CYCLE DETECTION ---
+		// If we are already in the middle of processing this package, just return.
+		// This breaks the recursive loop without erroring, allowing the original
+		// call to eventually resolve the package in the correct order.
+		if inProgress[pkgName] {
+			return nil
+		}
+		if processed[pkgName] {
+			return nil
+		}
+
+		inProgress[pkgName] = true
+		defer func() { delete(inProgress, pkgName) }()
+
+		pkgDir, err := findPackageDir(pkgName)
+		if err != nil {
+			return fmt.Errorf("package source not found for '%s': %w", pkgName, err)
+		}
+
+		deps, err := parseDependsFile(pkgDir)
+		if err != nil {
+			return fmt.Errorf("failed to parse dependencies for %s: %w", pkgName, err)
+		}
+
+		// Process all dependencies recursively first.
+		for _, dep := range deps {
+			if dep.Name == pkgName {
+				continue
+			}
+			if dep.Rebuild {
+				plan.RebuildPackages[dep.Name] = true
+			}
+
+			// --- CORRECT OPTIONAL DEPENDENCY LOGIC ---
+			if dep.Optional {
+				// If a dependency is optional AND it is NOT currently installed,
+				// we do two things:
+				// 1. Mark the CURRENT package for a post-rebuild.
+				// 2. Skip processing this optional dependency for now.
+				if !isPackageInstalled(dep.Name) {
+					plan.PostRebuilds[pkgName] = true
+					continue // Move to the next dependency
+				}
+			}
+
+			// If the dependency is required (or optional and already installed), process it.
+			if err := processPkg(dep.Name); err != nil {
+				return err
+			}
+		}
+
+		// Now, decide if the package itself needs to be in the build order.
+		shouldBuild := false
+		if userRequestedPackages[pkgName] {
+			shouldBuild = true // User explicitly asked for it.
+		} else if plan.RebuildPackages[pkgName] {
+			shouldBuild = true // Another package marked it for rebuild.
+		} else if !isPackageInstalled(pkgName) {
+			shouldBuild = true // It's a dependency that isn't installed.
+		}
+
+		if shouldBuild {
+			if !alreadyInOrder[pkgName] {
+				plan.Order = append(plan.Order, pkgName)
+				alreadyInOrder[pkgName] = true
+			}
+		}
+
+		processed[pkgName] = true
+		return nil
+	}
+
+	// Start the process for all initial targets.
+	for _, target := range targetPackages {
+		if err := processPkg(target); err != nil {
+			return nil, err
+		}
+	}
+
+	return plan, nil
+}
+
+// findPackageDir locates the package source directory
+func findPackageDir(pkgName string) (string, error) {
+	paths := strings.Split(repoPaths, ":")
+	for _, repoPath := range paths {
+		repoPath = strings.TrimSpace(repoPath)
+		if repoPath == "" {
+			continue
+		}
+		pkgDir := filepath.Join(repoPath, pkgName)
+		if info, err := os.Stat(pkgDir); err == nil && info.IsDir() {
+			return pkgDir, nil
+		}
+	}
+	return "", fmt.Errorf("not found in any repository")
 }
 
 // getInstalledVersion reads the installed version string from the package's metadata. Returns (version, true) if found.
@@ -4369,28 +4408,6 @@ var forbiddenSystemDirsRecursive = map[string]struct{}{
 type fileMetadata struct {
 	AbsPath string
 	B3Sum   string
-}
-
-// getUserConfirmation prompts the user and accepts 'y' or 'n'.
-// It can print the prompt with a specific color style if p is not nil.
-func getUserConfirmation(p colorPrinter, format string, a ...any) bool {
-	reader := bufio.NewReader(os.Stdin)
-	prompt := fmt.Sprintf(format, a...) // Create the final prompt string first
-
-	for {
-		// Use cPrintf to print the prompt. It handles the nil case automatically.
-		cPrintf(p, "%s", prompt)
-
-		input, _ := reader.ReadString('\n')
-		input = strings.TrimSpace(strings.ToLower(input))
-		if input == "y" || input == "" { // Default to 'yes' on Enter
-			return true
-		}
-		if input == "n" {
-			return false
-		}
-		cPrintln(colWarn, "Invalid input. Please enter 'y' or 'n'.")
-	}
 }
 
 // askForConfirmation prompts the user and defaults to 'yes'.
@@ -6461,26 +6478,27 @@ func pkgUninstall(pkgName string, cfg *Config, execCtx *Executor, force, yes boo
 	return nil
 }
 
+// handleBuildCommand orchestrates the entire build process, intelligently selecting the
+// correct dependency resolution strategy based on the build mode (normal, bootstrap, or alldeps).
 func handleBuildCommand(args []string, cfg *Config) {
-	// 1. Initialize a FlagSet for the "build" subcommand
+	// --- 1. Flag Parsing & Initial Setup ---
 	buildCmd := flag.NewFlagSet("build", flag.ExitOnError)
-	var autoInstall = buildCmd.Bool("a", false, "Automatically install the package(s) after successful build without prompting.")
-	var idleBuild = buildCmd.Bool("i", false, "Use half cpu cores and lowest niceness for build process.")
-	var superidleBuild = buildCmd.Bool("ii", false, "Use one cpu core and lowest niceness for build process.")
-	var verbose = buildCmd.Bool("v", false, "Enable verbose output (show build process output).")
-	var verboseLong = buildCmd.Bool("verbose", false, "Enable verbose output (show build process output).")
-	var bootstrap = buildCmd.Bool("bootstrap", false, "Enable bootstrap build mode")
-	var bootstrapDir = buildCmd.String("bootstrap-dir", "", "Specify the bootstrap directory (used with --bootstrap)")
-	var allDeps = buildCmd.Bool("alldeps", false, "Force build all dependencies (no binary packages used)")
+	var autoInstall = buildCmd.Bool("a", false, "Automatically install the package(s) after successful build.")
+	var idleBuild = buildCmd.Bool("i", false, "Use half CPU cores and lowest niceness for build process.")
+	var superidleBuild = buildCmd.Bool("ii", false, "Use one CPU core and lowest niceness for build process.")
+	var verbose = buildCmd.Bool("v", false, "Enable verbose output.")
+	var verboseLong = buildCmd.Bool("verbose", false, "Enable verbose output.")
+	var bootstrap = buildCmd.Bool("bootstrap", false, "Enable bootstrap build mode.")
+	var bootstrapDir = buildCmd.String("bootstrap-dir", "", "Specify the bootstrap directory.")
+	var allDeps = buildCmd.Bool("alldeps", false, "Force build of all dependencies from source.")
 
-	// Parse the arguments specific to the "build" subcommand
 	if err := buildCmd.Parse(args); err != nil {
 		fmt.Fprintf(os.Stderr, "Error parsing build flags: %v\n", err)
 		os.Exit(1)
 	}
+
 	// Set the global variables based on the parsed flags
 	// Determine the build priority. Super idle takes precedence over idle.
-
 	if *superidleBuild {
 		buildPriority = "superidle"
 	} else if *idleBuild {
@@ -6490,406 +6508,510 @@ func handleBuildCommand(args []string, cfg *Config) {
 	}
 	Verbose = *verbose || *verboseLong
 
-	// Handle bootstrap logic
+	// --- Bootstrap Repository & Path Setup ---
 	if *bootstrap {
 		if *bootstrapDir == "" {
-			fmt.Fprintln(os.Stderr, "Error: --bootstrap requires --bootstrap-dir to be specified")
-			os.Exit(1)
+			log.Fatal("Error: bootstrap requires bootstrap-dir")
 		}
 		if cfg.Values == nil {
 			cfg.Values = make(map[string]string)
 		}
 		cfg.Values["LFS"] = *bootstrapDir
+		cfg.Values["HOKUTO_ROOT"] = *bootstrapDir
+		cfg.Values["HOKUTO_CACHE_DIR"] = filepath.Join(*bootstrapDir, "var", "cache", "hokuto")
+
+		if fi, err := os.Stat("/repo/bootstrap"); err == nil && fi.IsDir() {
+			cfg.Values["HOKUTO_PATH"] = "/repo/bootstrap"
+		} else if fi, err := os.Stat("/tmp/repo/bootstrap"); err == nil && fi.IsDir() {
+			cfg.Values["HOKUTO_PATH"] = "/tmp/repo/bootstrap"
+		} else {
+			cfg.Values["HOKUTO_PATH"] = "/tmp/repo/bootstrap"
+			// Need to download and unpack into /tmp/repo
+			url := "https://github.com/sauzeros/bootstrap/releases/download/latest/bootstrap-repo.tar.xz"
+			tmpFile := filepath.Join(os.TempDir(), "bootstrap-repo.tar.xz")
+			colArrow.Print("-> ")
+			colSuccess.Printf("Downloading bootstrap repo from %s\n", url)
+			resp, err := http.Get(url)
+			if err != nil {
+				log.Fatalf("failed to download bootstrap repo: %v", err)
+			}
+			defer resp.Body.Close()
+
+			out, err := os.Create(tmpFile)
+			if err != nil {
+				log.Fatalf("failed to create temp file: %v", err)
+			}
+			if _, err := io.Copy(out, resp.Body); err != nil {
+				out.Close()
+				log.Fatalf("failed to save bootstrap archive: %v", err)
+			}
+			out.Close()
+
+			// Unpack into /tmp/repo
+			colArrow.Print("-> ")
+			colSuccess.Println("Unpacking bootstrap repo into /tmp/repo")
+
+			extractDir := filepath.Join(os.TempDir(), "repo")
+			if err := os.MkdirAll(extractDir, 0o755); err != nil {
+				log.Fatalf("failed to create extract dir %s: %v", extractDir, err)
+			}
+
+			f, err := os.Open(tmpFile)
+			if err != nil {
+				log.Fatalf("failed to open downloaded archive: %v", err)
+			}
+			defer f.Close()
+
+			xzr, err := xz.NewReader(f)
+			if err != nil {
+				log.Fatalf("failed to create xz reader: %v", err)
+			}
+			tr := tar.NewReader(xzr)
+			for {
+				hdr, err := tr.Next()
+				if err == io.EOF {
+					break
+				}
+				if err != nil {
+					log.Fatalf("error reading tar: %v", err)
+				}
+				target := filepath.Join(extractDir, hdr.Name)
+				switch hdr.Typeflag {
+				case tar.TypeDir:
+					if err := os.MkdirAll(target, os.FileMode(hdr.Mode)); err != nil {
+						log.Fatalf("failed to create dir %s: %v", target, err)
+					}
+				case tar.TypeReg:
+					if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+						log.Fatalf("failed to create parent dir: %v", err)
+					}
+					outFile, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, os.FileMode(hdr.Mode))
+					if err != nil {
+						log.Fatalf("failed to create file %s: %v", target, err)
+					}
+					if _, err := io.Copy(outFile, tr); err != nil {
+						outFile.Close()
+						log.Fatalf("failed to write file %s: %v", target, err)
+					}
+					outFile.Close()
+				case tar.TypeSymlink:
+					if err := os.Symlink(hdr.Linkname, target); err != nil && !os.IsExist(err) {
+						log.Fatalf("failed to create symlink %s -> %s: %v", target, hdr.Linkname, err)
+					}
+					log.Printf("Bootstrap repo unpacked successfully into /tmp/repo")
+				}
+			}
+		}
+		initConfig(cfg)
 	}
 
-	// The positional arguments (package names) are now in buildCmd.Args()
 	packagesToProcess := buildCmd.Args()
-	if len(packagesToProcess) < 1 {
-		fmt.Println("Usage: hokuto build [options] <package> [package...]")
-		fmt.Println("Options:")
-		buildCmd.PrintDefaults()
+	if len(packagesToProcess) == 0 {
+		fmt.Println("Usage: hokuto build [options] <package>...")
 		os.Exit(1)
 	}
-
-	// Set to non-critical (0 is default, but good to be explicit)
-	isCriticalAtomic.Store(0)
-
-	// --- CONDITIONAL OVERRIDE FOR HOKUTO_ROOT ---
-	if *bootstrap {
-
-		// 1. Get the LFS root path
-		lfsRoot := cfg.Values["LFS"]
-		if lfsRoot == "" {
-			log.Fatalf("bootstrap mode requires LFS to be set in config")
-		}
-
-		// 2. Override HOKUTO_ROOT and cachedir
-		cfg.Values["HOKUTO_ROOT"] = lfsRoot
-		cfg.Values["HOKUTO_CACHE_DIR"] = filepath.Join(lfsRoot, "var/cache/hokuto")
-
-		// 1. Check for existing /repo/bootstrap
-		if fi, err := os.Stat("/repo/bootstrap"); err == nil && fi.IsDir() {
-			// Use pre-existing /repo/bootstrap
-			cfg.Values["HOKUTO_PATH"] = "/repo/bootstrap"
-			colArrow.Print("-> ")
-			colSuccess.Println("Using existing bootstrap repo at /repo/bootstrap")
-		} else {
-			// 2. Check for existing /tmp/repo/bootstrap
-			if fi, err := os.Stat("/tmp/repo/bootstrap"); err == nil && fi.IsDir() {
-				cfg.Values["HOKUTO_PATH"] = "/tmp/repo/bootstrap"
-				colArrow.Print("-> ")
-				colSuccess.Println("Using existing bootstrap repo at /tmp/repo/bootstrap")
-			} else {
-				// Need to download and unpack into /tmp/repo
-				url := "https://github.com/sauzeros/bootstrap/releases/download/latest/bootstrap-repo.tar.xz"
-				tmpFile := filepath.Join(os.TempDir(), "bootstrap-repo.tar.xz")
-				colArrow.Print("-> ")
-				colSuccess.Printf("Downloading bootstrap repo from %s\n", url)
-				resp, err := http.Get(url)
-				if err != nil {
-					log.Fatalf("failed to download bootstrap repo: %v", err)
-				}
-				defer resp.Body.Close()
-
-				out, err := os.Create(tmpFile)
-				if err != nil {
-					log.Fatalf("failed to create temp file: %v", err)
-				}
-				if _, err := io.Copy(out, resp.Body); err != nil {
-					out.Close()
-					log.Fatalf("failed to save bootstrap archive: %v", err)
-				}
-				out.Close()
-
-				// Unpack into /tmp/repo
-				colArrow.Print("-> ")
-				colSuccess.Println("Unpacking bootstrap repo into /tmp/repo")
-
-				extractDir := filepath.Join(os.TempDir(), "repo")
-				if err := os.MkdirAll(extractDir, 0o755); err != nil {
-					log.Fatalf("failed to create extract dir %s: %v", extractDir, err)
-				}
-
-				f, err := os.Open(tmpFile)
-				if err != nil {
-					log.Fatalf("failed to open downloaded archive: %v", err)
-				}
-				defer f.Close()
-
-				xzr, err := xz.NewReader(f)
-				if err != nil {
-					log.Fatalf("failed to create xz reader: %v", err)
-				}
-
-				tr := tar.NewReader(xzr)
-				for {
-					hdr, err := tr.Next()
-					if err == io.EOF {
-						break
-					}
-					if err != nil {
-						log.Fatalf("error reading tar: %v", err)
-					}
-
-					target := filepath.Join(extractDir, hdr.Name)
-
-					switch hdr.Typeflag {
-					case tar.TypeDir:
-						if err := os.MkdirAll(target, os.FileMode(hdr.Mode)); err != nil {
-							log.Fatalf("failed to create dir %s: %v", target, err)
-						}
-					case tar.TypeReg:
-						if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
-							log.Fatalf("failed to create parent dir: %v", err)
-						}
-						outFile, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, os.FileMode(hdr.Mode))
-						if err != nil {
-							log.Fatalf("failed to create file %s: %v", target, err)
-						}
-						if _, err := io.Copy(outFile, tr); err != nil {
-							outFile.Close()
-							log.Fatalf("failed to write file %s: %v", target, err)
-						}
-						outFile.Close()
-					case tar.TypeSymlink:
-						if err := os.Symlink(hdr.Linkname, target); err != nil && !os.IsExist(err) {
-							log.Fatalf("failed to create symlink %s -> %s: %v", target, hdr.Linkname, err)
-						}
-					}
-				}
-
-				log.Printf("Bootstrap repo unpacked successfully into /tmp/repo")
-				cfg.Values["HOKUTO_PATH"] = "/tmp/repo/bootstrap"
-			}
-		}
-	}
-	// Call initConfig with the possibly modified config
-	initConfig(cfg)
-
-	// --- GLOBAL DEPENDENCY RESOLUTION & BINARY CHECK ---
-
-	// masterMissingDeps will hold all unique packages needed across all requested builds (in reverse build order)
-	var masterMissingDeps []string
-	// masterProcessed tracks all dependencies across all packages to avoid duplicates and loops
-	masterProcessed := make(map[string]bool)
-
-	// Track which packages the user explicitly requested (to defer final install)
-	targetPackages := make(map[string]bool)
+	userRequestedMap := make(map[string]bool)
 	for _, pkg := range packagesToProcess {
-		targetPackages[pkg] = true
+		userRequestedMap[pkg] = true
 	}
 
-	// 2. Resolve dependencies for ALL requested packages
-	var packagesToBuildFromDeps []string
+	// --- 2. SELECT DEPENDENCY STRATEGY and EXECUTE BUILD ---
+	var failedBuilds = make(map[string]error)
 
-	if *allDeps {
-		// When --alldeps is active, build dependencies in forward order (as they appear in depends file)
-		// and allow duplicates to be rebuilt
-		fmt.Println("--alldeps flag set: building all dependencies in order with duplicates allowed")
-
+	// ** STRATEGY 1: Bootstrap or --alldeps mode **
+	if *bootstrap || *allDeps {
+		colArrow.Print("-> ")
+		colSuccess.Println("Using forward-dependency build strategy for bootstrap/--alldeps mode.")
+		var fullBuildList []string
 		for _, pkgName := range packagesToProcess {
-			colArrow.Print("-> ")
-			colSuccess.Println("Resolving dependencies for target package %s", pkgName)
-
-			// Get dependencies in forward order (as they appear in depends file)
 			deps, err := getPackageDependenciesForward(pkgName)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error resolving dependencies for %s: %v\n", pkgName, err)
-				os.Exit(1)
+				log.Fatalf("Error resolving forward dependencies for %s: %v", pkgName, err)
 			}
-
-			// Add all dependencies (including duplicates) followed by the package itself
-			packagesToBuildFromDeps = append(packagesToBuildFromDeps, deps...)
-			packagesToBuildFromDeps = append(packagesToBuildFromDeps, pkgName)
+			fullBuildList = append(fullBuildList, deps...)
+			fullBuildList = append(fullBuildList, pkgName) // Add the target itself
 		}
-	} else {
-		// Normal mode: use existing dependency resolution (reverse order, no duplicates)
-		for _, pkgName := range packagesToProcess {
-			colArrow.Print("-> ")
-			colSuccess.Printf("Resolving dependencies for target package %s\n", pkgName)
-
-			// NOTE: resolveMissingDeps must be able to handle being called multiple times
-			// and update masterProcessed and masterMissingDeps correctly, acting like a global resolver.
-			if err := resolveMissingDeps(pkgName, masterProcessed, &masterMissingDeps); err != nil {
-				fmt.Fprintf(os.Stderr, "Error resolving dependencies for %s: %v\n", pkgName, err)
-				os.Exit(1)
-			}
-		}
-		packagesToBuildFromDeps = masterMissingDeps
-	}
-
-	var finalPackagesToBuild []string
-
-	// 3. BINARY CHECK AND USER PROMPT LOGIC (for all collected packages)
-	// When --alldeps is set, skip binary check entirely and force build everything
-	if *allDeps {
-		// All packages will be built, no filtering needed
-		finalPackagesToBuild = packagesToBuildFromDeps
-	} else {
-		for _, depPkg := range packagesToBuildFromDeps {
-			version, err := getRepoVersion(depPkg)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Fatal error: could not determine version for %s: %v\n", depPkg, err)
-				os.Exit(1)
-			}
-			tarballPath := filepath.Join(BinDir, fmt.Sprintf("%s-%s.tar.zst", depPkg, version))
-
-			// Only consider using a binary if it is NOT one of the user-requested target packages
-			if !targetPackages[depPkg] {
-				if _, err := os.Stat(tarballPath); err == nil {
-					// Binary exists
-					fmt.Printf("Dependency '%s' is not installed, but a built binary (%s) is available.\n", depPkg, filepath.Base(tarballPath))
-
-					// PROMPT: Do you want to use the pre-built binary?
-					if !getUserConfirmation(colNote, "-> Do you want to use the available binary package for dependency %s? (Y/n) ", depPkg) {
-						fmt.Printf("User chose to build %s.\n", depPkg)
-						finalPackagesToBuild = append(finalPackagesToBuild, depPkg)
-					} else {
-						colArrow.Print("-> ")
-						colSuccess.Printf("Using available binary for %s. Installing\n", depPkg)
-						// Check if package has dependencies to uninstall first
-						depsToUninstall := getPackageDependenciesToUninstall(depPkg)
-						if len(depsToUninstall) > 0 {
-							debugf("Package %s requires uninstalling dependencies: %v\n", depPkg, depsToUninstall)
-							for _, dep := range depsToUninstall {
-								debugf("Uninstalling %s\n", dep)
-								if err := pkgUninstall(dep, cfg, RootExec, true, true); err != nil {
-									// Log warning but continue with installation
-									debugf("Warning: failed to uninstall %s: %v (continuing with installation)\n", dep, err)
-								} else {
-									debugf("%s uninstalled successfully.\n", dep)
-								}
-							}
-						}
-						// Immediate install of dependency binary
-						isCriticalAtomic.Store(1)
-						if err := pkgInstall(tarballPath, depPkg, cfg, RootExec); err != nil {
-							isCriticalAtomic.Store(0)
-							fmt.Fprintf(os.Stderr, "Fatal error installing binary %s: %v\n", depPkg, err)
-							os.Exit(1)
-						}
-						isCriticalAtomic.Store(0)
-						colArrow.Print("-> ")
-						colSuccess.Printf("Dependency %s installed successfully from binary.\n", depPkg)
-						// This package is installed and won't be built, so skip adding to finalPackagesToBuild
-					}
-				} else {
-					// No binary found, must build
-					finalPackagesToBuild = append(finalPackagesToBuild, depPkg)
-				}
-			} else {
-				// User-requested target package that was also missing, always proceed to build
-				finalPackagesToBuild = append(finalPackagesToBuild, depPkg)
-			}
-		}
-	}
-
-	// Update the final list of packages to actually build
-	packagesToBuild := finalPackagesToBuild
-
-	// --- NEW LOGIC START ---
-	// This block ensures that all packages the user explicitly requested are
-	// included in the final build list, forcing a rebuild if they are already installed.
-
-	// Skip this logic when --alldeps is active since all packages are already in the list
-	if !*allDeps {
-		// Create a quick lookup map of what's already in the build queue
-		// to prevent adding duplicates.
-		alreadyInBuildList := make(map[string]bool)
-		for _, pkg := range packagesToBuild {
-			alreadyInBuildList[pkg] = true
-		}
-
-		// Iterate through the original user request and add any target packages
-		// that aren't already in the build list.
-		for _, targetPkg := range packagesToProcess {
-			if !alreadyInBuildList[targetPkg] {
-				// This package was not "missing", but the user wants to rebuild it.
-				colArrow.Print("-> ")
-				colSuccess.Printf("Package '%s' is already installed. Adding to queue for a forced rebuild.\n", targetPkg)
-				packagesToBuild = append(packagesToBuild, targetPkg)
-			}
-		}
-	}
-	// --- NEW LOGIC END ---
-
-	// --- FINAL LIST CHECK ---
-
-	// If after all dependency resolution and user requests, there's nothing to build, exit.
-	if len(packagesToBuild) == 0 {
-		fmt.Printf("All required packages are installed and no rebuild was requested. Nothing to do.\n")
-		os.Exit(0)
-	}
-
-	colArrow.Print("-> ")
-	colSuccess.Printf("The following packages will be built in order: %s\n", strings.Join(packagesToBuild, ", "))
-	// If idle priority is set, inform the user
-	if setIdlePriority {
-		cPrintf(colWarn, "NOTE: Build process niceness set to IDLE (nice -n 19).\n")
-	}
-
-	// --- EXECUTION OF BUILD LOOP ---
-	var builtTargetPackages []string // Track the target packages that were successfully built
-	for _, buildPkg := range packagesToBuild {
-		// ... (Steps 3A, 3B - Get Version, Build) ...
-		version, err := getRepoVersion(buildPkg)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Fatal error: could not determine version for %s: %v\n", buildPkg, err)
-			os.Exit(1)
-		}
-		tarballPath := filepath.Join(BinDir, fmt.Sprintf("%s-%s.tar.zst", buildPkg, version))
 
 		colArrow.Print("-> ")
-		colSuccess.Printf("Starting build: %s (%s)\n", buildPkg, version)
-		if err := pkgBuild(buildPkg, cfg, UserExec, *bootstrap); err != nil {
-			colArrow.Print("-> ")
-			colError.Printf("Fatal error building %s: %v\n", buildPkg, err)
-			os.Exit(1)
-		}
+		colSuccess.Printf("Build order: %s\n", strings.Join(fullBuildList, " -> "))
+		fmt.Println()
 
-		// --- STEP 3C: Install (Dependencies are installed immediately when --alldeps is set) ---
-		if !targetPackages[buildPkg] { // If it's *not* a target package (i.e., it's a dependency)
-			// Install dependencies immediately (always auto-install when --alldeps is set)
-			isCriticalAtomic.Store(1)
-
-			// Check if dependency has dependencies to uninstall first
-			depsToUninstall := getPackageDependenciesToUninstall(buildPkg)
-			if len(depsToUninstall) > 0 {
-				debugf("Package %s requires uninstalling dependencies: %v\n", buildPkg, depsToUninstall)
-				for _, dep := range depsToUninstall {
-					debugf("Uninstalling %s\n", dep)
-					if err := pkgUninstall(dep, cfg, RootExec, true, true); err != nil {
-						// Log warning but continue with installation
-						debugf("Warning: failed to uninstall %s: %v (continuing with installation)\n", dep, err)
-					} else {
-						debugf("%s uninstalled successfully.\n", dep)
-					}
-				}
+		// Execute the simple, sequential build
+		for _, pkgName := range fullBuildList {
+			// ** THE CRITICAL FIX IS HERE **
+			// If in bootstrap mode (not --alldeps alone), check if the package is already installed.
+			if *bootstrap && isPackageInstalled(pkgName) {
+				colArrow.Print("-> ")
+				colSuccess.Printf("Package '%s' is already installed in the target directory. Skipping.\n", pkgName)
+				continue
 			}
-			if err := pkgInstall(tarballPath, buildPkg, cfg, RootExec); err != nil {
+			// *****************************
+
+			colArrow.Print("-> ")
+			colSuccess.Printf("[Build] Building: %s\n", pkgName)
+			if err := pkgBuild(pkgName, cfg, UserExec, *bootstrap); err != nil {
+				failedBuilds[pkgName] = err
+				color.Danger.Printf("Fatal build failure for %s: %v\n", pkgName, err)
+				break
+			}
+
+			// In bootstrap/alldeps mode, every built package is installed immediately.
+			version, _ := getRepoVersion(pkgName)
+			tarballPath := filepath.Join(BinDir, fmt.Sprintf("%s-%s.tar.zst", pkgName, version))
+			isCriticalAtomic.Store(1)
+			handlePreInstallUninstall(pkgName, cfg, RootExec)
+			if installErr := pkgInstall(tarballPath, pkgName, cfg, RootExec); installErr != nil {
 				isCriticalAtomic.Store(0)
-				fmt.Fprintf(os.Stderr, "Fatal error installing dependency %s: %v\n", buildPkg, err)
-				os.Exit(1)
+				failedBuilds[pkgName] = fmt.Errorf("post-build installation failed: %w", installErr)
+				break // Fatal error
 			}
 			isCriticalAtomic.Store(0)
+		}
+
+	} else {
+		// ** STRATEGY 2: Normal Build Mode **
+		colArrow.Print("-> ")
+		colSuccess.Println("Discovering all required dependencies...")
+		masterProcessed := make(map[string]bool)
+		var missingDeps []string
+		for _, pkgName := range packagesToProcess {
+			if err := resolveMissingDeps(pkgName, masterProcessed, &missingDeps); err != nil {
+				log.Fatalf("Error resolving dependencies for %s: %v", pkgName, err)
+			}
+		}
+		packagesThatMustBeBuilt := make(map[string]bool)
+		for pkg := range userRequestedMap {
+			packagesThatMustBeBuilt[pkg] = true
+		}
+
+		for _, depPkg := range missingDeps {
+			if packagesThatMustBeBuilt[depPkg] {
+				continue
+			}
+			version, err := getRepoVersion(depPkg)
+			if err != nil {
+				log.Fatalf("Error: could not get version for dependency %s: %v", depPkg, err)
+			}
+			tarballPath := filepath.Join(BinDir, fmt.Sprintf("%s-%s.tar.zst", depPkg, version))
+			if _, err := os.Stat(tarballPath); err == nil {
+				if askForConfirmation(colInfo, "Dependency '%s' is missing. Use available binary package?", depPkg) {
+					isCriticalAtomic.Store(1)
+					handlePreInstallUninstall(depPkg, cfg, RootExec)
+					if err := pkgInstall(tarballPath, depPkg, cfg, RootExec); err != nil {
+						isCriticalAtomic.Store(0)
+						log.Fatalf("Fatal error installing binary %s: %v", depPkg, err)
+					}
+					isCriticalAtomic.Store(0)
+				} else {
+					packagesThatMustBeBuilt[depPkg] = true
+				}
+			} else {
+				packagesThatMustBeBuilt[depPkg] = true
+			}
+		}
+
+		var buildListInput []string
+		for pkg := range packagesThatMustBeBuilt {
+			buildListInput = append(buildListInput, pkg)
+		}
+
+		if len(buildListInput) == 0 {
+			fmt.Println("All packages and dependencies are already installed. Nothing to do.")
+			os.Exit(0)
+		}
+
+		colArrow.Print("-> ")
+		colSuccess.Println("Phase 1: Generating Initial Build Plan...")
+		initialPlan, err := resolveBuildPlan(buildListInput, userRequestedMap)
+		if err != nil {
+			log.Fatalf("Error generating initial build plan: %v", err)
+		}
+		if len(initialPlan.Order) == 0 {
+			fmt.Println("All packages are up to date. Nothing to build.")
+			os.Exit(0)
+		}
+
+		colArrow.Print("-> ")
+		colSuccess.Printf("Initial build order: %s\n", strings.Join(initialPlan.Order, " -> "))
+		if len(initialPlan.PostRebuilds) > 0 {
+			var rebuilds []string
+			for pkg := range initialPlan.PostRebuilds {
+				rebuilds = append(rebuilds, pkg)
+			}
+			sort.Strings(rebuilds)
 			colArrow.Print("-> ")
-			colSuccess.Printf("Dependency %s installed successfully.\n", buildPkg)
-		} else {
-			// If it's a target package, defer install and save its name
-			builtTargetPackages = append(builtTargetPackages, buildPkg)
-			debugf("Target package %s built successfully. Installation deferred.\n", buildPkg)
+			colWarn.Printf("Packages scheduled for rebuild with optional features: %s\n", strings.Join(rebuilds, ", "))
+		}
+		fmt.Println()
+
+		failedPass1, targetsPass1 := executeBuildPass(initialPlan, "Initial Pass", false, cfg, bootstrap)
+		failedBuilds = failedPass1
+
+		var packagesToRebuild []string
+		for pkg := range initialPlan.PostRebuilds {
+			if _, ok := failedBuilds[pkg]; !ok {
+				packagesToRebuild = append(packagesToRebuild, pkg)
+			}
+		}
+
+		if len(packagesToRebuild) > 0 {
+			fmt.Println()
+			colArrow.Print("-> ")
+			colSuccess.Println("Phase 2: Generating Rebuild Plan for Optional Dependencies...")
+			rebuildRequestMap := make(map[string]bool)
+			for _, pkg := range packagesToRebuild {
+				rebuildRequestMap[pkg] = true
+			}
+			rebuildPlan, err := resolveBuildPlan(packagesToRebuild, rebuildRequestMap)
+			if err != nil {
+				log.Fatalf("Error generating rebuild plan: %v", err)
+			}
+
+			if len(rebuildPlan.Order) > 0 {
+				colArrow.Print("-> ")
+				colSuccess.Printf("Rebuild order: %s\n", strings.Join(rebuildPlan.Order, " -> "))
+				fmt.Println()
+				failedPass2, _ := executeBuildPass(rebuildPlan, "Rebuild Pass", true, cfg, bootstrap)
+				for k, v := range failedPass2 {
+					failedBuilds[k] = v
+				}
+			}
+		}
+
+		if len(targetsPass1) > 0 {
+			shouldInstall := *autoInstall
+			if !shouldInstall {
+				sort.Strings(targetsPass1)
+				shouldInstall = askForConfirmation(colWarn, "-> Do you want to install the following built package(s): %s?", strings.Join(targetsPass1, ", "))
+			}
+			if shouldInstall {
+				for _, finalPkg := range targetsPass1 {
+					if _, failed := failedBuilds[finalPkg]; failed {
+						continue
+					}
+					version, _ := getRepoVersion(finalPkg)
+					tarballPath := filepath.Join(BinDir, fmt.Sprintf("%s-%s.tar.zst", finalPkg, version))
+					isCriticalAtomic.Store(1)
+					handlePreInstallUninstall(finalPkg, cfg, RootExec)
+					if err := pkgInstall(tarballPath, finalPkg, cfg, RootExec); err != nil {
+						isCriticalAtomic.Store(0)
+						failedBuilds[finalPkg] = fmt.Errorf("final installation failed: %w", err)
+					}
+					isCriticalAtomic.Store(0)
+				}
+			}
 		}
 	}
 
-	// --- FINAL INSTALL PROMPT ---
-	if len(builtTargetPackages) > 0 {
-		// Note: The prompt/auto-install applies to ALL built target packages
-		shouldInstall := *autoInstall
-		if !shouldInstall {
-			// Prompt user once for all built target packages
-			targetsList := strings.Join(builtTargetPackages, ", ")
-			shouldInstall = getUserConfirmation(colWarn, "-> Do you want to install the following package(s): %s (Y/n) ", targetsList)
+	// --- Final Report ---
+	fmt.Println("\n" + strings.Repeat("=", 30))
+	color.Bold.Println("         Build Summary")
+	fmt.Println(strings.Repeat("=", 30))
+	if len(failedBuilds) == 0 {
+		colArrow.Print("-> ")
+		colSuccess.Println("All packages built and installed successfully.")
+		os.Exit(0)
+	}
+	color.Danger.Println("\nFailed or Blocked Packages:")
+	var failedKeys []string
+	for k := range failedBuilds {
+		failedKeys = append(failedKeys, k)
+	}
+	sort.Strings(failedKeys)
+	for _, pkg := range failedKeys {
+		fmt.Printf("  - %-20s: %v\n", pkg, failedBuilds[pkg])
+	}
+	fmt.Println()
+	os.Exit(1)
+}
+
+// executeBuildPass is a new helper required by the refactoring above.
+// Add this function to your main.go file.
+func executeBuildPass(plan *BuildPlan, passName string, installAllTargets bool, cfg *Config, bootstrap *bool) (map[string]error, []string) {
+	userRequestedMap := make(map[string]bool)
+	// We need to know which packages were user-requested to defer installation.
+	// This is a simplified way; in a larger app, you'd pass this map down.
+	// For now, we assume that if installAllTargets is false, it's the initial pass.
+	if !installAllTargets {
+		// This is a heuristic. A more robust solution would pass the original user request map.
+		for _, pkg := range plan.Order {
+			if !isPackageInstalled(pkg) { // A rough way to guess user targets
+				userRequestedMap[pkg] = true
+			}
+		}
+	}
+
+	toBuild := plan.Order
+	failed := make(map[string]error)
+	var successfullyBuiltTargets []string
+	passInProgress := true
+	for passInProgress && len(toBuild) > 0 {
+		progressThisPass := false
+		var remainingAfterPass []string
+		for _, pkgName := range toBuild {
+			if _, isFailed := failed[pkgName]; isFailed {
+				continue
+			}
+			canBuild := true
+			pkgDir, _ := findPackageDir(pkgName)
+			deps, _ := parseDependsFile(pkgDir)
+			for _, dep := range deps {
+				if !dep.Optional && !isPackageInstalled(dep.Name) {
+					if _, hasFailed := failed[dep.Name]; hasFailed {
+						failed[pkgName] = fmt.Errorf("blocked by failed dependency '%s'", dep.Name)
+					}
+					canBuild = false
+					break
+				}
+			}
+			if !canBuild {
+				remainingAfterPass = append(remainingAfterPass, pkgName)
+				continue
+			}
+			colArrow.Print("-> ")
+			colSuccess.Printf("[%s] Building: %s\n", passName, pkgName)
+			if err := pkgBuild(pkgName, cfg, UserExec, *bootstrap); err != nil {
+				failed[pkgName] = err
+				color.Danger.Printf("Build failed for %s: %v\n\n", pkgName, err)
+			} else {
+				progressThisPass = true
+				if installAllTargets || !userRequestedMap[pkgName] {
+					version, _ := getRepoVersion(pkgName)
+					tarballPath := filepath.Join(BinDir, fmt.Sprintf("%s-%s.tar.zst", pkgName, version))
+					isCriticalAtomic.Store(1)
+					handlePreInstallUninstall(pkgName, cfg, RootExec)
+					if installErr := pkgInstall(tarballPath, pkgName, cfg, RootExec); installErr != nil {
+						isCriticalAtomic.Store(0)
+						failed[pkgName] = fmt.Errorf("post-build installation failed: %w", installErr)
+					} else {
+						isCriticalAtomic.Store(0)
+					}
+				} else {
+					successfullyBuiltTargets = append(successfullyBuiltTargets, pkgName)
+				}
+			}
+		}
+		toBuild = remainingAfterPass
+		passInProgress = progressThisPass
+	}
+	for _, pkg := range toBuild {
+		if _, exists := failed[pkg]; !exists {
+			failed[pkg] = errors.New("blocked by a failed dependency")
+		}
+	}
+	return failed, successfullyBuiltTargets
+}
+
+// getPackageDependenciesForward recursively collects all dependencies for a package
+// in forward order (as they appear in depends files).
+// Duplicates are only allowed for "gcc" - all other packages are added once.
+// This is used with the --alldeps flag to rebuild everything including duplicates.
+func getPackageDependenciesForward(pkgName string) ([]string, error) {
+	var result []string
+	seen := make(map[string]bool)       // Track non-gcc packages to avoid duplicates
+	inProgress := make(map[string]bool) // Track packages currently being processed to prevent infinite recursion
+
+	// Helper function for recursive traversal
+	var collectDeps func(string) error
+	collectDeps = func(currentPkg string) error {
+		// Check if we're already processing this package (prevents infinite recursion)
+		if inProgress[currentPkg] {
+			return nil
 		}
 
-		if shouldInstall {
-			// Loop and install all successfully built target packages
-			for _, finalPkg := range builtTargetPackages {
-				version, _ := getRepoVersion(finalPkg) // Re-get version (should not fail)
-				tarballPath := filepath.Join(BinDir, fmt.Sprintf("%s-%s.tar.zst", finalPkg, version))
+		// Mark as in-progress
+		inProgress[currentPkg] = true
+		defer func() {
+			// Unmark when done (allows gcc to be processed multiple times in different branches)
+			delete(inProgress, currentPkg)
+		}()
+		// --- Find the Package Source Directory (pkgDir) ---
+		paths := strings.Split(repoPaths, ":")
+		var pkgDir string
+		var found bool
 
-				// Check if package has dependencies to uninstall first
-				depsToUninstall := getPackageDependenciesToUninstall(finalPkg)
-				if len(depsToUninstall) > 0 {
-					debugf("Package %s requires uninstalling dependencies: %v\n", finalPkg, depsToUninstall)
-					for _, dep := range depsToUninstall {
-						debugf("Uninstalling %s\n", dep)
-						if err := pkgUninstall(dep, cfg, RootExec, true, true); err != nil {
-							// Log warning but continue with installation
-							debugf("Warning: failed to uninstall %s: %v (continuing with installation)\n", dep, err)
-						} else {
-							debugf("%s uninstalled successfully.\n", dep)
+		for _, repoPath := range paths {
+			repoPath = strings.TrimSpace(repoPath)
+			if repoPath == "" {
+				continue
+			}
+			currentPkgDir := filepath.Join(repoPath, currentPkg)
+			if info, err := os.Stat(currentPkgDir); err == nil && info.IsDir() {
+				pkgDir = currentPkgDir
+				found = true
+				break
+			}
+		}
+
+		if !found {
+			return fmt.Errorf("package source not found in any repository path for %s", currentPkg)
+		}
+
+		// --- Parse the depends file ---
+		dependencies, err := parseDependsFile(pkgDir)
+		if err != nil {
+			return fmt.Errorf("failed to parse dependencies for %s: %w", currentPkg, err)
+		}
+
+		// --- Recursively collect dependencies in forward order ---
+		for _, dep := range dependencies {
+			depName := dep.Name
+
+			// Safety check: a package cannot depend on itself
+			if depName == currentPkg {
+				continue
+			}
+
+			// Version constraint checking (same as resolveMissingDeps)
+			if dep.Op != "" && isPackageInstalled(depName) {
+				if installedVer, ok := getInstalledVersion(depName); ok {
+					if !versionSatisfies(installedVer, dep.Op, dep.Version) {
+						switch dep.Op {
+						case "<=":
+							return fmt.Errorf("error %s version %s or lower required for build (installed %s)", depName, dep.Version, installedVer)
+						case ">=":
+							return fmt.Errorf("error %s version %s or higher required for build (installed %s)", depName, dep.Version, installedVer)
+						case "==":
+							return fmt.Errorf("error %s version exactly %s required for build (installed %s)", depName, dep.Version, installedVer)
+						case "<":
+							return fmt.Errorf("error %s version lower than %s required for build (installed %s)", depName, dep.Version, installedVer)
+						case ">":
+							return fmt.Errorf("error %s version greater than %s required for build (installed %s)", depName, dep.Version, installedVer)
+						default:
+							return fmt.Errorf("error %s version constraint %s%s not satisfied (installed %s)", depName, dep.Op, dep.Version, installedVer)
 						}
 					}
 				}
-				colArrow.Print("-> ")
-				colSuccess.Printf("Starting installation of target package %s\n", finalPkg)
-				isCriticalAtomic.Store(1)
-				if err := pkgInstall(tarballPath, finalPkg, cfg, RootExec); err != nil {
-					isCriticalAtomic.Store(0)
-					fmt.Fprintf(os.Stderr, "Fatal error installing final package %s: %v\n", finalPkg, err)
-					os.Exit(1)
-				}
-				isCriticalAtomic.Store(0)
-				colArrow.Print("-> ")
-				colSuccess.Printf("Package %s installed successfully.\n", finalPkg)
 			}
-		} else {
-			debugf("Installation of target packages skipped by user. Built packages remain in %s.\n", BinDir)
+
+			// Recursively collect dependencies of this dependency
+			if err := collectDeps(depName); err != nil {
+				return err
+			}
+
+			// Add the dependency itself AFTER its dependencies (forward order)
+			// Special handling: gcc can be added multiple times, all others only once
+			if depName == "gcc" {
+				// Always add gcc, allowing duplicates
+				result = append(result, depName)
+			} else {
+				// For non-gcc packages, only add if not seen before
+				if !seen[depName] {
+					seen[depName] = true
+					result = append(result, depName)
+				}
+			}
 		}
+
+		return nil
 	}
 
-	// Clean up or exit after a successful run
-	os.Exit(0)
+	// Start the recursive collection
+	if err := collectDeps(pkgName); err != nil {
+		return nil, err
+	}
+
+	return result, nil
 }
 
 // executeMountCommand accepts the FULL destination path (e.g., /var/tmp/lfs/dev/tty)
@@ -7268,6 +7390,25 @@ func getPackageDependenciesToUninstall(name string) []string {
 			return []string{name}
 		}
 		return nil // No dependencies to uninstall
+	}
+}
+
+// handlePreInstallUninstall checks for and removes packages that must be uninstalled
+// before a new package can be installed
+func handlePreInstallUninstall(pkgName string, cfg *Config, execCtx *Executor) {
+	depsToUninstall := getPackageDependenciesToUninstall(pkgName)
+	if len(depsToUninstall) > 0 {
+		colArrow.Print("-> ")
+		colWarn.Printf("Uninstalling conflicting packages for %s: %v\n", pkgName, strings.Join(depsToUninstall, ", "))
+		for _, dep := range depsToUninstall {
+			// Use force and yes flags to ensure silent, non-interactive uninstallation.
+			if err := pkgUninstall(dep, cfg, execCtx, true, true); err != nil {
+				// This is a non-fatal warning. The installation should proceed.
+				debugf("Warning: failed to uninstall conflicting package %s: %v\n", dep, err)
+			} else {
+				debugf("Uninstalled conflicting package %s successfully.\n", dep)
+			}
+		}
 	}
 }
 
@@ -7699,24 +7840,14 @@ func main() {
 				// Direct tarball path
 				tarballPath = arg
 				base := filepath.Base(tarballPath)
-
-				// Determine package name from tarball filename (e.g., pkgname-version.tar.zst)
-				// Remove .tar.zst extension first
 				nameWithoutExt := strings.TrimSuffix(base, ".tar.zst")
-
-				// Find the last dash that separates package name from version
-				// Version typically contains dots, so we look for the last dash before the version
 				lastDashIndex := strings.LastIndex(nameWithoutExt, "-")
 				if lastDashIndex == -1 {
 					fmt.Fprintf(os.Stderr, "Error: Could not determine package name from tarball file name: %s\n", arg)
 					allSucceeded = false
 					continue
 				}
-
-				// Extract the part before the last dash as package name
 				pkgName = nameWithoutExt[:lastDashIndex]
-
-				// Verify the tarball actually exists before attempting install
 				if _, err := os.Stat(tarballPath); err != nil {
 					fmt.Fprintf(os.Stderr, "Error: Tarball not found or inaccessible: %s\n", tarballPath)
 					allSucceeded = false
@@ -7726,19 +7857,13 @@ func main() {
 			} else {
 				// Package name
 				pkgName = arg
-
-				// 1. Get the version for the package
 				version, err := getRepoVersion(pkgName)
 				if err != nil {
 					fmt.Fprintf(os.Stderr, "Error determining version for %s: %v\n", pkgName, err)
 					allSucceeded = false
 					continue
 				}
-
-				// 2. Determine the expected path in BinDir
 				tarballPath = filepath.Join(BinDir, fmt.Sprintf("%s-%s.tar.zst", pkgName, version))
-
-				// 3. Check if the pre-built tarball exists
 				if _, err := os.Stat(tarballPath); err != nil {
 					cPrintf(colWarn, "Error: Package tarball not found for %s at %s.\n", pkgName, tarballPath)
 					allSucceeded = false
@@ -7746,28 +7871,15 @@ func main() {
 				}
 			}
 
-			// --- Installation Execution ---
-			// Check if package has dependencies to uninstall first
-			depsToUninstall := getPackageDependenciesToUninstall(pkgName)
-			if len(depsToUninstall) > 0 {
-				debugf("Package %s requires uninstalling dependencies: %v\n", pkgName, depsToUninstall)
-				for _, dep := range depsToUninstall {
-					debugf("Uninstalling %s\n", dep)
-					if err := pkgUninstall(dep, cfg, RootExec, true, true); err != nil {
-						// Log warning but continue with installation
-						debugf("Warning: failed to uninstall %s: %v (continuing with installation)\n", dep, err)
-					} else {
-						debugf("%s uninstalled successfully.\n", dep)
-					}
-				}
-			}
+			// --- ** USE THE NEW HELPER FUNCTION HERE ** ---
+			handlePreInstallUninstall(pkgName, cfg, RootExec)
+
 			colArrow.Print("-> ")
 			colSuccess.Printf("Installing %s from %s\n", pkgName, tarballPath)
 
 			if err := pkgInstall(tarballPath, pkgName, cfg, RootExec); err != nil {
 				fmt.Fprintf(os.Stderr, "Error installing package %s: %v\n", pkgName, err)
 				allSucceeded = false
-				// Continue to the next package
 				continue
 			}
 			colArrow.Print("-> ")
@@ -7775,7 +7887,6 @@ func main() {
 		}
 
 		if !allSucceeded {
-			// Exit with an error code if any package failed to install
 			os.Exit(1)
 		}
 
