@@ -1795,16 +1795,32 @@ func generateLibDeps(outputDir, libdepsFile string, execCtx *Executor) error {
 	}
 	sort.Strings(sortedLibs)
 
-	// Write the final file (as user is fine, since it's in the staging dir)
-	if err := os.WriteFile(libdepsFile, []byte(strings.Join(sortedLibs, "\n")+"\n"), 0644); err != nil {
-		return err
+	// --- FIX: Use a privileged 'tee' command to write the file ---
+	// This ensures the write succeeds even if the staging directory is root-owned (from an asroot build).
+	if len(sortedLibs) > 0 {
+		content := strings.Join(sortedLibs, "\n") + "\n"
+		cmd := exec.Command("tee", libdepsFile)
+		cmd.Stdin = strings.NewReader(content)
+		// Discard tee's stdout to prevent it from printing the content to the console.
+		cmd.Stdout = io.Discard
+
+		// Use the privileged RootExec to ensure the write is successful.
+		if err := execCtx.Run(cmd); err != nil {
+			return fmt.Errorf("failed to write libdeps file via tee: %w", err)
+		}
+	} else {
+		// If there are no dependencies, create an empty file.
+		touchCmd := exec.Command("touch", libdepsFile)
+		if err := execCtx.Run(touchCmd); err != nil {
+			return fmt.Errorf("failed to create empty libdeps file: %w", err)
+		}
 	}
 
 	debugf("Library dependencies written to %s (%d deps)\n", libdepsFile, len(seen))
 	return nil
 }
 
-func generateDepends(pkgName, pkgDir, outputDir, rootDir string) error {
+func generateDepends(pkgName, pkgDir, outputDir, rootDir string, execCtx *Executor) error {
 	installedDir := filepath.Join(outputDir, "var", "db", "hokuto", "installed", pkgName)
 	dependsFile := filepath.Join(installedDir, "depends")
 
@@ -1892,9 +1908,15 @@ func generateDepends(pkgName, pkgDir, outputDir, rootDir string) error {
 	sort.Strings(deps)
 	content := strings.Join(deps, "\n")
 
-	debugf("Writing depends for %s: %s\n", pkgName, content)
-	if err := os.WriteFile(dependsFile, []byte(content+"\n"), 0644); err != nil {
-		return fmt.Errorf("failed to write depends: %v", err)
+	// --- FIX: Use a privileged 'tee' command to write the depends file ---
+	// This ensures the write succeeds even in a root-owned staging directory.
+	cmd := exec.Command("tee", dependsFile)
+	cmd.Stdin = strings.NewReader(content + "\n")
+	cmd.Stdout = io.Discard // Don't print the file content to the console
+
+	// Use RootExec, which is guaranteed to have the necessary permissions.
+	if err := execCtx.Run(cmd); err != nil {
+		return fmt.Errorf("failed to write depends file via tee: %w", err)
 	}
 
 	return nil
@@ -3774,7 +3796,7 @@ func checkForUpgrades(ctx context.Context, cfg *Config) error {
 		// Set critical section for the installation phase
 		isCriticalAtomic.Store(1)
 		handlePreInstallUninstall(pkgName, cfg, RootExec)
-		if err := pkgInstall(tarballPath, pkgName, cfg, RootExec); err != nil {
+		if err := pkgInstall(tarballPath, pkgName, cfg, RootExec, false); err != nil {
 			isCriticalAtomic.Store(0) // Unset on failure
 			color.Danger.Printf("Installation failed for %s: %v\n", pkgName, err)
 			failedPackages = append(failedPackages, pkgName)
@@ -4974,7 +4996,7 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool) er
 	}
 
 	// Generate depends
-	if err := generateDepends(pkgName, pkgDir, outputDir, rootDir); err != nil {
+	if err := generateDepends(pkgName, pkgDir, outputDir, rootDir, buildExec); err != nil {
 		return fmt.Errorf("failed to generate depends: %v", err)
 	}
 	debugf("Depends written to %s\n", filepath.Join(installedDir, "depends"))
@@ -5498,14 +5520,14 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 
 	// Generate libdeps
 	libdepsFile := filepath.Join(installedDir, "libdeps")
-	if err := generateLibDeps(outputDir, libdepsFile, RootExec); err != nil {
+	if err := generateLibDeps(outputDir, libdepsFile, buildExec); err != nil {
 		fmt.Printf("Warning: failed to generate libdeps: %v\n", err)
 	} else {
 		debugf("Library dependencies written to %s\n", libdepsFile)
 	}
 
 	// Generate depends
-	if err := generateDepends(pkgName, pkgDir, outputDir, rootDir); err != nil {
+	if err := generateDepends(pkgName, pkgDir, outputDir, rootDir, buildExec); err != nil {
 		return fmt.Errorf("failed to generate depends: %v", err)
 	}
 	debugf("Depends written to %s\n", filepath.Join(installedDir, "depends"))
@@ -5630,7 +5652,7 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 	return nil
 }
 
-func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor) error {
+func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes bool) error {
 
 	// Special handling for glibc: direct extraction without staging or checks
 	if pkgName == "glibc" {
@@ -5762,12 +5784,14 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor) err
 			cmd.Stderr = os.Stderr
 			cmd.Run()
 
-			cPrintf(colInfo, "File %s modified, %schoose action: [k]eep current, [U]se new, [e]dit: ", file, ownerDisplay)
 			var input string
-			fmt.Scanln(&input)
+			if !yes {
+				cPrintf(colInfo, "File %s modified, %schoose action: [k]eep current, [U]se new, [e]dit: ", file, ownerDisplay)
+				fmt.Scanln(&input)
+			}
 			input = strings.TrimSpace(input)
 			if input == "" {
-				input = "u" // default to use new when user just presses enter
+				input = "u" // Default to 'use new' if user presses enter or if in --yes mode
 			}
 			switch input {
 			case "k":
@@ -5854,10 +5878,13 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor) err
 			}
 		} else {
 			// file does NOT exist in staging
-			cPrintf(colInfo, "User modified %s, but new package has no file. Keep it? [y/N]: ", file)
-			var input string
-			fmt.Scanln(&input)
-			ans := strings.ToLower(strings.TrimSpace(input))
+			ans := "n" // Default to not keeping the file
+			if !yes {
+				cPrintf(colInfo, "User modified %s, but new package has no file. Keep it? [y/N]: ", file)
+				var input string
+				fmt.Scanln(&input)
+				ans = strings.ToLower(strings.TrimSpace(input))
+			}
 			if ans == "y" {
 				// ensure staging directory exists (run as root)
 				stagingFileDir := filepath.Dir(stagingFile)
@@ -6080,20 +6107,16 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor) err
 		// 8a. Prompt for rebuild (Hokuto is guaranteed to be run in a terminal)
 		cPrintf(colWarn, "\nWARNING: The following packages depend on libraries that were removed/upgraded:\n  %s\n", strings.Join(affectedList, ", "))
 
-		performRebuild := true // Default to true, and allow user input to override
-
-		cPrintf(colInfo, "Do you want to rebuild these packages now? This is highly recommended. [Y/n]: ")
-
-		var answer string
-		// Read the line. Using '_' to discard the error and the count,
-		// as we only care if 'answer' is "n".
-		_, _ = fmt.Scanln(&answer) // Corrected line: 'err' replaced with '_'
-
-		// Check if the trimmed input is 'n' (No). An empty input (user pressed Enter)
-		// or an error (like EOF on Enter) will fall through to 'performRebuild = true'.
-		if strings.ToLower(strings.TrimSpace(answer)) == "n" {
-			cPrintf(colInfo, "Skipping rebuild")
-			performRebuild = false
+		performRebuild := false
+		if !yes {
+			performRebuild = true // default to true unless user says 'n'
+			cPrintf(colInfo, "Do you want to rebuild these packages now? This is highly recommended. [Y/n]: ")
+			var answer string
+			fmt.Scanln(&answer)
+			if strings.ToLower(strings.TrimSpace(answer)) == "n" {
+				cPrintf(colInfo, "Skipping rebuild")
+				performRebuild = false
+			}
 		}
 		// If err != nil (like when only Enter is pressed), or input is empty/ 'y',
 		// performRebuild remains true.
@@ -6653,7 +6676,7 @@ func handleBuildCommand(args []string, cfg *Config) {
 			tarballPath := filepath.Join(BinDir, fmt.Sprintf("%s-%s.tar.zst", pkgName, version))
 			isCriticalAtomic.Store(1)
 			handlePreInstallUninstall(pkgName, cfg, RootExec)
-			if installErr := pkgInstall(tarballPath, pkgName, cfg, RootExec); installErr != nil {
+			if installErr := pkgInstall(tarballPath, pkgName, cfg, RootExec, true); installErr != nil {
 				isCriticalAtomic.Store(0)
 				failedBuilds[pkgName] = fmt.Errorf("post-build installation failed: %w", installErr)
 				break // Fatal error
@@ -6690,7 +6713,7 @@ func handleBuildCommand(args []string, cfg *Config) {
 				if askForConfirmation(colInfo, "Dependency '%s' is missing. Use available binary package?", depPkg) {
 					isCriticalAtomic.Store(1)
 					handlePreInstallUninstall(depPkg, cfg, RootExec)
-					if err := pkgInstall(tarballPath, depPkg, cfg, RootExec); err != nil {
+					if err := pkgInstall(tarballPath, depPkg, cfg, RootExec, false); err != nil {
 						isCriticalAtomic.Store(0)
 						log.Fatalf("Fatal error installing binary %s: %v", depPkg, err)
 					}
@@ -6786,7 +6809,7 @@ func handleBuildCommand(args []string, cfg *Config) {
 					tarballPath := filepath.Join(BinDir, fmt.Sprintf("%s-%s.tar.zst", finalPkg, version))
 					isCriticalAtomic.Store(1)
 					handlePreInstallUninstall(finalPkg, cfg, RootExec)
-					if err := pkgInstall(tarballPath, finalPkg, cfg, RootExec); err != nil {
+					if err := pkgInstall(tarballPath, finalPkg, cfg, RootExec, false); err != nil {
 						isCriticalAtomic.Store(0)
 						failedBuilds[finalPkg] = fmt.Errorf("final installation failed: %w", err)
 					}
@@ -6860,7 +6883,7 @@ func executeBuildPass(plan *BuildPlan, passName string, installAllTargets bool, 
 					tarballPath := filepath.Join(BinDir, fmt.Sprintf("%s-%s.tar.zst", pkgName, version))
 					isCriticalAtomic.Store(1)
 					handlePreInstallUninstall(pkgName, cfg, RootExec)
-					if installErr := pkgInstall(tarballPath, pkgName, cfg, RootExec); installErr != nil {
+					if installErr := pkgInstall(tarballPath, pkgName, cfg, RootExec, false); installErr != nil {
 						isCriticalAtomic.Store(0)
 						failed[pkgName] = fmt.Errorf("post-build installation failed: %w", installErr)
 					} else {
@@ -7374,13 +7397,29 @@ func getPackageDependenciesToUninstall(name string) []string {
 }
 
 // handlePreInstallUninstall checks for and removes packages that must be uninstalled
-// before a new package can be installed
+// before a new package can be installed. It now verifies packages are installed
+// before attempting removal.
 func handlePreInstallUninstall(pkgName string, cfg *Config, execCtx *Executor) {
-	depsToUninstall := getPackageDependenciesToUninstall(pkgName)
-	if len(depsToUninstall) > 0 {
+	potentialDepsToUninstall := getPackageDependenciesToUninstall(pkgName)
+
+	// --- FIX: Filter the list to only include packages that are actually installed ---
+	var depsToActuallyUninstall []string
+	if len(potentialDepsToUninstall) > 0 {
+		for _, dep := range potentialDepsToUninstall {
+			// Use the existing silent check to see if the package is installed.
+			if checkPackageExactMatch(dep) {
+				depsToActuallyUninstall = append(depsToActuallyUninstall, dep)
+			}
+		}
+	}
+
+	// --- Now, only proceed if there are real packages to uninstall ---
+	if len(depsToActuallyUninstall) > 0 {
 		colArrow.Print("-> ")
-		colWarn.Printf("Uninstalling conflicting packages for %s: %v\n", pkgName, strings.Join(depsToUninstall, ", "))
-		for _, dep := range depsToUninstall {
+		// The message is now more accurate, as it only lists packages we KNOW are installed.
+		colWarn.Printf("Uninstalling conflicting installed packages for %s: %v\n", pkgName, strings.Join(depsToActuallyUninstall, ", "))
+
+		for _, dep := range depsToActuallyUninstall {
 			// Use force and yes flags to ensure silent, non-interactive uninstallation.
 			if err := pkgUninstall(dep, cfg, execCtx, true, true); err != nil {
 				// This is a non-fatal warning. The installation should proceed.
@@ -7796,13 +7835,22 @@ func main() {
 		handleBuildCommand(buildArgs, cfg)
 
 	case "install", "i":
-		// Get all arguments after "hokuto" and "install"
-		args := os.Args[2:]
-		if len(args) == 0 {
-			fmt.Println("Usage: hokuto install <tarball|pkgname>")
+		installCmd := flag.NewFlagSet("install", flag.ExitOnError)
+		var yes = installCmd.Bool("y", false, "Assume 'yes' to all prompts and overwrite modified files.")
+		var yesLong = installCmd.Bool("yes", false, "Assume 'yes' to all prompts and overwrite modified files.")
+
+		if err := installCmd.Parse(os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "Error parsing install flags: %v\n", err)
+			os.Exit(1)
+		}
+		packagesToInstall := installCmd.Args()
+		if len(packagesToInstall) == 0 {
+			fmt.Println("Usage: hokuto install [options] <tarball|pkgname>...")
+			installCmd.PrintDefaults()
 			os.Exit(1)
 		}
 
+		effectiveYes := *yes || *yesLong
 		// Set to CRITICAL (1) for the entire installation process
 		isCriticalAtomic.Store(1)
 		// Ensure it is reset when the install function returns/panics
@@ -7811,7 +7859,7 @@ func main() {
 		allSucceeded := true
 
 		// Loop through all provided arguments (tarballs or package names)
-		for _, arg := range args {
+		for _, arg := range packagesToInstall {
 			var tarballPath, pkgName string
 
 			debugf("Processing argument: %s\n", arg)
@@ -7857,7 +7905,7 @@ func main() {
 			colArrow.Print("-> ")
 			colSuccess.Printf("Installing %s from %s\n", pkgName, tarballPath)
 
-			if err := pkgInstall(tarballPath, pkgName, cfg, RootExec); err != nil {
+			if err := pkgInstall(tarballPath, pkgName, cfg, RootExec, effectiveYes); err != nil {
 				fmt.Fprintf(os.Stderr, "Error installing package %s: %v\n", pkgName, err)
 				allSucceeded = false
 				continue
