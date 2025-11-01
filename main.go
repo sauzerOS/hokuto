@@ -4006,20 +4006,22 @@ func parseDepToken(token string) (string, string, string, bool, bool) {
 
 // BuildPlan represents the complete build plan with proper ordering
 type BuildPlan struct {
-	Order           []string          // Final build order
-	SkippedPackages map[string]string // pkgName -> reason for skip
-	RebuildPackages map[string]bool   // Packages marked for rebuild
-	PostRebuilds    map[string]bool   // Packages needing a rebuild for optional deps
+	Order             []string            // Final build order
+	SkippedPackages   map[string]string   // pkgName -> reason for skip
+	RebuildPackages   map[string]bool     // Packages marked for rebuild
+	PostRebuilds      map[string]bool     // Packages needing a rebuild for optional deps
+	PostBuildRebuilds map[string][]string // Stores post-build actions
 }
 
 // resolveBuildPlan creates a dynamic, context-aware build plan.
 // It correctly handles resolvable circular dependencies caused by optional dependencies.
 func resolveBuildPlan(targetPackages []string, userRequestedPackages map[string]bool) (*BuildPlan, error) {
 	plan := &BuildPlan{
-		Order:           []string{},
-		SkippedPackages: make(map[string]string),
-		RebuildPackages: make(map[string]bool),
-		PostRebuilds:    make(map[string]bool),
+		Order:             []string{},
+		SkippedPackages:   make(map[string]string),
+		RebuildPackages:   make(map[string]bool),
+		PostRebuilds:      make(map[string]bool),
+		PostBuildRebuilds: make(map[string][]string),
 	}
 
 	processed := make(map[string]bool)
@@ -4057,12 +4059,20 @@ func resolveBuildPlan(targetPackages []string, userRequestedPackages map[string]
 			if dep.Name == pkgName {
 				continue
 			}
-			if dep.Rebuild {
-				plan.RebuildPackages[dep.Name] = true
-			}
 
-			// --- CORRECT OPTIONAL DEPENDENCY LOGIC ---
-			if dep.Optional {
+			if dep.Rebuild {
+				// This is a post-build action. Add it to the map for the current package.
+				plan.PostBuildRebuilds[pkgName] = append(plan.PostBuildRebuilds[pkgName], dep.Name)
+
+				// CRITICAL: We still need to process the dependency normally to ensure
+				// it's built at least ONCE *before* the current package.
+				// The `processed` map will prevent it from being added to the main
+				// build Order multiple times.
+				if err := processPkg(dep.Name); err != nil {
+					return err
+				}
+
+			} else if dep.Optional {
 				// If a dependency is optional AND it is NOT currently installed,
 				// we do two things:
 				// 1. Mark the CURRENT package for a post-rebuild.
@@ -4076,6 +4086,14 @@ func resolveBuildPlan(targetPackages []string, userRequestedPackages map[string]
 			// If the dependency is required (or optional and already installed), process it.
 			if err := processPkg(dep.Name); err != nil {
 				return err
+			} else {
+				// --- This is a normal, required dependency ---
+				if dep.Rebuild { // This is the old pre-build rebuild logic
+					plan.RebuildPackages[dep.Name] = true
+				}
+				if err := processPkg(dep.Name); err != nil {
+					return err
+				}
 			}
 		}
 
@@ -6092,6 +6110,8 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 	}
 
 	// 7. Run package post-install script
+	colArrow.Print("-> ")
+	colSuccess.Println("Executing package post-install script")
 	if err := executePostInstall(pkgName, rootDir, execCtx); err != nil {
 		fmt.Printf("warning: post-install for %s returned error: %v\n", pkgName, err)
 	}
@@ -6878,21 +6898,74 @@ func executeBuildPass(plan *BuildPlan, passName string, installAllTargets bool, 
 				continue
 			} else {
 				progressThisPass = true
-				if installAllTargets || !userRequestedMap[pkgName] {
+				// We need to know if there are other packages waiting in this pass.
+				// We can find the index of the current package in the original `toBuild` slice.
+				currentIndex := -1
+				for i, pkg := range toBuild {
+					if pkg == pkgName {
+						currentIndex = i
+						break
+					}
+				}
+				// If there are packages after this one, it's a potential dependency.
+				isDependencyForThisPass := (currentIndex != -1 && currentIndex < len(toBuild)-1)
+
+				// Determine if we should install immediately.
+				// We install immediately IF:
+				//  - It's a dependency (not a user target), OR
+				//  - It's a user target that is also a dependency for something else IN THIS BATCH.
+				shouldInstallNow := !userRequestedMap[pkgName] || isDependencyForThisPass
+
+				if installAllTargets || shouldInstallNow {
+					// Install the package immediately.
 					version, _ := getRepoVersion(pkgName)
 					tarballPath := filepath.Join(BinDir, fmt.Sprintf("%s-%s.tar.zst", pkgName, version))
 					isCriticalAtomic.Store(1)
 					handlePreInstallUninstall(pkgName, cfg, RootExec)
-					if installErr := pkgInstall(tarballPath, pkgName, cfg, RootExec, false); installErr != nil {
+					// Always run non-interactively because the user already confirmed the batch.
+					if installErr := pkgInstall(tarballPath, pkgName, cfg, RootExec, true); installErr != nil {
 						isCriticalAtomic.Store(0)
 						failed[pkgName] = fmt.Errorf("post-build installation failed: %w", installErr)
 					} else {
 						isCriticalAtomic.Store(0)
 					}
 				} else {
+					// This is the final user target in a batch (or a single build). Defer installation.
 					successfullyBuiltTargets = append(successfullyBuiltTargets, pkgName)
 				}
 			}
+
+			// --- 2. NEW: Check for and execute post-build rebuilds ---
+			if rebuilds, ok := plan.PostBuildRebuilds[pkgName]; ok {
+				fmt.Println() // Add a blank line for readability
+				colArrow.Print("-> ")
+				colWarn.Printf("Executing post-build rebuilds triggered by %s: %v\n", pkgName, rebuilds)
+
+				for _, rebuildPkg := range rebuilds {
+					// A. Build the package again
+					if err := pkgBuild(rebuildPkg, cfg, UserExec, *bootstrap); err != nil {
+						color.Danger.Printf("Post-build of '%s' failed: %v\n", rebuildPkg, err)
+						// Mark the PARENT package as failed, because its post-build action failed.
+						failed[pkgName] = fmt.Errorf("post-build of '%s' failed: %w", rebuildPkg, err)
+						break // Stop processing other rebuilds for this parent
+					}
+
+					// B. Install the newly rebuilt package automatically
+					version, _ := getRepoVersion(rebuildPkg)
+					tarballPath := filepath.Join(BinDir, fmt.Sprintf("%s-%s.tar.zst", rebuildPkg, version))
+					isCriticalAtomic.Store(1)
+					handlePreInstallUninstall(rebuildPkg, cfg, RootExec)
+					// Always run this non-interactively
+					if installErr := pkgInstall(tarballPath, rebuildPkg, cfg, RootExec, true); installErr != nil {
+						isCriticalAtomic.Store(0)
+						color.Danger.Printf("Installation of rebuilt '%s' failed: %v\n", rebuildPkg, installErr)
+						failed[pkgName] = fmt.Errorf("install of post-built '%s' failed: %w", rebuildPkg, installErr)
+						break
+					}
+					isCriticalAtomic.Store(0)
+				}
+			}
+
 		}
 		toBuild = remainingAfterPass
 		passInProgress = progressThisPass
