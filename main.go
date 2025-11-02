@@ -4020,7 +4020,7 @@ type BuildPlan struct {
 
 // resolveBuildPlan creates a dynamic, context-aware build plan.
 // It correctly handles resolvable circular dependencies caused by optional dependencies.
-func resolveBuildPlan(targetPackages []string, userRequestedPackages map[string]bool) (*BuildPlan, error) {
+func resolveBuildPlan(targetPackages []string, userRequestedPackages map[string]bool, withRebuilds bool) (*BuildPlan, error) {
 	plan := &BuildPlan{
 		Order:             []string{},
 		SkippedPackages:   make(map[string]string),
@@ -4065,41 +4065,22 @@ func resolveBuildPlan(targetPackages []string, userRequestedPackages map[string]
 				continue
 			}
 
-			if dep.Rebuild {
+			// Conditionally handle the 'rebuild' flag
+			if withRebuilds && dep.Rebuild {
+				// This is a post-build action. Add it to the map for the current package.
 				plan.PostBuildRebuilds[pkgName] = append(plan.PostBuildRebuilds[pkgName], dep.Name)
-				if err := processPkg(dep.Name); err != nil {
-					return err
-				}
 
 			} else if dep.Optional {
-				// --- THIS IS THE NEW LOGIC FOR OPTIONAL DEPS ---
 				if !isPackageInstalled(dep.Name) {
-					// Record that pkgName needs a rebuild because dep.Name is missing.
+					// Record that pkgName needs an inline rebuild because an optional dep is missing.
 					plan.PostRebuilds[pkgName] = append(plan.PostRebuilds[pkgName], dep.Name)
-				}
-				// Always process the dependency to get it into the build order.
-				if err := processPkg(dep.Name); err != nil {
-					return err
-				}
-
-			} else {
-				// --- Normal, required dependency ---
-				if err := processPkg(dep.Name); err != nil {
-					return err
 				}
 			}
 
-			// If the dependency is required (or optional and already installed), process it.
+			// CRITICAL: Always process the dependency to ensure it gets into the build order at least once.
+			// This covers normal deps, optional deps, and 'rebuild' deps (when withRebuilds is off).
 			if err := processPkg(dep.Name); err != nil {
 				return err
-			} else {
-				// --- This is a normal, required dependency ---
-				if dep.Rebuild { // This is the old pre-build rebuild logic
-					plan.RebuildPackages[dep.Name] = true
-				}
-				if err := processPkg(dep.Name); err != nil {
-					return err
-				}
 			}
 		}
 
@@ -6530,12 +6511,15 @@ func handleBuildCommand(args []string, cfg *Config) {
 	var bootstrap = buildCmd.Bool("bootstrap", false, "Enable bootstrap build mode.")
 	var bootstrapDir = buildCmd.String("bootstrap-dir", "", "Specify the bootstrap directory.")
 	var allDeps = buildCmd.Bool("alldeps", false, "Force build of all dependencies from source.")
+	var withRebuilds = buildCmd.Bool("rebuilds", false, "Enable post-build actions for dependencies marked with 'rebuild'.")
+	var withRebuildsShort = buildCmd.Bool("r", false, "Alias for -rebuilds.")
 
 	if err := buildCmd.Parse(args); err != nil {
 		fmt.Fprintf(os.Stderr, "Error parsing build flags: %v\n", err)
 		os.Exit(1)
 	}
 
+	effectiveRebuilds := *withRebuilds || *withRebuildsShort
 	// Set the global variables based on the parsed flags
 	// Determine the build priority. Super idle takes precedence over idle.
 	if *superidleBuild {
@@ -6762,7 +6746,7 @@ func handleBuildCommand(args []string, cfg *Config) {
 
 		colArrow.Print("-> ")
 		colSuccess.Println("Phase 1: Generating Initial Build Plan...")
-		initialPlan, err := resolveBuildPlan(buildListInput, userRequestedMap)
+		initialPlan, err := resolveBuildPlan(buildListInput, userRequestedMap, effectiveRebuilds)
 		if err != nil {
 			log.Fatalf("Error generating initial build plan: %v", err)
 		}
@@ -6884,11 +6868,14 @@ func executeBuildPass(plan *BuildPlan, passName string, installAllTargets bool, 
 				// If there are packages after this one, it's a potential dependency.
 				isDependencyForThisPass := (currentIndex != -1 && currentIndex < len(toBuild)-1)
 
-				// Determine if we should install immediately.
+				// --- NEW: Check if this package triggers any post-build rebuilds ---
+				triggersRebuilds := len(plan.PostBuildRebuilds[pkgName]) > 0
+
 				// We install immediately IF:
-				//  - It's a dependency (not a user target), OR
-				//  - It's a user target that is also a dependency for something else IN THIS BATCH.
-				shouldInstallNow := !userRequestedMap[pkgName] || isDependencyForThisPass
+				//  - It's a dependency, OR
+				//  - It's a user target that is a dependency for something else in this batch, OR
+				//  - It's a user target that triggers a post-build rebuild.
+				shouldInstallNow := !userRequestedMap[pkgName] || isDependencyForThisPass || triggersRebuilds
 
 				if installAllTargets || shouldInstallNow {
 					// Install the package immediately.
@@ -6896,72 +6883,70 @@ func executeBuildPass(plan *BuildPlan, passName string, installAllTargets bool, 
 					tarballPath := filepath.Join(BinDir, fmt.Sprintf("%s-%s.tar.zst", pkgName, version))
 					isCriticalAtomic.Store(1)
 					handlePreInstallUninstall(pkgName, cfg, RootExec)
-					// Always run non-interactively because the user already confirmed the batch.
 					colArrow.Print("-> ")
 					colSuccess.Printf("Installing: %s\n", pkgName)
 					if installErr := pkgInstall(tarballPath, pkgName, cfg, RootExec, true); installErr != nil {
 						isCriticalAtomic.Store(0)
 						failed[pkgName] = fmt.Errorf("post-build installation failed: %w", installErr)
-					} else {
-						isCriticalAtomic.Store(0)
-						// --- START OF NEW INLINE REBUILD LOGIC ---
-						builtThisPass[pkgName] = true // Mark the current package as successfully built and installed
-
-						// Now, check if this installation satisfies an optional dependency for a package we've already built.
-						for parent, missingDeps := range plan.PostRebuilds {
-							// Condition 1: The parent package must have already been built in this pass.
-							if !builtThisPass[parent] {
-								continue
-							}
-
-							// Condition 2: Check if ALL of its missing optional deps are now available.
-							allDepsNowAvailable := true
-							for _, dep := range missingDeps {
-								if !builtThisPass[dep] {
-									allDepsNowAvailable = false
-									break
-								}
-							}
-
-							if allDepsNowAvailable {
-								fmt.Println()
-								colArrow.Print("-> ")
-								colWarn.Printf("Optional dependency '%s' now available for '%s'. Triggering immediate rebuild.\n", strings.Join(missingDeps, ", "), parent)
-
-								// Rebuild the parent package
-								if err := pkgBuild(parent, cfg, UserExec, *bootstrap); err != nil {
-									color.Danger.Printf("Inline rebuild of '%s' failed: %v\n", parent, err)
-									failed[parent] = fmt.Errorf("inline rebuild failed: %w", err)
-									continue // Move to check the next parent
-								}
-
-								// Install the newly rebuilt parent
-								version, _ := getRepoVersion(parent)
-								tarballPath := filepath.Join(BinDir, fmt.Sprintf("%s-%s.tar.zst", parent, version))
-								isCriticalAtomic.Store(1)
-								handlePreInstallUninstall(parent, cfg, RootExec)
-								if installErr := pkgInstall(tarballPath, parent, cfg, RootExec, true); installErr != nil {
-									isCriticalAtomic.Store(0)
-									color.Danger.Printf("Installation of rebuilt '%s' failed: %v\n", parent, installErr)
-									failed[parent] = fmt.Errorf("install of rebuilt '%s' failed: %w", parent, installErr)
-								} else {
-									isCriticalAtomic.Store(0)
-									colArrow.Print("-> ")
-									colSuccess.Printf("Inline rebuild of '%s' installed successfully.\n", parent)
-								}
-
-								// CRITICAL: Remove the parent from the map to prevent multiple rebuilds.
-								delete(plan.PostRebuilds, parent)
-							}
-						}
-
+						// We must 'continue' here to stop processing this package's post-build actions.
+						continue
 					}
+					isCriticalAtomic.Store(0)
 				} else {
-					// This is the final user target in a batch (or a single build). Defer installation.
+					// This is a standalone user target. Defer installation until the end.
 					successfullyBuiltTargets = append(successfullyBuiltTargets, pkgName)
 				}
-			}
 
+				builtThisPass[pkgName] = true // Mark the current package as successfully built and installed
+
+				// Now, check if this installation satisfies an optional dependency for a package we've already built.
+				for parent, missingDeps := range plan.PostRebuilds {
+					// Condition 1: The parent package must have already been built in this pass.
+					if !builtThisPass[parent] {
+						continue
+					}
+
+					// Condition 2: Check if ALL of its missing optional deps are now available.
+					allDepsNowAvailable := true
+					for _, dep := range missingDeps {
+						if !builtThisPass[dep] {
+							allDepsNowAvailable = false
+							break
+						}
+					}
+
+					if allDepsNowAvailable {
+						fmt.Println()
+						colArrow.Print("-> ")
+						colWarn.Printf("Optional dependency '%s' now available for '%s'. Triggering immediate rebuild.\n", strings.Join(missingDeps, ", "), parent)
+
+						// Rebuild the parent package
+						if err := pkgBuild(parent, cfg, UserExec, *bootstrap); err != nil {
+							color.Danger.Printf("Inline rebuild of '%s' failed: %v\n", parent, err)
+							failed[parent] = fmt.Errorf("inline rebuild failed: %w", err)
+							continue // Move to check the next parent
+						}
+
+						// Install the newly rebuilt parent
+						version, _ := getRepoVersion(parent)
+						tarballPath := filepath.Join(BinDir, fmt.Sprintf("%s-%s.tar.zst", parent, version))
+						isCriticalAtomic.Store(1)
+						handlePreInstallUninstall(parent, cfg, RootExec)
+						if installErr := pkgInstall(tarballPath, parent, cfg, RootExec, true); installErr != nil {
+							isCriticalAtomic.Store(0)
+							color.Danger.Printf("Installation of rebuilt '%s' failed: %v\n", parent, installErr)
+							failed[parent] = fmt.Errorf("install of rebuilt '%s' failed: %w", parent, installErr)
+						} else {
+							isCriticalAtomic.Store(0)
+							colArrow.Print("-> ")
+							colSuccess.Printf("Inline rebuild of '%s' installed successfully.\n", parent)
+						}
+
+						// CRITICAL: Remove the parent from the map to prevent multiple rebuilds.
+						delete(plan.PostRebuilds, parent)
+					}
+				}
+			}
 			// --- 2. NEW: Check for and execute post-build rebuilds ---
 			if rebuilds, ok := plan.PostBuildRebuilds[pkgName]; ok {
 				fmt.Println() // Add a blank line for readability
