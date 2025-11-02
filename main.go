@@ -59,8 +59,6 @@ var (
 	Verbose              bool
 	WantLTO              string
 	newPackageDir        string
-	idleUpdate           bool
-	superidleUpdate      bool
 	setIdlePriority      bool
 	buildPriority        string
 	ConfigFile           = "/etc/hokuto.conf"
@@ -229,7 +227,14 @@ func initConfig(cfg *Config) {
 	// Load the GNU mirror URL if it's set in the config
 	if mirror, exists := cfg.Values["GNU_MIRROR"]; exists && mirror != "" {
 		gnuMirrorURL = strings.TrimRight(mirror, "/") // Remove trailing slash if present
-		debugf("=> Using GNU mirror: %s\n", gnuMirrorURL)
+		debugf("=> Using GNU mirror from config: %s\n", gnuMirrorURL)
+	}
+
+	// --- NEW: Set a default mirror if none was provided by the user ---
+	if gnuMirrorURL == "" {
+		// mirrors.kernel.org is a reliable and globally distributed mirror, making it an excellent default.
+		gnuMirrorURL = "https://mirrors.kernel.org/gnu"
+		debugf("=> No GNU mirror configured, using default: %s\n", gnuMirrorURL)
 	}
 
 	SourcesDir = CacheDir + "/sources"
@@ -4009,7 +4014,7 @@ type BuildPlan struct {
 	Order             []string            // Final build order
 	SkippedPackages   map[string]string   // pkgName -> reason for skip
 	RebuildPackages   map[string]bool     // Packages marked for rebuild
-	PostRebuilds      map[string]bool     // Packages needing a rebuild for optional deps
+	PostRebuilds      map[string][]string // Packages needing a rebuild for optional deps
 	PostBuildRebuilds map[string][]string // Stores post-build actions
 }
 
@@ -4020,7 +4025,7 @@ func resolveBuildPlan(targetPackages []string, userRequestedPackages map[string]
 		Order:             []string{},
 		SkippedPackages:   make(map[string]string),
 		RebuildPackages:   make(map[string]bool),
-		PostRebuilds:      make(map[string]bool),
+		PostRebuilds:      make(map[string][]string),
 		PostBuildRebuilds: make(map[string][]string),
 	}
 
@@ -4061,25 +4066,26 @@ func resolveBuildPlan(targetPackages []string, userRequestedPackages map[string]
 			}
 
 			if dep.Rebuild {
-				// This is a post-build action. Add it to the map for the current package.
 				plan.PostBuildRebuilds[pkgName] = append(plan.PostBuildRebuilds[pkgName], dep.Name)
-
-				// CRITICAL: We still need to process the dependency normally to ensure
-				// it's built at least ONCE *before* the current package.
-				// The `processed` map will prevent it from being added to the main
-				// build Order multiple times.
 				if err := processPkg(dep.Name); err != nil {
 					return err
 				}
 
 			} else if dep.Optional {
-				// If a dependency is optional AND it is NOT currently installed,
-				// we do two things:
-				// 1. Mark the CURRENT package for a post-rebuild.
-				// 2. Skip processing this optional dependency for now.
+				// --- THIS IS THE NEW LOGIC FOR OPTIONAL DEPS ---
 				if !isPackageInstalled(dep.Name) {
-					plan.PostRebuilds[pkgName] = true
-					continue // Move to the next dependency
+					// Record that pkgName needs a rebuild because dep.Name is missing.
+					plan.PostRebuilds[pkgName] = append(plan.PostRebuilds[pkgName], dep.Name)
+				}
+				// Always process the dependency to get it into the build order.
+				if err := processPkg(dep.Name); err != nil {
+					return err
+				}
+
+			} else {
+				// --- Normal, required dependency ---
+				if err := processPkg(dep.Name); err != nil {
+					return err
 				}
 			}
 
@@ -4741,9 +4747,25 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool) er
 		return fmt.Errorf("build script not found: %v", err)
 	}
 
-	// 1. Define the base C/C++/LD flags
+	// Define the base C/C++/LD flags
 	var defaultCFLAGS = "-O2 -march=x86-64 -mtune=generic -pipe -fPIC"
 	var defaultLDFLAGS = ""
+
+	// Define core count to use
+	var numCores int
+	switch buildPriority {
+	case "idle":
+		numCores = runtime.NumCPU() / 2
+		if numCores < 1 {
+			numCores = 1
+		}
+	case "superidle":
+		numCores = 1
+	default: // "normal"
+		numCores = runtime.NumCPU()
+	}
+
+	ltoJobString := fmt.Sprintf("%d", numCores)
 
 	// Build environment
 	env := os.Environ()
@@ -4762,8 +4784,11 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool) er
 			"LFS_TGT":     "x86_64-lfs-linux-gnu",
 			"LFS_TGT32":   "i686-lfs-linux-gnu",
 			"LFS_TGTX32":  "x86_64-lfs-linux-gnux32",
+			"CFLAGS":      "-O2 -march=x86-64 -mtune=generic -pipe -fPIC",
+			"CXXFLAGS":    "-O2 -march=x86-64 -mtune=generic -pipe -fPIC",
+			"LDFLAGS":     "",
 			"PATH":        filepath.Join(lfsRoot, "tools/bin") + ":/usr/bin:/bin",
-			"MAKEFLAGS":   fmt.Sprintf("-j%d", runtime.NumCPU()),
+			"MAKEFLAGS":   fmt.Sprintf("-j%d", numCores),
 			"CONFIG_SITE": filepath.Join(lfsRoot, "usr/share/config.site"),
 			"HOKUTO_ROOT": lfsRoot,
 			"TMPDIR":      currentTmpDir,
@@ -4771,68 +4796,42 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool) er
 	} else {
 		// --- Normal build environment---
 		defaults = map[string]string{
-			"AR":          "gcc-ar",
-			"CC":          "cc",
-			"CXX":         "c++",
-			"NM":          "gcc-nm",
-			"RANLIB":      "gcc-ranlib",
-			"CFLAGS":      defaultCFLAGS, // Use the constant
-			"CXXFLAGS":    "",
-			"LDFLAGS":     defaultLDFLAGS, // Use the constant
-			"MAKEFLAGS":   fmt.Sprintf("-j%d", runtime.NumCPU()),
-			"RUSTFLAGS":   fmt.Sprintf("--remap-path-prefix=%s=.", buildDir),
-			"GOFLAGS":     "-trimpath -modcacherw",
-			"GOPATH":      filepath.Join(buildDir, "go"),
-			"HOKUTO_ROOT": cfg.Values["HOKUTO_ROOT"],
-			"TMPDIR":      currentTmpDir,
+			"AR":                         "gcc-ar",
+			"CC":                         "cc",
+			"CXX":                        "c++",
+			"NM":                         "gcc-nm",
+			"RANLIB":                     "gcc-ranlib",
+			"CFLAGS":                     defaultCFLAGS,
+			"CXXFLAGS":                   "",
+			"LDFLAGS":                    defaultLDFLAGS,
+			"MAKEFLAGS":                  fmt.Sprintf("-j%d", numCores),
+			"CMAKE_BUILD_PARALLEL_LEVEL": fmt.Sprintf("%d", numCores),
+			"RUSTFLAGS":                  fmt.Sprintf("--remap-path-prefix=%s=.", buildDir),
+			"GOFLAGS":                    "-trimpath -modcacherw",
+			"GOPATH":                     filepath.Join(buildDir, "go"),
+			"HOKUTO_ROOT":                cfg.Values["HOKUTO_ROOT"],
+			"TMPDIR":                     currentTmpDir,
 		}
 
-		// Based on the priority, override the defaults for cores and signal the wrapper.
-		switch buildPriority {
-		case "idle":
-			numCores := runtime.NumCPU() / 2
-			if numCores < 1 {
-				numCores = 1
-			}
-			defaults["MAKEFLAGS"] = fmt.Sprintf("-j%d", numCores)
-			defaults["CMAKE_BUILD_PARALLEL_LEVEL"] = fmt.Sprintf("%d", numCores)
-			defaults["HOKUTO_BUILD_PRIORITY"] = "idle" // Set variable for wrapper
-		case "superidle":
-			numCores := 1
-			defaults["MAKEFLAGS"] = fmt.Sprintf("-j%d", numCores)
-			defaults["CMAKE_BUILD_PARALLEL_LEVEL"] = fmt.Sprintf("%d", numCores)
-			defaults["HOKUTO_BUILD_PRIORITY"] = "superidle" // Set variable for wrapper
+		if buildPriority == "idle" || buildPriority == "superidle" {
+			defaults["HOKUTO_BUILD_PRIORITY"] = buildPriority
 		}
-	}
 
-	// Only apply normal flag logic if not in bootstrap mode
-	if !bootstrap {
-
-		// 2. Select the appropriate keys and default values based on cfg.DefaultLTO
 		var cflagsKey, cxxflagsKey, ldflagsKey string
-
 		if shouldLTO {
 			cflagsKey = "CFLAGS_LTO"
 			cxxflagsKey = "CXXFLAGS_LTO"
 			ldflagsKey = "LDFLAGS_LTO"
-			// Set LTO defaults if they are not defined in the configuration
-			// (You'd likely define these globally in your program)
-			defaults["CFLAGS"] = defaultCFLAGS + " -flto=auto"   // Example LTO flag
-			defaults["LDFLAGS"] = defaultLDFLAGS + " -flto=auto" // Example LTO flag
+			// Set a default that includes the placeholder, in case the config doesn't.
+			defaults["CFLAGS"] = defaultCFLAGS + " -flto=LTOJOBS"
+			defaults["LDFLAGS"] = defaultLDFLAGS + " -flto=LTOJOBS"
 		} else {
 			cflagsKey = "CFLAGS"
 			cxxflagsKey = "CXXFLAGS"
 			ldflagsKey = "LDFLAGS"
-			defaults["CFLAGS"] = defaultCFLAGS
-			defaults["LDFLAGS"] = defaultLDFLAGS
 		}
 
-		// 3. Set CXXFLAGS default based on CFLAGS if not set, regardless of LTO
-		defaults["CXXFLAGS"] = ""
-
-		// 4. Override defaults with actual config values
-		// We only need to check the CFLAGS, CXXFLAGS, LDFLAGS keys now
-		// This ensures the correct, prioritized value from the config is used.
+		// Override defaults with actual config values
 		if val := cfg.Values[cflagsKey]; val != "" {
 			defaults["CFLAGS"] = val
 		}
@@ -4843,14 +4842,19 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool) er
 			defaults["LDFLAGS"] = val
 		}
 
-		// The CXXFLAGS fallback logic must be applied AFTER CFLAGS is finalized.
-		// We must apply it before the final loop, as the final loop simply appends.
+		// Perform the placeholder substitution *only in the normal build path*.
+		if shouldLTO {
+			defaults["CFLAGS"] = strings.ReplaceAll(defaults["CFLAGS"], "LTOJOBS", ltoJobString)
+			defaults["LDFLAGS"] = strings.ReplaceAll(defaults["LDFLAGS"], "LTOJOBS", ltoJobString)
+			defaults["CXXFLAGS"] = strings.ReplaceAll(defaults["CXXFLAGS"], "LTOJOBS", ltoJobString)
+		}
+
+		// Final fallback for CXXFLAGS
 		finalCXXFLAGS := defaults["CXXFLAGS"]
 		if finalCXXFLAGS == "" {
-			// Fallback to CFLAGS if CXXFLAGS is still empty
 			finalCXXFLAGS = defaults["CFLAGS"]
 		}
-		defaults["CXXFLAGS"] = finalCXXFLAGS // Update the map with the resolved value
+		defaults["CXXFLAGS"] = finalCXXFLAGS
 	}
 
 	for k, v := range defaults {
@@ -6783,37 +6787,6 @@ func handleBuildCommand(args []string, cfg *Config) {
 		failedPass1, targetsPass1 := executeBuildPass(initialPlan, "Initial Pass", false, cfg, bootstrap, userRequestedMap)
 		failedBuilds = failedPass1
 
-		var packagesToRebuild []string
-		for pkg := range initialPlan.PostRebuilds {
-			if _, ok := failedBuilds[pkg]; !ok {
-				packagesToRebuild = append(packagesToRebuild, pkg)
-			}
-		}
-
-		if len(packagesToRebuild) > 0 {
-			fmt.Println()
-			colArrow.Print("-> ")
-			colSuccess.Println("Phase 2: Generating Rebuild Plan for Optional Dependencies...")
-			rebuildRequestMap := make(map[string]bool)
-			for _, pkg := range packagesToRebuild {
-				rebuildRequestMap[pkg] = true
-			}
-			rebuildPlan, err := resolveBuildPlan(packagesToRebuild, rebuildRequestMap)
-			if err != nil {
-				log.Fatalf("Error generating rebuild plan: %v", err)
-			}
-
-			if len(rebuildPlan.Order) > 0 {
-				colArrow.Print("-> ")
-				colSuccess.Printf("Rebuild order: %s\n", strings.Join(rebuildPlan.Order, " -> "))
-				fmt.Println()
-				failedPass2, _ := executeBuildPass(rebuildPlan, "Rebuild Pass", true, cfg, bootstrap, rebuildRequestMap)
-				for k, v := range failedPass2 {
-					failedBuilds[k] = v
-				}
-			}
-		}
-
 		if len(targetsPass1) > 0 {
 			shouldInstall := *autoInstall
 			if !shouldInstall {
@@ -6866,6 +6839,7 @@ func executeBuildPass(plan *BuildPlan, passName string, installAllTargets bool, 
 	toBuild := plan.Order
 	failed := make(map[string]error)
 	var successfullyBuiltTargets []string
+	builtThisPass := make(map[string]bool)
 	passInProgress := true
 	for passInProgress && len(toBuild) > 0 {
 		progressThisPass := false
@@ -6891,7 +6865,7 @@ func executeBuildPass(plan *BuildPlan, passName string, installAllTargets bool, 
 				continue
 			}
 			colArrow.Print("-> ")
-			colSuccess.Printf("[%s] Building: %s\n", passName, pkgName)
+			colSuccess.Printf("Building: %s\n", pkgName)
 			if err := pkgBuild(pkgName, cfg, UserExec, *bootstrap); err != nil {
 				failed[pkgName] = err
 				color.Danger.Printf("Build failed for %s: %v\n\n", pkgName, err)
@@ -6923,11 +6897,64 @@ func executeBuildPass(plan *BuildPlan, passName string, installAllTargets bool, 
 					isCriticalAtomic.Store(1)
 					handlePreInstallUninstall(pkgName, cfg, RootExec)
 					// Always run non-interactively because the user already confirmed the batch.
+					colArrow.Print("-> ")
+					colSuccess.Printf("Installing: %s\n", pkgName)
 					if installErr := pkgInstall(tarballPath, pkgName, cfg, RootExec, true); installErr != nil {
 						isCriticalAtomic.Store(0)
 						failed[pkgName] = fmt.Errorf("post-build installation failed: %w", installErr)
 					} else {
 						isCriticalAtomic.Store(0)
+						// --- START OF NEW INLINE REBUILD LOGIC ---
+						builtThisPass[pkgName] = true // Mark the current package as successfully built and installed
+
+						// Now, check if this installation satisfies an optional dependency for a package we've already built.
+						for parent, missingDeps := range plan.PostRebuilds {
+							// Condition 1: The parent package must have already been built in this pass.
+							if !builtThisPass[parent] {
+								continue
+							}
+
+							// Condition 2: Check if ALL of its missing optional deps are now available.
+							allDepsNowAvailable := true
+							for _, dep := range missingDeps {
+								if !builtThisPass[dep] {
+									allDepsNowAvailable = false
+									break
+								}
+							}
+
+							if allDepsNowAvailable {
+								fmt.Println()
+								colArrow.Print("-> ")
+								colWarn.Printf("Optional dependency '%s' now available for '%s'. Triggering immediate rebuild.\n", strings.Join(missingDeps, ", "), parent)
+
+								// Rebuild the parent package
+								if err := pkgBuild(parent, cfg, UserExec, *bootstrap); err != nil {
+									color.Danger.Printf("Inline rebuild of '%s' failed: %v\n", parent, err)
+									failed[parent] = fmt.Errorf("inline rebuild failed: %w", err)
+									continue // Move to check the next parent
+								}
+
+								// Install the newly rebuilt parent
+								version, _ := getRepoVersion(parent)
+								tarballPath := filepath.Join(BinDir, fmt.Sprintf("%s-%s.tar.zst", parent, version))
+								isCriticalAtomic.Store(1)
+								handlePreInstallUninstall(parent, cfg, RootExec)
+								if installErr := pkgInstall(tarballPath, parent, cfg, RootExec, true); installErr != nil {
+									isCriticalAtomic.Store(0)
+									color.Danger.Printf("Installation of rebuilt '%s' failed: %v\n", parent, installErr)
+									failed[parent] = fmt.Errorf("install of rebuilt '%s' failed: %w", parent, installErr)
+								} else {
+									isCriticalAtomic.Store(0)
+									colArrow.Print("-> ")
+									colSuccess.Printf("Inline rebuild of '%s' installed successfully.\n", parent)
+								}
+
+								// CRITICAL: Remove the parent from the map to prevent multiple rebuilds.
+								delete(plan.PostRebuilds, parent)
+							}
+						}
+
 					}
 				} else {
 					// This is the final user target in a batch (or a single build). Defer installation.
