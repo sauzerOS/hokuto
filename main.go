@@ -3780,20 +3780,23 @@ func checkForUpgrades(ctx context.Context, cfg *Config) error {
 
 	// --- REFACTORED BUILD AND INSTALL LOGIC ---
 	var failedPackages []string
+	var totalUpdateDuration time.Duration // Accumulator for the whole update process
+	totalToUpdate := len(pkgNames)
 
-	for _, pkgName := range pkgNames {
+	for i, pkgName := range pkgNames {
 		colArrow.Print("\n-> ")
-		colSuccess.Printf("Executing update for: %s\n", pkgName)
+		colSuccess.Printf("Executing update for: %s (%d/%d)\n", pkgName, i+1, totalToUpdate)
 
 		// A. Directly call pkgBuild within the current process
 		// We pass UserExec because pkgBuild itself creates the appropriate
 		// privileged or unprivileged build-specific executor.
-		if err := pkgBuild(pkgName, cfg, UserExec, false); err != nil {
+		duration, err := pkgBuild(pkgName, cfg, UserExec, false, i+1, totalToUpdate)
+		if err != nil {
 			color.Danger.Printf("Build failed for %s: %v\n", pkgName, err)
 			failedPackages = append(failedPackages, pkgName)
 			continue // <<< IMPORTANT: Move to the next package on failure
 		}
-
+		totalUpdateDuration += duration
 		// B. If build is successful, install the package
 		version, _ := getRepoVersion(pkgName)
 		tarballPath := filepath.Join(BinDir, fmt.Sprintf("%s-%s.tar.zst", pkgName, version))
@@ -3808,14 +3811,13 @@ func checkForUpgrades(ctx context.Context, cfg *Config) error {
 			continue
 		}
 		isCriticalAtomic.Store(0) // Unset on success
-		colArrow.Print("-> ")
-		colSuccess.Println("Update and install completed successfully.")
 	}
 
 	if len(failedPackages) > 0 {
 		return fmt.Errorf("some packages failed to update: %s", strings.Join(failedPackages, ", "))
 	}
-
+	colArrow.Print("-> ")
+	colSuccess.Printf("System update completed successfully (%d/%d) Total Time: %s\n", totalToUpdate, totalToUpdate, totalUpdateDuration.Truncate(time.Second))
 	return nil
 }
 
@@ -4597,7 +4599,7 @@ func PostInstallTasks(e *Executor) error {
 }
 
 // build package
-func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool) error {
+func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, currentIndex int, totalCount int) (time.Duration, error) {
 
 	// Define the ANSI escape code format for setting the terminal title.
 	// \033]0; sets the title, and \a (bell character) terminates the sequence.
@@ -4625,7 +4627,7 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool) er
 		}
 	}
 	if !found {
-		return fmt.Errorf("package %s not found in HOKUTO_PATH", pkgName)
+		return 0, fmt.Errorf("package %s not found in HOKUTO_PATH", pkgName)
 	}
 
 	// 1. Initialize a LOCAL temporary directory variable with the global default.
@@ -4647,14 +4649,14 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool) er
 		// If that fails, fall back to system rm -rf with rootExec
 		rmCmd := exec.Command("rm", "-rf", pkgTmpDir)
 		if err2 := RootExec.Run(rmCmd); err2 != nil {
-			return fmt.Errorf("failed to clean pkgTmpDir %s: %v (fallback also failed: %v)", pkgTmpDir, err, err2)
+			return 0, fmt.Errorf("failed to clean pkgTmpDir %s: %v (fallback also failed: %v)", pkgTmpDir, err, err2)
 		}
 	}
 
 	// Rereate build/output dirs (non-root, inside TMPDIR)
 	for _, dir := range []string{buildDir, outputDir, logDir} {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
-			return fmt.Errorf("failed to create dir %s: %v", dir, err)
+			return 0, fmt.Errorf("failed to create dir %s: %v", dir, err)
 		}
 	}
 
@@ -4683,17 +4685,17 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool) er
 	}
 	// Fetch all sources for the build, including git repositories.
 	if err := fetchSources(pkgName, pkgDir, true); err != nil {
-		return fmt.Errorf("failed to fetch sources: %v", err)
+		return 0, fmt.Errorf("failed to fetch sources: %v", err)
 	}
 
 	// Perform checksum verification.
 	if err := verifyOrCreateChecksums(pkgName, pkgDir, false); err != nil {
-		return fmt.Errorf("source verification failed: %w", err)
+		return 0, fmt.Errorf("source verification failed: %w", err)
 	}
 
 	// Prepare sources in build directory
 	if err := prepareSources(pkgName, pkgDir, buildDir, buildExec); err != nil {
-		return fmt.Errorf("failed to prepare sources: %v", err)
+		return 0, fmt.Errorf("failed to prepare sources: %v", err)
 	}
 
 	// Check if strip should be disabled
@@ -4718,14 +4720,14 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool) er
 	versionFile := filepath.Join(pkgDir, "version")
 	versionData, err := os.ReadFile(versionFile)
 	if err != nil {
-		return fmt.Errorf("failed to read version file: %v", err)
+		return 0, fmt.Errorf("failed to read version file: %v", err)
 	}
 	version := strings.Fields(string(versionData))[0]
 
 	// Build script
 	buildScript := filepath.Join(pkgDir, "build")
 	if _, err := os.Stat(buildScript); err != nil {
-		return fmt.Errorf("build script not found: %v", err)
+		return 0, fmt.Errorf("build script not found: %v", err)
 	}
 
 	// Define the base C/C++/LD flags
@@ -4756,7 +4758,7 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool) er
 		// --- Bootstrap environment (like the lfs user) ---
 		lfsRoot := cfg.Values["LFS"]
 		if lfsRoot == "" {
-			return fmt.Errorf("bootstrap mode requires LFS to be set in config")
+			return 0, fmt.Errorf("bootstrap mode requires LFS to be set in config")
 		}
 
 		defaults = map[string]string{
@@ -4850,7 +4852,7 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool) er
 	logFile, err := os.Create(filepath.Join(logDir, "build-log.txt"))
 	if err != nil {
 		// Handle the error (e.g., return it, or panic if log file creation is mandatory)
-		return fmt.Errorf("failed to create build log file: %w", err)
+		return 0, fmt.Errorf("failed to create build log file: %w", err)
 	}
 	defer logFile.Close() // Ensure the log file is closed when the function exits
 
@@ -4912,7 +4914,7 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool) er
 				select {
 				case <-ticker.C:
 					elapsed := time.Since(startTime).Truncate(time.Second)
-					title := fmt.Sprintf("%s elapsed: %s", pkgName, elapsed)
+					title := fmt.Sprintf("Building: %s (%d/%d) elapsed: %s", pkgName, currentIndex, totalCount, elapsed)
 					setTerminalTitle(title)
 					colArrow.Print("-> ")
 					colSuccess.Printf("Building %s elapsed: %s\r", pkgName, elapsed)
@@ -4975,7 +4977,7 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool) er
 			_ = buildExec.Run(tailOnce)
 		}
 
-		return runErr
+		return 0, runErr
 	}
 
 	// success
@@ -4987,7 +4989,7 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool) er
 	debugf("Creating metadata directory: %s\n", installedDir)
 	mkdirCmd := exec.Command("mkdir", "-p", installedDir)
 	if err := buildExec.Run(mkdirCmd); err != nil {
-		return fmt.Errorf("failed to create installed dir: %v", err)
+		return 0, fmt.Errorf("failed to create installed dir: %v", err)
 	}
 
 	// Generate libdeps
@@ -5000,7 +5002,7 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool) er
 
 	// Generate depends
 	if err := generateDepends(pkgName, pkgDir, outputDir, rootDir, buildExec); err != nil {
-		return fmt.Errorf("failed to generate depends: %v", err)
+		return 0, fmt.Errorf("failed to generate depends: %v", err)
 	}
 	debugf("Depends written to %s\n", filepath.Join(installedDir, "depends"))
 
@@ -5011,7 +5013,7 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool) er
 		// NOTE: stripPackage uses buildExec (UserExec) to run the external 'strip' command
 		if err := stripPackage(outputDir, buildExec); err != nil {
 			// Treat strip failure as a build failure (or a warning, depending on policy)
-			return fmt.Errorf("build failed during stripping phase for %s: %w", pkgName, err)
+			return 0, fmt.Errorf("build failed during stripping phase for %s: %w", pkgName, err)
 		}
 	} else {
 		debugf("Skipping binary stripping for %s (NoStrip is true).\n", pkgName)
@@ -5022,7 +5024,7 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool) er
 	versionDst := filepath.Join(installedDir, "version")
 	cpCmd := exec.Command("cp", "--remove-destination", versionSrc, versionDst)
 	if err := buildExec.Run(cpCmd); err != nil {
-		return fmt.Errorf("failed to copy version file: %v", err)
+		return 0, fmt.Errorf("failed to copy version file: %v", err)
 	}
 
 	// Copy build file from pkgDir
@@ -5030,7 +5032,7 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool) er
 	buildDst := filepath.Join(installedDir, "build")
 	cpbCmd := exec.Command("cp", "--remove-destination", buildSrc, buildDst)
 	if err := buildExec.Run(cpbCmd); err != nil {
-		return fmt.Errorf("failed to copy build file: %v", err)
+		return 0, fmt.Errorf("failed to copy build file: %v", err)
 	}
 
 	// Copy post-install file from pkgDir if it exists
@@ -5040,15 +5042,15 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool) er
 	if fi, err := os.Stat(postinstallSrc); err == nil && !fi.IsDir() {
 		// ensure installedDir exists
 		if err := os.MkdirAll(filepath.Dir(postinstallDst), 0o755); err != nil {
-			return fmt.Errorf("failed to create installed dir: %v", err)
+			return 0, fmt.Errorf("failed to create installed dir: %v", err)
 		}
 
 		cpCmd := exec.Command("cp", "--remove-destination", postinstallSrc, postinstallDst)
 		if err := buildExec.Run(cpCmd); err != nil {
-			return fmt.Errorf("failed to copy post-install file: %v", err)
+			return 0, fmt.Errorf("failed to copy post-install file: %v", err)
 		}
 	} else if err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("failed to stat post-install file: %v", err)
+		return 0, fmt.Errorf("failed to stat post-install file: %v", err)
 	}
 
 	// Add asroot file to package metadata if the package was built as root
@@ -5112,12 +5114,12 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool) er
 
 	// Generate manifest
 	if err := generateManifest(outputDir, installedDir, buildExec); err != nil {
-		return fmt.Errorf("failed to generate manifest: %v", err)
+		return 0, fmt.Errorf("failed to generate manifest: %v", err)
 	}
 
 	// Generate package archive
 	if err := createPackageTarball(pkgName, version, outputDir, buildExec); err != nil {
-		return fmt.Errorf("failed to package tarball: %v", err)
+		return 0, fmt.Errorf("failed to package tarball: %v", err)
 	}
 
 	// Cleanup tmpdirs
@@ -5130,11 +5132,13 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool) er
 			fmt.Fprintf(os.Stderr, "failed to cleanup build tmpdirs: %v\n", err)
 		}
 	}
+
 	// Build SUCCESSFUL: Set title to success status
 	finalTitle := fmt.Sprintf("✅ SUCCESS: %s", pkgName)
 	setTerminalTitle(finalTitle)
 	debugf("HOKUTO ROOT IS", rootDir)
-	return nil
+	return time.Since(startTime), nil
+
 }
 
 // pkgBuildRebuild is used after an uninstall/upgrade to rebuild dependent packages.
@@ -6513,6 +6517,7 @@ func handleBuildCommand(args []string, cfg *Config) {
 	var allDeps = buildCmd.Bool("alldeps", false, "Force build of all dependencies from source.")
 	var withRebuilds = buildCmd.Bool("rebuilds", false, "Enable post-build actions for dependencies marked with 'rebuild'.")
 	var withRebuildsShort = buildCmd.Bool("r", false, "Alias for -rebuilds.")
+	var orderedBuild = buildCmd.Bool("ordered", false, "Force build order based on the target package's depends file.")
 
 	if err := buildCmd.Parse(args); err != nil {
 		fmt.Fprintf(os.Stderr, "Error parsing build flags: %v\n", err)
@@ -6630,7 +6635,7 @@ func handleBuildCommand(args []string, cfg *Config) {
 
 	packagesToProcess := buildCmd.Args()
 	if len(packagesToProcess) == 0 {
-		fmt.Println("Usage: hokuto build [options] <package>...")
+		fmt.Println("Usage: hokuto build [options] <package>")
 		os.Exit(1)
 	}
 	userRequestedMap := make(map[string]bool)
@@ -6638,8 +6643,10 @@ func handleBuildCommand(args []string, cfg *Config) {
 		userRequestedMap[pkg] = true
 	}
 
-	// --- 2. SELECT DEPENDENCY STRATEGY and EXECUTE BUILD ---
+	// --- SELECT DEPENDENCY STRATEGY and EXECUTE BUILD ---
 	var failedBuilds = make(map[string]error)
+	var totalElapsedTime time.Duration
+	var totalBuildCount int
 
 	// ** STRATEGY 1: Bootstrap or --alldeps mode **
 	if *bootstrap || *allDeps {
@@ -6657,10 +6664,11 @@ func handleBuildCommand(args []string, cfg *Config) {
 
 		colArrow.Print("-> ")
 		colSuccess.Printf("Build order: %s\n", strings.Join(fullBuildList, " -> "))
-		fmt.Println()
 
 		// Execute the simple, sequential build
-		for _, pkgName := range fullBuildList {
+
+		totalBuildCount := len(fullBuildList)
+		for i, pkgName := range fullBuildList {
 			// ** THE CRITICAL FIX IS HERE **
 			// If in bootstrap mode (not --alldeps alone), check if the package is already installed.
 			if *bootstrap && isPackageInstalled(pkgName) {
@@ -6671,14 +6679,15 @@ func handleBuildCommand(args []string, cfg *Config) {
 			// *****************************
 
 			colArrow.Print("-> ")
-			colSuccess.Printf("[Build] Building: %s\n", pkgName)
-			if err := pkgBuild(pkgName, cfg, UserExec, *bootstrap); err != nil {
+			colSuccess.Printf("Building: %s (%d/%d)\n", pkgName, i+1, totalBuildCount)
+			duration, err := pkgBuild(pkgName, cfg, UserExec, *bootstrap, i+1, totalBuildCount)
+			if err != nil {
 				failedBuilds[pkgName] = err
 				colArrow.Print("-> ")
 				color.Danger.Printf("Fatal build failure for %s: %v\n", pkgName, err)
-				break
+				goto BuildSummary
 			}
-
+			totalElapsedTime += duration
 			// In bootstrap/alldeps mode, every built package is installed immediately.
 			version, _ := getRepoVersion(pkgName)
 			tarballPath := filepath.Join(BinDir, fmt.Sprintf("%s-%s.tar.zst", pkgName, version))
@@ -6695,7 +6704,7 @@ func handleBuildCommand(args []string, cfg *Config) {
 	} else {
 		// ** STRATEGY 2: Normal Build Mode **
 		colArrow.Print("-> ")
-		colSuccess.Println("Discovering all required dependencies...")
+		colSuccess.Println("Discovering all required dependencies")
 		masterProcessed := make(map[string]bool)
 		var missingDeps []string
 		for _, pkgName := range packagesToProcess {
@@ -6734,72 +6743,136 @@ func handleBuildCommand(args []string, cfg *Config) {
 			}
 		}
 
-		var buildListInput []string
-		for pkg := range packagesThatMustBeBuilt {
-			buildListInput = append(buildListInput, pkg)
-		}
-
-		if len(buildListInput) == 0 {
-			fmt.Println("All packages and dependencies are already installed. Nothing to do.")
+		if len(packagesThatMustBeBuilt) == 0 {
+			fmt.Println("All packages and dependencies are already installed.")
 			os.Exit(0)
 		}
+		// Set the total count for the summary.
+		totalBuildCount = len(packagesThatMustBeBuilt)
 
-		colArrow.Print("-> ")
-		colSuccess.Println("Phase 1: Generating Initial Build Plan...")
-		initialPlan, err := resolveBuildPlan(buildListInput, userRequestedMap, effectiveRebuilds)
-		if err != nil {
-			log.Fatalf("Error generating initial build plan: %v", err)
-		}
-		if len(initialPlan.Order) == 0 {
-			fmt.Println("All packages are up to date. Nothing to build.")
-			os.Exit(0)
-		}
-
-		colArrow.Print("-> ")
-		colSuccess.Printf("Initial build order: %s\n", strings.Join(initialPlan.Order, " -> "))
-		if len(initialPlan.PostRebuilds) > 0 {
-			var rebuilds []string
-			for pkg := range initialPlan.PostRebuilds {
-				rebuilds = append(rebuilds, pkg)
-			}
-			sort.Strings(rebuilds)
+		// --- CHOOSE BUILD STRATEGY: ORDERED or GRAPH-BASED ---
+		if *orderedBuild && len(packagesToProcess) == 1 {
+			// --- NEW: ORDERED "DRIVER" BUILD MODE ---
+			targetMetaPackage := packagesToProcess[0]
 			colArrow.Print("-> ")
-			colWarn.Printf("Packages scheduled for rebuild with optional features: %s\n", strings.Join(rebuilds, ", "))
-		}
-		fmt.Println()
+			colSuccess.Printf("Using ordered build mode driven by '%s'.\n\n", targetMetaPackage)
 
-		failedPass1, targetsPass1 := executeBuildPass(initialPlan, "Initial Pass", false, cfg, bootstrap, userRequestedMap)
-		failedBuilds = failedPass1
-
-		if len(targetsPass1) > 0 {
-			shouldInstall := *autoInstall
-			if !shouldInstall {
-				sort.Strings(targetsPass1)
-				shouldInstall = askForConfirmation(colWarn, "-> Do you want to install the following built package(s): %s?", strings.Join(targetsPass1, ", "))
+			pkgDir, err := findPackageDir(targetMetaPackage)
+			if err != nil {
+				log.Fatalf("Cannot find source for target package '%s': %v", targetMetaPackage, err)
 			}
-			if shouldInstall {
-				for _, finalPkg := range targetsPass1 {
-					if _, failed := failedBuilds[finalPkg]; failed {
-						continue
-					}
-					version, _ := getRepoVersion(finalPkg)
-					tarballPath := filepath.Join(BinDir, fmt.Sprintf("%s-%s.tar.zst", finalPkg, version))
-					isCriticalAtomic.Store(1)
-					handlePreInstallUninstall(finalPkg, cfg, RootExec)
-					if err := pkgInstall(tarballPath, finalPkg, cfg, RootExec, false); err != nil {
+			orderedTopLevelDeps, err := parseDependsFile(pkgDir)
+			if err != nil {
+				log.Fatalf("Cannot parse depends file for '%s': %v", targetMetaPackage, err)
+			}
+
+			// Add the meta-package itself to the list to be processed last
+			orderedTopLevelDeps = append(orderedTopLevelDeps, DepSpec{Name: targetMetaPackage})
+
+			for i, dep := range orderedTopLevelDeps {
+				pkgName := dep.Name
+				// Only process this top-level dependency if it's in our list of things to build
+				if !packagesThatMustBeBuilt[pkgName] {
+					continue
+				}
+
+				colArrow.Print("-> ")
+				color.Bold.Printf("--- Processing Top-Level Dependency %d/%d: %s ---\n", i+1, len(orderedTopLevelDeps), pkgName)
+
+				plan, err := resolveBuildPlan([]string{pkgName}, userRequestedMap, effectiveRebuilds)
+				if err != nil {
+					log.Fatalf("Error generating build plan for '%s': %v", pkgName, err)
+				}
+				if len(plan.Order) == 0 {
+					colSuccess.Printf("Package '%s' is already built and up to date. Skipping.\n\n", pkgName)
+					continue
+				}
+
+				colInfo.Printf("Build order for this group: %s\n\n", strings.Join(plan.Order, " -> "))
+
+				failedThisGroup, _, elapsedThisGroup := executeBuildPass(plan, pkgName, true, cfg, bootstrap, userRequestedMap)
+				totalElapsedTime += elapsedThisGroup
+				for k, v := range failedThisGroup {
+					failedBuilds[k] = v
+				}
+
+				// If any build in this group failed, stop the entire process.
+				if len(failedThisGroup) > 0 {
+					color.Danger.Println("\nBuild failed in this group. Aborting ordered build.")
+					goto BuildSummary
+				}
+			}
+
+		} else {
+			if *orderedBuild {
+				colWarn.Println("Warning: -ordered flag is only supported for a single target package. Using default build mode.")
+			}
+
+			var buildListInput []string
+			for pkg := range packagesThatMustBeBuilt {
+				buildListInput = append(buildListInput, pkg)
+			}
+
+			colArrow.Print("-> ")
+			colSuccess.Println("Generating Build Plan")
+			initialPlan, err := resolveBuildPlan(buildListInput, userRequestedMap, effectiveRebuilds)
+			if err != nil {
+				log.Fatalf("Error generating build plan: %v", err)
+			}
+			if len(initialPlan.Order) == 0 {
+				fmt.Println("All packages are up to date. Nothing to build.")
+				os.Exit(0)
+			}
+
+			colArrow.Print("-> ")
+			colSuccess.Printf("Build Order:")
+			colNote.Printf(" %s\n", strings.Join(initialPlan.Order, " -> "))
+			if len(initialPlan.PostRebuilds) > 0 {
+				var rebuilds []string
+				for parent, deps := range initialPlan.PostRebuilds {
+					rebuilds = append(rebuilds, fmt.Sprintf("%s (for %s)", parent, strings.Join(deps, ",")))
+				}
+				sort.Strings(rebuilds)
+				colArrow.Print("-> ")
+				colWarn.Printf("Packages scheduled for inline rebuild with optional features: %s\n", strings.Join(rebuilds, ", "))
+			}
+
+			failedPass1, targetsPass1, elapsedPass1 := executeBuildPass(initialPlan, "Initial Pass", false, cfg, bootstrap, userRequestedMap)
+			totalElapsedTime = elapsedPass1
+			failedBuilds = failedPass1
+
+			if len(targetsPass1) > 0 {
+				shouldInstall := *autoInstall
+				if !shouldInstall {
+					sort.Strings(targetsPass1)
+					shouldInstall = askForConfirmation(colWarn, "-> Do you want to install the following built package(s): %s?", strings.Join(targetsPass1, ", "))
+				}
+				if shouldInstall {
+					for _, finalPkg := range targetsPass1 {
+						if _, failed := failedBuilds[finalPkg]; failed {
+							continue
+						}
+						version, _ := getRepoVersion(finalPkg)
+						tarballPath := filepath.Join(BinDir, fmt.Sprintf("%s-%s.tar.zst", finalPkg, version))
+						isCriticalAtomic.Store(1)
+						handlePreInstallUninstall(finalPkg, cfg, RootExec)
+						if err := pkgInstall(tarballPath, finalPkg, cfg, RootExec, true); err != nil {
+							isCriticalAtomic.Store(0)
+							failedBuilds[finalPkg] = fmt.Errorf("final installation failed: %w", err)
+						}
 						isCriticalAtomic.Store(0)
-						failedBuilds[finalPkg] = fmt.Errorf("final installation failed: %w", err)
 					}
-					isCriticalAtomic.Store(0)
 				}
 			}
 		}
 	}
 
+BuildSummary:
+
 	// --- Final Report ---
 	if len(failedBuilds) == 0 {
 		colArrow.Print("-> ")
-		colSuccess.Println("All packages built and installed successfully.")
+		colSuccess.Printf("All packages built and installed successfully (%d/%d) Time: %s\n", totalBuildCount, totalBuildCount, totalElapsedTime.Truncate(time.Second))
 		os.Exit(0)
 	}
 	color.Danger.Print("-> ")
@@ -6818,17 +6891,18 @@ func handleBuildCommand(args []string, cfg *Config) {
 
 // executeBuildPass is a new helper required by the refactoring above.
 // Add this function to your main.go file.
-func executeBuildPass(plan *BuildPlan, passName string, installAllTargets bool, cfg *Config, bootstrap *bool, userRequestedMap map[string]bool) (map[string]error, []string) {
+func executeBuildPass(plan *BuildPlan, passName string, installAllTargets bool, cfg *Config, bootstrap *bool, userRequestedMap map[string]bool) (map[string]error, []string, time.Duration) {
 
 	toBuild := plan.Order
 	failed := make(map[string]error)
 	var successfullyBuiltTargets []string
 	builtThisPass := make(map[string]bool)
+	var totalElapsedTime time.Duration
 	passInProgress := true
 	for passInProgress && len(toBuild) > 0 {
 		progressThisPass := false
 		var remainingAfterPass []string
-		for _, pkgName := range toBuild {
+		for i, pkgName := range toBuild {
 			if _, isFailed := failed[pkgName]; isFailed {
 				continue
 			}
@@ -6848,14 +6922,19 @@ func executeBuildPass(plan *BuildPlan, passName string, installAllTargets bool, 
 				remainingAfterPass = append(remainingAfterPass, pkgName)
 				continue
 			}
+			totalInPlan := len(plan.Order) // Get the original total count
 			colArrow.Print("-> ")
-			colSuccess.Printf("Building: %s\n", pkgName)
-			if err := pkgBuild(pkgName, cfg, UserExec, *bootstrap); err != nil {
+			colSuccess.Print("Building: ")
+			colNote.Printf("%s (%d/%d)\n", pkgName, i+1, totalInPlan)
+
+			duration, err := pkgBuild(pkgName, cfg, UserExec, *bootstrap, i+1, totalInPlan)
+			if err != nil {
 				failed[pkgName] = err
 				color.Danger.Printf("Build failed for %s: %v\n\n", pkgName, err)
 				continue
 			} else {
 				progressThisPass = true
+				totalElapsedTime += duration // Accumulate the time from the successful build
 				// We need to know if there are other packages waiting in this pass.
 				// We can find the index of the current package in the original `toBuild` slice.
 				currentIndex := -1
@@ -6884,7 +6963,8 @@ func executeBuildPass(plan *BuildPlan, passName string, installAllTargets bool, 
 					isCriticalAtomic.Store(1)
 					handlePreInstallUninstall(pkgName, cfg, RootExec)
 					colArrow.Print("-> ")
-					colSuccess.Printf("Installing: %s\n", pkgName)
+					colSuccess.Printf("Installing: ")
+					colNote.Print("%s (%d/%d) Time: %s\n", pkgName, i+1, totalInPlan, duration.Truncate(time.Second))
 					if installErr := pkgInstall(tarballPath, pkgName, cfg, RootExec, true); installErr != nil {
 						isCriticalAtomic.Store(0)
 						failed[pkgName] = fmt.Errorf("post-build installation failed: %w", installErr)
@@ -6921,12 +7001,13 @@ func executeBuildPass(plan *BuildPlan, passName string, installAllTargets bool, 
 						colWarn.Printf("Optional dependency '%s' now available for '%s'. Triggering immediate rebuild.\n", strings.Join(missingDeps, ", "), parent)
 
 						// Rebuild the parent package
-						if err := pkgBuild(parent, cfg, UserExec, *bootstrap); err != nil {
+						duration, err := pkgBuild(parent, cfg, UserExec, *bootstrap, i+1, totalInPlan)
+						if err != nil {
 							color.Danger.Printf("Inline rebuild of '%s' failed: %v\n", parent, err)
 							failed[parent] = fmt.Errorf("inline rebuild failed: %w", err)
 							continue // Move to check the next parent
 						}
-
+						totalElapsedTime += duration
 						// Install the newly rebuilt parent
 						version, _ := getRepoVersion(parent)
 						tarballPath := filepath.Join(BinDir, fmt.Sprintf("%s-%s.tar.zst", parent, version))
@@ -6955,12 +7036,14 @@ func executeBuildPass(plan *BuildPlan, passName string, installAllTargets bool, 
 
 				for _, rebuildPkg := range rebuilds {
 					// A. Build the package again
-					if err := pkgBuild(rebuildPkg, cfg, UserExec, *bootstrap); err != nil {
+					duration, err := pkgBuild(rebuildPkg, cfg, UserExec, *bootstrap, i+1, totalInPlan)
+					if err != nil {
 						color.Danger.Printf("Post-build of '%s' failed: %v\n", rebuildPkg, err)
 						// Mark the PARENT package as failed, because its post-build action failed.
 						failed[pkgName] = fmt.Errorf("post-build of '%s' failed: %w", rebuildPkg, err)
 						break // Stop processing other rebuilds for this parent
 					}
+					totalElapsedTime += duration
 
 					// B. Install the newly rebuilt package automatically
 					version, _ := getRepoVersion(rebuildPkg)
@@ -6987,7 +7070,7 @@ func executeBuildPass(plan *BuildPlan, passName string, installAllTargets bool, 
 			failed[pkg] = errors.New("blocked by a failed dependency")
 		}
 	}
-	return failed, successfullyBuiltTargets
+	return failed, successfullyBuiltTargets, totalElapsedTime
 }
 
 // getPackageDependenciesForward recursively collects all dependencies for a package
