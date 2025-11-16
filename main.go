@@ -4766,7 +4766,17 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 		numCores = runtime.NumCPU()
 	}
 
-	ltoJobString := fmt.Sprintf("%d", numCores)
+	// Check for 'clang' file to determine LTOJOBS value
+	ltoJobString := fmt.Sprintf("%d", numCores) // Default to core count (for GCC)
+	clangFlagFile := filepath.Join(pkgDir, "clang")
+	if _, err := os.Stat(clangFlagFile); err == nil {
+		// 'clang' file exists, use "auto" for LTO jobs
+		ltoJobString = "auto"
+		debugf("Local 'clang' file found. Setting LTOJOBS=auto.\n")
+	} else {
+		// No 'clang' file, use core count
+		debugf("No 'clang' file found. Setting LTOJOBS=%s.\n", ltoJobString)
+	}
 
 	// Build environment
 	env := os.Environ()
@@ -5328,7 +5338,17 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 		defaults["CMAKE_BUILD_PARALLEL_LEVEL"] = fmt.Sprintf("%d", numCores)
 	}
 
-	ltoJobString := fmt.Sprintf("%d", numCores)
+	// Check for 'clang' file to determine LTOJOBS value
+	ltoJobString := fmt.Sprintf("%d", numCores) // Default to core count (for GCC)
+	clangFlagFile := filepath.Join(pkgDir, "clang")
+	if _, err := os.Stat(clangFlagFile); err == nil {
+		// 'clang' file exists, use "auto" for LTO jobs
+		ltoJobString = "auto"
+		debugf("Local 'clang' file found. Setting LTOJOBS=auto.\n")
+	} else {
+		// No 'clang' file, use core count
+		debugf("No 'clang' file found. Setting LTOJOBS=%s.\n", ltoJobString)
+	}
 
 	// Prepend oldLibsDir to PATH and LD_LIBRARY_PATH for tools run by the Executor
 	// This allows system tools (tar, rsync, cp) used by the Executor to function,
