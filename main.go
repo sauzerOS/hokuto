@@ -4145,7 +4145,12 @@ func getInstalledVersion(pkgName string) (string, bool) {
 	if v == "" {
 		return "", false
 	}
-	return v, true
+	// Extract just the version (first field), as version files can contain multiple fields like "3.6.5 1"
+	fields := strings.Fields(v)
+	if len(fields) == 0 {
+		return "", false
+	}
+	return fields[0], true
 }
 
 // versionSatisfies checks if installed satisfies op refVersion.
@@ -4628,6 +4633,19 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 	}
 	if !found {
 		return 0, fmt.Errorf("package %s not found in HOKUTO_PATH", pkgName)
+	}
+
+	// Special handling: Uninstall python before building/updating if it's already installed
+	if pkgName == "python" && isPackageInstalled("python") {
+		colArrow.Print("-> ")
+		colWarn.Printf("Uninstalling python to ensure Pip is built\n")
+		// Use force=true and yes=true to ensure non-interactive uninstallation
+		if err := pkgUninstall("python", cfg, RootExec, true, true); err != nil {
+			// This is a warning, not fatal - continue with build even if uninstall fails
+			debugf("Warning: failed to uninstall python before build: %v\n", err)
+		} else {
+			debugf("Successfully uninstalled python before build.\n")
+		}
 	}
 
 	// 1. Initialize a LOCAL temporary directory variable with the global default.
@@ -5288,10 +5306,11 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 		"TMPDIR":      currentTmpDir,
 	}
 
-	// Based on the priority, override the defaults for cores and signal the wrapper.
+	// Define core count to use
+	var numCores int
 	switch buildPriority {
 	case "idle":
-		numCores := runtime.NumCPU() / 2
+		numCores = runtime.NumCPU() / 2
 		if numCores < 1 {
 			numCores = 1
 		}
@@ -5299,11 +5318,17 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 		defaults["CMAKE_BUILD_PARALLEL_LEVEL"] = fmt.Sprintf("%d", numCores)
 		defaults["HOKUTO_BUILD_PRIORITY"] = "idle" // Set variable for wrapper
 	case "superidle":
-		numCores := 1
+		numCores = 1
 		defaults["MAKEFLAGS"] = fmt.Sprintf("-j%d", numCores)
 		defaults["CMAKE_BUILD_PARALLEL_LEVEL"] = fmt.Sprintf("%d", numCores)
 		defaults["HOKUTO_BUILD_PRIORITY"] = "superidle" // Set variable for wrapper
+	default: // "normal"
+		numCores = runtime.NumCPU()
+		defaults["MAKEFLAGS"] = fmt.Sprintf("-j%d", numCores)
+		defaults["CMAKE_BUILD_PARALLEL_LEVEL"] = fmt.Sprintf("%d", numCores)
 	}
+
+	ltoJobString := fmt.Sprintf("%d", numCores)
 
 	// Prepend oldLibsDir to PATH and LD_LIBRARY_PATH for tools run by the Executor
 	// This allows system tools (tar, rsync, cp) used by the Executor to function,
@@ -5336,10 +5361,9 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 		cflagsKey = "CFLAGS_LTO"
 		cxxflagsKey = "CXXFLAGS_LTO"
 		ldflagsKey = "LDFLAGS_LTO"
-		// Set LTO defaults if they are not defined in the configuration
-		// (You'd likely define these globally in your program)
-		defaults["CFLAGS"] = defaultCFLAGS + " -flto=auto"   // Example LTO flag
-		defaults["LDFLAGS"] = defaultLDFLAGS + " -flto=auto" // Example LTO flag
+		// Set a default that includes the placeholder, in case the config doesn't.
+		defaults["CFLAGS"] = defaultCFLAGS + " -flto=LTOJOBS"
+		defaults["LDFLAGS"] = defaultLDFLAGS + " -flto=LTOJOBS"
 	} else {
 		cflagsKey = "CFLAGS"
 		cxxflagsKey = "CXXFLAGS"
@@ -5362,6 +5386,13 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 	}
 	if val := cfg.Values[ldflagsKey]; val != "" {
 		defaults["LDFLAGS"] = val
+	}
+
+	// Perform the placeholder substitution *only when LTO is enabled*.
+	if shouldLTO {
+		defaults["CFLAGS"] = strings.ReplaceAll(defaults["CFLAGS"], "LTOJOBS", ltoJobString)
+		defaults["LDFLAGS"] = strings.ReplaceAll(defaults["LDFLAGS"], "LTOJOBS", ltoJobString)
+		defaults["CXXFLAGS"] = strings.ReplaceAll(defaults["CXXFLAGS"], "LTOJOBS", ltoJobString)
 	}
 
 	// The CXXFLAGS fallback logic must be applied AFTER CFLAGS is finalized.
@@ -5767,6 +5798,7 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 	}
 
 	// 3. Interactive handling of modified files
+	stdinReader := bufio.NewReader(os.Stdin)
 	for _, file := range modifiedFiles {
 		stagingFile := filepath.Join(stagingDir, file)
 		currentFile := filepath.Join(rootDir, file) // file under the install root
@@ -5794,9 +5826,14 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 			var input string
 			if !yes {
 				cPrintf(colInfo, "File %s modified, %schoose action: [k]eep current, [U]se new, [e]dit: ", file, ownerDisplay)
-				fmt.Scanln(&input)
+				// Use the shared, robust bufio.Reader
+				response, err := stdinReader.ReadString('\n')
+				if err != nil {
+					// Default to 'u' on read error (e.g., Ctrl+D)
+					response = "u"
+				}
+				input = strings.TrimSpace(response)
 			}
-			input = strings.TrimSpace(input)
 			if input == "" {
 				input = "u" // Default to 'use new' if user presses enter or if in --yes mode
 			}
@@ -5888,9 +5925,11 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 			ans := "n" // Default to not keeping the file
 			if !yes {
 				cPrintf(colInfo, "User modified %s, but new package has no file. Keep it? [y/N]: ", file)
-				var input string
-				fmt.Scanln(&input)
-				ans = strings.ToLower(strings.TrimSpace(input))
+				// Use the shared, robust bufio.Reader
+				response, err := stdinReader.ReadString('\n')
+				if err == nil {
+					ans = strings.ToLower(strings.TrimSpace(response))
+				}
 			}
 			if ans == "y" {
 				// ensure staging directory exists (run as root)
@@ -6116,25 +6155,59 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 		// 8a. Prompt for rebuild (Hokuto is guaranteed to be run in a terminal)
 		cPrintf(colWarn, "\nWARNING: The following packages depend on libraries that were removed/upgraded:\n  %s\n", strings.Join(affectedList, ", "))
 
-		performRebuild := false
+		// Interactive rebuild selection
+		var packagesToRebuild []string
+		rebuildAll := false // Flag to track if 'a' (all) was selected
+
 		if !yes {
-			performRebuild = true // default to true unless user says 'n'
-			cPrintf(colInfo, "Do you want to rebuild these packages now? This is highly recommended. [Y/n]: ")
-			var answer string
-			fmt.Scanln(&answer)
-			if strings.ToLower(strings.TrimSpace(answer)) == "n" {
-				cPrintf(colInfo, "Skipping rebuild")
-				performRebuild = false
+			// Use the same robust reader we defined earlier
+			for _, pkg := range affectedList {
+				if rebuildAll {
+					// 'all' was selected, just add and continue
+					packagesToRebuild = append(packagesToRebuild, pkg)
+					cPrintf(colInfo, "Rebuilding %s (auto-selected by 'all')\n", pkg)
+					continue
+				}
+
+				// Prompt for this specific package
+				cPrintf(colInfo, "Rebuild %s? [Y/n/a(ll)/q(uit)]: ", pkg)
+				response, err := stdinReader.ReadString('\n')
+				if err != nil {
+					response = "q" // Treat error (like Ctrl+D) as 'quit'
+				}
+				response = strings.ToLower(strings.TrimSpace(response))
+
+				switch response {
+				case "y", "": // Default is Yes
+					packagesToRebuild = append(packagesToRebuild, pkg)
+				case "n": // No
+					cPrintf(colInfo, "Skipping rebuild for %s\n", pkg)
+					continue
+				case "a": // All
+					cPrintf(colInfo, "Rebuilding %s and all subsequent packages\n", pkg)
+					rebuildAll = true
+					packagesToRebuild = append(packagesToRebuild, pkg)
+				case "q": // Quit
+					cPrintf(colInfo, "Quitting rebuild selection. No more packages will be rebuilt.\n")
+					goto RebuildSelectionDone // Break out of the loop
+				default: // Invalid, treat as 'No' for safety
+					cPrintf(colInfo, "Invalid input. Skipping rebuild for %s\n", pkg)
+					continue
+				}
 			}
+		RebuildSelectionDone: // Label for the 'quit' jump
+			// This is just a label, execution continues normally after the loop if 'q' wasn't used.
+		} else {
+			// If --yes is passed, just rebuild all affected packages (original behavior)
+			cPrintf(colInfo, "Rebuilding all affected packages due to --yes flag.\n")
+			packagesToRebuild = affectedList
 		}
-		// If err != nil (like when only Enter is pressed), or input is empty/ 'y',
-		// performRebuild remains true.
 
 		// 8b. Perform rebuild
-		if performRebuild {
+		if len(packagesToRebuild) > 0 {
 			colArrow.Print("-> ")
 			colSuccess.Println("Starting rebuild of affected packages")
-			for _, pkg := range affectedList {
+			for _, pkg := range packagesToRebuild {
 				cPrintf(colInfo, "\n--- Rebuilding %s ---\n", pkg)
 
 				if err := pkgBuildRebuild(pkg, cfg, execCtx, tempLibBackupDir); err != nil {
@@ -6777,7 +6850,7 @@ func handleBuildCommand(args []string, cfg *Config) {
 				}
 
 				colArrow.Print("-> ")
-				color.Bold.Printf("--- Processing Top-Level Dependency %d/%d: %s ---\n", i+1, len(orderedTopLevelDeps), pkgName)
+				colSuccess.Printf("Processing Top-Level Dependency %d/%d: %s \n", i+1, len(orderedTopLevelDeps), pkgName)
 
 				plan, err := resolveBuildPlan([]string{pkgName}, userRequestedMap, effectiveRebuilds)
 				if err != nil {
@@ -6963,8 +7036,7 @@ func executeBuildPass(plan *BuildPlan, passName string, installAllTargets bool, 
 					isCriticalAtomic.Store(1)
 					handlePreInstallUninstall(pkgName, cfg, RootExec)
 					colArrow.Print("-> ")
-					colSuccess.Printf("Installing: ")
-					colNote.Print("%s (%d/%d) Time: %s\n", pkgName, i+1, totalInPlan, duration.Truncate(time.Second))
+					colSuccess.Printf("Installing: %s (%d/%d) Time: %s\n", pkgName, i+1, totalInPlan, duration.Truncate(time.Second))
 					if installErr := pkgInstall(tarballPath, pkgName, cfg, RootExec, true); installErr != nil {
 						isCriticalAtomic.Store(0)
 						failed[pkgName] = fmt.Errorf("post-build installation failed: %w", installErr)
@@ -7554,7 +7626,7 @@ func getPackageDependenciesToUninstall(name string) []string {
 		return []string{"18-sed"}
 	case "hokuto":
 		return []string{"21-hokuto"}
-	case "python", "cython":
+	case "cython":
 		return []string{name}
 	default:
 		if strings.HasPrefix(name, "python-") || strings.HasPrefix(name, "cython-") {
@@ -7991,8 +8063,6 @@ func main() {
 		// This effectively translates `hokuto bootstrap /mnt/lfs` into
 		// `hokuto build --bootstrap --bootstrap-dir /mnt/lfs bootstrap`.
 		buildArgs := []string{
-			"--bootstrap",
-			"--bootstrap-dir",
 			bootstrapDirArg,
 			"bootstrap", // The specific package to build in bootstrap mode.
 		}
