@@ -1072,6 +1072,18 @@ func fetchSources(pkgName, pkgDir string, processGit bool) error {
 		return fmt.Errorf("could not read sources file: %v", err)
 	}
 
+	// Read package version for cache-busting
+	versionData, err := os.ReadFile(filepath.Join(pkgDir, "version"))
+	if err != nil {
+		// If we can't read the version file, we can't create a version-aware hash.
+		return fmt.Errorf("could not read version file for cache hashing: %v", err)
+	}
+	fields := strings.Fields(string(versionData))
+	if len(fields) == 0 {
+		return fmt.Errorf("version file %s is empty", filepath.Join(pkgDir, "version"))
+	}
+	pkgVersion := fields[0] // Get just the version string, e.g., "1.2.3"
+
 	lines := strings.Split(string(data), "\n")
 	pkgLinkDir := filepath.Join(SourcesDir, pkgName)
 
@@ -1163,8 +1175,12 @@ func fetchSources(pkgName, pkgDir string, processGit bool) error {
 		parts = strings.Split(originalSourceURL, "/")
 		origFilename = parts[len(parts)-1]
 
-		// The hash for the cache MUST be based on the original, canonical URL.
-		hashName = fmt.Sprintf("%s-%s", hashString(originalSourceURL), origFilename)
+		// Create a version-aware hash key by combining the URL and the package version.
+		// This busts the cache for static URLs (like .../stable.deb) when the package version file is updated.
+		hashInput := originalSourceURL + pkgVersion
+		// The hash for the cache is now based on the URL *and* the package version.
+		hashName = fmt.Sprintf("%s-%s", hashString(hashInput), origFilename)
+
 		cachePath = filepath.Join(CacheStore, hashName)
 
 		if _, err := os.Stat(cachePath); os.IsNotExist(err) {
