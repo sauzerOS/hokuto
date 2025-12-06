@@ -5598,7 +5598,7 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 	}
 
 	// Run build script
-	cPrintf(colInfo, "RebuildingRebuilding %s (version %s) in %s, install to %s (root=%v)\n",
+	debugf("Rebuilding %s (version %s) in %s, install to %s (root=%v)\n",
 		pkgName, version, buildDir, outputDir, buildExec)
 
 	// 1. Define the log file path
@@ -5710,16 +5710,21 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 		// Path to the build log (we created this earlier as logFile)
 		logPath := filepath.Join(logDir, "build-log.txt")
 
-		// Launch a tail -n 200 -f so the user can view the last 200 lines and follow live.
-		// Connect stdin/stdout/stderr so the user can Ctrl-C to exit the tail.
-		tailCmd := exec.Command("tail", "-n", "50", "-f", logPath)
-		tailCmd.Stdin = os.Stdin
-		tailCmd.Stdout = os.Stdout
-		tailCmd.Stderr = os.Stderr
-
-		// Run tail via the same Executor so privilege behavior and context cancellation are honored.
-		// Ignore tail errors (user may Ctrl-C to exit); we only return the original build error.
-		_ = buildExec.Run(tailCmd)
+		// If interactive, let user follow the log; otherwise show last N lines and continue.
+		if buildExec.Interactive {
+			tailCmd := exec.Command("tail", "-n", "50", "-f", logPath)
+			tailCmd.Stdin = os.Stdin
+			tailCmd.Stdout = os.Stdout
+			tailCmd.Stderr = os.Stderr
+			_ = buildExec.Run(tailCmd)
+		} else {
+			// Non-interactive: just print the last 50 lines and don't block.
+			tailOnce := exec.Command("tail", "-n", "50", logPath)
+			// Do NOT attach Stdin for non-interactive mode (avoid blocking).
+			tailOnce.Stdout = os.Stdout
+			tailOnce.Stderr = os.Stderr
+			_ = buildExec.Run(tailOnce)
+		}
 
 		return runErr
 	}
@@ -6476,20 +6481,22 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 				if err := pkgBuildRebuild(pkg, cfg, execCtx, tempLibBackupDir); err != nil {
 					failed = append(failed, fmt.Sprintf("rebuild of %s failed: %v", pkg, err))
 					cPrintf(colWarn, "WARNING: Rebuild of %s failed: %v\n", pkg, err)
-				} else {
-					rebuildOutputDir := filepath.Join(tmpDir, pkg, "output")
-
-					if err := rsyncStaging(rebuildOutputDir, rootDir, execCtx); err != nil {
-						failed = append(failed, fmt.Sprintf("failed to sync rebuilt package %s to root: %v", pkg, err))
-						cPrintf(colWarn, "WARNING: Failed to sync rebuilt package %s to root: %v\n", pkg, err)
-					}
-
-					rmCmd := exec.Command("rm", "-rf", filepath.Join(tmpDir, pkg))
-					if err := execCtx.Run(rmCmd); err != nil {
-						fmt.Fprintf(os.Stderr, "failed to cleanup rebuild tmpdirs for %s: %v\n", pkg, err)
-					}
-					cPrintf(colNote, "Rebuild of %s finished and installed.\n", pkg)
+					continue // Skip to next package on failure, same as hokuto update
 				}
+
+				rebuildOutputDir := filepath.Join(tmpDir, pkg, "output")
+
+				if err := rsyncStaging(rebuildOutputDir, rootDir, execCtx); err != nil {
+					failed = append(failed, fmt.Sprintf("failed to sync rebuilt package %s to root: %v", pkg, err))
+					cPrintf(colWarn, "WARNING: Failed to sync rebuilt package %s to root: %v\n", pkg, err)
+					continue // Skip cleanup on sync failure
+				}
+
+				rmCmd := exec.Command("rm", "-rf", filepath.Join(tmpDir, pkg))
+				if err := execCtx.Run(rmCmd); err != nil {
+					fmt.Fprintf(os.Stderr, "failed to cleanup rebuild tmpdirs for %s: %v\n", pkg, err)
+				}
+				cPrintf(colNote, "Rebuild of %s finished and installed.\n", pkg)
 			}
 		}
 	}
@@ -7904,6 +7911,8 @@ func getPackageDependenciesToUninstall(name string) []string {
 	case "streamlink":
 		return []string{name}
 	case "umu-launcher":
+		return []string{name}
+	case "btrfs-progs":
 		return []string{name}
 	default:
 		if strings.HasPrefix(name, "python-") || strings.HasPrefix(name, "cython-") {
