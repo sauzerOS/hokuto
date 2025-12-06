@@ -3827,7 +3827,7 @@ func checkDependencyBlocks(pkgName string, newVersion string, installedPackages 
 }
 
 // checkForUpgrades is the main function for the upgrade logic.
-func checkForUpgrades(ctx context.Context, cfg *Config) error {
+func checkForUpgrades(_ context.Context, cfg *Config) error {
 	colArrow.Print("-> ")
 	colSuccess.Println("Checking for Package Upgrades")
 
@@ -5946,6 +5946,82 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 		}
 	}
 
+	// Helper function to run diff with root executor fallback if permission denied
+	runDiffWithFallback := func(file1, file2 string, outputToStdout bool) error {
+		// Try to check if we can read the file first
+		if f, err := os.Open(file1); err != nil {
+			// If we can't read file1 due to permissions, try with root executor
+			if os.IsPermission(err) {
+				diffCmd := exec.Command("diff", "-u", file1, file2)
+				if outputToStdout {
+					diffCmd.Stdout = os.Stdout
+					diffCmd.Stderr = os.Stderr
+				}
+				// diff returns non-zero when files differ, which is normal - ignore that
+				_ = RootExec.Run(diffCmd)
+				return nil
+			}
+		} else {
+			f.Close()
+		}
+		// Try normal diff first
+		diffCmd := exec.Command("diff", "-u", file1, file2)
+		if outputToStdout {
+			diffCmd.Stdout = os.Stdout
+			diffCmd.Stderr = os.Stderr
+		}
+		err := diffCmd.Run()
+		// If diff fails, check if it's a permission issue by trying to read the file again
+		if err != nil {
+			if _, readErr := os.Open(file1); readErr != nil && os.IsPermission(readErr) {
+				// Retry with root executor
+				diffCmd := exec.Command("diff", "-u", file1, file2)
+				if outputToStdout {
+					diffCmd.Stdout = os.Stdout
+					diffCmd.Stderr = os.Stderr
+				}
+				_ = RootExec.Run(diffCmd)
+			}
+		}
+		// diff returns non-zero when files differ, which is normal - ignore that
+		return nil
+	}
+
+	// Helper function to get diff output with root executor fallback if permission denied
+	getDiffOutput := func(file1, file2 string) ([]byte, error) {
+		// Try to check if we can read the file first
+		if f, err := os.Open(file1); err != nil {
+			// If we can't read file1 due to permissions, try with root executor
+			if os.IsPermission(err) {
+				diffCmd := exec.Command("diff", "-u", file1, file2)
+				var out bytes.Buffer
+				diffCmd.Stdout = &out
+				diffCmd.Stderr = &out
+				// diff returns non-zero when files differ, which is normal - ignore that
+				_ = RootExec.Run(diffCmd)
+				return out.Bytes(), nil
+			}
+		} else {
+			f.Close()
+		}
+		// Try normal diff first
+		diffOut, err := exec.Command("diff", "-u", file1, file2).Output()
+		// If diff fails, check if it's a permission issue by trying to read the file again
+		if err != nil {
+			if _, readErr := os.Open(file1); readErr != nil && os.IsPermission(readErr) {
+				// Retry with root executor
+				diffCmd := exec.Command("diff", "-u", file1, file2)
+				var out bytes.Buffer
+				diffCmd.Stdout = &out
+				diffCmd.Stderr = &out
+				_ = RootExec.Run(diffCmd)
+				return out.Bytes(), nil
+			}
+		}
+		// diff returns non-zero when files differ, which is normal - return output anyway
+		return diffOut, nil
+	}
+
 	// 2. Detect user-modified files
 	debugf("detect user modified files")
 
@@ -5979,6 +6055,7 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 
 	// 3. Interactive handling of modified files
 	stdinReader := bufio.NewReader(os.Stdin)
+	skipAllPrompts := false // Flag to skip prompts for all remaining files
 	for _, file := range modifiedFiles {
 		stagingFile := filepath.Join(stagingDir, file)
 		currentFile := filepath.Join(rootDir, file) // file under the install root
@@ -5998,14 +6075,16 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 
 		if _, err := os.Stat(stagingFile); err == nil {
 			// file exists in staging
-			cmd := exec.Command("diff", "-u", currentFile, stagingFile)
-			cmd.Stdout = os.Stdout
-			cmd.Stderr = os.Stderr
-			cmd.Run()
+			// Try to display diff, retry with root executor if permission denied
+			runDiffWithFallback(currentFile, stagingFile, true)
+			// Flush stdout to ensure diff output is visible before prompt
+			os.Stdout.Sync()
 
 			var input string
-			if !yes {
-				cPrintf(colInfo, "File %s modified, %schoose action: [k]eep current, [U]se new, [e]dit: ", file, ownerDisplay)
+			if !yes && !skipAllPrompts {
+				cPrintf(colInfo, "File %s modified, %schoose action: [k]eep current, [U]se new, [e]dit, use new for [A]ll: ", file, ownerDisplay)
+				// Flush stdout to ensure prompt is visible
+				os.Stdout.Sync()
 				// Use the shared, robust bufio.Reader
 				response, err := stdinReader.ReadString('\n')
 				if err != nil {
@@ -6017,7 +6096,7 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 			if input == "" {
 				input = "u" // Default to 'use new' if user presses enter or if in --yes mode
 			}
-			switch input {
+			switch strings.ToLower(input) {
 			case "k":
 				cpCmd := exec.Command("cp", "--remove-destination", currentFile, stagingFile)
 				if err := execCtx.Run(cpCmd); err != nil {
@@ -6025,6 +6104,10 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 				}
 			case "u":
 				// keep staging file as-is
+			case "a":
+				// Use new for all remaining files - set flag and use new for this file
+				skipAllPrompts = true
+				// keep staging file as-is (same as "u")
 			case "e":
 				// --- NEW: Get original staging file permissions ---
 				stagingInfo, err := os.Stat(stagingFile)
@@ -6039,8 +6122,8 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 				}
 
 				// produce unified diff (currentFile vs stagingFile); ignore diff errors (non-zero exit means differences)
-				diffCmd := exec.Command("diff", "-u", currentFile, stagingFile)
-				diffOut, _ := diffCmd.Output() // we don't fail if diff returns non-zero
+				// Try to get diff output, retry with root executor if permission denied
+				diffOut, _ := getDiffOutput(currentFile, stagingFile) // we don't fail if diff returns non-zero
 
 				// create temp file prefilled with staging content + marked diff
 				tmp, err := os.CreateTemp("", "hokuto-edit-")
@@ -7109,7 +7192,7 @@ func handleBuildCommand(args []string, cfg *Config) {
 						tarballPath := filepath.Join(BinDir, fmt.Sprintf("%s-%s.tar.zst", finalPkg, version))
 						isCriticalAtomic.Store(1)
 						handlePreInstallUninstall(finalPkg, cfg, RootExec)
-						if err := pkgInstall(tarballPath, finalPkg, cfg, RootExec, true); err != nil {
+						if err := pkgInstall(tarballPath, finalPkg, cfg, RootExec, false); err != nil {
 							isCriticalAtomic.Store(0)
 							failedBuilds[finalPkg] = fmt.Errorf("final installation failed: %w", err)
 						}
@@ -7807,6 +7890,20 @@ func getPackageDependenciesToUninstall(name string) []string {
 	case "hokuto":
 		return []string{"21-hokuto"}
 	case "cython":
+		return []string{name}
+	case "meson":
+		return []string{name}
+	case "libvirt-python":
+		return []string{name}
+	case "protontricks":
+		return []string{name}
+	case "pyqt-build":
+		return []string{name}
+	case "refind-btrfs":
+		return []string{name}
+	case "streamlink":
+		return []string{name}
+	case "umu-launcher":
 		return []string{name}
 	default:
 		if strings.HasPrefix(name, "python-") || strings.HasPrefix(name, "cython-") {
