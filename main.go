@@ -1845,8 +1845,10 @@ func generateDepends(pkgName, pkgDir, outputDir, rootDir string, execCtx *Execut
 	installedDir := filepath.Join(outputDir, "var", "db", "hokuto", "installed", pkgName)
 	dependsFile := filepath.Join(installedDir, "depends")
 
-	// --- FIX START: Initialize depSet at the beginning ---
-	depSet := make(map[string]struct{})
+	// Track library dependencies (auto-detected, just package names)
+	libDepSet := make(map[string]struct{})
+	// Track repo dependencies (from depends file, preserve full specs with version constraints)
+	repoDepLines := make(map[string]string) // package name -> full dependency line
 
 	// --- Part 1: Process automatically detected library dependencies ---
 	libdepsFile := filepath.Join(installedDir, "libdeps")
@@ -1890,7 +1892,7 @@ func generateDepends(pkgName, pkgDir, outputDir, rootDir string, execCtx *Execut
 
 						// Now, check the suffix of the path, not the whole line.
 						if strings.HasSuffix(pathInManifest, lib) {
-							depSet[otherPkg] = struct{}{}
+							libDepSet[otherPkg] = struct{}{}
 							break // Found the owner, move to the next library
 						}
 					}
@@ -1901,31 +1903,43 @@ func generateDepends(pkgName, pkgDir, outputDir, rootDir string, execCtx *Execut
 	// --- End of Part 1 ---
 
 	// --- Part 2: Merge manually specified dependencies from the repo file ---
+	// Preserve full dependency specifications including version constraints
 	repoDepends := filepath.Join(pkgDir, "depends")
 	if data, err := os.ReadFile(repoDepends); err == nil {
 		for _, line := range strings.Split(string(data), "\n") {
 			line = strings.TrimSpace(line)
 			if line != "" && !strings.HasPrefix(line, "#") {
-				// Use the existing token parser to extract just the package name.
+				// Extract package name to use as key in the map
 				name, _, _, _, _ := parseDepToken(line)
 				if name != "" {
-					depSet[name] = struct{}{}
+					// Store the full line to preserve version constraints
+					repoDepLines[name] = line
 				}
 			}
 		}
 	}
 	// --- End of Part 2 ---
 
-	// --- FIX: Only exit now if there are truly no dependencies to write ---
-	if len(depSet) == 0 {
+	// --- Part 3: Build the final depends file content ---
+	// First, add all repo dependencies (with their full specs)
+	var deps []string
+	for name, line := range repoDepLines {
+		deps = append(deps, line)
+		// Remove from libDepSet if it's also a repo dep (repo deps take precedence)
+		delete(libDepSet, name)
+	}
+
+	// Then, add library-only dependencies (just package names)
+	for dep := range libDepSet {
+		deps = append(deps, dep)
+	}
+
+	// If no dependencies at all, exit early
+	if len(deps) == 0 {
 		return nil
 	}
 
-	// --- Part 3: Write the final, combined depends file ---
-	var deps []string
-	for dep := range depSet {
-		deps = append(deps, dep)
-	}
+	// Sort dependencies for consistent output
 	sort.Strings(deps)
 	content := strings.Join(deps, "\n")
 
@@ -3726,6 +3740,92 @@ func parsePackageList(output []byte) (map[string]Package, error) {
 	return packages, scanner.Err()
 }
 
+// readLockFile reads /etc/hokuto.lock and returns a map of package name -> locked version.
+// Returns an empty map if the file doesn't exist or on error (errors are silently ignored).
+func readLockFile() map[string]string {
+	lockFile := "/etc/hokuto.lock"
+	locked := make(map[string]string)
+
+	data, err := os.ReadFile(lockFile)
+	if err != nil {
+		// File doesn't exist or can't be read - return empty map
+		return locked
+	}
+
+	scanner := bufio.NewScanner(strings.NewReader(string(data)))
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		// Parse line: "package-name version"
+		fields := strings.Fields(line)
+		if len(fields) >= 2 {
+			pkgName := fields[0]
+			version := fields[1]
+			locked[pkgName] = version
+		}
+	}
+
+	return locked
+}
+
+// checkDependencyBlocks checks if any installed package depends on a lower version
+// of the package being updated. Returns the blocking package name if found, empty string otherwise.
+func checkDependencyBlocks(pkgName string, newVersion string, installedPackages map[string]Package) string {
+	// Iterate through all installed packages
+	for installedPkgName := range installedPackages {
+		// Skip the package itself
+		if installedPkgName == pkgName {
+			continue
+		}
+
+		// Read the depends file for this installed package
+		dependsPath := filepath.Join(Installed, installedPkgName, "depends")
+		data, err := os.ReadFile(dependsPath)
+		if err != nil {
+			// No depends file or can't read it - skip
+			continue
+		}
+
+		// Parse the depends file
+		scanner := bufio.NewScanner(strings.NewReader(string(data)))
+		for scanner.Scan() {
+			line := strings.TrimSpace(scanner.Text())
+			if line == "" || strings.HasPrefix(line, "#") {
+				continue
+			}
+
+			// Parse dependency spec (e.g., "python-sabctools==8.2.6")
+			name, op, ver, _, _ := parseDepToken(line)
+			if name != pkgName {
+				continue
+			}
+
+			// If there's a version constraint, check if the new version violates it
+			if op != "" && ver != "" {
+				// Check if the new version is higher than the required version
+				// If the constraint is ==, <=, or <, and new version is higher, it's blocked
+				if op == "==" {
+					// Exact version required - any other version is blocked
+					if ver != newVersion {
+						return installedPkgName
+					}
+				} else if op == "<=" || op == "<" {
+					// Maximum version constraint - if new version is higher, it's blocked
+					if compareVersions(newVersion, ver) > 0 {
+						return installedPkgName
+					}
+				}
+				// For >= and >, we allow the update (new version satisfies the constraint)
+			}
+		}
+	}
+
+	return ""
+}
+
 // checkForUpgrades is the main function for the upgrade logic.
 func checkForUpgrades(ctx context.Context, cfg *Config) error {
 	colArrow.Print("-> ")
@@ -3770,16 +3870,60 @@ func checkForUpgrades(ctx context.Context, cfg *Config) error {
 		}
 	}
 
+	// 2.5. Filter upgrade list based on dependencies and lock file
+	lockedPackages := readLockFile()
+	var filteredUpgradeList []Package
+	var blockedPackages []string
+
+	for _, pkg := range upgradeList {
+		shouldSkip := false
+		blockReason := ""
+
+		// Check if blocked by installed package dependencies
+		blockingPkg := checkDependencyBlocks(pkg.Name, pkg.RepoVersion, installedPackages)
+		if blockingPkg != "" {
+			shouldSkip = true
+			blockReason = fmt.Sprintf("%s update blocked by %s", pkg.Name, blockingPkg)
+		}
+
+		// Check if locked in /etc/hokuto.lock
+		if lockedVersion, isLocked := lockedPackages[pkg.Name]; isLocked {
+			// If locked version is lower than the new version, block the update
+			if compareVersions(lockedVersion, pkg.RepoVersion) < 0 {
+				shouldSkip = true
+				if blockReason != "" {
+					blockReason += " and lock file"
+				} else {
+					blockReason = fmt.Sprintf("%s update blocked by lock file (locked at %s)", pkg.Name, lockedVersion)
+				}
+			}
+		}
+
+		if shouldSkip {
+			blockedPackages = append(blockedPackages, blockReason)
+		} else {
+			filteredUpgradeList = append(filteredUpgradeList, pkg)
+		}
+	}
+
+	// Print blocked packages if any
+	if len(blockedPackages) > 0 {
+		cPrintf(colWarn, "\n--- %d Package(s) Blocked from Update ---\n", len(blockedPackages))
+		for _, reason := range blockedPackages {
+			cPrintf(colWarn, "  - %s\n", reason)
+		}
+	}
+
 	// 3. Handle upgrade list
-	if len(upgradeList) == 0 {
+	if len(filteredUpgradeList) == 0 {
 		colArrow.Print("-> ")
 		colSuccess.Println("No packages to upgrade.")
 		return nil
 	}
 
-	cPrintf(colInfo, "\n--- %d Package(s) to Upgrade ---\n", len(upgradeList))
+	cPrintf(colInfo, "\n--- %d Package(s) to Upgrade ---\n", len(filteredUpgradeList))
 	var pkgNames []string
-	for _, pkg := range upgradeList {
+	for _, pkg := range filteredUpgradeList {
 		// Print full version/revision information for clarity
 		cPrintf(colInfo, "  - %s: %s %s -> %s %s\n",
 			pkg.Name,
