@@ -8238,7 +8238,7 @@ func main() {
 	case "version", "--version":
 		// Print version first
 		// HOKUTOVERSION (string for search)
-		fmt.Println("hokuto 0.3.1")
+		fmt.Println("hokuto 0.3.2")
 
 		// Try to pick and show a random embedded PNG from assets/
 		imgs, err := listEmbeddedImages()
