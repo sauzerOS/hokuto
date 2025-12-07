@@ -1183,6 +1183,17 @@ func fetchSources(pkgName, pkgDir string, processGit bool) error {
 
 		cachePath = filepath.Join(CacheStore, hashName)
 
+		// This removes files like "OLDHASH-filename.tar.xz" so only "NEWHASH-filename.tar.xz" remains.
+		globPattern := filepath.Join(CacheStore, "*-"+origFilename)
+		if matches, err := filepath.Glob(globPattern); err == nil {
+			for _, match := range matches {
+				if match != cachePath {
+					debugf("Removing obsolete cached file: %s\n", match)
+					_ = os.Remove(match)
+				}
+			}
+		}
+
 		if _, err := os.Stat(cachePath); os.IsNotExist(err) {
 			colArrow.Print("-> ")
 			colSuccess.Printf("Fetching source: %s\n", origFilename)
@@ -1255,6 +1266,13 @@ func hasB3sum() bool {
 func verifyOrCreateChecksums(pkgName, pkgDir string, force bool) error {
 	pkgSrcDir := filepath.Join(SourcesDir, pkgName)
 	checksumFile := filepath.Join(pkgDir, "checksums")
+
+	//Read version for consistent hashing
+	versionData, err := os.ReadFile(filepath.Join(pkgDir, "version"))
+	if err != nil {
+		return fmt.Errorf("could not read version file: %v", err)
+	}
+	pkgVersion := strings.Fields(string(versionData))[0]
 
 	// Create source directory if it doesn't exist
 	if err := os.MkdirAll(pkgSrcDir, 0755); err != nil {
@@ -1370,9 +1388,20 @@ func verifyOrCreateChecksums(pkgName, pkgDir string, force bool) error {
 			colSuccess.Printf("Downloading %s\n", fname)
 			actionSummary = "Updated"
 
-			// The hash for the cache MUST be based on the original, canonical URL.
-			hashName := fmt.Sprintf("%s-%s", hashString(originalURL), fname)
+			//Use version-aware hash and cleanup
+			hashInput := originalURL + pkgVersion
+			hashName := fmt.Sprintf("%s-%s", hashString(hashInput), fname)
 			cachePath := filepath.Join(CacheStore, hashName)
+
+			// Clean up old versions/hashes of this file
+			globPattern := filepath.Join(CacheStore, "*-"+fname)
+			if matches, err := filepath.Glob(globPattern); err == nil {
+				for _, match := range matches {
+					if match != cachePath {
+						_ = os.Remove(match)
+					}
+				}
+			}
 
 			_ = os.Remove(cachePath)
 			_ = os.Remove(filePath)
@@ -3289,6 +3318,13 @@ func executePostInstall(pkgName, rootDir string, execCtx *Executor) error {
 		// run the same absolute path inside the chroot
 		cmd = exec.Command("chroot", rootDir, scriptPath)
 	}
+
+	// Get the user who invoked sudo (SUDO_USER) or current user
+	realUser := os.Getenv("SUDO_USER")
+	if realUser == "" {
+		realUser = os.Getenv("USER")
+	}
+	cmd.Env = append(os.Environ(), fmt.Sprintf("HOKUTO_REAL_USER=%s", realUser))
 
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
