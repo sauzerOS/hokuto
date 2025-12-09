@@ -73,6 +73,7 @@ var (
 	embeddedImages embed.FS
 	//go:embed assets/ca-bundle.crt
 	embeddedAssets embed.FS
+	WorldFile      = "/var/db/hokuto/world"
 )
 
 // color helpers
@@ -797,6 +798,272 @@ func findPackagesByManifestString(query string) error {
 	return nil
 }
 
+// addToWorld adds a package to the world file if it's not already there.
+func addToWorld(pkgName string) error {
+	// 1. Read existing world
+	content, err := os.ReadFile(WorldFile)
+	// It's okay if file doesn't exist yet
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+
+	lines := strings.Split(string(content), "\n")
+	for _, line := range lines {
+		if strings.TrimSpace(line) == pkgName {
+			return nil // Already in world
+		}
+	}
+
+	// 2. Append new package
+	f, err := os.OpenFile(WorldFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		// Try with root if permission denied
+		if os.IsPermission(err) {
+			cmd := exec.Command("sh", "-c", fmt.Sprintf("echo '%s' >> %s", pkgName, WorldFile))
+			return RootExec.Run(cmd)
+		}
+		return err
+	}
+	defer f.Close()
+
+	if _, err := f.WriteString(pkgName + "\n"); err != nil {
+		return err
+	}
+	return nil
+}
+
+// removeFromWorld removes a package from the world file.
+func removeFromWorld(pkgName string) error {
+	content, err := os.ReadFile(WorldFile)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+
+	lines := strings.Split(string(content), "\n")
+	var newLines []string
+	changed := false
+
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == pkgName {
+			changed = true
+			continue
+		}
+		if trimmed != "" {
+			newLines = append(newLines, trimmed)
+		}
+	}
+
+	if !changed {
+		return nil
+	}
+
+	// Write back
+	newContent := strings.Join(newLines, "\n") + "\n"
+
+	// Attempt direct write
+	if err := os.WriteFile(WorldFile, []byte(newContent), 0644); err != nil {
+		// Fallback to root write
+		if os.IsPermission(err) {
+			tmpFile, _ := os.CreateTemp("", "world-tmp")
+			tmpFile.WriteString(newContent)
+			tmpFile.Close()
+			defer os.Remove(tmpFile.Name())
+
+			cmd := exec.Command("cp", tmpFile.Name(), WorldFile)
+			return RootExec.Run(cmd)
+		}
+		return err
+	}
+	return nil
+}
+
+// getInstalledDeps returns the list of dependencies for an *installed* package
+// by reading the /var/db/hokuto/installed/<pkg>/depends file.
+func getInstalledDeps(pkgName string) ([]string, error) {
+	depFile := filepath.Join(Installed, pkgName, "depends")
+	data, err := os.ReadFile(depFile)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return []string{}, nil
+		}
+		return nil, err
+	}
+
+	var deps []string
+	scanner := bufio.NewScanner(strings.NewReader(string(data)))
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		// Parse "pkgname>=1.0" -> "pkgname"
+		name, _, _, _, _ := parseDepToken(line)
+		if name != "" && name != pkgName {
+			deps = append(deps, name)
+		}
+	}
+	return deps, nil
+}
+
+// findOrphans identifies packages that are installed but not in the World file
+// and not a dependency of any package reachable from the World file.
+func findOrphans() ([]string, error) {
+	// 1. Read World File
+	worldData, err := os.ReadFile(WorldFile)
+	if err != nil && !os.IsNotExist(err) {
+		return nil, err
+	}
+
+	worldPkgs := make(map[string]bool)
+	for _, line := range strings.Split(string(worldData), "\n") {
+		t := strings.TrimSpace(line)
+		if t != "" {
+			worldPkgs[t] = true
+		}
+	}
+
+	// 2. Build the "Keep" set (World + all recursive dependencies)
+	keepSet := make(map[string]bool)
+	queue := []string{}
+
+	// Initialize with World packages that are actually installed
+	for pkg := range worldPkgs {
+		if checkPackageExactMatch(pkg) {
+			keepSet[pkg] = true
+			queue = append(queue, pkg)
+		}
+	}
+
+	// BFS traversal
+	head := 0
+	for head < len(queue) {
+		curr := queue[head]
+		head++
+
+		deps, err := getInstalledDeps(curr)
+		if err != nil {
+			continue
+		}
+
+		for _, dep := range deps {
+			// If dependency is installed and not yet kept
+			if !keepSet[dep] && checkPackageExactMatch(dep) {
+				keepSet[dep] = true
+				queue = append(queue, dep)
+			}
+		}
+	}
+
+	// 3. Find Orphans (All Installed - Keep Set)
+	var orphans []string
+	entries, err := os.ReadDir(Installed)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		pkg := e.Name()
+		if !keepSet[pkg] {
+			orphans = append(orphans, pkg)
+		}
+	}
+
+	return orphans, nil
+}
+
+// handleOrphanCleanup prompts the user to remove orphans.
+func handleOrphanCleanup(cfg *Config) {
+	orphans, err := findOrphans()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: failed to calculate orphans: %v\n", err)
+		return
+	}
+
+	if len(orphans) == 0 {
+		return
+	}
+
+	sort.Strings(orphans)
+	colArrow.Print("\n-> ")
+	colWarn.Printf("Orphan packages found (%d): %s\n", len(orphans), strings.Join(orphans, ", "))
+
+	if askForConfirmation(colWarn, "Do you want to remove these orphans?") {
+		// We set force=true (skip dep checks because we know they are orphans)
+		// We set yes=false (ask confirmation per package or let user verify removal)
+		// Or strictly, usually recursive removal assumes yes. Let's ask once.
+
+		// Use batch removal logic
+		for _, pkg := range orphans {
+			// Using force=true to bypass reverse-dep check (since we calculated they are orphans)
+			// Using yes=true because user already confirmed the batch
+			if err := pkgUninstall(pkg, cfg, RootExec, true, true); err != nil {
+				color.Danger.Printf("Failed to remove orphan %s: %v\n", pkg, err)
+			} else {
+				colArrow.Print("-> ")
+				colSuccess.Printf("Removed orphan: ")
+				colNote.Printf("%s\n", pkg)
+			}
+		}
+
+		// Recursive check? Removing orphans might create NEW orphans.
+		// A simple way is to call this function recursively if any removal happened.
+		handleOrphanCleanup(cfg)
+	}
+}
+
+// resolveBinaryDependencies recursively finds missing dependencies for a package.
+// It populates 'plan' with the names of packages that need to be installed, in topological order.
+// 'visited' tracks packages processed in this specific resolution pass to prevent cycles.
+func resolveBinaryDependencies(pkgName string, visited map[string]bool, plan *[]string) error {
+	// 1. Cycle detection
+	if visited[pkgName] {
+		return nil
+	}
+	visited[pkgName] = true
+
+	// 2. Check if already installed
+	// If the package is already installed, we don't need to do anything for it
+	// or its dependencies (assuming installed packages are consistent).
+	if checkPackageExactMatch(pkgName) {
+		return nil
+	}
+
+	// 3. Find source directory to read 'depends' file
+	// We rely on the source repo metadata to know what the binary dependencies are.
+	pkgDir, err := findPackageDir(pkgName)
+	if err != nil {
+		// If we can't find the source, we can't resolve dependencies.
+		// However, for 'install', maybe the user just has a binary and no source.
+		// In that case, we can't auto-resolve. We return an error.
+		return fmt.Errorf("cannot resolve dependencies for %s: source not found in HOKUTO_PATH", pkgName)
+	}
+
+	// 4. Parse dependencies
+	deps, err := parseDependsFile(pkgDir)
+	if err != nil {
+		return fmt.Errorf("failed to parse depends for %s: %w", pkgName, err)
+	}
+
+	// 5. Recurse for each dependency
+	for _, dep := range deps {
+		if err := resolveBinaryDependencies(dep.Name, visited, plan); err != nil {
+			return err
+		}
+	}
+
+	// 6. Add current package to plan (Post-order traversal)
+	// This ensures dependencies are listed before the package that needs them.
+	*plan = append(*plan, pkgName)
+	return nil
+}
+
 // newPackage creates a minimal package skeleton in $newPackageDir/<pkg>.
 // - creates directory $newPackageDir/<pkg>
 // - creates build, version, sources files with the right modes and contents
@@ -1078,43 +1345,55 @@ func downloadFile(originalURL, finalURL, destFile string) error {
 	return nil
 }
 
-// prefetchSources runs in a background goroutine to download sources
-// for upcoming packages in the update list.
+// prefetchSources runs in a background goroutine to download sources.
+// It uses a semaphore to limit concurrent downloads to 10.
 func prefetchSources(pkgNames []string) {
-	// We use a semaphore to limit concurrent downloads (optional, e.g., max 3 files at once)
-	// For simplicity, we'll do them sequentially in the background thread
-	// so we don't choke the user's bandwidth while building.
+	if len(pkgNames) == 0 {
+		return
+	}
 
-	debugf("Starting background prefetch for %d packages...\n", len(pkgNames))
+	concurrencyLimit := 10
+	debugf("Starting background prefetch for %d packages (concurrency: %d)...\n", len(pkgNames), concurrencyLimit)
+
+	// Semaphore to limit concurrency
+	sem := make(chan struct{}, concurrencyLimit)
+	var wg sync.WaitGroup
 
 	for _, pkgName := range pkgNames {
-		// 1. Find the package directory (reusing logic from pkgBuild)
-		paths := strings.Split(repoPaths, ":")
-		var pkgDir string
-		found := false
-		for _, repo := range paths {
-			tryPath := filepath.Join(repo, pkgName)
-			if info, err := os.Stat(tryPath); err == nil && info.IsDir() {
-				pkgDir = tryPath
-				found = true
-				break
+		// Acquire a slot in the semaphore (blocks if 10 are already running)
+		sem <- struct{}{}
+		wg.Add(1)
+
+		go func(name string) {
+			defer wg.Done()
+			defer func() { <-sem }() // Release the slot when done
+
+			// Logic to find package directory
+			paths := strings.Split(repoPaths, ":")
+			var pkgDir string
+			found := false
+			for _, repo := range paths {
+				tryPath := filepath.Join(repo, name)
+				if info, err := os.Stat(tryPath); err == nil && info.IsDir() {
+					pkgDir = tryPath
+					found = true
+					break
+				}
 			}
-		}
 
-		if !found {
-			// Skip if not found, the main thread will error out appropriately later
-			continue
-		}
-
-		// 2. Call fetchSources
-		// We pass 'true' for processGit, or 'false' depending on your preference.
-		// Usually updates might need git pulls.
-		// Note: fetchSources prints output. In the background, this might interleave
-		// with build logs.
-		if err := fetchSources(pkgName, pkgDir, true); err != nil {
-			debugf("Background prefetch failed for %s: %v\n", pkgName, err)
-		}
+			if found {
+				// We use 'true' for processGit.
+				// Since we have file locking in downloadFile, this is thread-safe for files.
+				if err := fetchSources(name, pkgDir, true); err != nil {
+					// Log debug only, main thread will handle critical failures later
+					debugf("Background prefetch failed for %s: %v\n", name, err)
+				}
+			}
+		}(pkgName)
 	}
+
+	// Wait for all downloads to finish (optional, but good for cleanup)
+	wg.Wait()
 	debugf("Background prefetch completed.\n")
 }
 
@@ -1267,12 +1546,21 @@ func fetchSources(pkgName, pkgDir string, processGit bool) error {
 		}
 
 		linkPath = filepath.Join(pkgLinkDir, origFilename)
-		if _, err := os.Lstat(linkPath); err == nil {
-			os.Remove(linkPath)
+
+		// Use atomic symlink creation (Create Temp -> Rename) to prevent "file exists" race conditions
+		// if the background prefetcher and main thread overlap.
+		tmpLinkPath := fmt.Sprintf("%s.tmp.%d", linkPath, time.Now().UnixNano())
+
+		if err := os.Symlink(cachePath, tmpLinkPath); err != nil {
+			return fmt.Errorf("failed to create temp symlink: %v", err)
 		}
-		if err := os.Symlink(cachePath, linkPath); err != nil {
+
+		// Atomic replace: if linkPath exists (from another thread), this simply overwrites it safely.
+		if err := os.Rename(tmpLinkPath, linkPath); err != nil {
+			os.Remove(tmpLinkPath) // Cleanup on failure
 			return fmt.Errorf("failed to symlink %s -> %s: %v", cachePath, linkPath, err)
 		}
+
 		debugf("Linked %s -> %s\n", linkPath, cachePath)
 	}
 
@@ -4036,10 +4324,12 @@ func checkForUpgrades(_ context.Context, cfg *Config) error {
 		return nil
 	}
 
-	// Launch background prefetcher for all packages in the list
-	// This will start downloading sources for the 2nd, 3rd... package
-	// while the 1st one is building.
-	go prefetchSources(pkgNames)
+	// Launch background prefetcher for SUBSEQUENT packages.
+	// We skip the first one (pkgNames[0]) because the main thread builds it immediately,
+	// so prefetching it creates unnecessary race conditions/double logs.
+	if len(pkgNames) > 1 {
+		go prefetchSources(pkgNames[1:])
+	}
 
 	// --- REFACTORED BUILD AND INSTALL LOGIC ---
 	var failedPackages []string
@@ -6854,7 +7144,7 @@ func pkgUninstall(pkgName string, cfg *Config, execCtx *Executor, force, yes boo
 				if err := execCtx.Run(rmCmd); err != nil {
 					failed = append(failed, fmt.Sprintf("%s: %v", file, err))
 				} else {
-					fmt.Printf("Removed %s\n", file)
+					debugf("Removed %s\n", file)
 				}
 			}
 		} else {
@@ -7111,6 +7401,10 @@ func handleBuildCommand(args []string, cfg *Config) {
 		colArrow.Print("-> ")
 		colSuccess.Printf("Build order: %s\n", strings.Join(fullBuildList, " -> "))
 
+		if len(fullBuildList) > 1 {
+			go prefetchSources(fullBuildList[1:])
+		}
+
 		// Execute the simple, sequential build
 
 		totalBuildCount := len(fullBuildList)
@@ -7143,6 +7437,11 @@ func handleBuildCommand(args []string, cfg *Config) {
 				isCriticalAtomic.Store(0)
 				failedBuilds[pkgName] = fmt.Errorf("post-build installation failed: %w", installErr)
 				break // Fatal error
+			}
+			// Add to world file
+			// Only add if user specifically asked for this package
+			if userRequestedMap[pkgName] {
+				addToWorld(pkgName)
 			}
 			isCriticalAtomic.Store(0)
 		}
@@ -7273,6 +7572,10 @@ func handleBuildCommand(args []string, cfg *Config) {
 			colArrow.Print("-> ")
 			colSuccess.Printf("Build Order:")
 			colNote.Printf(" %s\n", strings.Join(initialPlan.Order, " -> "))
+			if len(initialPlan.Order) > 1 {
+				// Prefetch the plan list, skipping the first one which starts immediately
+				go prefetchSources(initialPlan.Order[1:])
+			}
 			if len(initialPlan.PostRebuilds) > 0 {
 				var rebuilds []string
 				for parent, deps := range initialPlan.PostRebuilds {
@@ -7305,6 +7608,11 @@ func handleBuildCommand(args []string, cfg *Config) {
 						if err := pkgInstall(tarballPath, finalPkg, cfg, RootExec, false); err != nil {
 							isCriticalAtomic.Store(0)
 							failedBuilds[finalPkg] = fmt.Errorf("final installation failed: %w", err)
+						} else {
+							// Add package to world file
+							if userRequestedMap[finalPkg] {
+								addToWorld(finalPkg)
+							}
 						}
 						isCriticalAtomic.Store(0)
 					}
@@ -7335,8 +7643,7 @@ BuildSummary:
 	os.Exit(1)
 }
 
-// executeBuildPass is a new helper required by the refactoring above.
-// Add this function to your main.go file.
+// Helper for HandleBuildCommand to execute a single build pass based on the provided BuildPlan.
 func executeBuildPass(plan *BuildPlan, passName string, installAllTargets bool, cfg *Config, bootstrap *bool, userRequestedMap map[string]bool) (map[string]error, []string, time.Duration) {
 
 	toBuild := plan.Order
@@ -7381,19 +7688,38 @@ func executeBuildPass(plan *BuildPlan, passName string, installAllTargets bool, 
 			} else {
 				progressThisPass = true
 				totalElapsedTime += duration // Accumulate the time from the successful build
-				// We need to know if there are other packages waiting in this pass.
-				// We can find the index of the current package in the original `toBuild` slice.
-				currentIndex := -1
-				for i, pkg := range toBuild {
-					if pkg == pkgName {
-						currentIndex = i
-						break
+
+				// Check if this package is required by any SUBSEQUENT package in the current build pass.
+				// This ensures we only auto-install user-requested packages if absolutely necessary for the build chain.
+				isDependencyForThisPass := false
+
+				// Only check look-ahead if it's a user requested package.
+				// Implicit dependencies (!userRequestedMap) are auto-installed by default logic below.
+				if userRequestedMap[pkgName] {
+					// Look ahead in the remaining list for packages that depend on this one
+					for k := i + 1; k < len(toBuild); k++ {
+						futurePkg := toBuild[k]
+
+						// Check dependencies of futurePkg
+						fDir, err := findPackageDir(futurePkg)
+						if err == nil {
+							fDeps, err := parseDependsFile(fDir)
+							if err == nil {
+								for _, d := range fDeps {
+									if d.Name == pkgName {
+										isDependencyForThisPass = true
+										break
+									}
+								}
+							}
+						}
+						if isDependencyForThisPass {
+							break
+						}
 					}
 				}
-				// If there are packages after this one, it's a potential dependency.
-				isDependencyForThisPass := (currentIndex != -1 && currentIndex < len(toBuild)-1)
 
-				// --- NEW: Check if this package triggers any post-build rebuilds ---
+				// Check if this package triggers any post-build rebuilds ---
 				triggersRebuilds := len(plan.PostBuildRebuilds[pkgName]) > 0
 
 				// We install immediately IF:
@@ -7415,6 +7741,12 @@ func executeBuildPass(plan *BuildPlan, passName string, installAllTargets bool, 
 						failed[pkgName] = fmt.Errorf("post-build installation failed: %w", installErr)
 						// We must 'continue' here to stop processing this package's post-build actions.
 						continue
+					}
+					// Add to World file
+					// Only add if this was an explicit user target,
+					// NOT if it was just installed because it's a dependency (shouldInstallNow check logic)
+					if userRequestedMap[pkgName] {
+						addToWorld(pkgName)
 					}
 					isCriticalAtomic.Store(0)
 				} else {
@@ -8017,6 +8349,8 @@ func getPackageDependenciesToUninstall(name string) []string {
 		return []string{name}
 	case "btrfs-progs":
 		return []string{name}
+	case "arandr":
+		return []string{name}
 	default:
 		if strings.HasPrefix(name, "python-") || strings.HasPrefix(name, "cython-") {
 			return []string{name}
@@ -8478,6 +8812,65 @@ func main() {
 		}
 
 		effectiveYes := *yes || *yesLong
+
+		// We build a list of ALL packages to install (explicit + dependencies).
+
+		var installPlan []string
+		visited := make(map[string]bool)
+
+		// Map to track which packages were explicitly requested by the user
+		// so we only add those to the World file later.
+		userRequestedMap := make(map[string]bool)
+
+		for _, arg := range packagesToInstall {
+			// If argument is a tarball file (ends in .tar.zst), we just add it to the plan directly.
+			// We cannot auto-resolve dependencies for a raw file path easily.
+			if strings.HasSuffix(arg, ".tar.zst") {
+				installPlan = append(installPlan, arg)
+				// We attempt to guess the package name for World file tracking
+				base := filepath.Base(arg)
+				nameWithoutExt := strings.TrimSuffix(base, ".tar.zst")
+				lastDash := strings.LastIndex(nameWithoutExt, "-")
+				if lastDash != -1 {
+					pkgName := nameWithoutExt[:lastDash]
+					userRequestedMap[pkgName] = true
+				}
+				continue
+			}
+
+			// If argument is a package name
+			pkgName := arg
+			userRequestedMap[pkgName] = true
+
+			// Recursively find missing dependencies
+			if err := resolveBinaryDependencies(pkgName, visited, &installPlan); err != nil {
+				fmt.Fprintf(os.Stderr, "Error resolving dependencies for %s: %v\n", pkgName, err)
+				os.Exit(1)
+			}
+		}
+
+		if len(installPlan) == 0 {
+			colArrow.Print("-> ")
+			colSuccess.Println("All packages and dependencies are already installed.")
+			os.Exit(0)
+		}
+
+		// Notify user if extra dependencies were pulled in
+		if len(installPlan) > len(packagesToInstall) {
+			var extraDeps []string
+			for _, pkg := range installPlan {
+				// Only add if it wasn't explicitly asked for by the user
+				if !userRequestedMap[pkg] {
+					extraDeps = append(extraDeps, pkg)
+				}
+			}
+
+			if len(extraDeps) > 0 {
+				colArrow.Print("-> ")
+				colWarn.Printf("The following extra dependencies will be installed: %v\n", extraDeps)
+			}
+		}
+
 		// Set to CRITICAL (1) for the entire installation process
 		isCriticalAtomic.Store(1)
 		// Ensure it is reset when the install function returns/panics
@@ -8485,14 +8878,12 @@ func main() {
 
 		allSucceeded := true
 
-		// Loop through all provided arguments (tarballs or package names)
-		for _, arg := range packagesToInstall {
+		// Iterate through the calculated plan
+		for _, arg := range installPlan {
 			var tarballPath, pkgName string
 
-			debugf("Processing argument: %s\n", arg)
-
 			if strings.HasSuffix(arg, ".tar.zst") {
-				// Direct tarball path
+				// Case A: Direct Tarball
 				tarballPath = arg
 				base := filepath.Base(tarballPath)
 				nameWithoutExt := strings.TrimSuffix(base, ".tar.zst")
@@ -8508,9 +8899,8 @@ func main() {
 					allSucceeded = false
 					continue
 				}
-
 			} else {
-				// Package name
+				// Case B: Package Name (Auto-resolved or requested)
 				pkgName = arg
 				version, err := getRepoVersion(pkgName)
 				if err != nil {
@@ -8519,14 +8909,19 @@ func main() {
 					continue
 				}
 				tarballPath = filepath.Join(BinDir, fmt.Sprintf("%s-%s.tar.zst", pkgName, version))
+
+				// Verify binary exists in cache
 				if _, err := os.Stat(tarballPath); err != nil {
-					cPrintf(colWarn, "Error: Package tarball not found for %s at %s.\n", pkgName, tarballPath)
+					// Fallback: If not in cache, maybe we can fetch the source?
+					// But this is 'install', not 'build'. We should error out.
+					cPrintf(colWarn, "Error: Binary package not found for %s.\n", pkgName)
+					cPrintf(colInfo, "Expected path: %s\n", tarballPath)
+					cPrintf(colInfo, "Tip: Run 'hokuto build %s' to create the binary.\n", pkgName)
 					allSucceeded = false
 					continue
 				}
 			}
 
-			// --- ** USE THE NEW HELPER FUNCTION HERE ** ---
 			handlePreInstallUninstall(pkgName, cfg, RootExec)
 
 			colArrow.Print("-> ")
@@ -8537,6 +8932,15 @@ func main() {
 				allSucceeded = false
 				continue
 			}
+
+			// --- Add to World File ---
+			// Only if the user explicitly requested this package (not auto-deps)
+			if userRequestedMap[pkgName] {
+				if err := addToWorld(pkgName); err != nil {
+					fmt.Fprintf(os.Stderr, "Warning: failed to add %s to world file: %v\n", pkgName, err)
+				}
+			}
+
 			colArrow.Print("-> ")
 			colSuccess.Printf("Package %s installed successfully.\n", pkgName)
 		}
@@ -8595,6 +8999,8 @@ func main() {
 			} else {
 				colArrow.Print("-> ")
 				colSuccess.Printf("Package %s removed\n", pkgName)
+				// Remove from world file
+				removeFromWorld(pkgName)
 			}
 		}
 
@@ -8602,6 +9008,8 @@ func main() {
 			// Exit with an error code if any package failed to uninstall
 			os.Exit(1)
 		}
+		// Orphan Packages Cleanup
+		handleOrphanCleanup(cfg)
 
 	case "update", "u":
 		// --- FIX: Use a proper FlagSet to parse arguments and set buildPriority ---
