@@ -65,6 +65,7 @@ var (
 	gnuMirrorURL         string
 	gnuOriginalURL       = "https://ftp.gnu.org/gnu"
 	gnuMirrorMessageOnce sync.Once
+	BinaryMirror         string
 	errPackageNotFound   = errors.New("package not found")
 	// Global executors (declared, to be assigned in main)
 	UserExec *Executor
@@ -231,11 +232,16 @@ func initConfig(cfg *Config) {
 		debugf("=> Using GNU mirror from config: %s\n", gnuMirrorURL)
 	}
 
-	// --- NEW: Set a default mirror if none was provided by the user ---
+	// Set a default mirror if none was provided by the user
 	if gnuMirrorURL == "" {
 		// mirrors.kernel.org is a reliable and globally distributed mirror, making it an excellent default.
 		gnuMirrorURL = "https://mirrors.kernel.org/gnu"
 		debugf("=> No GNU mirror configured, using default: %s\n", gnuMirrorURL)
+	}
+
+	if mirror, exists := cfg.Values["HOKUTO_MIRROR"]; exists && mirror != "" {
+		BinaryMirror = strings.TrimRight(mirror, "/")
+		debugf("=> Using Binary Mirror: %s\n", BinaryMirror)
 	}
 
 	SourcesDir = CacheDir + "/sources"
@@ -1217,14 +1223,24 @@ func downloadFile(originalURL, finalURL, destFile string) error {
 		})
 	}
 
-	// 1. Ensure the cache directory exists
-	if err := os.MkdirAll(CacheStore, 0o755); err != nil {
-		return fmt.Errorf("failed to create cache directory %s: %w", CacheStore, err)
+	// Determine absolute path.
+	// If destFile is absolute, use it directly (for binaries).
+	// If relative, join with CacheStore (for sources).
+	var absPath string
+	if filepath.IsAbs(destFile) {
+		absPath = destFile
+	} else {
+		// Legacy behavior for fetchSources
+		if err := os.MkdirAll(CacheStore, 0o755); err != nil {
+			return fmt.Errorf("failed to create cache directory %s: %w", CacheStore, err)
+		}
+		absPath = filepath.Join(CacheStore, filepath.Base(destFile))
 	}
 
-	// 2. Prepare the destination path
-	destFile = filepath.Base(destFile) // Ensure we only have the filename
-	absPath := filepath.Join(CacheStore, destFile)
+	// Ensure parent directory exists (critical for BinDir downloads)
+	if err := os.MkdirAll(filepath.Dir(absPath), 0o755); err != nil {
+		return fmt.Errorf("failed to create parent directory for %s: %w", absPath, err)
+	}
 	lockPath := absPath + ".lock"
 
 	// Create/Open a lock file to prevent race conditions between background prefetcher and main builder
@@ -1342,6 +1358,28 @@ func downloadFile(originalURL, finalURL, destFile string) error {
 	}
 
 	debugf("Download successful with native Go HTTP client.")
+	return nil
+}
+
+// fetchBinaryPackage attempts to download a binary package from the configured mirror.
+func fetchBinaryPackage(pkgName, version string) error {
+	if BinaryMirror == "" {
+		return fmt.Errorf("no HOKUTO_MIRROR configured")
+	}
+
+	filename := fmt.Sprintf("%s-%s.tar.zst", pkgName, version)
+	url := fmt.Sprintf("%s/%s", BinaryMirror, filename)
+	destPath := filepath.Join(BinDir, filename)
+
+	colArrow.Print("-> ")
+	colSuccess.Printf("Fetching binary from mirror: %s\n", filename)
+
+	// We use 'true' for showProgress to give feedback during download
+	if err := downloadFile(url, url, destPath); err != nil {
+		// Clean up partial file on failure to prevent corrupt cache
+		os.Remove(destPath)
+		return err
+	}
 	return nil
 }
 
@@ -5076,6 +5114,8 @@ func PostInstallTasks(e *Executor) error {
 		// These are ordered roughly from fastest to slowest
 		// to get quick wins out of the way first.
 		{"systemctl", []string{"daemon-reload"}},
+		{"systemd-sysusers", nil},
+		{"systemd-tmpfiles", []string{"--create"}},
 		{"ldconfig", nil},
 		{"glib-compile-schemas", []string{"/usr/share/glib-2.0/schemas"}},
 		{"gdk-pixbuf-query-loaders", []string{"--update-cache"}},
@@ -8910,15 +8950,30 @@ func main() {
 				}
 				tarballPath = filepath.Join(BinDir, fmt.Sprintf("%s-%s.tar.zst", pkgName, version))
 
-				// Verify binary exists in cache
+				// 1. Check Local Cache
 				if _, err := os.Stat(tarballPath); err != nil {
-					// Fallback: If not in cache, maybe we can fetch the source?
-					// But this is 'install', not 'build'. We should error out.
-					cPrintf(colWarn, "Error: Binary package not found for %s.\n", pkgName)
-					cPrintf(colInfo, "Expected path: %s\n", tarballPath)
-					cPrintf(colInfo, "Tip: Run 'hokuto build %s' to create the binary.\n", pkgName)
-					allSucceeded = false
-					continue
+					foundOnMirror := false
+
+					// 2. Not in local cache? Try Mirror.
+					if BinaryMirror != "" {
+						if err := fetchBinaryPackage(pkgName, version); err == nil {
+							foundOnMirror = true
+						} else {
+							debugf("Mirror fetch failed for %s: %v\n", pkgName, err)
+						}
+					}
+
+					// 3. If still not found, error out.
+					if !foundOnMirror {
+						cPrintf(colWarn, "Error: Binary package not found for %s.\n", pkgName)
+						cPrintf(colInfo, "Expected path: %s\n", tarballPath)
+						if BinaryMirror != "" {
+							cPrintf(colInfo, "Mirror check failed or file missing on server.\n")
+						}
+						cPrintf(colInfo, "Tip: Run 'hokuto build %s' to create the binary.\n", pkgName)
+						allSucceeded = false
+						continue
+					}
 				}
 			}
 
