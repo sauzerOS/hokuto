@@ -40,10 +40,11 @@ import (
 	"lukechampine.com/blake3"
 )
 
-// --- NEW GLOBAL STATE ---
+// GLOBAL STATE
 // We use a value of 1 for critical and 0 for non-critical/default.
 var isCriticalAtomic atomic.Int32
 
+// Global variables
 var (
 	rootDir              string
 	CacheDir             string
@@ -75,6 +76,7 @@ var (
 	//go:embed assets/ca-bundle.crt
 	embeddedAssets embed.FS
 	WorldFile      = "/var/db/hokuto/world"
+	WorldMakeFile  = "/var/db/hokuto/world_make"
 )
 
 // color helpers
@@ -887,6 +889,146 @@ func removeFromWorld(pkgName string) error {
 	return nil
 }
 
+// addToWorldMake adds a package to the world_make file.
+func addToWorldMake(pkgName string) error {
+	// 1. Check if already in world_make
+	content, err := os.ReadFile(WorldMakeFile)
+	if err == nil {
+		lines := strings.Split(string(content), "\n")
+		for _, line := range lines {
+			if strings.TrimSpace(line) == pkgName {
+				return nil
+			}
+		}
+	}
+
+	// 2. Append
+	f, err := os.OpenFile(WorldMakeFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		if os.IsPermission(err) {
+			cmd := exec.Command("sh", "-c", fmt.Sprintf("echo '%s' >> %s", pkgName, WorldMakeFile))
+			return RootExec.Run(cmd)
+		}
+		return err
+	}
+	defer f.Close()
+
+	if _, err := f.WriteString(pkgName + "\n"); err != nil {
+		return err
+	}
+	return nil
+}
+
+// removeFromWorldMake removes a package from the world_make file.
+func removeFromWorldMake(pkgName string) error {
+	content, err := os.ReadFile(WorldMakeFile)
+	if err != nil {
+		return nil
+	}
+
+	lines := strings.Split(string(content), "\n")
+	var newLines []string
+	changed := false
+
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == pkgName {
+			changed = true
+			continue
+		}
+		if trimmed != "" {
+			newLines = append(newLines, trimmed)
+		}
+	}
+
+	if !changed {
+		return nil
+	}
+
+	newContent := strings.Join(newLines, "\n") + "\n"
+
+	if err := os.WriteFile(WorldMakeFile, []byte(newContent), 0644); err != nil {
+		if os.IsPermission(err) {
+			tmpFile, _ := os.CreateTemp("", "worldmake-tmp")
+			tmpFile.WriteString(newContent)
+			tmpFile.Close()
+			defer os.Remove(tmpFile.Name())
+			cmd := exec.Command("cp", tmpFile.Name(), WorldMakeFile)
+			return RootExec.Run(cmd)
+		}
+		return err
+	}
+	return nil
+}
+
+// findMakeOrphans identifies build-only dependencies that are no longer needed.
+func findMakeOrphans() ([]string, error) {
+	// 1. Read World Make (Candidates)
+	makeData, err := os.ReadFile(WorldMakeFile)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	candidates := make(map[string]bool)
+	for _, line := range strings.Split(string(makeData), "\n") {
+		t := strings.TrimSpace(line)
+		if t != "" {
+			candidates[t] = true
+		}
+	}
+
+	if len(candidates) == 0 {
+		return nil, nil
+	}
+
+	// 2. Read World (Explicitly wanted packages)
+	worldData, _ := os.ReadFile(WorldFile)
+	for _, line := range strings.Split(string(worldData), "\n") {
+		t := strings.TrimSpace(line)
+		// If user explicitly installed it later, remove from candidates
+		if candidates[t] {
+			delete(candidates, t)
+		}
+	}
+
+	// 3. Build set of ALL current runtime requirements
+	// Scan every installed package, read its depends, add to required set.
+	requiredRuntime := make(map[string]bool)
+
+	entries, err := os.ReadDir(Installed)
+	if err == nil {
+		for _, e := range entries {
+			if !e.IsDir() {
+				continue
+			}
+			pkg := e.Name()
+
+			// Get runtime deps (this excludes 'make' deps automatically via parseDepends logic)
+			deps, err := getInstalledDeps(pkg)
+			if err != nil {
+				continue
+			}
+
+			for _, dep := range deps {
+				requiredRuntime[dep] = true
+			}
+		}
+	}
+
+	// 4. Filter Candidates
+	var orphans []string
+	for pkg := range candidates {
+		// If it's not required for runtime, and it's installed, it's a make orphan
+		if !requiredRuntime[pkg] && checkPackageExactMatch(pkg) {
+			orphans = append(orphans, pkg)
+		}
+	}
+
+	return orphans, nil
+}
+
 // getInstalledDeps returns the list of dependencies for an *installed* package
 // by reading the /var/db/hokuto/installed/<pkg>/depends file.
 func getInstalledDeps(pkgName string) ([]string, error) {
@@ -907,7 +1049,7 @@ func getInstalledDeps(pkgName string) ([]string, error) {
 			continue
 		}
 		// Parse "pkgname>=1.0" -> "pkgname"
-		name, _, _, _, _ := parseDepToken(line)
+		name, _, _, _, _, _ := parseDepToken(line)
 		if name != "" && name != pkgName {
 			deps = append(deps, name)
 		}
@@ -984,43 +1126,76 @@ func findOrphans() ([]string, error) {
 	return orphans, nil
 }
 
-// handleOrphanCleanup prompts the user to remove orphans.
+// handleOrphanCleanup finds orphans and prompts the user to remove them individually.
 func handleOrphanCleanup(cfg *Config) {
+	// --- STAGE 1: Normal Orphans (Runtime) ---
+	colArrow.Print("-> ")
+	colSuccess.Println("Checking for runtime orphan packages")
+
 	orphans, err := findOrphans()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: failed to calculate orphans: %v\n", err)
-		return
 	}
 
-	if len(orphans) == 0 {
-		return
-	}
+	if len(orphans) > 0 {
+		sort.Strings(orphans)
+		colArrow.Print("-> ")
+		colWarn.Printf("Found %d runtime orphan package(s).\n", len(orphans))
 
-	sort.Strings(orphans)
-	colArrow.Print("\n-> ")
-	colWarn.Printf("Orphan packages found (%d): %s\n", len(orphans), strings.Join(orphans, ", "))
-
-	if askForConfirmation(colWarn, "Do you want to remove these orphans?") {
-		// We set force=true (skip dep checks because we know they are orphans)
-		// We set yes=false (ask confirmation per package or let user verify removal)
-		// Or strictly, usually recursive removal assumes yes. Let's ask once.
-
-		// Use batch removal logic
 		for _, pkg := range orphans {
-			// Using force=true to bypass reverse-dep check (since we calculated they are orphans)
-			// Using yes=true because user already confirmed the batch
-			if err := pkgUninstall(pkg, cfg, RootExec, true, true); err != nil {
-				color.Danger.Printf("Failed to remove orphan %s: %v\n", pkg, err)
-			} else {
+			if askForConfirmation(colWarn, "Remove runtime orphan %s?", pkg) {
 				colArrow.Print("-> ")
-				colSuccess.Printf("Removed orphan: ")
+				colSuccess.Printf("Removing: ")
 				colNote.Printf("%s\n", pkg)
+				if err := pkgUninstall(pkg, cfg, RootExec, true, true); err != nil {
+					color.Danger.Printf("Failed to remove %s: %v\n", pkg, err)
+				} else {
+					removeFromWorld(pkg)
+					removeFromWorldMake(pkg) // Remove from make world too if present
+				}
+			} else {
+				cPrintf(colInfo, "Skipped %s\n", pkg)
 			}
 		}
+	} else {
+		colArrow.Print("-> ")
+		colSuccess.Println("No runtime orphans found.")
+	}
 
-		// Recursive check? Removing orphans might create NEW orphans.
-		// A simple way is to call this function recursively if any removal happened.
-		handleOrphanCleanup(cfg)
+	// --- STAGE 2: Make Orphans (Build Dependencies) ---
+	colArrow.Print("\n-> ")
+	colSuccess.Println("Checking for unneeded build dependencies")
+
+	makeOrphans, err := findMakeOrphans()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: failed to calculate make orphans: %v\n", err)
+		return
+	}
+
+	if len(makeOrphans) > 0 {
+		sort.Strings(makeOrphans)
+		colArrow.Print("-> ")
+		colWarn.Printf("Found %d unneeded build dependency package(s).\n", len(makeOrphans))
+
+		for _, pkg := range makeOrphans {
+			if askForConfirmation(colWarn, "Remove build dependency %s?", pkg) {
+				colArrow.Print("-> ")
+				colSuccess.Printf("Removing: ")
+				colNote.Printf("%s\n", pkg)
+				if err := pkgUninstall(pkg, cfg, RootExec, true, true); err != nil {
+					color.Danger.Printf("Failed to remove %s: %v\n", pkg, err)
+				} else {
+					removeFromWorldMake(pkg)
+					// Also try to remove from world just in case of state desync
+					removeFromWorld(pkg)
+				}
+			} else {
+				cPrintf(colInfo, "Skipped %s\n", pkg)
+			}
+		}
+	} else {
+		colArrow.Print("-> ")
+		colSuccess.Println("No unneeded build dependencies found.")
 	}
 }
 
@@ -1059,6 +1234,11 @@ func resolveBinaryDependencies(pkgName string, visited map[string]bool, plan *[]
 
 	// 5. Recurse for each dependency
 	for _, dep := range deps {
+		// Skip build-time only dependencies
+		if dep.Make {
+			continue
+		}
+
 		if err := resolveBinaryDependencies(dep.Name, visited, plan); err != nil {
 			return err
 		}
@@ -2327,8 +2507,12 @@ func generateDepends(pkgName, pkgDir, outputDir, rootDir string, execCtx *Execut
 			line = strings.TrimSpace(line)
 			if line != "" && !strings.HasPrefix(line, "#") {
 				// Extract package name to use as key in the map
-				name, _, _, _, _ := parseDepToken(line)
+				name, _, _, _, _, makeDep := parseDepToken(line)
 				if name != "" {
+					// Skip build-time only dependencies
+					if makeDep {
+						continue
+					}
 					// Store the full line to preserve version constraints
 					repoDepLines[name] = line
 				}
@@ -4222,7 +4406,7 @@ func checkDependencyBlocks(pkgName string, newVersion string, installedPackages 
 			}
 
 			// Parse dependency spec (e.g., "python-sabctools==8.2.6")
-			name, op, ver, _, _ := parseDepToken(line)
+			name, op, ver, _, _, _ := parseDepToken(line)
 			if name != pkgName {
 				continue
 			}
@@ -4531,6 +4715,7 @@ type DepSpec struct {
 	Version  string
 	Optional bool
 	Rebuild  bool
+	Make     bool // True if dependency is only needed at build time
 }
 
 // parseDependsFile reads the package's depends file and returns a list of dependency specs.
@@ -4554,7 +4739,7 @@ func parseDependsFile(pkgDir string) ([]DepSpec, error) {
 		}
 
 		// Correctly capture all return values from the updated token parser.
-		name, op, ver, optional, rebuild := parseDepToken(line)
+		name, op, ver, optional, rebuild, makeDep := parseDepToken(line)
 		if name != "" {
 			dependencies = append(dependencies, DepSpec{
 				Name:     name,
@@ -4562,6 +4747,7 @@ func parseDependsFile(pkgDir string) ([]DepSpec, error) {
 				Version:  ver,
 				Optional: optional, // Correctly assign the 'optional' flag.
 				Rebuild:  rebuild,
+				Make:     makeDep,
 			})
 		}
 	}
@@ -4570,15 +4756,15 @@ func parseDependsFile(pkgDir string) ([]DepSpec, error) {
 }
 
 // parseDepToken parses tokens like "pkg", "pkg<=1.2.3 optional", "pkg rebuild" and returns name, op, version, and flags.
-func parseDepToken(token string) (string, string, string, bool, bool) {
+func parseDepToken(token string) (string, string, string, bool, bool, bool) {
 	// Split by whitespace to separate package spec from flags
 	parts := strings.Fields(token)
 	if len(parts) == 0 {
-		return "", "", "", false, false
+		return "", "", "", false, false, false
 	}
 
 	pkgSpec := parts[0]
-	var optional, rebuild bool
+	var optional, rebuild, makeDep bool
 
 	// Check for flags in remaining parts
 	for i := 1; i < len(parts); i++ {
@@ -4587,6 +4773,8 @@ func parseDepToken(token string) (string, string, string, bool, bool) {
 			optional = true
 		case "rebuild":
 			rebuild = true
+		case "make":
+			makeDep = true
 		}
 	}
 
@@ -4596,10 +4784,10 @@ func parseDepToken(token string) (string, string, string, bool, bool) {
 		if idx := strings.Index(pkgSpec, op); idx != -1 {
 			name := pkgSpec[:idx]
 			ver := pkgSpec[idx+len(op):]
-			return strings.TrimSpace(name), op, strings.TrimSpace(ver), optional, rebuild
+			return strings.TrimSpace(name), op, strings.TrimSpace(ver), optional, rebuild, makeDep
 		}
 	}
-	return pkgSpec, "", "", optional, rebuild
+	return pkgSpec, "", "", optional, rebuild, makeDep
 }
 
 // BuildPlan represents the complete build plan with proper ordering
@@ -7788,6 +7976,37 @@ func executeBuildPass(plan *BuildPlan, passName string, installAllTargets bool, 
 					if userRequestedMap[pkgName] {
 						addToWorld(pkgName)
 					}
+
+					// Check if it's a Make Dependency
+					// If the user did NOT request it explicitly, check if it was pulled in
+					// as a 'make' dependency by any other package in the toBuild list.
+					if !userRequestedMap[pkgName] {
+						isMakeDep := false
+						// Scan all packages in the plan (including those already built or waiting)
+						// to see if any of them list 'pkgName' as a 'make' dependency.
+						for _, otherPkg := range plan.Order {
+							pDir, err := findPackageDir(otherPkg)
+							if err == nil {
+								deps, err := parseDependsFile(pDir)
+								if err == nil {
+									for _, d := range deps {
+										if d.Name == pkgName && d.Make {
+											isMakeDep = true
+											break
+										}
+									}
+								}
+							}
+							if isMakeDep {
+								break
+							}
+						}
+
+						if isMakeDep {
+							addToWorldMake(pkgName)
+						}
+					}
+
 					isCriticalAtomic.Store(0)
 				} else {
 					// This is a standalone user target. Defer installation until the end.
@@ -8435,18 +8654,19 @@ func handlePreInstallUninstall(pkgName string, cfg *Config, execCtx *Executor) {
 }
 
 // handleCleanupCommand handles the 'cleanup' subcommand
-func handleCleanupCommand(args []string) error {
+func handleCleanupCommand(args []string, cfg *Config) error {
 	cleanupCmd := flag.NewFlagSet("cleanup", flag.ExitOnError)
 	cleanSources := cleanupCmd.Bool("sources", false, "Remove all cached source files.")
 	cleanBins := cleanupCmd.Bool("bins", false, "Remove all built binary packages.")
-	cleanAll := cleanupCmd.Bool("all", false, "Remove both sources and binaries.")
+	cleanOrphans := cleanupCmd.Bool("orphans", false, "Check and remove orphaned packages.")
+	cleanAll := cleanupCmd.Bool("all", false, "sources, binaries and orphans.")
 
 	if err := cleanupCmd.Parse(args); err != nil {
 		return err // Should not happen with flag.ExitOnError
 	}
 
 	// If no flags are provided, show help and exit
-	if !*cleanSources && !*cleanBins && !*cleanAll {
+	if !*cleanSources && !*cleanBins && !*cleanAll && !*cleanOrphans {
 		fmt.Println("Usage: hokuto cleanup [flag]")
 		fmt.Println("You must specify what to clean up. Use one of the following flags:")
 		cleanupCmd.PrintDefaults()
@@ -8457,6 +8677,7 @@ func handleCleanupCommand(args []string) error {
 	if *cleanAll {
 		*cleanSources = true
 		*cleanBins = true
+		*cleanOrphans = true
 	}
 
 	if *cleanSources {
@@ -8490,6 +8711,10 @@ func handleCleanupCommand(args []string) error {
 			colArrow.Print("-> ")
 			colSuccess.Println("Cleanup of binary cache canceled.")
 		}
+	}
+
+	if *cleanOrphans {
+		handleOrphanCleanup(cfg)
 	}
 
 	return nil
@@ -8540,7 +8765,7 @@ func printHelp() {
 		{"edit, e", "<pkg>", "Edit a package's build files. -a (edit all files)"},
 		{"bootstrap", "<dir>", "Build a bootstrap rootfs in target directory"},
 		{"chroot", "<dir> [cmd...]", "Enter chroot and run command (default: /bin/bash)"},
-		{"cleanup", "[options]", "Clean up cache directories. -sources, -bins, -all"},
+		{"cleanup", "[options]", "Cleanup: -sources, -bins, -orphans, -all"},
 	}
 
 	// --- Dynamic Padding Logic ---
@@ -8708,10 +8933,12 @@ func main() {
 		exitCode = runChrootCommand(os.Args[2:], RootExec)
 
 	case "cleanup":
-		if err := handleCleanupCommand(os.Args[2:]); err != nil {
+		// Pass 'cfg' to the function
+		if err := handleCleanupCommand(os.Args[2:], cfg); err != nil {
 			fmt.Fprintf(os.Stderr, "Cleanup failed: %v\n", err)
 			os.Exit(1)
 		}
+
 	case "version", "--version":
 		// Print version first
 		// HOKUTOVERSION (string for search)
@@ -9063,8 +9290,6 @@ func main() {
 			// Exit with an error code if any package failed to uninstall
 			os.Exit(1)
 		}
-		// Orphan Packages Cleanup
-		handleOrphanCleanup(cfg)
 
 	case "update", "u":
 		// --- FIX: Use a proper FlagSet to parse arguments and set buildPriority ---
