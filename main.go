@@ -958,6 +958,28 @@ func downloadFile(originalURL, finalURL, destFile string) error {
 	// 2. Prepare the destination path
 	destFile = filepath.Base(destFile) // Ensure we only have the filename
 	absPath := filepath.Join(CacheStore, destFile)
+	lockPath := absPath + ".lock"
+
+	// Create/Open a lock file to prevent race conditions between background prefetcher and main builder
+	lFile, err := os.Create(lockPath)
+	if err != nil {
+		return fmt.Errorf("failed to create lock file: %w", err)
+	}
+	defer lFile.Close()
+
+	// Acquire an exclusive lock. This will block if another process/goroutine is downloading.
+	if err := unix.Flock(int(lFile.Fd()), unix.LOCK_EX); err != nil {
+		return fmt.Errorf("failed to acquire lock for download: %w", err)
+	}
+	// Ensure we release the lock when done
+	defer unix.Flock(int(lFile.Fd()), unix.LOCK_UN)
+
+	// DOUBLE CHECK: Now that we have the lock, check if the file exists again.
+	// The background worker might have finished it while we were waiting for the lock.
+	if _, err := os.Stat(absPath); err == nil {
+		debugf("File %s appeared after acquiring lock, skipping download.\n", absPath)
+		return nil
+	}
 
 	debugf("Downloading %s -> %s\n", finalURL, absPath)
 
@@ -1054,6 +1076,46 @@ func downloadFile(originalURL, finalURL, destFile string) error {
 
 	debugf("Download successful with native Go HTTP client.")
 	return nil
+}
+
+// prefetchSources runs in a background goroutine to download sources
+// for upcoming packages in the update list.
+func prefetchSources(pkgNames []string) {
+	// We use a semaphore to limit concurrent downloads (optional, e.g., max 3 files at once)
+	// For simplicity, we'll do them sequentially in the background thread
+	// so we don't choke the user's bandwidth while building.
+
+	debugf("Starting background prefetch for %d packages...\n", len(pkgNames))
+
+	for _, pkgName := range pkgNames {
+		// 1. Find the package directory (reusing logic from pkgBuild)
+		paths := strings.Split(repoPaths, ":")
+		var pkgDir string
+		found := false
+		for _, repo := range paths {
+			tryPath := filepath.Join(repo, pkgName)
+			if info, err := os.Stat(tryPath); err == nil && info.IsDir() {
+				pkgDir = tryPath
+				found = true
+				break
+			}
+		}
+
+		if !found {
+			// Skip if not found, the main thread will error out appropriately later
+			continue
+		}
+
+		// 2. Call fetchSources
+		// We pass 'true' for processGit, or 'false' depending on your preference.
+		// Usually updates might need git pulls.
+		// Note: fetchSources prints output. In the background, this might interleave
+		// with build logs.
+		if err := fetchSources(pkgName, pkgDir, true); err != nil {
+			debugf("Background prefetch failed for %s: %v\n", pkgName, err)
+		}
+	}
+	debugf("Background prefetch completed.\n")
 }
 
 // applyGnuMirror checks if a URL is a canonical GNU URL and replaces it with the
@@ -3973,6 +4035,11 @@ func checkForUpgrades(_ context.Context, cfg *Config) error {
 		cPrintln(colNote, "Upgrade canceled by user.")
 		return nil
 	}
+
+	// Launch background prefetcher for all packages in the list
+	// This will start downloading sources for the 2nd, 3rd... package
+	// while the 1st one is building.
+	go prefetchSources(pkgNames)
 
 	// --- REFACTORED BUILD AND INSTALL LOGIC ---
 	var failedPackages []string
