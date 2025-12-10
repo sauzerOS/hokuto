@@ -2648,7 +2648,23 @@ func listOutputFiles(outputDir string, execCtx *Executor) ([]string, error) {
 
 func generateManifest(outputDir, installedDir string, execCtx *Executor) error {
 	manifestFile := filepath.Join(installedDir, "manifest")
-	tmpManifest := filepath.Join(os.TempDir(), filepath.Base(manifestFile)+".tmp")
+
+	// Create a secure, unique temporary file
+	fTmp, err := os.CreateTemp("", "hokuto-manifest-*.tmp")
+	if err != nil {
+		return fmt.Errorf("failed to create temporary manifest file: %v", err)
+	}
+	tmpManifest := fTmp.Name()
+	fTmp.Close() // Close immediately, we re-open it with specific flags later
+
+	// Set permissions to 0644 so it's readable if we switch contexts (e.g. root reading user file)
+	if err := os.Chmod(tmpManifest, 0o644); err != nil {
+		os.Remove(tmpManifest)
+		return fmt.Errorf("failed to chmod temp manifest: %v", err)
+	}
+
+	// Ensure cleanup happens even if we error out early
+	defer os.Remove(tmpManifest)
 
 	mkdirCmd := exec.Command("mkdir", "-p", installedDir)
 	if err := execCtx.Run(mkdirCmd); err != nil {
@@ -2782,7 +2798,6 @@ func generateManifest(outputDir, installedDir string, execCtx *Executor) error {
 	if err := execCtx.Run(cpCmd); err != nil {
 		return fmt.Errorf("failed to copy temporary manifest into place: %v", err)
 	}
-	_ = os.Remove(tmpManifest)
 
 	debugf("Manifest written to %s (%d entries)\n", manifestFile, len(filtered))
 	return nil
@@ -3866,7 +3881,7 @@ func copyTreeWithTar(src, dst string, execCtx *Executor) error {
 // executePostInstall runs the post-install script for pkgName if present.
 // If rootDir != "/" it attempts to run the same absolute path via chroot.
 // If chroot fails the function prints a warning and returns nil.
-func executePostInstall(pkgName, rootDir string, execCtx *Executor) error {
+func executePostInstall(pkgName, rootDir string, execCtx *Executor, cfg *Config) error {
 
 	// absolute path inside the system (and inside the chroot)
 	const relScript = "/var/db/hokuto/installed"
@@ -3889,6 +3904,12 @@ func executePostInstall(pkgName, rootDir string, execCtx *Executor) error {
 	} else {
 		// run the same absolute path inside the chroot
 		cmd = exec.Command("chroot", rootDir, scriptPath)
+	}
+
+	// Inject MULTILIB environment variable
+	cmd.Env = os.Environ() // Start with system environment
+	if cfg.Values["HOKUTO_MULTILIB"] == "1" {
+		cmd.Env = append(cmd.Env, "MULTILIB=1")
 	}
 
 	// Get the user who invoked sudo (SUDO_USER) or current user
@@ -5570,14 +5591,43 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 			return 0, fmt.Errorf("bootstrap mode requires LFS to be set in config")
 		}
 
+		// --- NEW: Architecture Detection ---
+		targetArch := cfg.Values["HOKUTO_ARCH"]
+		if targetArch == "" {
+			targetArch = "x86_64" // Default
+		}
+
+		var lfsTgt, cflags string
+
+		switch targetArch {
+		case "aarch64", "arm64":
+			// Raspberry Pi 4 / ARM64 Settings
+			lfsTgt = "aarch64-lfs-linux-gnu"
+			// Cortex-A72 is the CPU in RPi4.
+			// If you want generic ARM64, use -march=armv8-a
+			cflags = "-O2 -mcpu=cortex-a72 -pipe -fPIC"
+			colArrow.Print("-> ")
+			colSuccess.Println("Configuring bootstrap for AArch64 (Raspberry Pi 4)")
+
+		case "x86_64":
+			// Standard Intel/AMD Settings
+			lfsTgt = "x86_64-lfs-linux-gnu"
+			cflags = "-O2 -march=x86-64 -mtune=generic -pipe -fPIC"
+
+		default:
+			// Fallback or user provided custom arch
+			lfsTgt = fmt.Sprintf("%s-lfs-linux-gnu", targetArch)
+			cflags = "-O2 -pipe -fPIC"
+			colWarn.Printf("Warning: Unknown architecture %s, using generic flags.\n", targetArch)
+		}
+
 		defaults = map[string]string{
 			"LFS":         lfsRoot,
 			"LC_ALL":      "POSIX",
-			"LFS_TGT":     "x86_64-lfs-linux-gnu",
+			"LFS_TGT":     lfsTgt,
 			"LFS_TGT32":   "i686-lfs-linux-gnu",
-			"LFS_TGTX32":  "x86_64-lfs-linux-gnux32",
-			"CFLAGS":      "-O2 -march=x86-64 -mtune=generic -pipe -fPIC",
-			"CXXFLAGS":    "-O2 -march=x86-64 -mtune=generic -pipe -fPIC",
+			"CFLAGS":      cflags,
+			"CXXFLAGS":    cflags,
 			"LDFLAGS":     "",
 			"PATH":        filepath.Join(lfsRoot, "tools/bin") + ":/usr/bin:/bin",
 			"MAKEFLAGS":   fmt.Sprintf("-j%d", numCores),
@@ -5647,6 +5697,11 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 			finalCXXFLAGS = defaults["CFLAGS"]
 		}
 		defaults["CXXFLAGS"] = finalCXXFLAGS
+	}
+
+	// Handle MULTILIB
+	if cfg.Values["HOKUTO_MULTILIB"] == "1" {
+		defaults["MULTILIB"] = "1"
 	}
 
 	for k, v := range defaults {
@@ -6205,6 +6260,11 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 	}
 	defaults["CXXFLAGS"] = finalCXXFLAGS // Update the map with the resolved value
 
+	// Handle MULTILIB
+	if cfg.Values["HOKUTO_MULTILIB"] == "1" {
+		defaults["MULTILIB"] = "1"
+	}
+
 	// 5. Final loop to assemble the environment array
 	for k, def := range defaults {
 		// Check if the current key should be excluded from being appended.
@@ -6531,7 +6591,7 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 		}
 
 		// Always run post-install hook for glibc
-		if err := executePostInstall(pkgName, rootDir, execCtx); err != nil {
+		if err := executePostInstall(pkgName, rootDir, execCtx, cfg); err != nil {
 			colArrow.Print("-> ")
 			color.Danger.Printf("post-install for %s returned error: %v\n", pkgName, err)
 		}
@@ -6574,42 +6634,72 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 
 	// Helper function to run diff with root executor fallback if permission denied
 	runDiffWithFallback := func(file1, file2 string, outputToStdout bool) error {
+		// Helper to filter binary diff messages
+		printFiltered := func(out string) {
+			if strings.HasPrefix(out, "Binary files") && strings.Contains(out, "differ") {
+				if Debug {
+					fmt.Print(out)
+				}
+			} else {
+				fmt.Print(out)
+			}
+		}
 		// Try to check if we can read the file first
 		if f, err := os.Open(file1); err != nil {
 			// If we can't read file1 due to permissions, try with root executor
 			if os.IsPermission(err) {
 				diffCmd := exec.Command("diff", "-u", file1, file2)
+				var outBuf bytes.Buffer
 				if outputToStdout {
-					diffCmd.Stdout = os.Stdout
+					diffCmd.Stdout = &outBuf
 					diffCmd.Stderr = os.Stderr
 				}
 				// diff returns non-zero when files differ, which is normal - ignore that
 				_ = RootExec.Run(diffCmd)
+
+				if outputToStdout {
+					printFiltered(outBuf.String())
+				}
 				return nil
 			}
 		} else {
 			f.Close()
 		}
+
 		// Try normal diff first
 		diffCmd := exec.Command("diff", "-u", file1, file2)
+		var outBuf bytes.Buffer
 		if outputToStdout {
-			diffCmd.Stdout = os.Stdout
+			diffCmd.Stdout = &outBuf
 			diffCmd.Stderr = os.Stderr
 		}
+
 		err := diffCmd.Run()
-		// If diff fails, check if it's a permission issue by trying to read the file again
+
+		// If diff returns error (exit code 1 means diffs found, >1 means error)
 		if err != nil {
+			// Check if it's a permission issue by trying to read the file again
 			if _, readErr := os.Open(file1); readErr != nil && os.IsPermission(readErr) {
 				// Retry with root executor
 				diffCmd := exec.Command("diff", "-u", file1, file2)
+				outBuf.Reset()
 				if outputToStdout {
-					diffCmd.Stdout = os.Stdout
+					diffCmd.Stdout = &outBuf
 					diffCmd.Stderr = os.Stderr
 				}
 				_ = RootExec.Run(diffCmd)
+
+				if outputToStdout {
+					printFiltered(outBuf.String())
+				}
+				return nil
 			}
 		}
-		// diff returns non-zero when files differ, which is normal - ignore that
+
+		// Print the captured output (if any) from the normal run
+		if outputToStdout {
+			printFiltered(outBuf.String())
+		}
 		return nil
 	}
 
@@ -7029,7 +7119,7 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 	// 7. Run package post-install script
 	colArrow.Print("-> ")
 	colSuccess.Println("Executing package post-install script")
-	if err := executePostInstall(pkgName, rootDir, execCtx); err != nil {
+	if err := executePostInstall(pkgName, rootDir, execCtx, cfg); err != nil {
 		fmt.Printf("warning: post-install for %s returned error: %v\n", pkgName, err)
 	}
 
@@ -7594,6 +7684,36 @@ func handleBuildCommand(args []string, cfg *Config) {
 				}
 			}
 		}
+
+		colArrow.Print("-> ")
+		// askForConfirmation defaults to "Yes"
+		if askForConfirmation(colInfo, "Enable Multilib support?") {
+			cfg.Values["HOKUTO_MULTILIB"] = "1"
+			colSuccess.Println("Multilib support enabled for bootstrap.")
+		} else {
+			// Ensure it is unset
+			cfg.Values["HOKUTO_MULTILIB"] = "0"
+			colWarn.Println("Multilib support disabled for bootstrap.")
+		}
+
+		// Architecture Prompt
+		colArrow.Print("-> ")
+		colInfo.Println("Select Target Architecture:")
+		colInfo.Println("  1. x86_64 (Intel/AMD)")
+		colInfo.Println("  2. aarch64 (Raspberry Pi 4 / ARM64)")
+		fmt.Print("Enter choice [1/2]: ")
+
+		var archChoice string
+		fmt.Scanln(&archChoice)
+
+		if strings.TrimSpace(archChoice) == "2" {
+			cfg.Values["HOKUTO_ARCH"] = "aarch64"
+			colSuccess.Println("Target set to AArch64.")
+		} else {
+			cfg.Values["HOKUTO_ARCH"] = "x86_64"
+			colSuccess.Println("Target set to x86_64.")
+		}
+
 		initConfig(cfg)
 	}
 
@@ -8942,7 +9062,7 @@ func main() {
 	case "version", "--version":
 		// Print version first
 		// HOKUTOVERSION (string for search)
-		fmt.Println("hokuto 0.3.2")
+		colSuccess.Printf("hokuto 0.3.3")
 
 		// Try to pick and show a random embedded PNG from assets/
 		imgs, err := listEmbeddedImages()
@@ -9053,8 +9173,10 @@ func main() {
 		// This effectively translates `hokuto bootstrap /mnt/lfs` into
 		// `hokuto build --bootstrap --bootstrap-dir /mnt/lfs bootstrap`.
 		buildArgs := []string{
+			"-bootstrap",
+			"-bootstrap-dir",
 			bootstrapDirArg,
-			"bootstrap", // The specific package to build in bootstrap mode.
+			"bootstrap", // The actual package name to build
 		}
 		colArrow.Print("-> ")
 		colSuccess.Printf("Starting bootstrap process in directory: %s\n", bootstrapDirArg)
