@@ -80,6 +80,14 @@ var (
 	embeddedAssets embed.FS
 	WorldFile      = "/var/db/hokuto/world"
 	WorldMakeFile  = "/var/db/hokuto/world_make"
+
+	// Split Screen State
+	useSplitScreen bool
+	termHeight     int
+	termWidth      int
+	headerContent  string
+	footerContent  string
+	screenMu       sync.Mutex
 )
 
 // color helpers
@@ -121,6 +129,122 @@ func debugf(format string, args ...any) {
 	if Debug {
 		fmt.Printf(format, args...)
 	}
+}
+
+// --- SPLIT SCREEN IMPLEMENTATION ---
+
+// getTermSize returns width, height
+func getTermSize() (int, int, error) {
+	ws, err := unix.IoctlGetWinsize(int(os.Stdout.Fd()), unix.TIOCGWINSZ)
+	if err != nil {
+		return 80, 24, err
+	}
+	return int(ws.Col), int(ws.Row), nil
+}
+
+// enableSplitScreen sets up the scrolling region
+func enableSplitScreen() {
+	if !termIsTerminal() {
+		return
+	}
+
+	w, h, err := getTermSize()
+	if err != nil {
+		return
+	}
+
+	screenMu.Lock()
+	defer screenMu.Unlock()
+
+	termWidth = w
+	termHeight = h
+	useSplitScreen = true
+
+	// ANSI Sequence:
+	// \033[?1049h : Switch to alternate buffer (optional, keeps main history clean)
+	// \033[2J     : Clear screen
+	// \033[4;%dr  : Set scroll region from line 4 to Height-2 (Reserve 3 lines top, 2 lines bottom)
+
+	// We reserve 3 lines at TOP (Header) and 1 line at BOTTOM (Status/Prompt)
+	// Scroll region is 4 to h-1
+	scrollEnd := h - 1
+	if scrollEnd < 5 {
+		scrollEnd = 5
+	} // Safety for tiny windows
+
+	fmt.Print("\033[?1049h\033[2J")
+	fmt.Printf("\033[4;%dr", scrollEnd)
+	fmt.Printf("\033[4;1H") // Move cursor to start of scroll region
+}
+
+// disableSplitScreen restores the terminal
+func disableSplitScreen() {
+	if !useSplitScreen {
+		return
+	}
+
+	screenMu.Lock()
+	defer screenMu.Unlock()
+
+	// Reset scroll region (DECSTBM with no args)
+	// Switch back to main buffer
+	fmt.Print("\033[r\033[?1049l")
+	useSplitScreen = false
+}
+
+// updateHeader writes to the fixed top region
+func updateHeader(line1, line2 string) {
+	if !useSplitScreen {
+		return
+	}
+	screenMu.Lock()
+	defer screenMu.Unlock()
+
+	// Save Cursor (\0337)
+	// Move to 1,1 (\033[1;1H)
+	// Clear Line (\033[2K)
+	// Print text
+	// ... repeat for line 2 and separator
+	// Restore Cursor (\0338)
+
+	fmt.Print("\0337")
+
+	// Line 1: Main Title
+	fmt.Print("\033[1;1H\033[2K") // Row 1
+	color.Bold.Print(line1)
+
+	// Line 2: Details
+	fmt.Print("\033[2;1H\033[2K") // Row 2
+	color.Info.Print(line2)
+
+	// Line 3: Separator
+	fmt.Print("\033[3;1H\033[2K") // Row 3
+	fmt.Print(strings.Repeat("─", termWidth))
+
+	fmt.Print("\0338")
+}
+
+// updateFooter writes to the fixed bottom region (for prompts/status)
+func updateFooter(msg string) {
+	if !useSplitScreen {
+		return
+	}
+	screenMu.Lock()
+	defer screenMu.Unlock()
+
+	fmt.Print("\0337")
+
+	// Move to bottom line
+	fmt.Printf("\033[%d;1H\033[2K", termHeight)
+	fmt.Print(msg)
+
+	fmt.Print("\0338")
+}
+
+// Helper to check if stdout is a terminal
+func termIsTerminal() bool {
+	_, err := unix.IoctlGetWinsize(int(os.Stdout.Fd()), unix.TIOCGWINSZ)
+	return err == nil
 }
 
 // Config struct
@@ -5233,30 +5357,45 @@ type fileMetadata struct {
 // It can print the prompt with a specific color style if p is not nil.
 func askForConfirmation(p colorPrinter, format string, a ...any) bool {
 	reader := bufio.NewReader(os.Stdin)
-	// First, create the main part of the prompt using the provided arguments.
 	mainPrompt := fmt.Sprintf(format, a...)
-	// Then, create the final, full prompt string.
 	fullPrompt := fmt.Sprintf("%s [Y/n]: ", mainPrompt)
 
-	for {
-		// Use our existing cPrintf helper to print the prompt with the desired color.
-		// cPrintf will handle the case where 'p' is nil and print without color.
+	if useSplitScreen {
+		// --- Split Screen Mode ---
+		screenMu.Lock()
+		// Save cursor, Move to bottom line, Clear line, Print prompt
+		fmt.Printf("\0337\033[%d;1H\033[2K", termHeight)
 		cPrintf(p, "%s", fullPrompt)
+		// We DO NOT restore cursor yet, because we want the user to type at the bottom
+		screenMu.Unlock()
 
 		response, err := reader.ReadString('\n')
+
+		// Restore cursor to the build log area after input
+		fmt.Print("\0338")
+
 		if err != nil {
-			return false // On error (like Ctrl+D), default to "no"
+			return false
 		}
-
 		response = strings.ToLower(strings.TrimSpace(response))
+		return response == "y" || response == "yes" || response == ""
+	}
 
+	// --- Normal Mode (Original Logic) ---
+	for {
+		cPrintf(p, "%s", fullPrompt)
+		response, err := reader.ReadString('\n')
+		if err != nil {
+			return false
+		}
+		response = strings.ToLower(strings.TrimSpace(response))
 		if response == "y" || response == "yes" || response == "" {
 			return true
 		}
 		if response == "n" || response == "no" {
 			return false
 		}
-		cPrintln(colWarn, "Invalid input. Please type 'y' (yes) or 'n' (no).")
+		cPrintln(colWarn, "Invalid input.")
 	}
 }
 
@@ -5418,7 +5557,7 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 
 	// Helper function to set the title in the TTY.
 	setTerminalTitle := func(title string) {
-		// Outputting directly to os.Stdout sets the title in the terminal session.
+		//	// Outputting directly to os.Stdout sets the title in the terminal session.
 		fmt.Printf(setTitleFormat, title)
 	}
 
@@ -5637,6 +5776,102 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 		}
 
 	} else {
+
+		// 1. Detect Architecture
+		// ----------------------
+		targetArch := cfg.Values["HOKUTO_ARCH"]
+		if targetArch == "" {
+			cmd := exec.Command("uname", "-m")
+			out, err := cmd.Output()
+			if err == nil {
+				targetArch = strings.TrimSpace(string(out))
+			} else {
+				// Final fallback to Go runtime info
+				targetArch = runtime.GOARCH
+			}
+		}
+		// Normalize architecture names
+		if targetArch == "amd64" {
+			targetArch = "x86_64"
+		}
+		if targetArch == "arm64" {
+			targetArch = "aarch64"
+		}
+
+		isX86 := (targetArch == "x86_64")
+		isARM := (targetArch == "aarch64")
+
+		// 2. Apply Architecture Constraints (LTO & Multilib)
+		// --------------------------------------------------
+
+		// Disable LTO for non-x86 architectures
+		if !isX86 && shouldLTO {
+			debugf("Disabling LTO for %s architecture.\n", targetArch)
+			shouldLTO = false
+		}
+
+		// Determine Multilib state (Only allow '1' if config requests it AND we are on x86_64)
+		multilibVal := "0"
+		if isX86 && cfg.Values["HOKUTO_MULTILIB"] == "1" {
+			multilibVal = "1"
+		} else if cfg.Values["HOKUTO_MULTILIB"] == "1" {
+			debugf("Disabling MULTILIB for %s architecture (config requested enabled).\n", targetArch)
+		}
+
+		// 3. Select Compiler Flags
+		var cflagsVal, cxxflagsVal, ldflagsVal string
+
+		if isARM {
+			// Case A: ARM64
+			cflagsVal = cfg.Values["CFLAGS_ARM64"]
+			cxxflagsVal = cfg.Values["CXXFLAGS_ARM64"]
+			ldflagsVal = cfg.Values["LDFLAGS"]
+		} else if shouldLTO {
+			// Case B: x86_64 with LTO
+			cflagsVal = cfg.Values["CFLAGS_LTO"]
+			cxxflagsVal = cfg.Values["CXXFLAGS_LTO"]
+			ldflagsVal = cfg.Values["LDFLAGS_LTO"]
+		} else {
+			// Case C: Standard (LTO disabled or x86 without LTO config)
+			cflagsVal = cfg.Values["CFLAGS"]
+			cxxflagsVal = cfg.Values["CXXFLAGS"]
+			ldflagsVal = cfg.Values["LDFLAGS"]
+		}
+
+		// Fallbacks
+		if cflagsVal == "" {
+			cflagsVal = defaultCFLAGS
+		}
+		if cxxflagsVal == "" {
+			cxxflagsVal = cflagsVal
+		}
+		if ldflagsVal == "" {
+			ldflagsVal = defaultLDFLAGS
+		}
+
+		// --- FIX: Apply Substitution ALWAYS ---
+		// This ensures that if CFLAGS_ARM64 or standard CFLAGS contains "LTOJOBS",
+		// it gets resolved correctly instead of breaking the build.
+		cflagsVal = strings.ReplaceAll(cflagsVal, "LTOJOBS", ltoJobString)
+		cxxflagsVal = strings.ReplaceAll(cxxflagsVal, "LTOJOBS", ltoJobString)
+		ldflagsVal = strings.ReplaceAll(ldflagsVal, "LTOJOBS", ltoJobString)
+
+		// 4. Apply Linker Logic (Mold)
+		// ----------------------------
+		// "replace -fuse-ld=bfd with -fuse-ld=mold if mold is installed and LTO is disabled"
+		if !shouldLTO {
+			useMold := checkPackageExactMatch("mold")
+
+			if useMold {
+				// Upgrade BFD/Gold to Mold
+				ldflagsVal = strings.ReplaceAll(ldflagsVal, "-fuse-ld=bfd", "-fuse-ld=mold")
+				ldflagsVal = strings.ReplaceAll(ldflagsVal, "-fuse-ld=gold", "-fuse-ld=mold")
+			} else {
+				// Fallback: If config asks for Mold but it's not installed, revert to BFD
+				ldflagsVal = strings.ReplaceAll(ldflagsVal, "-fuse-ld=mold", "-fuse-ld=bfd")
+			}
+		}
+
 		// --- Normal build environment---
 		defaults = map[string]string{
 			"AR":                         "gcc-ar",
@@ -5644,10 +5879,9 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 			"CXX":                        "c++",
 			"NM":                         "gcc-nm",
 			"RANLIB":                     "gcc-ranlib",
-			"CFLAGS":                     defaultCFLAGS,
-			"CXXFLAGS":                   "",
-			"LDFLAGS":                    defaultLDFLAGS,
-			"CONFIG_SITE":                ("usr/share/config.site"),
+			"CFLAGS":                     cflagsVal,
+			"CXXFLAGS":                   cxxflagsVal,
+			"LDFLAGS":                    ldflagsVal,
 			"MAKEFLAGS":                  fmt.Sprintf("-j%d", numCores),
 			"CMAKE_BUILD_PARALLEL_LEVEL": fmt.Sprintf("%d", numCores),
 			"RUSTFLAGS":                  fmt.Sprintf("--remap-path-prefix=%s=.", buildDir),
@@ -5655,77 +5889,15 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 			"GOPATH":                     filepath.Join(buildDir, "go"),
 			"HOKUTO_ROOT":                cfg.Values["HOKUTO_ROOT"],
 			"TMPDIR":                     currentTmpDir,
+			"CONFIG_SITE":                ("/usr/share/config.site"),
+			"HOKUTO_ARCH":                targetArch,
+			"MULTILIB":                   multilibVal,
 		}
 
 		if buildPriority == "idle" || buildPriority == "superidle" {
 			defaults["HOKUTO_BUILD_PRIORITY"] = buildPriority
 		}
-
-		var cflagsKey, cxxflagsKey, ldflagsKey string
-		if shouldLTO {
-			cflagsKey = "CFLAGS_LTO"
-			cxxflagsKey = "CXXFLAGS_LTO"
-			ldflagsKey = "LDFLAGS_LTO"
-			// Set a default that includes the placeholder, in case the config doesn't.
-			defaults["CFLAGS"] = defaultCFLAGS + " -flto=LTOJOBS"
-			defaults["LDFLAGS"] = defaultLDFLAGS + " -flto=LTOJOBS"
-		} else {
-			cflagsKey = "CFLAGS"
-			cxxflagsKey = "CXXFLAGS"
-			ldflagsKey = "LDFLAGS"
-		}
-
-		// Override defaults with actual config values
-		if val := cfg.Values[cflagsKey]; val != "" {
-			defaults["CFLAGS"] = val
-		}
-		if val := cfg.Values[cxxflagsKey]; val != "" {
-			defaults["CXXFLAGS"] = val
-		}
-		if val := cfg.Values[ldflagsKey]; val != "" {
-			defaults["LDFLAGS"] = val
-		}
-
-		// Perform the placeholder substitution *only in the normal build path*.
-		if shouldLTO {
-			defaults["CFLAGS"] = strings.ReplaceAll(defaults["CFLAGS"], "LTOJOBS", ltoJobString)
-			defaults["LDFLAGS"] = strings.ReplaceAll(defaults["LDFLAGS"], "LTOJOBS", ltoJobString)
-			defaults["CXXFLAGS"] = strings.ReplaceAll(defaults["CXXFLAGS"], "LTOJOBS", ltoJobString)
-		}
-
-		// Final fallback for CXXFLAGS
-		finalCXXFLAGS := defaults["CXXFLAGS"]
-		if finalCXXFLAGS == "" {
-			finalCXXFLAGS = defaults["CFLAGS"]
-		}
-		defaults["CXXFLAGS"] = finalCXXFLAGS
 	}
-
-	// Handle MULTILIB
-	if cfg.Values["HOKUTO_MULTILIB"] == "1" {
-		defaults["MULTILIB"] = "1"
-	}
-
-	// Set HOKUTO_ARCH
-	targetArch := cfg.Values["HOKUTO_ARCH"]
-	if targetArch == "" {
-		// Fallback to uname -m if not set in config
-		cmd := exec.Command("uname", "-m")
-		out, err := cmd.Output()
-		if err == nil {
-			targetArch = strings.TrimSpace(string(out))
-		} else {
-			// Fallback to Go runtime arch if uname fails
-			targetArch = runtime.GOARCH
-			switch targetArch {
-			case "amd64":
-				targetArch = "x86_64"
-			case "arm64":
-				targetArch = "aarch64"
-			}
-		}
-	}
-	defaults["HOKUTO_ARCH"] = targetArch
 
 	for k, v := range defaults {
 		env = append(env, fmt.Sprintf("%s=%s", k, v))
@@ -5801,14 +5973,16 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 				select {
 				case <-ticker.C:
 					elapsed := time.Since(startTime).Truncate(time.Second)
-					title := fmt.Sprintf("Building: %s (%d/%d) elapsed: %s", pkgName, currentIndex, totalCount, elapsed)
-					setTerminalTitle(title)
-					colArrow.Print("-> ")
-					colSuccess.Printf("Building %s elapsed: %s\r", pkgName, elapsed)
+
+					// Update the Split Screen Header
+					headerL1 := fmt.Sprintf("HOKUTO BUILDER | Target: %s | Arch: %s", cfg.Values["HOKUTO_ARCH"], arch)
+					headerL2 := fmt.Sprintf("Building: %s (%d/%d) | Time: %s", pkgName, currentIndex, totalCount, elapsed)
+					updateHeader(headerL1, headerL2)
+
+					// Update Title bar too
+					setTerminalTitle(fmt.Sprintf("Building %s (%s)", pkgName, elapsed))
+
 				case <-doneCh:
-					fmt.Print("\r")
-					return
-				case <-buildExec.Context.Done():
 					return
 				}
 			}
@@ -6156,25 +6330,9 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 		return fmt.Errorf("build script not found: %v", err)
 	}
 
-	// 2. Build environment (Modified to include the backed-up libs for Executor tools)
-	env := os.Environ()
-	defaults := map[string]string{
-		"AR":          "gcc-ar",
-		"CC":          "cc",
-		"CXX":         "c++",
-		"NM":          "gcc-nm",
-		"RANLIB":      "gcc-ranlib",
-		"CFLAGS":      "-O2 -march=x86-64 -mtune=generic -pipe -fPIC",
-		"CXXFLAGS":    "",
-		"LDFLAGS":     "",
-		"CONFIG_SITE": "/usr/share/config.site",
-		"MAKEFLAGS":   fmt.Sprintf("-j%d", runtime.NumCPU()),
-		"RUSTFLAGS":   fmt.Sprintf("--remap-path-prefix=%s=.", buildDir),
-		"GOFLAGS":     "-trimpath -modcacherw",
-		"GOPATH":      filepath.Join(buildDir, "go"),
-		"HOKUTO_ROOT": rootDir,
-		"TMPDIR":      currentTmpDir,
-	}
+	// Define the base C/C++/LD flags
+	var defaultCFLAGS = "-O2 -march=x86-64 -mtune=generic -pipe -fPIC"
+	var defaultLDFLAGS = ""
 
 	// Define core count to use
 	var numCores int
@@ -6184,31 +6342,142 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 		if numCores < 1 {
 			numCores = 1
 		}
-		defaults["MAKEFLAGS"] = fmt.Sprintf("-j%d", numCores)
-		defaults["CMAKE_BUILD_PARALLEL_LEVEL"] = fmt.Sprintf("%d", numCores)
-		defaults["HOKUTO_BUILD_PRIORITY"] = "idle" // Set variable for wrapper
 	case "superidle":
 		numCores = 1
-		defaults["MAKEFLAGS"] = fmt.Sprintf("-j%d", numCores)
-		defaults["CMAKE_BUILD_PARALLEL_LEVEL"] = fmt.Sprintf("%d", numCores)
-		defaults["HOKUTO_BUILD_PRIORITY"] = "superidle" // Set variable for wrapper
 	default: // "normal"
 		numCores = runtime.NumCPU()
-		defaults["MAKEFLAGS"] = fmt.Sprintf("-j%d", numCores)
-		defaults["CMAKE_BUILD_PARALLEL_LEVEL"] = fmt.Sprintf("%d", numCores)
 	}
 
 	// Check for 'clang' file to determine LTOJOBS value
 	ltoJobString := fmt.Sprintf("%d", numCores) // Default to core count (for GCC)
 	clangFlagFile := filepath.Join(pkgDir, "clang")
 	if _, err := os.Stat(clangFlagFile); err == nil {
-		// 'clang' file exists, use "auto" for LTO jobs
 		ltoJobString = "auto"
 		debugf("Local 'clang' file found. Setting LTOJOBS=auto.\n")
 	} else {
-		// No 'clang' file, use core count
 		debugf("No 'clang' file found. Setting LTOJOBS=%s.\n", ltoJobString)
 	}
+
+	// Initialize Defaults Map
+	defaults := map[string]string{
+		"AR":                         "gcc-ar",
+		"CC":                         "cc",
+		"CXX":                        "c++",
+		"NM":                         "gcc-nm",
+		"RANLIB":                     "gcc-ranlib",
+		"MAKEFLAGS":                  fmt.Sprintf("-j%d", numCores),
+		"CMAKE_BUILD_PARALLEL_LEVEL": fmt.Sprintf("%d", numCores),
+		"RUSTFLAGS":                  fmt.Sprintf("--remap-path-prefix=%s=.", buildDir),
+		"GOFLAGS":                    "-trimpath -modcacherw",
+		"GOPATH":                     filepath.Join(buildDir, "go"),
+		"HOKUTO_ROOT":                rootDir,
+		"TMPDIR":                     currentTmpDir,
+		"CONFIG_SITE":                ("/usr/share/config.site"),
+	}
+
+	if buildPriority == "idle" || buildPriority == "superidle" {
+		defaults["HOKUTO_BUILD_PRIORITY"] = buildPriority
+	}
+
+	// --- START REFACTORED FLAG LOGIC (Matches pkgBuild) ---
+
+	// 1. Detect Architecture
+	// ----------------------
+	targetArch := cfg.Values["HOKUTO_ARCH"]
+	if targetArch == "" {
+		cmd := exec.Command("uname", "-m")
+		out, err := cmd.Output()
+		if err == nil {
+			targetArch = strings.TrimSpace(string(out))
+		} else {
+			targetArch = runtime.GOARCH
+		}
+	}
+	if targetArch == "amd64" {
+		targetArch = "x86_64"
+	}
+	if targetArch == "arm64" {
+		targetArch = "aarch64"
+	}
+
+	isX86 := (targetArch == "x86_64")
+	isARM := (targetArch == "aarch64")
+
+	// 2. Apply Architecture Constraints
+	// ---------------------------------
+	if !isX86 && shouldLTO {
+		debugf("Disabling LTO for %s architecture (rebuild).\n", targetArch)
+		shouldLTO = false
+	}
+
+	multilibVal := "0"
+	if isX86 && cfg.Values["HOKUTO_MULTILIB"] == "1" {
+		multilibVal = "1"
+	} else if cfg.Values["HOKUTO_MULTILIB"] == "1" {
+		debugf("Disabling MULTILIB for %s architecture (rebuild).\n", targetArch)
+	}
+
+	// 3. Select Compiler Flags
+	var cflagsVal, cxxflagsVal, ldflagsVal string
+
+	if isARM {
+		// Case A: ARM64
+		cflagsVal = cfg.Values["CFLAGS_ARM64"]
+		cxxflagsVal = cfg.Values["CXXFLAGS_ARM64"]
+		ldflagsVal = cfg.Values["LDFLAGS"]
+	} else if shouldLTO {
+		// Case B: x86_64 with LTO
+		cflagsVal = cfg.Values["CFLAGS_LTO"]
+		cxxflagsVal = cfg.Values["CXXFLAGS_LTO"]
+		ldflagsVal = cfg.Values["LDFLAGS_LTO"]
+	} else {
+		// Case C: Standard (LTO disabled or x86 without LTO config)
+		cflagsVal = cfg.Values["CFLAGS"]
+		cxxflagsVal = cfg.Values["CXXFLAGS"]
+		ldflagsVal = cfg.Values["LDFLAGS"]
+	}
+
+	// Fallbacks
+	if cflagsVal == "" {
+		cflagsVal = defaultCFLAGS
+	}
+	if cxxflagsVal == "" {
+		cxxflagsVal = cflagsVal
+	}
+	if ldflagsVal == "" {
+		ldflagsVal = defaultLDFLAGS
+	}
+
+	// --- FIX: Apply Substitution ALWAYS ---
+	// This ensures that if CFLAGS_ARM64 or standard CFLAGS contains "LTOJOBS",
+	// it gets resolved correctly instead of breaking the build.
+	cflagsVal = strings.ReplaceAll(cflagsVal, "LTOJOBS", ltoJobString)
+	cxxflagsVal = strings.ReplaceAll(cxxflagsVal, "LTOJOBS", ltoJobString)
+	ldflagsVal = strings.ReplaceAll(ldflagsVal, "LTOJOBS", ltoJobString)
+
+	// 4. Apply Linker Logic (Mold)
+	// ----------------------------
+	if !shouldLTO {
+		useMold := checkPackageExactMatch("mold")
+		if useMold {
+			ldflagsVal = strings.ReplaceAll(ldflagsVal, "-fuse-ld=bfd", "-fuse-ld=mold")
+			ldflagsVal = strings.ReplaceAll(ldflagsVal, "-fuse-ld=gold", "-fuse-ld=mold")
+		} else {
+			ldflagsVal = strings.ReplaceAll(ldflagsVal, "-fuse-ld=mold", "-fuse-ld=bfd")
+		}
+	}
+
+	// 5. Update defaults map
+	// ----------------------
+	defaults["CFLAGS"] = cflagsVal
+	defaults["CXXFLAGS"] = cxxflagsVal
+	defaults["LDFLAGS"] = ldflagsVal
+	defaults["HOKUTO_ARCH"] = targetArch
+	defaults["MULTILIB"] = multilibVal
+	// --- END REFACTORED FLAG LOGIC ---
+
+	// Prepare Environment Array
+	env := os.Environ()
 
 	// Prepend oldLibsDir to PATH and LD_LIBRARY_PATH for tools run by the Executor
 	// This allows system tools (tar, rsync, cp) used by the Executor to function,
@@ -6229,84 +6498,6 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 	currentLdLibPath := os.Getenv("LD_LIBRARY_PATH")
 	newLdLibPath := fmt.Sprintf("LD_LIBRARY_PATH=%s:%s:%s", oldLibLib, oldLibUsrLib, currentLdLibPath)
 	env = append(env, newLdLibPath)
-
-	// 1. Define the base C/C++/LD flags
-	var defaultCFLAGS = "-O2 -march=x86-64 -mtune=generic -pipe -fPIC"
-	var defaultLDFLAGS = ""
-
-	// 2. Select the appropriate keys and default values based on cfg.DefaultLTO
-	var cflagsKey, cxxflagsKey, ldflagsKey string
-
-	if shouldLTO {
-		cflagsKey = "CFLAGS_LTO"
-		cxxflagsKey = "CXXFLAGS_LTO"
-		ldflagsKey = "LDFLAGS_LTO"
-		// Set a default that includes the placeholder, in case the config doesn't.
-		defaults["CFLAGS"] = defaultCFLAGS + " -flto=LTOJOBS"
-		defaults["LDFLAGS"] = defaultLDFLAGS + " -flto=LTOJOBS"
-	} else {
-		cflagsKey = "CFLAGS"
-		cxxflagsKey = "CXXFLAGS"
-		ldflagsKey = "LDFLAGS"
-		defaults["CFLAGS"] = defaultCFLAGS
-		defaults["LDFLAGS"] = defaultLDFLAGS
-	}
-
-	// 3. Set CXXFLAGS default based on CFLAGS if not set, regardless of LTO
-	defaults["CXXFLAGS"] = ""
-
-	// 4. Override defaults with actual config values
-	// We only need to check the CFLAGS, CXXFLAGS, LDFLAGS keys now
-	// This ensures the correct, prioritized value from the config is used.
-	if val := cfg.Values[cflagsKey]; val != "" {
-		defaults["CFLAGS"] = val
-	}
-	if val := cfg.Values[cxxflagsKey]; val != "" {
-		defaults["CXXFLAGS"] = val
-	}
-	if val := cfg.Values[ldflagsKey]; val != "" {
-		defaults["LDFLAGS"] = val
-	}
-
-	// Perform the placeholder substitution *only when LTO is enabled*.
-	if shouldLTO {
-		defaults["CFLAGS"] = strings.ReplaceAll(defaults["CFLAGS"], "LTOJOBS", ltoJobString)
-		defaults["LDFLAGS"] = strings.ReplaceAll(defaults["LDFLAGS"], "LTOJOBS", ltoJobString)
-		defaults["CXXFLAGS"] = strings.ReplaceAll(defaults["CXXFLAGS"], "LTOJOBS", ltoJobString)
-	}
-
-	// The CXXFLAGS fallback logic must be applied AFTER CFLAGS is finalized.
-	// We must apply it before the final loop, as the final loop simply appends.
-	finalCXXFLAGS := defaults["CXXFLAGS"]
-	if finalCXXFLAGS == "" {
-		// Fallback to CFLAGS if CXXFLAGS is still empty
-		finalCXXFLAGS = defaults["CFLAGS"]
-	}
-	defaults["CXXFLAGS"] = finalCXXFLAGS // Update the map with the resolved value
-
-	// Handle MULTILIB
-	if cfg.Values["HOKUTO_MULTILIB"] == "1" {
-		defaults["MULTILIB"] = "1"
-	}
-
-	// Set HOKUTO_ARCH
-	targetArch := cfg.Values["HOKUTO_ARCH"]
-	if targetArch == "" {
-		cmd := exec.Command("uname", "-m")
-		out, err := cmd.Output()
-		if err == nil {
-			targetArch = strings.TrimSpace(string(out))
-		} else {
-			targetArch = runtime.GOARCH
-			switch targetArch {
-			case "amd64":
-				targetArch = "x86_64"
-			case "arm64":
-				targetArch = "aarch64"
-			}
-		}
-	}
-	defaults["HOKUTO_ARCH"] = targetArch
 
 	// 5. Final loop to assemble the environment array
 	for k, def := range defaults {
@@ -7633,6 +7824,9 @@ func handleBuildCommand(args []string, cfg *Config) {
 	}
 	Verbose = *verbose || *verboseLong
 
+	enableSplitScreen()
+	defer disableSplitScreen()
+
 	// --- Bootstrap Repository & Path Setup ---
 	if *bootstrap {
 		if *bootstrapDir == "" {
@@ -8035,7 +8229,7 @@ BuildSummary:
 }
 
 // Helper for HandleBuildCommand to execute a single build pass based on the provided BuildPlan.
-func executeBuildPass(plan *BuildPlan, passName string, installAllTargets bool, cfg *Config, bootstrap *bool, userRequestedMap map[string]bool) (map[string]error, []string, time.Duration) {
+func executeBuildPass(plan *BuildPlan, _ string, installAllTargets bool, cfg *Config, bootstrap *bool, userRequestedMap map[string]bool) (map[string]error, []string, time.Duration) {
 
 	toBuild := plan.Order
 	failed := make(map[string]error)
@@ -9034,6 +9228,7 @@ func main() {
 						// Give more time for graceful shutdown (increased from 500ms to 2s)
 						colArrow.Print("\n-> ")
 						color.Danger.Printf("Graceful shutdown timeout. Exiting.")
+						disableSplitScreen() // Force restore terminal
 						os.Exit(0)
 					}
 				}
@@ -9109,7 +9304,7 @@ func main() {
 		if err != nil || len(imgs) == 0 {
 			// No images available — nothing more to do
 			if err != nil {
-				fmt.Fprintln(os.Stderr, "warning: failed to list embedded images:", err)
+				debugf("warning: failed to list embedded images: %v\n", err)
 			}
 			break
 		}
@@ -9123,7 +9318,7 @@ func main() {
 		// Display via chafa using the main context (ctx must be in scope in main)
 		// Forward a small default set of chafa flags; you may change or pass none.
 		if err := displayEmbeddedWithChafa(ctx, choice, "--symbols=block", "--size=80x40"); err != nil {
-			fmt.Fprintln(os.Stderr, "error displaying image:", err)
+			debugf("error displaying image: %v\n", err)
 		}
 
 		// Print version and architecture
