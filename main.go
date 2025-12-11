@@ -68,6 +68,8 @@ var (
 	gnuMirrorMessageOnce sync.Once
 	BinaryMirror         string
 	version              = "dev" //default version; overridden at build time
+	arch                 = runtime.GOARCH
+	buildDate            = "unknown" // overridden at build time
 	errPackageNotFound   = errors.New("package not found")
 	// Global executors (declared, to be assigned in main)
 	UserExec *Executor
@@ -9101,8 +9103,6 @@ func main() {
 		}
 
 	case "version", "--version":
-		// Print version first
-		colSuccess.Printf("hokuto %s\n", version)
 
 		// Try to pick and show a random embedded PNG from assets/
 		imgs, err := listEmbeddedImages()
@@ -9125,6 +9125,9 @@ func main() {
 		if err := displayEmbeddedWithChafa(ctx, choice, "--symbols=block", "--size=80x40"); err != nil {
 			fmt.Fprintln(os.Stderr, "error displaying image:", err)
 		}
+
+		// Print version and architecture
+		colNote.Printf("hokuto %s (%s) built %s\n", version, arch, buildDate)
 
 		// ...
 	case "list", "ls":
