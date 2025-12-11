@@ -80,14 +80,6 @@ var (
 	embeddedAssets embed.FS
 	WorldFile      = "/var/db/hokuto/world"
 	WorldMakeFile  = "/var/db/hokuto/world_make"
-
-	// Split Screen State
-	useSplitScreen bool
-	termHeight     int
-	termWidth      int
-	headerContent  string
-	footerContent  string
-	screenMu       sync.Mutex
 )
 
 // color helpers
@@ -129,122 +121,6 @@ func debugf(format string, args ...any) {
 	if Debug {
 		fmt.Printf(format, args...)
 	}
-}
-
-// --- SPLIT SCREEN IMPLEMENTATION ---
-
-// getTermSize returns width, height
-func getTermSize() (int, int, error) {
-	ws, err := unix.IoctlGetWinsize(int(os.Stdout.Fd()), unix.TIOCGWINSZ)
-	if err != nil {
-		return 80, 24, err
-	}
-	return int(ws.Col), int(ws.Row), nil
-}
-
-// enableSplitScreen sets up the scrolling region
-func enableSplitScreen() {
-	if !termIsTerminal() {
-		return
-	}
-
-	w, h, err := getTermSize()
-	if err != nil {
-		return
-	}
-
-	screenMu.Lock()
-	defer screenMu.Unlock()
-
-	termWidth = w
-	termHeight = h
-	useSplitScreen = true
-
-	// ANSI Sequence:
-	// \033[?1049h : Switch to alternate buffer (optional, keeps main history clean)
-	// \033[2J     : Clear screen
-	// \033[4;%dr  : Set scroll region from line 4 to Height-2 (Reserve 3 lines top, 2 lines bottom)
-
-	// We reserve 3 lines at TOP (Header) and 1 line at BOTTOM (Status/Prompt)
-	// Scroll region is 4 to h-1
-	scrollEnd := h - 1
-	if scrollEnd < 5 {
-		scrollEnd = 5
-	} // Safety for tiny windows
-
-	fmt.Print("\033[?1049h\033[2J")
-	fmt.Printf("\033[4;%dr", scrollEnd)
-	fmt.Printf("\033[4;1H") // Move cursor to start of scroll region
-}
-
-// disableSplitScreen restores the terminal
-func disableSplitScreen() {
-	if !useSplitScreen {
-		return
-	}
-
-	screenMu.Lock()
-	defer screenMu.Unlock()
-
-	// Reset scroll region (DECSTBM with no args)
-	// Switch back to main buffer
-	fmt.Print("\033[r\033[?1049l")
-	useSplitScreen = false
-}
-
-// updateHeader writes to the fixed top region
-func updateHeader(line1, line2 string) {
-	if !useSplitScreen {
-		return
-	}
-	screenMu.Lock()
-	defer screenMu.Unlock()
-
-	// Save Cursor (\0337)
-	// Move to 1,1 (\033[1;1H)
-	// Clear Line (\033[2K)
-	// Print text
-	// ... repeat for line 2 and separator
-	// Restore Cursor (\0338)
-
-	fmt.Print("\0337")
-
-	// Line 1: Main Title
-	fmt.Print("\033[1;1H\033[2K") // Row 1
-	color.Bold.Print(line1)
-
-	// Line 2: Details
-	fmt.Print("\033[2;1H\033[2K") // Row 2
-	color.Info.Print(line2)
-
-	// Line 3: Separator
-	fmt.Print("\033[3;1H\033[2K") // Row 3
-	fmt.Print(strings.Repeat("─", termWidth))
-
-	fmt.Print("\0338")
-}
-
-// updateFooter writes to the fixed bottom region (for prompts/status)
-func updateFooter(msg string) {
-	if !useSplitScreen {
-		return
-	}
-	screenMu.Lock()
-	defer screenMu.Unlock()
-
-	fmt.Print("\0337")
-
-	// Move to bottom line
-	fmt.Printf("\033[%d;1H\033[2K", termHeight)
-	fmt.Print(msg)
-
-	fmt.Print("\0338")
-}
-
-// Helper to check if stdout is a terminal
-func termIsTerminal() bool {
-	_, err := unix.IoctlGetWinsize(int(os.Stdout.Fd()), unix.TIOCGWINSZ)
-	return err == nil
 }
 
 // Config struct
@@ -5357,38 +5233,22 @@ type fileMetadata struct {
 // It can print the prompt with a specific color style if p is not nil.
 func askForConfirmation(p colorPrinter, format string, a ...any) bool {
 	reader := bufio.NewReader(os.Stdin)
+	// First, create the main part of the prompt using the provided arguments.
 	mainPrompt := fmt.Sprintf(format, a...)
+	// Then, create the final, full prompt string.
 	fullPrompt := fmt.Sprintf("%s [Y/n]: ", mainPrompt)
 
-	if useSplitScreen {
-		// --- Split Screen Mode ---
-		screenMu.Lock()
-		// Save cursor, Move to bottom line, Clear line, Print prompt
-		fmt.Printf("\0337\033[%d;1H\033[2K", termHeight)
-		cPrintf(p, "%s", fullPrompt)
-		// We DO NOT restore cursor yet, because we want the user to type at the bottom
-		screenMu.Unlock()
-
-		response, err := reader.ReadString('\n')
-
-		// Restore cursor to the build log area after input
-		fmt.Print("\0338")
-
-		if err != nil {
-			return false
-		}
-		response = strings.ToLower(strings.TrimSpace(response))
-		return response == "y" || response == "yes" || response == ""
-	}
-
-	// --- Normal Mode (Original Logic) ---
 	for {
+		// Use our existing cPrintf helper to print the prompt with the desired color.
+		// cPrintf will handle the case where 'p' is nil and print without color.
 		cPrintf(p, "%s", fullPrompt)
 		response, err := reader.ReadString('\n')
+
 		if err != nil {
-			return false
+			return false // On error (like Ctrl+D), default to "no"
 		}
 		response = strings.ToLower(strings.TrimSpace(response))
+
 		if response == "y" || response == "yes" || response == "" {
 			return true
 		}
@@ -5973,16 +5833,15 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 				select {
 				case <-ticker.C:
 					elapsed := time.Since(startTime).Truncate(time.Second)
-
-					// Update the Split Screen Header
-					headerL1 := fmt.Sprintf("HOKUTO BUILDER | Target: %s | Arch: %s", cfg.Values["HOKUTO_ARCH"], arch)
-					headerL2 := fmt.Sprintf("Building: %s (%d/%d) | Time: %s", pkgName, currentIndex, totalCount, elapsed)
-					updateHeader(headerL1, headerL2)
-
-					// Update Title bar too
-					setTerminalTitle(fmt.Sprintf("Building %s (%s)", pkgName, elapsed))
+					title := fmt.Sprintf("Building: %s (%d/%d) elapsed: %s", pkgName, currentIndex, totalCount, elapsed)
+					setTerminalTitle(title)
+					colArrow.Print("-> ")
+					colSuccess.Printf("Building %s elapsed: %s\r", pkgName, elapsed)
 
 				case <-doneCh:
+					fmt.Print("\r")
+					return
+				case <-buildExec.Context.Done():
 					return
 				}
 			}
@@ -7824,9 +7683,6 @@ func handleBuildCommand(args []string, cfg *Config) {
 	}
 	Verbose = *verbose || *verboseLong
 
-	enableSplitScreen()
-	defer disableSplitScreen()
-
 	// --- Bootstrap Repository & Path Setup ---
 	if *bootstrap {
 		if *bootstrapDir == "" {
@@ -9228,7 +9084,6 @@ func main() {
 						// Give more time for graceful shutdown (increased from 500ms to 2s)
 						colArrow.Print("\n-> ")
 						color.Danger.Printf("Graceful shutdown timeout. Exiting.")
-						disableSplitScreen() // Force restore terminal
 						os.Exit(0)
 					}
 				}
