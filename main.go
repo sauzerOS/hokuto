@@ -67,6 +67,7 @@ var (
 	gnuOriginalURL       = "https://ftp.gnu.org/gnu"
 	gnuMirrorMessageOnce sync.Once
 	BinaryMirror         string
+	version              = "dev" //default version; overridden at build time
 	errPackageNotFound   = errors.New("package not found")
 	// Global executors (declared, to be assigned in main)
 	UserExec *Executor
@@ -5585,13 +5586,13 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 	var defaults = map[string]string{}
 
 	if bootstrap {
-		// --- Bootstrap environment (like the lfs user) ---
+		// --- Bootstrap environment ---
 		lfsRoot := cfg.Values["LFS"]
 		if lfsRoot == "" {
 			return 0, fmt.Errorf("bootstrap mode requires LFS to be set in config")
 		}
 
-		// --- NEW: Architecture Detection ---
+		// --- Architecture Detection ---
 		targetArch := cfg.Values["HOKUTO_ARCH"]
 		if targetArch == "" {
 			targetArch = "x86_64" // Default
@@ -5603,38 +5604,36 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 		case "aarch64", "arm64":
 			// Raspberry Pi 4 / ARM64 Settings
 			lfsTgt = "aarch64-lfs-linux-gnu"
-			// Cortex-A72 is the CPU in RPi4.
-			// If you want generic ARM64, use -march=armv8-a
-			cflags = "-O2 -mcpu=cortex-a72 -pipe -fPIC"
+			cflags = "-O2 -pipe"
 			colArrow.Print("-> ")
-			colSuccess.Println("Configuring bootstrap for AArch64 (Raspberry Pi 4)")
+			colSuccess.Println("Configuring bootstrap for AArch64")
 
 		case "x86_64":
-			// Standard Intel/AMD Settings
 			lfsTgt = "x86_64-lfs-linux-gnu"
 			cflags = "-O2 -march=x86-64 -mtune=generic -pipe -fPIC"
 
 		default:
-			// Fallback or user provided custom arch
 			lfsTgt = fmt.Sprintf("%s-lfs-linux-gnu", targetArch)
 			cflags = "-O2 -pipe -fPIC"
-			colWarn.Printf("Warning: Unknown architecture %s, using generic flags.\n", targetArch)
 		}
 
 		defaults = map[string]string{
-			"LFS":         lfsRoot,
-			"LC_ALL":      "POSIX",
-			"LFS_TGT":     lfsTgt,
-			"LFS_TGT32":   "i686-lfs-linux-gnu",
-			"CFLAGS":      cflags,
-			"CXXFLAGS":    cflags,
-			"LDFLAGS":     "",
+			"LFS":       lfsRoot,
+			"LC_ALL":    "POSIX",
+			"LFS_TGT":   lfsTgt,
+			"LFS_TGT32": "i686-lfs-linux-gnu",
+			"CFLAGS":    cflags,
+			"CXXFLAGS":  cflags,
+			"LDFLAGS":   "",
+			// Crucial: Put LFS tools first in PATH
 			"PATH":        filepath.Join(lfsRoot, "tools/bin") + ":/usr/bin:/bin",
 			"MAKEFLAGS":   fmt.Sprintf("-j%d", numCores),
 			"CONFIG_SITE": filepath.Join(lfsRoot, "usr/share/config.site"),
 			"HOKUTO_ROOT": lfsRoot,
 			"TMPDIR":      currentTmpDir,
+			"HOKUTO_ARCH": targetArch,
 		}
+
 	} else {
 		// --- Normal build environment---
 		defaults = map[string]string{
@@ -5646,6 +5645,7 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 			"CFLAGS":                     defaultCFLAGS,
 			"CXXFLAGS":                   "",
 			"LDFLAGS":                    defaultLDFLAGS,
+			"CONFIG_SITE":                ("usr/share/config.site"),
 			"MAKEFLAGS":                  fmt.Sprintf("-j%d", numCores),
 			"CMAKE_BUILD_PARALLEL_LEVEL": fmt.Sprintf("%d", numCores),
 			"RUSTFLAGS":                  fmt.Sprintf("--remap-path-prefix=%s=.", buildDir),
@@ -5703,6 +5703,27 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 	if cfg.Values["HOKUTO_MULTILIB"] == "1" {
 		defaults["MULTILIB"] = "1"
 	}
+
+	// Set HOKUTO_ARCH
+	targetArch := cfg.Values["HOKUTO_ARCH"]
+	if targetArch == "" {
+		// Fallback to uname -m if not set in config
+		cmd := exec.Command("uname", "-m")
+		out, err := cmd.Output()
+		if err == nil {
+			targetArch = strings.TrimSpace(string(out))
+		} else {
+			// Fallback to Go runtime arch if uname fails
+			targetArch = runtime.GOARCH
+			switch targetArch {
+			case "amd64":
+				targetArch = "x86_64"
+			case "arm64":
+				targetArch = "aarch64"
+			}
+		}
+	}
+	defaults["HOKUTO_ARCH"] = targetArch
 
 	for k, v := range defaults {
 		env = append(env, fmt.Sprintf("%s=%s", k, v))
@@ -6144,6 +6165,7 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 		"CFLAGS":      "-O2 -march=x86-64 -mtune=generic -pipe -fPIC",
 		"CXXFLAGS":    "",
 		"LDFLAGS":     "",
+		"CONFIG_SITE": "/usr/share/config.site",
 		"MAKEFLAGS":   fmt.Sprintf("-j%d", runtime.NumCPU()),
 		"RUSTFLAGS":   fmt.Sprintf("--remap-path-prefix=%s=.", buildDir),
 		"GOFLAGS":     "-trimpath -modcacherw",
@@ -6264,6 +6286,25 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 	if cfg.Values["HOKUTO_MULTILIB"] == "1" {
 		defaults["MULTILIB"] = "1"
 	}
+
+	// Set HOKUTO_ARCH
+	targetArch := cfg.Values["HOKUTO_ARCH"]
+	if targetArch == "" {
+		cmd := exec.Command("uname", "-m")
+		out, err := cmd.Output()
+		if err == nil {
+			targetArch = strings.TrimSpace(string(out))
+		} else {
+			targetArch = runtime.GOARCH
+			switch targetArch {
+			case "amd64":
+				targetArch = "x86_64"
+			case "arm64":
+				targetArch = "aarch64"
+			}
+		}
+	}
+	defaults["HOKUTO_ARCH"] = targetArch
 
 	// 5. Final loop to assemble the environment array
 	for k, def := range defaults {
@@ -7696,10 +7737,10 @@ func handleBuildCommand(args []string, cfg *Config) {
 			colWarn.Println("Multilib support disabled for bootstrap.")
 		}
 
-		// Architecture Prompt
+		// Architecture Selection & Auto-Toolchain Setup
 		colArrow.Print("-> ")
 		colInfo.Println("Select Target Architecture:")
-		colInfo.Println("  1. x86_64 (Intel/AMD)")
+		colInfo.Println("  1. x86_64 (Intel/AMD) - Default")
 		colInfo.Println("  2. aarch64 (Raspberry Pi 4 / ARM64)")
 		fmt.Print("Enter choice [1/2]: ")
 
@@ -9061,8 +9102,7 @@ func main() {
 
 	case "version", "--version":
 		// Print version first
-		// HOKUTOVERSION (string for search)
-		colSuccess.Printf("hokuto 0.3.3")
+		colSuccess.Printf("hokuto %s\n", version)
 
 		// Try to pick and show a random embedded PNG from assets/
 		imgs, err := listEmbeddedImages()
