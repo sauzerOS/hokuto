@@ -1,0 +1,596 @@
+package hokuto
+
+// Code in this file was split out of main.go for readability.
+// No behavior changes intended.
+
+import (
+	"bufio"
+	"context"
+	"fmt"
+	"os"
+	"os/exec"
+	"path"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"github.com/gookit/color"
+)
+
+func getRepoVersion(pkgName string) (string, error) {
+	// 1. Split the repoPaths string by the colon (':') separator.
+	paths := strings.Split(repoPaths, ":")
+
+	var lastErr error
+
+	// 2. Iterate over all individual repository paths.
+	for _, repoPath := range paths {
+		// Trim any potential whitespace from the path
+		repoPath = strings.TrimSpace(repoPath)
+		if repoPath == "" {
+			continue // Skip empty paths
+		}
+
+		// 3. Construct the full path to the version file.
+		// filepath.Join handles the correct path separators (e.g., '/' or '\')
+		versionFile := filepath.Join(repoPath, pkgName, "version")
+
+		// 4. Attempt to read the file.
+		data, err := os.ReadFile(versionFile)
+		if err == nil {
+			// File found and read successfully. Process the content.
+			fields := strings.Fields(string(data))
+			if len(fields) == 0 {
+				// If the file is empty, this path is considered invalid but we can stop here.
+				return "", fmt.Errorf("invalid version file format (empty file) for %s in path %s", pkgName, repoPath)
+			}
+
+			// Successfully found the version. Return it immediately.
+			return fields[0], nil
+		} else if !os.IsNotExist(err) {
+			// If we hit an error other than "file not found," it's a serious issue
+			// (e.g., permission denied) so we'll record it and continue trying other paths
+			// but keep the error to return if no file is found anywhere.
+			lastErr = fmt.Errorf("could not read version file for %s in path %s: %w", pkgName, repoPath, err)
+		}
+		// If os.IsNotExist(err) is true, we just continue to the next path.
+	}
+
+	// 5. If the loop completes without finding a valid version file,
+	// return the last non-FileNotFound error if one occurred, otherwise
+	// return a generic "not found" error.
+	if lastErr != nil {
+		return "", lastErr
+	}
+	return "", fmt.Errorf("version file for %s not found in any of the specified paths", pkgName)
+}
+
+// getRepoVersion2 reads pkgname/version from repoPaths and returns the version string,
+// the revision string, and an error.
+// The version file format is: "<version> <revision>", e.g. "1.0 1".
+// used for the update check
+
+func getRepoVersion2(pkgName string) (version string, revision string, err error) {
+	// 1. Split the repoPaths string by the colon (':') separator.
+	paths := strings.Split(repoPaths, ":")
+
+	var lastErr error
+
+	// 2. Iterate over all individual repository paths.
+	for _, repoPath := range paths {
+		// Trim any potential whitespace from the path
+		repoPath = strings.TrimSpace(repoPath)
+		if repoPath == "" {
+			continue // Skip empty paths
+		}
+
+		// 3. Construct the full path to the version file.
+		versionFile := filepath.Join(repoPath, pkgName, "version")
+
+		// 4. Attempt to read the file.
+		data, err := os.ReadFile(versionFile)
+		if err == nil {
+			// File found and read successfully. Process the content.
+			fields := strings.Fields(string(data))
+
+			if len(fields) < 1 {
+				// File exists but is empty/invalid
+				return "", "", fmt.Errorf("invalid version file format (missing version) for %s in path %s", pkgName, repoPath)
+			}
+
+			// Extract the version (first field)
+			pkgVersion := fields[0]
+
+			// Extract the revision (second field). If missing, default to "0" or "1"
+			// based on your package system's convention. Assuming default to "1" is safest
+			// to avoid false updates if older packages didn't have a revision number.
+			pkgRevision := "1" // Default revision if only one field is present
+			if len(fields) >= 2 {
+				pkgRevision = fields[1]
+			}
+
+			// Successfully found the version and revision. Return them immediately.
+			return pkgVersion, pkgRevision, nil
+		} else if !os.IsNotExist(err) {
+			// If we hit an error other than "file not found," record it.
+			lastErr = fmt.Errorf("could not read version file for %s in path %s: %w", pkgName, repoPath, err)
+		}
+		// If os.IsNotExist(err) is true, we just continue to the next path.
+	}
+
+	// 5. If the loop completes without finding a valid version file,
+	// return the last non-FileNotFound error if one occurred, otherwise
+	// return a generic "not found" error.
+	if lastErr != nil {
+		return "", "", lastErr
+	}
+	return "", "", fmt.Errorf("version file for %s not found in any of the specified paths", pkgName)
+}
+
+// getBaseRepoPath extracts the base repository path (e.g., "/repo/reponame1")
+// from a longer path (e.g., "/repo/reponame1/one").
+
+func getBaseRepoPath(fullPath string) string {
+	parts := strings.Split(fullPath, "/")
+
+	// Example: for "/repo/reponame1/one", parts is ["", "repo", "reponame1", "one"]
+
+	// We need at least parts for "", "repo", "reponameX". Length >= 3.
+	if len(parts) < 3 {
+		return fullPath
+	}
+
+	// We explicitly construct the path to ensure the leading '/' is present.
+	// parts[0] is "", parts[1] is "repo", parts[2] is "reponame1"
+	// We want to join "repo" and "reponame1" and prepend "/"
+
+	// Check if the path is absolute (starts with '/')
+	isAbs := strings.HasPrefix(fullPath, "/")
+
+	// The components we want to join are parts[1] and parts[2]
+	repoDir := path.Join(parts[1], parts[2])
+
+	if isAbs {
+		// Prepend the "/" to make it absolute again
+		return "/" + repoDir
+	}
+
+	return repoDir // Return the relative path if the original wasn't absolute (though it should be)
+}
+
+// updateRepos updates each unique repository found in repoPaths
+
+func updateRepos() {
+	// 1. Split the global repoPaths string by the path separator ":"
+	paths := strings.Split(repoPaths, ":")
+
+	// 2. Determine the unique base repository directories
+	uniqueRepoDirs := make(map[string]struct{})
+	for _, p := range paths {
+		// Clean the path to get the base repository directory
+		repoDir := getBaseRepoPath(p)
+
+		if repoDir != "" {
+			uniqueRepoDirs[repoDir] = struct{}{}
+		}
+	}
+	colArrow.Print("-> ")
+	colSuccess.Println("Unique repositories to update:")
+	for dir := range uniqueRepoDirs {
+		colArrow.Print("-> ")
+		colSuccess.Printf("%s\n", dir)
+
+		// 3. Execute 'git pull' in each unique directory
+		// We use dir as the working directory for 'git pull'
+		cmd := exec.Command("git", "pull")
+		cmd.Dir = dir // Set the working directory for the command
+
+		// Capture output for logging and error checking
+		output, err := cmd.CombinedOutput()
+
+		if err != nil {
+			fmt.Printf("Error pulling repo %s: %v\nOutput:\n%s\n", dir, err, strings.TrimSpace(string(output)))
+		} else {
+			colArrow.Print("-> ")
+			colSuccess.Printf("Successfully pulled repo %s\nOutput:\n%s\n", dir, strings.TrimSpace(string(output)))
+		}
+	}
+}
+
+// checkPackageExists checks if a specific package directory exists in the Installed path.
+// It returns true if the package directory exists and is a directory, false otherwise.
+// This is a direct, silent check, ideal for internal dependency resolution.
+
+func checkPackageExists(pkgName string) bool {
+	// Determine the full path to the package's installed directory
+	pkgPath := filepath.Join(Installed, pkgName)
+
+	// Check if the path exists and is a directory.
+	info, err := os.Stat(pkgPath)
+	if err != nil {
+		// os.IsNotExist(err) covers the most common failure,
+		// any other error (permission, etc.) is treated as "not installed" for safety.
+		return false
+	}
+
+	// Ensure it's actually a directory (to exclude possible stray files)
+	return info.IsDir()
+}
+
+// getInstalledPackageOutput reads installed package versions from the filesystem,
+// filters them by searchTerm, and returns the list as a formatted byte slice.
+
+func getInstalledPackageOutput(searchTerm string) ([]byte, error) {
+	var outputBuilder strings.Builder
+
+	// Step 1: Get the full list of installed package directories.
+	entries, err := os.ReadDir(Installed)
+	if err != nil {
+		if os.IsNotExist(err) {
+			// If the directory doesn't exist, treat it as empty, no error.
+			return []byte(""), nil
+		}
+		return nil, fmt.Errorf("failed to read installed directory %s: %w", Installed, err)
+	}
+
+	var allPkgs []string
+	for _, e := range entries {
+		if e.IsDir() {
+			allPkgs = append(allPkgs, e.Name())
+		}
+	}
+
+	// Step 2: Filter the list if a search term was provided.
+	var pkgsToShow []string
+	if searchTerm != "" {
+		for _, pkg := range allPkgs {
+			if strings.Contains(pkg, searchTerm) {
+				pkgsToShow = append(pkgsToShow, pkg)
+			}
+		}
+	} else {
+		// If no search term, show everything.
+		pkgsToShow = allPkgs
+	}
+
+	// Step 3: Format and collect the information (instead of printing).
+	// The format is expected to be: "<pkgName> <version> [revision]"
+	for _, p := range pkgsToShow {
+		versionFile := filepath.Join(Installed, p, "version")
+		versionInfo := "unknown 0" // Default for unreadable file
+
+		if data, err := os.ReadFile(versionFile); err == nil {
+			// Use the full content of the version file (e.g., "1.0 1")
+			versionInfo = strings.TrimSpace(string(data))
+		}
+
+		// Write the package name and its full version info to the buffer
+		// Example line: "fcron 3.4.0 1"
+		outputBuilder.WriteString(fmt.Sprintf("%s %s\n", p, versionInfo))
+	}
+
+	// Return the collected data as a byte slice.
+	return []byte(outputBuilder.String()), nil
+}
+
+// Struct to hold package information
+type Package struct {
+	Name              string
+	InstalledVersion  string
+	InstalledRevision string
+	RepoVersion       string
+	RepoRevision      string
+}
+
+// parsePackageList converts the output of getInstalledPackageOutput into a map of packages.
+
+func parsePackageList(output []byte) (map[string]Package, error) {
+	packages := make(map[string]Package)
+	scanner := bufio.NewScanner(strings.NewReader(string(output)))
+
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+
+		parts := strings.Fields(line)
+		// Expecting at least 3 parts: <name> <version> <revision>
+		if len(parts) < 3 {
+			// Allow for packages with missing revision (assume 0 or 1 for simplicity)
+			// For now, let's strictly require 3 fields for accurate comparison
+			return nil, fmt.Errorf("invalid package list format (expected name, version, revision): %s", line)
+		}
+
+		pkgName := parts[0]
+		pkgVersion := parts[1]
+		pkgRevision := parts[2] // EXTRACT THE REVISION
+
+		packages[pkgName] = Package{
+			Name:              pkgName,
+			InstalledVersion:  pkgVersion,
+			InstalledRevision: pkgRevision, // Store the revision
+		}
+	}
+	return packages, scanner.Err()
+}
+
+// readLockFile reads /etc/hokuto.lock and returns a map of package name -> locked version.
+// Returns an empty map if the file doesn't exist or on error (errors are silently ignored).
+
+func readLockFile() map[string]string {
+	lockFile := "/etc/hokuto.lock"
+	locked := make(map[string]string)
+
+	data, err := os.ReadFile(lockFile)
+	if err != nil {
+		// File doesn't exist or can't be read - return empty map
+		return locked
+	}
+
+	scanner := bufio.NewScanner(strings.NewReader(string(data)))
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		// Parse line: "package-name version"
+		fields := strings.Fields(line)
+		if len(fields) >= 2 {
+			pkgName := fields[0]
+			version := fields[1]
+			locked[pkgName] = version
+		}
+	}
+
+	return locked
+}
+
+// checkDependencyBlocks checks if any installed package depends on a lower version
+// of the package being updated. Returns the blocking package name if found, empty string otherwise.
+
+func checkDependencyBlocks(pkgName string, newVersion string, installedPackages map[string]Package) string {
+	// Iterate through all installed packages
+	for installedPkgName := range installedPackages {
+		// Skip the package itself
+		if installedPkgName == pkgName {
+			continue
+		}
+
+		// Read the depends file for this installed package
+		dependsPath := filepath.Join(Installed, installedPkgName, "depends")
+		data, err := os.ReadFile(dependsPath)
+		if err != nil {
+			// No depends file or can't read it - skip
+			continue
+		}
+
+		// Parse the depends file
+		scanner := bufio.NewScanner(strings.NewReader(string(data)))
+		for scanner.Scan() {
+			line := strings.TrimSpace(scanner.Text())
+			if line == "" || strings.HasPrefix(line, "#") {
+				continue
+			}
+
+			// Parse dependency spec (e.g., "python-sabctools==8.2.6")
+			name, op, ver, _, _, _ := parseDepToken(line)
+			if name != pkgName {
+				continue
+			}
+
+			// If there's a version constraint, check if the new version violates it
+			if op != "" && ver != "" {
+				// Check if the new version is higher than the required version
+				// If the constraint is ==, <=, or <, and new version is higher, it's blocked
+				if op == "==" {
+					// Exact version required - any other version is blocked
+					if ver != newVersion {
+						return installedPkgName
+					}
+				} else if op == "<=" || op == "<" {
+					// Maximum version constraint - if new version is higher, it's blocked
+					if compareVersions(newVersion, ver) > 0 {
+						return installedPkgName
+					}
+				}
+				// For >= and >, we allow the update (new version satisfies the constraint)
+			}
+		}
+	}
+
+	return ""
+}
+
+// checkForUpgrades is the main function for the upgrade logic.
+
+func checkForUpgrades(_ context.Context, cfg *Config) error {
+	colArrow.Print("-> ")
+	colSuccess.Println("Checking for Package Upgrades")
+
+	// 1. Get list of installed packages
+	output, err := getInstalledPackageOutput("")
+	if err != nil {
+		return fmt.Errorf("could not retrieve installed packages: %w", err)
+	}
+
+	installedPackages, err := parsePackageList(output)
+	if err != nil {
+		return fmt.Errorf("failed to parse package list: %w", err)
+	}
+
+	var upgradeList []Package
+
+	// 2. Compare installed version + revision vs. repo version + revision
+	for name, pkg := range installedPackages {
+		// Updated call to getRepoVersion to capture both version and revision
+		repoVersion, repoRevision, err := getRepoVersion2(name)
+		if err != nil {
+			// Log error but continue to the next package
+			debugf("Warning: Could not get repo version for %s: %v\n", name, err)
+			continue
+		}
+
+		// Store repo information on the package struct
+		pkg.RepoVersion = repoVersion
+		pkg.RepoRevision = repoRevision
+
+		// Comparison Logic: Check for a mismatch in either version OR revision
+		isVersionMismatch := pkg.InstalledVersion != pkg.RepoVersion
+		isRevisionMismatch := pkg.InstalledRevision != pkg.RepoRevision
+
+		// NOTE: A more complex system would compare versions numerically,
+		// but for simple string equality checks, this is sufficient:
+		if isVersionMismatch || isRevisionMismatch {
+			// Add to upgrade list
+			upgradeList = append(upgradeList, pkg)
+		}
+	}
+
+	// 2.5. Filter upgrade list based on dependencies and lock file
+	lockedPackages := readLockFile()
+	var filteredUpgradeList []Package
+	var blockedPackages []string
+
+	for _, pkg := range upgradeList {
+		shouldSkip := false
+		blockReason := ""
+
+		// Check if blocked by installed package dependencies
+		blockingPkg := checkDependencyBlocks(pkg.Name, pkg.RepoVersion, installedPackages)
+		if blockingPkg != "" {
+			shouldSkip = true
+			blockReason = fmt.Sprintf("%s update blocked by %s", pkg.Name, blockingPkg)
+		}
+
+		// Check if locked in /etc/hokuto.lock
+		if lockedVersion, isLocked := lockedPackages[pkg.Name]; isLocked {
+			// If locked version is lower than the new version, block the update
+			if compareVersions(lockedVersion, pkg.RepoVersion) < 0 {
+				shouldSkip = true
+				if blockReason != "" {
+					blockReason += " and lock file"
+				} else {
+					blockReason = fmt.Sprintf("%s update blocked by lock file (locked at %s)", pkg.Name, lockedVersion)
+				}
+			}
+		}
+
+		if shouldSkip {
+			blockedPackages = append(blockedPackages, blockReason)
+		} else {
+			filteredUpgradeList = append(filteredUpgradeList, pkg)
+		}
+	}
+
+	// Print blocked packages if any
+	if len(blockedPackages) > 0 {
+		cPrintf(colWarn, "\n--- %d Package(s) Blocked from Update ---\n", len(blockedPackages))
+		for _, reason := range blockedPackages {
+			cPrintf(colWarn, "  - %s\n", reason)
+		}
+	}
+
+	// 3. Handle upgrade list
+	if len(filteredUpgradeList) == 0 {
+		colArrow.Print("-> ")
+		colSuccess.Println("No packages to upgrade.")
+		return nil
+	}
+
+	cPrintf(colInfo, "\n--- %d Package(s) to Upgrade ---\n", len(filteredUpgradeList))
+	var pkgNames []string
+	for _, pkg := range filteredUpgradeList {
+		// Print full version/revision information for clarity
+		cPrintf(colInfo, "  - %s: %s %s -> %s %s\n",
+			pkg.Name,
+			pkg.InstalledVersion, pkg.InstalledRevision,
+			pkg.RepoVersion, pkg.RepoRevision)
+		pkgNames = append(pkgNames, pkg.Name)
+	}
+
+	// 4. Prompt user for upgrade
+	if !askForConfirmation(colWarn, "Do you want to upgrade these packages?") {
+		cPrintln(colNote, "Upgrade canceled by user.")
+		return nil
+	}
+
+	// Launch background prefetcher for SUBSEQUENT packages.
+	// We skip the first one (pkgNames[0]) because the main thread builds it immediately,
+	// so prefetching it creates unnecessary race conditions/double logs.
+	if len(pkgNames) > 1 {
+		go prefetchSources(pkgNames[1:])
+	}
+
+	// --- REFACTORED BUILD AND INSTALL LOGIC ---
+	var failedPackages []string
+	var totalUpdateDuration time.Duration // Accumulator for the whole update process
+	totalToUpdate := len(pkgNames)
+
+	for i, pkgName := range pkgNames {
+		colArrow.Print("\n-> ")
+		colSuccess.Printf("Executing update for: %s (%d/%d)\n", pkgName, i+1, totalToUpdate)
+
+		// A. Directly call pkgBuild within the current process
+		// We pass UserExec because pkgBuild itself creates the appropriate
+		// privileged or unprivileged build-specific executor.
+		duration, err := pkgBuild(pkgName, cfg, UserExec, false, i+1, totalToUpdate)
+		if err != nil {
+			color.Danger.Printf("Build failed for %s: %v\n", pkgName, err)
+			failedPackages = append(failedPackages, pkgName)
+			continue // <<< IMPORTANT: Move to the next package on failure
+		}
+		totalUpdateDuration += duration
+		// B. If build is successful, install the package
+		version, _ := getRepoVersion(pkgName)
+		tarballPath := filepath.Join(BinDir, fmt.Sprintf("%s-%s.tar.zst", pkgName, version))
+
+		// Set critical section for the installation phase
+		isCriticalAtomic.Store(1)
+		handlePreInstallUninstall(pkgName, cfg, RootExec)
+		if err := pkgInstall(tarballPath, pkgName, cfg, RootExec, false); err != nil {
+			isCriticalAtomic.Store(0) // Unset on failure
+			color.Danger.Printf("Installation failed for %s: %v\n", pkgName, err)
+			failedPackages = append(failedPackages, pkgName)
+			continue
+		}
+		isCriticalAtomic.Store(0) // Unset on success
+	}
+
+	if len(failedPackages) > 0 {
+		return fmt.Errorf("some packages failed to update: %s", strings.Join(failedPackages, ", "))
+	}
+	colArrow.Print("-> ")
+	colSuccess.Printf("System update completed successfully (%d/%d) Total Time: %s\n", totalToUpdate, totalToUpdate, totalUpdateDuration.Truncate(time.Second))
+	return nil
+}
+
+// resolveMissingDeps recursively finds all missing dependencies for a package.
+// It assumes cfg is passed in, as it's needed for the recursive call.
+
+func isPackageInstalled(pkgName string) bool {
+	// Simply defer to the silent checker.
+	return checkPackageExists(pkgName)
+}
+
+func getInstalledVersion(pkgName string) (string, bool) {
+	// Installed root directory is stored in global variable Installed
+	versionPath := filepath.Join(Installed, pkgName, "version")
+	b, err := os.ReadFile(versionPath)
+	if err != nil {
+		return "", false
+	}
+	v := strings.TrimSpace(string(b))
+	if v == "" {
+		return "", false
+	}
+	// Extract just the version (first field), as version files can contain multiple fields like "3.6.5 1"
+	fields := strings.Fields(v)
+	if len(fields) == 0 {
+		return "", false
+	}
+	return fields[0], true
+}
+
+// versionSatisfies checks if installed satisfies op refVersion.

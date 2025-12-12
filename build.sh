@@ -1,8 +1,14 @@
 #!/bin/sh -e
+
+VERSION=$(cat VERSION)
+BUILD_DATE=$(date +"%Y-%m-%d %H:%M:%S %Z")
+
+# build amd64
 export GOOS=linux
 export GOARCH=amd64
 export CGO_ENABLED=0            # set 0 to avoid cgo and produce static bin when possible
-VERSION="0.2.0"
+
 go build -trimpath -o hokuto \
-  -ldflags="-s -w -X main.version=${VERSION}" \
-  ./...
+  -ldflags="-s -w -X hokuto/internal/hokuto.version=${VERSION} \
+  -X 'hokuto/internal/hokuto.buildDate=${BUILD_DATE}'" \
+  ./cmd/hokuto

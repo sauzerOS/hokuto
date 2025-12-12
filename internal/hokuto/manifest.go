@@ -1,0 +1,314 @@
+package hokuto
+
+// Code in this file was split out of main.go for readability.
+// No behavior changes intended.
+
+import (
+	"bufio"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"strings"
+)
+
+type ManifestEntry struct {
+	Path     string
+	Checksum string
+}
+
+// parseManifest reads a manifest file and returns a map of file paths to their entries.
+// The map key is the file Path.
+// parseManifest reads a manifest file and returns a map of file paths to their entries.
+// It specifically skips entries that represent directories (end with '/').
+
+func generateManifest(outputDir, installedDir string, execCtx *Executor) error {
+	manifestFile := filepath.Join(installedDir, "manifest")
+
+	// Create a secure, unique temporary file
+	fTmp, err := os.CreateTemp("", "hokuto-manifest-*.tmp")
+	if err != nil {
+		return fmt.Errorf("failed to create temporary manifest file: %v", err)
+	}
+	tmpManifest := fTmp.Name()
+	fTmp.Close() // Close immediately, we re-open it with specific flags later
+
+	// Set permissions to 0644 so it's readable if we switch contexts (e.g. root reading user file)
+	if err := os.Chmod(tmpManifest, 0o644); err != nil {
+		os.Remove(tmpManifest)
+		return fmt.Errorf("failed to chmod temp manifest: %v", err)
+	}
+
+	// Ensure cleanup happens even if we error out early
+	defer os.Remove(tmpManifest)
+
+	mkdirCmd := exec.Command("mkdir", "-p", installedDir)
+	if err := execCtx.Run(mkdirCmd); err != nil {
+		return fmt.Errorf("failed to create installedDir: %v", err)
+	}
+
+	entries, err := listOutputFiles(outputDir, execCtx)
+	if err != nil {
+		// fallback to RootExec
+		entries, err = listOutputFiles(outputDir, RootExec)
+		if err != nil {
+			return fmt.Errorf("failed to list output files: %v", err)
+		}
+	}
+
+	relManifest, err := filepath.Rel(outputDir, manifestFile)
+	if err != nil {
+		return fmt.Errorf("failed to compute relative path for manifest: %v", err)
+	}
+	manifestEntryPath := "/" + relManifest
+
+	filtered := make([]string, 0, len(entries))
+	for _, e := range entries {
+		if e != manifestEntryPath {
+			filtered = append(filtered, e)
+		}
+	}
+
+	f, err := os.OpenFile(tmpManifest, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	if err != nil {
+		return fmt.Errorf("failed to open temporary manifest file: %v", err)
+	}
+	defer f.Close()
+
+	var dirs, symlinks, regularFiles []string
+	symlinkMap := make(map[string]bool)
+
+	for _, entry := range filtered {
+		if strings.HasSuffix(entry, "/") {
+			dirs = append(dirs, entry)
+			continue
+		}
+		absPath := filepath.Join(outputDir, strings.TrimPrefix(entry, "/"))
+		fileType, err := lstatViaExecutor(absPath, execCtx)
+		if err != nil {
+			return fmt.Errorf("failed to lstat %s: %v", absPath, err)
+		}
+		if fileType == "symbolic link" {
+			symlinks = append(symlinks, entry)
+			symlinkMap[entry] = true
+		} else {
+			regularFiles = append(regularFiles, absPath)
+		}
+	}
+
+	// Write directory entries correctly
+	for _, entry := range dirs {
+		rel := strings.TrimPrefix(entry, "/")
+		if !strings.HasSuffix(rel, "/") {
+			rel += "/"
+		}
+		cleaned := "/" + rel
+		if _, err := fmt.Fprintln(f, cleaned); err != nil {
+			return fmt.Errorf("failed to write manifest entry: %v", err)
+		}
+	}
+
+	for _, entry := range symlinks {
+		if _, err := fmt.Fprintf(f, "%s 000000\n", entry); err != nil {
+			return fmt.Errorf("failed to write symlink entry: %v", err)
+		}
+	}
+
+	var checksums map[string]string
+	if !execCtx.ShouldRunAsRoot {
+		checksums, err = b3sumBatch(regularFiles, runtime.NumCPU()*2)
+		if err != nil {
+			debugf("parallel b3sum failed (%v), falling back to sequential\n", err)
+			checksums = make(map[string]string)
+			for _, absPath := range regularFiles {
+				checksum, serr := b3sum(absPath, RootExec)
+				if serr != nil {
+					return fmt.Errorf("b3sum failed for %s: %v", absPath, serr)
+				}
+				checksums[absPath] = checksum
+			}
+		}
+	} else {
+		checksums = make(map[string]string)
+		for _, absPath := range regularFiles {
+			checksum, err := b3sum(absPath, execCtx)
+			if err != nil {
+				return fmt.Errorf("b3sum failed for %s: %v", absPath, err)
+			}
+			checksums[absPath] = checksum
+		}
+	}
+
+	for _, entry := range filtered {
+		if strings.HasSuffix(entry, "/") || symlinkMap[entry] {
+			continue
+		}
+		absPath := filepath.Join(outputDir, strings.TrimPrefix(entry, "/"))
+		checksum, exists := checksums[absPath]
+		if !exists {
+			return fmt.Errorf("missing checksum for %s", absPath)
+		}
+		if _, err := fmt.Fprintf(f, "%s  %s\n", entry, checksum); err != nil {
+			return fmt.Errorf("failed to write manifest entry: %v", err)
+		}
+	}
+
+	f.Close()
+
+	tempChecksum, err := b3sum(tmpManifest, execCtx)
+	if err != nil {
+		return fmt.Errorf("b3sum failed for temporary manifest %s: %v", tmpManifest, err)
+	}
+
+	f, err = os.OpenFile(tmpManifest, os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		return fmt.Errorf("failed to re-open temporary manifest file for final entry: %v", err)
+	}
+	if _, err := fmt.Fprintf(f, "%s  %s\n", manifestEntryPath, tempChecksum); err != nil {
+		f.Close()
+		return fmt.Errorf("failed to write final manifest entry: %v", err)
+	}
+	f.Close()
+
+	cpCmd := exec.Command("cp", "--remove-destination", tmpManifest, manifestFile)
+	if err := execCtx.Run(cpCmd); err != nil {
+		return fmt.Errorf("failed to copy temporary manifest into place: %v", err)
+	}
+
+	debugf("Manifest written to %s (%d entries)\n", manifestFile, len(filtered))
+	return nil
+}
+
+// copyFile copies a single file from src to dst
+
+func parseManifest(filePath string) (map[string]ManifestEntry, error) {
+	entries := make(map[string]ManifestEntry)
+
+	file, err := os.Open(filePath)
+	if err != nil {
+		// Treat non-existent base manifest as an empty manifest.
+		if os.IsNotExist(err) {
+			return entries, nil
+		}
+		return nil, fmt.Errorf("failed to open manifest file %s: %w", filePath, err)
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue // Skip empty lines and comments
+		}
+
+		// Check if the line represents a directory.
+		// We look for a line that starts with '/' and ends with '/', and has no other fields.
+		if strings.HasSuffix(line, "/") {
+			// Check if the line contains ONLY the directory path.
+			// If there's any whitespace, it might be a malformed file entry,
+			// but for a pure directory line like "/etc/", this will be false.
+			if len(strings.Fields(line)) == 1 {
+				continue // Skip directories
+			}
+		}
+
+		fields := strings.Fields(line)
+
+		// Now, we expect exactly two fields (Path and Checksum) for a file.
+		// If we get fewer, we return an error indicating a malformed file entry.
+		if len(fields) < 2 {
+			// The user's error message comes from here when processing a directory line.
+			// Since we've pre-filtered pure directory lines, this catches real malformed file lines.
+			return nil, fmt.Errorf("invalid manifest line format: %s", line)
+		}
+
+		path := fields[0]
+		checksum := fields[1]
+
+		entries[path] = ManifestEntry{Path: path, Checksum: checksum}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("error reading manifest file %s: %w", filePath, err)
+	}
+
+	return entries, nil
+}
+
+// updateManifestWithNewFiles appends new entries from stagingManifest2 to stagingManifest.
+// This operation requires root privileges, so it uses the global RootExec.
+
+func updateManifestWithNewFiles(stagingManifest, stagingManifest2 string) error {
+	// 1. Parse the base manifest (currently tracked files)
+	// NOTE: parseManifest likely handles reading the file contents, which may require
+	// elevated access if called during installation, but here it's likely called on
+	// staged files, which should be accessible by the running user.
+	baseEntries, err := parseManifest(stagingManifest)
+	if err != nil {
+		return fmt.Errorf("error parsing base manifest (%s): %w", stagingManifest, err)
+	}
+
+	// 2. Parse the new manifest (newly staged files)
+	newEntries, err := parseManifest(stagingManifest2)
+	if err != nil {
+		return fmt.Errorf("error parsing new manifest (%s): %w", stagingManifest2, err)
+	}
+
+	// 3. Determine new files to add
+	newFilesToTrack := make([]ManifestEntry, 0)
+	const zeroChecksum = "000000" // The required replacement checksum
+
+	for path, newEntry := range newEntries {
+		// Ignore any entry that contains the temporary manifest identifier.
+		// This prevents the manifest file itself from being added to the final manifest.
+		if strings.Contains(path, "staging-manifest") {
+			continue
+		}
+
+		// Check if the file path exists in the original base manifest
+		if _, exists := baseEntries[path]; !exists {
+			// This is a new file! Add it to the list to be appended,
+			// but with the zero checksum.
+
+			entryToAdd := newEntry
+			entryToAdd.Checksum = zeroChecksum
+			newFilesToTrack = append(newFilesToTrack, entryToAdd)
+		}
+	}
+
+	// If no new files were found, we are done.
+	if len(newFilesToTrack) == 0 {
+		return nil
+	}
+
+	// 4. CENTRALIZED PRIVILEGED APPEND (Replaces os.OpenFile and writer logic)
+
+	// First, format the data we want to append into an in-memory string.
+	var manifestLines strings.Builder
+	for _, entry := range newFilesToTrack {
+		// Append new entries in the specified format: path<space><space>checksum<newline>
+		manifestLines.WriteString(fmt.Sprintf("%s  %s\n", entry.Path, entry.Checksum))
+	}
+
+	// Second, use the RootExec to run the privileged 'tee -a' command.
+	// 'tee -a' reads from stdin and appends to the specified file, running as root
+	// via the Executor's mechanism (e.g., sudo).
+
+	// Arguments: tee -a <stagingManifest>
+	cmd := exec.Command("tee", "-a", stagingManifest)
+
+	// Pipe the data from the strings.Builder into the command's standard input
+	cmd.Stdin = strings.NewReader(manifestLines.String())
+
+	// Run the command using the global RootExec
+	if err := RootExec.Run(cmd); err != nil {
+		return fmt.Errorf("failed to append to manifest file %s via RootExec: %w", stagingManifest, err)
+	}
+
+	return nil
+}
+
+// getRepoVersion reads pkgname/version from repoPaths and returns the version string.
+// The version file format is: "<version> <revision>", e.g. "1.0 1".
+// We only care about the first field (the version).

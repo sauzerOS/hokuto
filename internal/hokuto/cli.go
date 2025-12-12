@@ -1,0 +1,649 @@
+package hokuto
+
+import (
+	"context"
+	"errors"
+	"flag"
+	"fmt"
+	"math/rand"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"strings"
+	"syscall"
+	"time"
+
+	"github.com/gookit/color"
+)
+
+// printHelp prints the commands table
+func printHelp() {
+	// General Usage Header
+	color.Bold.Println("Usage: hokuto <command> [arguments...]")
+	fmt.Println()
+	color.Info.Println("Available Commands:")
+
+	type cmdInfo struct {
+		Cmd  string
+		Args string
+		Desc string
+	}
+	// Restore detailed descriptions including command-specific options
+	cmds := []cmdInfo{
+		{"version, --version", "", "Show hokuto version and information"},
+		{"list, ls", "[pkg]", "List installed packages, optionally filter by name"},
+		{"checksum, c", "<pkg>", "Fetch sources and generate checksum file for a package. -f (force redwonload of sources)"},
+		{"build, b", "<pkg...>", "Build package(s). -a (auto-install), -i (half cpu cores), -ii (one cpu core), --alldeps"},
+		{"install, i", "<pkg...>", "Install pre-built packages from the binary cache or a specified .tar.zst file"},
+		{"uninstall, r", "<pkg...>", "Uninstall package(s). -f (force), -y (skip confirmation)"},
+		{"update, u", "[options]", "Update repositories and check for upgrades. Options: -i (half cpu cores), -ii (one cpu core)"},
+		{"manifest, m", "<pkg>", "Show the file list for an installed package"},
+		{"find, f", "<query>", "Find which package matches query string"},
+		{"new, n", "<pkg>", "Create a new package skeleton"},
+		{"edit, e", "<pkg>", "Edit a package's build files. -a (edit all files)"},
+		{"bootstrap", "<dir>", "Build a bootstrap rootfs in target directory"},
+		{"chroot", "<dir> [cmd...]", "Enter chroot and run command (default: /bin/bash)"},
+		{"cleanup", "[options]", "Cleanup: -sources, -bins, -orphans, -all"},
+	}
+
+	// --- Dynamic Padding Logic ---
+	// 1. Find the longest usage string to calculate the ideal width for the first column.
+	maxLen := 0
+	for _, c := range cmds {
+		length := len(c.Cmd) + len(c.Args)
+		if c.Args != "" {
+			length++ // Account for the space
+		}
+		if length > maxLen {
+			maxLen = length
+		}
+	}
+	// The final column width is the longest command plus some buffer space.
+	columnWidth := maxLen + 4
+
+	// 2. Print the formatted list with calculated padding.
+	for _, c := range cmds {
+		// This will hold the uncolored string to measure its length for padding
+		var usageString string
+		if c.Args != "" {
+			usageString = fmt.Sprintf("  %s %s", c.Cmd, c.Args)
+		} else {
+			usageString = fmt.Sprintf("  %s", c.Cmd)
+		}
+
+		// Print the colored command and arguments
+		fmt.Print("  ") // Indent
+		color.Bold.Print(c.Cmd)
+		if c.Args != "" {
+			fmt.Print(" ")
+			color.Cyan.Print(c.Args)
+		}
+
+		// Calculate the necessary padding and print it
+		pad := columnWidth - len(usageString)
+		if pad < 1 {
+			pad = 1
+		}
+		fmt.Print(strings.Repeat(" ", pad))
+
+		// Print the description
+		color.Info.Println(c.Desc)
+	}
+
+	fmt.Println()
+	color.Info.Println("Run 'hokuto <command> --help' for more details on a specific command.")
+}
+
+// Main is the CLI entrypoint for cmd/hokuto.
+func Main() {
+	// 1. CONTEXT AND SIGNAL SETUP
+	// Create the main application context and the function to cancel it.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// 2. SIGNAL CHANNEL SETUP
+	sigs := make(chan os.Signal, 1)
+	// Register to receive SIGINT (Ctrl+C) and SIGTERM (kill command)
+	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM)
+
+	// 3. SIGNAL HANDLING GOROUTINE
+	go func() {
+		for {
+			select {
+			case sig := <-sigs:
+				if isCriticalAtomic.Load() == 1 {
+					// --- CRITICAL PHASE: Block 1st signal, force exit on 2nd ---
+					colArrow.Print("\n-> ")
+					colError.Printf("Critical operation in progress (e.g., install). Press Ctrl+C AGAIN to force exit NOW.\n")
+
+					// Wait for a second signal or a short delay
+					select {
+					case <-sigs:
+						colArrow.Print("\n-> ")
+						colError.Printf("Forced immediate exit.")
+						os.Exit(130) // Common exit code for SIGINT
+					case <-time.After(5 * time.Second):
+						// If no second signal, continue waiting for the loop to repeat
+						continue
+					case <-ctx.Done():
+						return // Context cancelled from outside
+					}
+				} else {
+					// --- NON-CRITICAL PHASE: Graceful Cancellation ---
+					colArrow.Print("\n-> ")
+					color.Danger.Printf("Received %v. Cancelling process gracefully\n", sig)
+					cancel() // Cancel the context
+
+					// Give the command a moment to die and flush its buffers
+					time.Sleep(100 * time.Millisecond)
+
+					// Wait for a second signal for immediate exit
+					// NOTE: Don't check ctx.Done() here since we just cancelled it
+					select {
+					case <-sigs:
+						colArrow.Print("\n-> ")
+						color.Danger.Printf("Second interrupt received. Forcing immediate exit.")
+						os.Exit(130)
+					case <-time.After(2 * time.Second):
+						// Give more time for graceful shutdown (increased from 500ms to 2s)
+						colArrow.Print("\n-> ")
+						color.Danger.Printf("Graceful shutdown timeout. Exiting.")
+						os.Exit(0)
+					}
+				}
+
+			case <-ctx.Done():
+				return // Context cancelled from the main flow
+			} // <-- Correctly closed 'select' statement
+		} // <-- Correctly closed 'for' loop
+	}() // <-- Correctly closed 'go func'
+
+	// 4. MAIN LOGIC EXECUTION
+	// Check for immediate cancellation before starting (e.g., if signal received early)
+	if ctx.Err() != nil {
+		// Already cancelled before we started the main logic
+		return
+	}
+
+	if len(os.Args) < 2 {
+		printHelp()
+		return
+	}
+
+	cfg, err := loadConfig(ConfigFile)
+	if err != nil {
+		// handle error
+	}
+	mergeEnvOverrides(cfg)
+	initConfig(cfg)
+
+	// 5. CHECK IF ROOT PRIVILEGES ARE NEEDED
+	if needsRootPrivileges(os.Args[1:]) {
+		if err := authenticateOnce(); err != nil {
+			fmt.Fprintf(os.Stderr, "Authentication failed: %v\n", err)
+			os.Exit(1)
+		}
+	}
+
+	// 6. INITIALIZE EXECUTORS
+	UserExec = &Executor{
+		Context:         ctx,
+		ShouldRunAsRoot: false,
+	}
+	RootExec = &Executor{
+		Context:         ctx,
+		ShouldRunAsRoot: true,
+	}
+
+	// 7. MAIN LOGIC
+	var exitCode int
+
+	switch os.Args[1] {
+	case "chroot":
+		// Call the new wrapper function that contains the defer logic
+		exitCode = runChrootCommand(os.Args[2:], RootExec)
+
+	case "cleanup":
+		// Pass 'cfg' to the function
+		if err := handleCleanupCommand(os.Args[2:], cfg); err != nil {
+			fmt.Fprintf(os.Stderr, "Cleanup failed: %v\n", err)
+			os.Exit(1)
+		}
+
+	case "version", "--version":
+		// Try to pick and show a random embedded PNG from assets/
+		imgs, err := listEmbeddedImages()
+		if err != nil || len(imgs) == 0 {
+			// No images available — nothing more to do
+			if err != nil {
+				debugf("warning: failed to list embedded images: %v\n", err)
+			}
+			break
+		}
+
+		// Choose a random image
+		choice := imgs[rand.Intn(len(imgs))]
+
+		// Display via chafa using the main context (ctx must be in scope in main)
+		// Forward a small default set of chafa flags; you may change or pass none.
+		if err := displayEmbeddedWithChafa(ctx, choice, "--symbols=block", "--size=80x40"); err != nil {
+			debugf("error displaying image: %v\n", err)
+		}
+
+		// Print version and architecture
+		colNote.Printf("hokuto %s (%s) built %s\n", version, arch, buildDate)
+
+	case "list", "ls":
+		pkg := ""
+		if len(os.Args) >= 3 {
+			pkg = os.Args[2]
+		}
+		if err := listPackages(pkg); err != nil {
+			// If it's the "not found" error, the friendly message was already printed.
+			if errors.Is(err, errPackageNotFound) {
+				exitCode = 1
+			} else {
+				fmt.Fprintln(os.Stderr, "Error:", err)
+				exitCode = 1
+			}
+		}
+
+	case "check":
+		if len(os.Args) < 3 {
+			fmt.Println("Usage: hokuto check <pkgname>")
+			os.Exit(1)
+		}
+		pkgName := os.Args[2]
+
+		// Perform exact match check
+		if checkPackageExactMatch(pkgName) {
+			// Package found - silent success, exit 0
+			os.Exit(0)
+		} else {
+			// Package not found - silent failure, exit 1
+			os.Exit(1)
+		}
+
+	case "checksum", "c":
+		force := false
+
+		if len(os.Args) < 3 {
+			fmt.Println("Usage: hokuto checksum <pkg1> [<pkg2> ...] [-f]")
+			return
+		}
+
+		// Collect args after the command
+		args := os.Args[2:]
+
+		// If last argument is -f, enable force and drop it from package list
+		if len(args) > 0 && args[len(args)-1] == "-f" {
+			force = true
+			args = args[:len(args)-1]
+		}
+
+		if len(args) == 0 {
+			fmt.Println("Usage: hokuto checksum <pkg1> [<pkg2> ...] [-f]")
+			return
+		}
+
+		// args now contains one or more package names
+		var overallErr error
+		for _, pkg := range args {
+			if err := hokutoChecksum(pkg, force); err != nil {
+				fmt.Printf("Error for %s: %v\n", pkg, err)
+				overallErr = err
+				// continue to process remaining packages
+			}
+		}
+
+		if overallErr != nil {
+			os.Exit(1)
+		}
+
+	case "build", "b":
+		handleBuildCommand(os.Args[2:], cfg)
+
+	case "bootstrap":
+		// 1. Verify that the bootstrap directory is provided.
+		if len(os.Args) < 3 {
+			fmt.Fprintln(os.Stderr, "Usage: hokuto bootstrap <bootstrap-dir>")
+			fmt.Fprintln(os.Stderr, "Error: Missing required argument: <bootstrap-dir>")
+			os.Exit(1)
+		}
+		bootstrapDirArg := os.Args[2]
+
+		// 2. Construct the arguments to pass to the build handler.
+		// This effectively translates `hokuto bootstrap /mnt/lfs` into
+		// `hokuto build --bootstrap --bootstrap-dir /mnt/lfs bootstrap`.
+		buildArgs := []string{
+			"-bootstrap",
+			"-bootstrap-dir",
+			bootstrapDirArg,
+			"bootstrap", // The actual package name to build
+		}
+		colArrow.Print("-> ")
+		colSuccess.Printf("Starting bootstrap process in directory: %s\n", bootstrapDirArg)
+
+		// 3. Call the generic build handler with the constructed arguments.
+		handleBuildCommand(buildArgs, cfg)
+
+	case "install", "i":
+		installCmd := flag.NewFlagSet("install", flag.ExitOnError)
+		var yes = installCmd.Bool("y", false, "Assume 'yes' to all prompts and overwrite modified files.")
+		var yesLong = installCmd.Bool("yes", false, "Assume 'yes' to all prompts and overwrite modified files.")
+
+		if err := installCmd.Parse(os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "Error parsing install flags: %v\n", err)
+			os.Exit(1)
+		}
+		packagesToInstall := installCmd.Args()
+		if len(packagesToInstall) == 0 {
+			fmt.Println("Usage: hokuto install [options] <tarball|pkgname>...")
+			installCmd.PrintDefaults()
+			os.Exit(1)
+		}
+
+		effectiveYes := *yes || *yesLong
+
+		// We build a list of ALL packages to install (explicit + dependencies).
+		var installPlan []string
+		visited := make(map[string]bool)
+
+		// Map to track which packages were explicitly requested by the user
+		// so we only add those to the World file later.
+		userRequestedMap := make(map[string]bool)
+
+		for _, arg := range packagesToInstall {
+			// If argument is a tarball file (ends in .tar.zst), we just add it to the plan directly.
+			// We cannot auto-resolve dependencies for a raw file path easily.
+			if strings.HasSuffix(arg, ".tar.zst") {
+				installPlan = append(installPlan, arg)
+				// We attempt to guess the package name for World file tracking
+				base := filepath.Base(arg)
+				nameWithoutExt := strings.TrimSuffix(base, ".tar.zst")
+				lastDash := strings.LastIndex(nameWithoutExt, "-")
+				if lastDash != -1 {
+					pkgName := nameWithoutExt[:lastDash]
+					userRequestedMap[pkgName] = true
+				}
+				continue
+			}
+
+			// If argument is a package name
+			pkgName := arg
+			userRequestedMap[pkgName] = true
+
+			// Recursively find missing dependencies
+			if err := resolveBinaryDependencies(pkgName, visited, &installPlan); err != nil {
+				fmt.Fprintf(os.Stderr, "Error resolving dependencies for %s: %v\n", pkgName, err)
+				os.Exit(1)
+			}
+		}
+
+		if len(installPlan) == 0 {
+			colArrow.Print("-> ")
+			colSuccess.Println("All packages and dependencies are already installed.")
+			os.Exit(0)
+		}
+
+		// Notify user if extra dependencies were pulled in
+		if len(installPlan) > len(packagesToInstall) {
+			var extraDeps []string
+			for _, pkg := range installPlan {
+				// Only add if it wasn't explicitly asked for by the user
+				if !userRequestedMap[pkg] {
+					extraDeps = append(extraDeps, pkg)
+				}
+			}
+
+			if len(extraDeps) > 0 {
+				colArrow.Print("-> ")
+				colWarn.Printf("The following extra dependencies will be installed: %v\n", extraDeps)
+			}
+		}
+
+		// Set to CRITICAL (1) for the entire installation process
+		isCriticalAtomic.Store(1)
+		// Ensure it is reset when the install function returns/panics
+		defer isCriticalAtomic.Store(0)
+
+		allSucceeded := true
+
+		// Iterate through the calculated plan
+		for _, arg := range installPlan {
+			var tarballPath, pkgName string
+
+			if strings.HasSuffix(arg, ".tar.zst") {
+				// Case A: Direct Tarball
+				tarballPath = arg
+				base := filepath.Base(tarballPath)
+				nameWithoutExt := strings.TrimSuffix(base, ".tar.zst")
+				lastDashIndex := strings.LastIndex(nameWithoutExt, "-")
+				if lastDashIndex == -1 {
+					fmt.Fprintf(os.Stderr, "Error: Could not determine package name from tarball file name: %s\n", arg)
+					allSucceeded = false
+					continue
+				}
+				pkgName = nameWithoutExt[:lastDashIndex]
+				if _, err := os.Stat(tarballPath); err != nil {
+					fmt.Fprintf(os.Stderr, "Error: Tarball not found or inaccessible: %s\n", tarballPath)
+					allSucceeded = false
+					continue
+				}
+			} else {
+				// Case B: Package Name (Auto-resolved or requested)
+				pkgName = arg
+				version, err := getRepoVersion(pkgName)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "Error determining version for %s: %v\n", pkgName, err)
+					allSucceeded = false
+					continue
+				}
+				tarballPath = filepath.Join(BinDir, fmt.Sprintf("%s-%s.tar.zst", pkgName, version))
+
+				// 1. Check Local Cache
+				if _, err := os.Stat(tarballPath); err != nil {
+					foundOnMirror := false
+
+					// 2. Not in local cache? Try Mirror.
+					if BinaryMirror != "" {
+						if err := fetchBinaryPackage(pkgName, version); err == nil {
+							foundOnMirror = true
+						} else {
+							debugf("Mirror fetch failed for %s: %v\n", pkgName, err)
+						}
+					}
+
+					// 3. If still not found, error out.
+					if !foundOnMirror {
+						cPrintf(colWarn, "Error: Binary package not found for %s.\n", pkgName)
+						cPrintf(colInfo, "Expected path: %s\n", tarballPath)
+						if BinaryMirror != "" {
+							cPrintf(colInfo, "Mirror check failed or file missing on server.\n")
+						}
+						cPrintf(colInfo, "Tip: Run 'hokuto build %s' to create the binary.\n", pkgName)
+						allSucceeded = false
+						continue
+					}
+				}
+			}
+
+			handlePreInstallUninstall(pkgName, cfg, RootExec)
+
+			colArrow.Print("-> ")
+			colSuccess.Printf("Installing %s from %s\n", pkgName, tarballPath)
+
+			if err := pkgInstall(tarballPath, pkgName, cfg, RootExec, effectiveYes); err != nil {
+				fmt.Fprintf(os.Stderr, "Error installing package %s: %v\n", pkgName, err)
+				allSucceeded = false
+				continue
+			}
+
+			// --- Add to World File ---
+			// Only if the user explicitly requested this package (not auto-deps)
+			if userRequestedMap[pkgName] {
+				if err := addToWorld(pkgName); err != nil {
+					fmt.Fprintf(os.Stderr, "Warning: failed to add %s to world file: %v\n", pkgName, err)
+				}
+			}
+
+			colArrow.Print("-> ")
+			colSuccess.Printf("Package %s installed successfully.\n", pkgName)
+		}
+
+		if !allSucceeded {
+			os.Exit(1)
+		}
+
+	case "uninstall", "remove", "r":
+		// 1. Initialize a FlagSet for the "uninstall" subcommand
+		uninstallCmd := flag.NewFlagSet("uninstall", flag.ExitOnError)
+		var force = uninstallCmd.Bool("f", false, "Force uninstallation, ignoring dependency checks.")
+		var yes = uninstallCmd.Bool("y", false, "Assume 'yes' to all prompts.")
+		// Also support long flags for consistency
+		var forceLong = uninstallCmd.Bool("force", false, "Force uninstallation, ignoring dependency checks.")
+		var yesLong = uninstallCmd.Bool("yes", false, "Assume 'yes' to all prompts.")
+
+		if err := uninstallCmd.Parse(os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "Error parsing uninstall flags: %v\n", err)
+			os.Exit(1)
+		}
+
+		packagesToUninstall := uninstallCmd.Args()
+
+		if len(packagesToUninstall) == 0 {
+			fmt.Println("Usage: hokuto uninstall [options] <pkgname> [pkgname...]")
+			fmt.Println("Options:")
+			uninstallCmd.PrintDefaults()
+			os.Exit(1)
+		}
+
+		effectiveForce := *force || *forceLong
+		effectiveYes := *yes || *yesLong
+
+		// critical section for the entire operation
+		isCriticalAtomic.Store(1)
+		defer isCriticalAtomic.Store(0)
+
+		allSucceeded := true
+		for _, pkgName := range packagesToUninstall {
+			colArrow.Print("-> ")
+			colSuccess.Printf("Attempting to uninstall package: %s\n", pkgName)
+
+			if err := pkgUninstall(pkgName, cfg, RootExec, effectiveForce, effectiveYes); err != nil {
+				colArrow.Print("-> ")
+				color.Light.Printf("Error uninstalling %s: %v\n", pkgName, err)
+				allSucceeded = false
+			} else {
+				colArrow.Print("-> ")
+				colSuccess.Printf("Package %s removed\n", pkgName)
+				removeFromWorld(pkgName)
+			}
+		}
+
+		if !allSucceeded {
+			os.Exit(1)
+		}
+
+	case "update", "u":
+		// Use a proper FlagSet to parse arguments and set buildPriority
+		updateCmd := flag.NewFlagSet("update", flag.ExitOnError)
+		var idleBuild = updateCmd.Bool("i", false, "Use half CPU cores and lowest niceness for build process.")
+		var superidleBuild = updateCmd.Bool("ii", false, "Use one CPU core and lowest niceness for build process.")
+		var verbose = updateCmd.Bool("v", false, "Enable verbose output.")
+		// Add long flags for consistency
+		var idleBuildLong = updateCmd.Bool("idle", false, "Use half CPU cores and lowest niceness for build process.")
+		var superidleBuildLong = updateCmd.Bool("superidle", false, "Use one CPU core and lowest niceness for build process.")
+		var verboseLong = updateCmd.Bool("verbose", false, "Enable verbose output.")
+
+		if err := updateCmd.Parse(os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "Error parsing update flags: %v\n", err)
+			os.Exit(1)
+		}
+
+		// Set the global variables that pkgBuild() reads
+		if *superidleBuild || *superidleBuildLong {
+			buildPriority = "superidle"
+		} else if *idleBuild || *idleBuildLong {
+			buildPriority = "idle"
+		} else {
+			buildPriority = "normal"
+		}
+		Verbose = *verbose || *verboseLong
+
+		updateRepos()
+
+		if err := PostInstallTasks(RootExec); err != nil {
+			fmt.Fprintf(os.Stderr, "post-remove tasks completed with warnings: %v\n", err)
+		}
+
+		if err := checkForUpgrades(ctx, cfg); err != nil {
+			fmt.Fprintf(os.Stderr, "Upgrade process failed: %v\n", err)
+			os.Exit(1)
+		}
+
+	case "manifest", "m":
+		if len(os.Args) < 3 {
+			fmt.Println("Usage: hokuto manifest <pkgname>")
+			os.Exit(1)
+		}
+		pkg := os.Args[2]
+		if err := showManifest(pkg); err != nil {
+			fmt.Fprintln(os.Stderr, "Error:", err)
+			os.Exit(1)
+		}
+
+	case "find", "f":
+		if len(os.Args) < 3 {
+			fmt.Println("Usage: hokuto find <string>")
+			os.Exit(1)
+		}
+		query := os.Args[2]
+		if err := findPackagesByManifestString(query); err != nil {
+			fmt.Fprintln(os.Stderr, "Error:", err)
+			os.Exit(1)
+		}
+
+	case "new", "n":
+		if len(os.Args) < 3 {
+			fmt.Println("Usage: hokuto new <pkgname>")
+			os.Exit(1)
+		}
+		pkg := os.Args[2]
+		if err := newPackage(pkg); err != nil {
+			fmt.Fprintln(os.Stderr, "Error:", err)
+			os.Exit(1)
+		}
+
+	case "edit", "e":
+		if len(os.Args) < 3 {
+			fmt.Println("Usage: hokuto edit <pkgname> [-a]")
+			os.Exit(1)
+		}
+
+		pkg := os.Args[2]
+		openAll := false
+
+		if len(os.Args) == 4 {
+			if os.Args[3] == "-a" {
+				openAll = true
+			} else {
+				fmt.Println("Usage: hokuto edit <pkgname> [-a]")
+				os.Exit(1)
+			}
+		} else if len(os.Args) > 4 {
+			fmt.Println("Usage: hokuto edit <pkgname> [-a]")
+			os.Exit(1)
+		}
+
+		if err := editPackage(pkg, openAll); err != nil {
+			fmt.Fprintln(os.Stderr, "Error:", err)
+			os.Exit(1)
+		}
+
+	default:
+		printHelp()
+		exitCode = 1
+	}
+	os.Exit(exitCode)
+}
