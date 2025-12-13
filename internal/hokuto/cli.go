@@ -31,6 +31,7 @@ func printHelp() {
 	// Restore detailed descriptions including command-specific options
 	cmds := []cmdInfo{
 		{"version, --version", "", "Show hokuto version and information"},
+		{"log", "", "View build log in TUI mode"},
 		{"list, ls", "[pkg]", "List installed packages, optionally filter by name"},
 		{"checksum, c", "<pkg>", "Fetch sources and generate checksum file for a package. -f (force redwonload of sources)"},
 		{"build, b", "<pkg...>", "Build package(s). -a (auto-install), -i (half cpu cores), -ii (one cpu core), --alldeps"},
@@ -199,6 +200,9 @@ func Main() {
 	var exitCode int
 
 	switch os.Args[1] {
+	case "log":
+		exitCode = runTUI()
+
 	case "chroot":
 		// Call the new wrapper function that contains the defer logic
 		exitCode = runChrootCommand(os.Args[2:], RootExec)
@@ -359,11 +363,18 @@ func Main() {
 			if strings.HasSuffix(arg, ".tar.zst") {
 				installPlan = append(installPlan, arg)
 				// We attempt to guess the package name for World file tracking
+				// Format: pkgname-version-revision.tar.zst
 				base := filepath.Base(arg)
 				nameWithoutExt := strings.TrimSuffix(base, ".tar.zst")
-				lastDash := strings.LastIndex(nameWithoutExt, "-")
-				if lastDash != -1 {
-					pkgName := nameWithoutExt[:lastDash]
+				// Find the last two dashes to separate name-version-revision
+				parts := strings.Split(nameWithoutExt, "-")
+				if len(parts) >= 3 {
+					// Rejoin all but the last two parts (version and revision) as package name
+					pkgName := strings.Join(parts[:len(parts)-2], "-")
+					userRequestedMap[pkgName] = true
+				} else if len(parts) >= 2 {
+					// Fallback for old format: pkgname-version.tar.zst
+					pkgName := parts[0]
 					userRequestedMap[pkgName] = true
 				}
 				continue
@@ -415,16 +426,25 @@ func Main() {
 
 			if strings.HasSuffix(arg, ".tar.zst") {
 				// Case A: Direct Tarball
+				// Format: pkgname-version-revision.tar.zst
 				tarballPath = arg
 				base := filepath.Base(tarballPath)
 				nameWithoutExt := strings.TrimSuffix(base, ".tar.zst")
-				lastDashIndex := strings.LastIndex(nameWithoutExt, "-")
-				if lastDashIndex == -1 {
-					fmt.Fprintf(os.Stderr, "Error: Could not determine package name from tarball file name: %s\n", arg)
-					allSucceeded = false
-					continue
+				parts := strings.Split(nameWithoutExt, "-")
+				if len(parts) < 3 {
+					// Fallback for old format: pkgname-version.tar.zst
+					lastDashIndex := strings.LastIndex(nameWithoutExt, "-")
+					if lastDashIndex == -1 {
+						fmt.Fprintf(os.Stderr, "Error: Could not determine package name from tarball file name: %s\n", arg)
+						allSucceeded = false
+						continue
+					}
+					pkgName = nameWithoutExt[:lastDashIndex]
+				} else {
+					// New format: pkgname-version-revision
+					// Rejoin all but the last two parts as package name
+					pkgName = strings.Join(parts[:len(parts)-2], "-")
 				}
-				pkgName = nameWithoutExt[:lastDashIndex]
 				if _, err := os.Stat(tarballPath); err != nil {
 					fmt.Fprintf(os.Stderr, "Error: Tarball not found or inaccessible: %s\n", tarballPath)
 					allSucceeded = false
@@ -433,13 +453,13 @@ func Main() {
 			} else {
 				// Case B: Package Name (Auto-resolved or requested)
 				pkgName = arg
-				version, err := getRepoVersion(pkgName)
+				version, revision, err := getRepoVersion2(pkgName)
 				if err != nil {
 					fmt.Fprintf(os.Stderr, "Error determining version for %s: %v\n", pkgName, err)
 					allSucceeded = false
 					continue
 				}
-				tarballPath = filepath.Join(BinDir, fmt.Sprintf("%s-%s.tar.zst", pkgName, version))
+				tarballPath = filepath.Join(BinDir, fmt.Sprintf("%s-%s-%s.tar.zst", pkgName, version, revision))
 
 				// 1. Check Local Cache
 				if _, err := os.Stat(tarballPath); err != nil {
@@ -447,7 +467,7 @@ func Main() {
 
 					// 2. Not in local cache? Try Mirror.
 					if BinaryMirror != "" {
-						if err := fetchBinaryPackage(pkgName, version); err == nil {
+						if err := fetchBinaryPackage(pkgName, version, revision); err == nil {
 							foundOnMirror = true
 						} else {
 							debugf("Mirror fetch failed for %s: %v\n", pkgName, err)

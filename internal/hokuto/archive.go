@@ -354,13 +354,13 @@ func unpackTarballFallback(tarballPath, dest string) error {
 // createPackageTarball creates a .tar.zst archive of outputDir into BinDir.
 // It uses system tar if available, otherwise falls back to pure-Go tar+zstd.
 
-func createPackageTarball(pkgName, pkgVer, outputDir string, execCtx *Executor) error {
+func createPackageTarball(pkgName, pkgVer, pkgRev, outputDir string, execCtx *Executor) error {
 	// Ensure BinDir exists
 	if err := os.MkdirAll(BinDir, 0o755); err != nil {
 		return fmt.Errorf("failed to create BinDir: %v", err)
 	}
 
-	tarballPath := filepath.Join(BinDir, fmt.Sprintf("%s-%s.tar.zst", pkgName, pkgVer))
+	tarballPath := filepath.Join(BinDir, fmt.Sprintf("%s-%s-%s.tar.zst", pkgName, pkgVer, pkgRev))
 
 	// --- Try system tar first ---
 	if _, err := exec.LookPath("tar"); err == nil {

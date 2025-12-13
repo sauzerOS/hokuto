@@ -154,13 +154,21 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 		shouldLTO = false // Override the global setting for this package only
 	}
 
-	// Read version
+	// Read version and revision
 	versionFile := filepath.Join(pkgDir, "version")
 	versionData, err := os.ReadFile(versionFile)
 	if err != nil {
 		return 0, fmt.Errorf("failed to read version file: %v", err)
 	}
-	version := strings.Fields(string(versionData))[0]
+	fields := strings.Fields(string(versionData))
+	if len(fields) == 0 {
+		return 0, fmt.Errorf("version file is empty")
+	}
+	version := fields[0]
+	revision := "1" // Default revision if not specified
+	if len(fields) >= 2 {
+		revision = fields[1]
+	}
 
 	// Build script
 	buildScript := filepath.Join(pkgDir, "build")
@@ -297,7 +305,23 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 		// 3. Select Compiler Flags
 		var cflagsVal, cxxflagsVal, ldflagsVal string
 
-		if isARM {
+		// Check if generic build is enabled (BinDir contains "/generic")
+		isGeneric := strings.Contains(BinDir, "/generic")
+
+		if isGeneric {
+			// Generic build: use CFLAGS_GEN and CFLAGS_GEN_LTO
+			if shouldLTO {
+				// Case: Generic with LTO
+				cflagsVal = cfg.Values["CFLAGS_GEN_LTO"]
+				cxxflagsVal = cfg.Values["CXXFLAGS_GEN_LTO"]
+				ldflagsVal = cfg.Values["LDFLAGS_LTO"]
+			} else {
+				// Case: Generic without LTO
+				cflagsVal = cfg.Values["CFLAGS_GEN"]
+				cxxflagsVal = cfg.Values["CXXFLAGS_GEN"]
+				ldflagsVal = cfg.Values["LDFLAGS"]
+			}
+		} else if isARM {
 			// Case A: ARM64
 			cflagsVal = cfg.Values["CFLAGS_ARM64"]
 			cxxflagsVal = cfg.Values["CXXFLAGS_ARM64"]
@@ -654,7 +678,7 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 	}
 
 	// Generate package archive
-	if err := createPackageTarball(pkgName, version, outputDir, buildExec); err != nil {
+	if err := createPackageTarball(pkgName, version, revision, outputDir, buildExec); err != nil {
 		return 0, fmt.Errorf("failed to package tarball: %v", err)
 	}
 
@@ -1276,10 +1300,36 @@ func handleBuildCommand(args []string, cfg *Config) {
 	var verboseLong = buildCmd.Bool("verbose", false, "Enable verbose output.")
 	var bootstrap = buildCmd.Bool("bootstrap", false, "Enable bootstrap build mode.")
 	var bootstrapDir = buildCmd.String("bootstrap-dir", "", "Specify the bootstrap directory.")
-	var allDeps = buildCmd.Bool("alldeps", false, "Force build of all dependencies from source.")
+	var allDeps = buildCmd.Bool("alldeps", false, "Force rebuild of all dependencies")
 	var withRebuilds = buildCmd.Bool("rebuilds", false, "Enable post-build actions for dependencies marked with 'rebuild'.")
 	var withRebuildsShort = buildCmd.Bool("r", false, "Alias for -rebuilds.")
 	var orderedBuild = buildCmd.Bool("ordered", false, "Force build order based on the target package's depends file.")
+	var genericBuild = buildCmd.Bool("generic", false, "Use _GEN flags and store packages in generic subfolder")
+
+	// Custom usage function that excludes bootstrap flags from help
+	buildCmd.Usage = func() {
+		fmt.Fprintf(os.Stderr, "Usage: hokuto build [options] <package>\n\n")
+		buildCmd.VisitAll(func(f *flag.Flag) {
+			// Skip bootstrap flags in help output
+			if f.Name == "bootstrap" || f.Name == "bootstrap-dir" {
+				return
+			}
+			s := fmt.Sprintf("  -%s", f.Name)
+			name, usage := flag.UnquoteUsage(f)
+			if len(name) > 0 {
+				s += " " + name
+			}
+			// Boolean flags of one ASCII letter are so common we
+			// treat them specially, putting their usage on the same line.
+			if len(s) <= 4 { // space, -, flag, space
+				s += "\t"
+			} else {
+				s += "\n    \t"
+			}
+			s += strings.ReplaceAll(usage, "\n", "\n    \t")
+			fmt.Fprint(os.Stderr, s, "\n")
+		})
+	}
 
 	if err := buildCmd.Parse(args); err != nil {
 		fmt.Fprintf(os.Stderr, "Error parsing build flags: %v\n", err)
@@ -1297,6 +1347,23 @@ func handleBuildCommand(args []string, cfg *Config) {
 		buildPriority = "normal"
 	}
 	Verbose = *verbose || *verboseLong
+
+	// Handle generic build flag
+	if *genericBuild {
+		// Set BinDir to generic subdirectory
+		BinDir = CacheDir + "/bin/generic"
+		// Ensure directory exists
+		if err := os.MkdirAll(BinDir, 0o755); err != nil {
+			log.Fatalf("Failed to create generic bin directory: %v", err)
+		}
+		// Set CXXFLAGS_GEN and CXXFLAGS_GEN_LTO to match CFLAGS_GEN and CFLAGS_GEN_LTO
+		if cfg.Values["CFLAGS_GEN"] != "" {
+			cfg.Values["CXXFLAGS_GEN"] = cfg.Values["CFLAGS_GEN"]
+		}
+		if cfg.Values["CFLAGS_GEN_LTO"] != "" {
+			cfg.Values["CXXFLAGS_GEN_LTO"] = cfg.Values["CFLAGS_GEN_LTO"]
+		}
+	}
 
 	// --- Bootstrap Repository & Path Setup ---
 	if *bootstrap {
@@ -1427,7 +1494,7 @@ func handleBuildCommand(args []string, cfg *Config) {
 
 	packagesToProcess := buildCmd.Args()
 	if len(packagesToProcess) == 0 {
-		fmt.Println("Usage: hokuto build [options] <package>")
+		buildCmd.Usage()
 		os.Exit(1)
 	}
 	userRequestedMap := make(map[string]bool)
@@ -1522,11 +1589,11 @@ func handleBuildCommand(args []string, cfg *Config) {
 			if packagesThatMustBeBuilt[depPkg] {
 				continue
 			}
-			version, err := getRepoVersion(depPkg)
+			version, revision, err := getRepoVersion2(depPkg)
 			if err != nil {
 				log.Fatalf("Error: could not get version for dependency %s: %v", depPkg, err)
 			}
-			tarballPath := filepath.Join(BinDir, fmt.Sprintf("%s-%s.tar.zst", depPkg, version))
+			tarballPath := filepath.Join(BinDir, fmt.Sprintf("%s-%s-%s.tar.zst", depPkg, version, revision))
 			if _, err := os.Stat(tarballPath); err == nil {
 				if askForConfirmation(colInfo, "Dependency '%s' is missing. Use available binary package?", depPkg) {
 					isCriticalAtomic.Store(1)
@@ -1657,8 +1724,8 @@ func handleBuildCommand(args []string, cfg *Config) {
 						if _, failed := failedBuilds[finalPkg]; failed {
 							continue
 						}
-						version, _ := getRepoVersion(finalPkg)
-						tarballPath := filepath.Join(BinDir, fmt.Sprintf("%s-%s.tar.zst", finalPkg, version))
+						version, revision, _ := getRepoVersion2(finalPkg)
+						tarballPath := filepath.Join(BinDir, fmt.Sprintf("%s-%s-%s.tar.zst", finalPkg, version, revision))
 						isCriticalAtomic.Store(1)
 						handlePreInstallUninstall(finalPkg, cfg, RootExec)
 						if err := pkgInstall(tarballPath, finalPkg, cfg, RootExec, false); err != nil {
@@ -1787,8 +1854,8 @@ func executeBuildPass(plan *BuildPlan, _ string, installAllTargets bool, cfg *Co
 
 				if installAllTargets || shouldInstallNow {
 					// Install the package immediately.
-					version, _ := getRepoVersion(pkgName)
-					tarballPath := filepath.Join(BinDir, fmt.Sprintf("%s-%s.tar.zst", pkgName, version))
+					version, revision, _ := getRepoVersion2(pkgName)
+					tarballPath := filepath.Join(BinDir, fmt.Sprintf("%s-%s-%s.tar.zst", pkgName, version, revision))
 					isCriticalAtomic.Store(1)
 					handlePreInstallUninstall(pkgName, cfg, RootExec)
 					colArrow.Print("-> ")
@@ -1874,8 +1941,8 @@ func executeBuildPass(plan *BuildPlan, _ string, installAllTargets bool, cfg *Co
 						}
 						totalElapsedTime += duration
 						// Install the newly rebuilt parent
-						version, _ := getRepoVersion(parent)
-						tarballPath := filepath.Join(BinDir, fmt.Sprintf("%s-%s.tar.zst", parent, version))
+						version, revision, _ := getRepoVersion2(parent)
+						tarballPath := filepath.Join(BinDir, fmt.Sprintf("%s-%s-%s.tar.zst", parent, version, revision))
 						isCriticalAtomic.Store(1)
 						handlePreInstallUninstall(parent, cfg, RootExec)
 						if installErr := pkgInstall(tarballPath, parent, cfg, RootExec, true); installErr != nil {
@@ -1911,8 +1978,8 @@ func executeBuildPass(plan *BuildPlan, _ string, installAllTargets bool, cfg *Co
 					totalElapsedTime += duration
 
 					// B. Install the newly rebuilt package automatically
-					version, _ := getRepoVersion(rebuildPkg)
-					tarballPath := filepath.Join(BinDir, fmt.Sprintf("%s-%s.tar.zst", rebuildPkg, version))
+					version, revision, _ := getRepoVersion2(rebuildPkg)
+					tarballPath := filepath.Join(BinDir, fmt.Sprintf("%s-%s-%s.tar.zst", rebuildPkg, version, revision))
 					isCriticalAtomic.Store(1)
 					handlePreInstallUninstall(rebuildPkg, cfg, RootExec)
 					// Always run this non-interactively

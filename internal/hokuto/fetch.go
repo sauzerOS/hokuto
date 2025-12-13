@@ -122,8 +122,18 @@ func downloadFileWithOptions(originalURL, finalURL, destFile string, opt downloa
 	// The background worker might have finished it while we were waiting for the lock.
 	if _, err := os.Stat(absPath); err == nil {
 		debugf("File %s appeared after acquiring lock, skipping download.\n", absPath)
+		// Remove lock file since we're not downloading
+		_ = os.Remove(lockPath)
 		return nil
 	}
+
+	// Ensure lock file is removed on successful download
+	defer func() {
+		if _, err := os.Stat(absPath); err == nil {
+			// File exists, download succeeded, remove lock file
+			_ = os.Remove(lockPath)
+		}
+	}()
 
 	debugf("Downloading %s -> %s\n", finalURL, absPath)
 
@@ -248,12 +258,12 @@ func downloadFileWithOptions(originalURL, finalURL, destFile string, opt downloa
 
 // fetchBinaryPackage attempts to download a binary package from the configured mirror.
 
-func fetchBinaryPackage(pkgName, version string) error {
+func fetchBinaryPackage(pkgName, version, revision string) error {
 	if BinaryMirror == "" {
 		return fmt.Errorf("no HOKUTO_MIRROR configured")
 	}
 
-	filename := fmt.Sprintf("%s-%s.tar.zst", pkgName, version)
+	filename := fmt.Sprintf("%s-%s-%s.tar.zst", pkgName, version, revision)
 	url := fmt.Sprintf("%s/%s", BinaryMirror, filename)
 	destPath := filepath.Join(BinDir, filename)
 
