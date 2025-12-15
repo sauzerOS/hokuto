@@ -543,8 +543,13 @@ func checkForUpgrades(_ context.Context, cfg *Config) error {
 		}
 		totalUpdateDuration += duration
 		// B. If build is successful, install the package
-		version, _ := getRepoVersion(pkgName)
-		tarballPath := filepath.Join(BinDir, fmt.Sprintf("%s-%s.tar.zst", pkgName, version))
+		version, revision, err := getRepoVersion2(pkgName)
+		if err != nil {
+			color.Danger.Printf("Failed to get version/revision for %s: %v\n", pkgName, err)
+			failedPackages = append(failedPackages, pkgName)
+			continue
+		}
+		tarballPath := filepath.Join(BinDir, fmt.Sprintf("%s-%s-%s.tar.zst", pkgName, version, revision))
 
 		// Set critical section for the installation phase
 		isCriticalAtomic.Store(1)

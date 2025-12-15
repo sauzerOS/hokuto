@@ -24,6 +24,48 @@ import (
 	"github.com/ulikunitz/xz"
 )
 
+// getScriptExitCode extracts the exit code from a script log file
+// script writes: "Script done on ... [COMMAND_EXIT_CODE="1"]"
+// Returns 0 if exit code cannot be determined (assume success)
+func getScriptExitCode(logPath string) int {
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		return 0 // Can't read file, assume success
+	}
+
+	content := string(data)
+	// Look for COMMAND_EXIT_CODE="N" pattern
+	idx := strings.LastIndex(content, "COMMAND_EXIT_CODE=\"")
+	if idx == -1 {
+		return 0 // Pattern not found, assume success
+	}
+
+	// Extract the exit code
+	start := idx + len("COMMAND_EXIT_CODE=\"")
+	end := strings.Index(content[start:], "\"")
+	if end == -1 {
+		return 0 // Malformed, assume success
+	}
+
+	exitCodeStr := content[start : start+end]
+	exitCode := 0
+	fmt.Sscanf(exitCodeStr, "%d", &exitCode)
+	return exitCode
+}
+
+// getOutputPackageName returns the output package name, which may be renamed for cross-system builds
+func getOutputPackageName(pkgName string, cfg *Config) string {
+	if cfg.Values["HOKUTO_CROSS_SYSTEM"] == "1" && cfg.Values["HOKUTO_CROSS_ARCH"] != "" {
+		// Rename package for cross-system builds: aarch64-pkgname
+		normalizedArch := cfg.Values["HOKUTO_CROSS_ARCH"]
+		if normalizedArch == "arm64" {
+			normalizedArch = "aarch64"
+		}
+		return normalizedArch + "-" + pkgName
+	}
+	return pkgName
+}
+
 func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, currentIndex int, totalCount int) (time.Duration, error) {
 
 	// Define the ANSI escape code format for setting the terminal title.
@@ -251,12 +293,13 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 			"CXXFLAGS":  cflags,
 			"LDFLAGS":   "",
 			// Crucial: Put LFS tools first in PATH
-			"PATH":        filepath.Join(lfsRoot, "tools/bin") + ":/usr/bin:/bin",
-			"MAKEFLAGS":   fmt.Sprintf("-j%d", numCores),
-			"CONFIG_SITE": filepath.Join(lfsRoot, "usr/share/config.site"),
-			"HOKUTO_ROOT": lfsRoot,
-			"TMPDIR":      currentTmpDir,
-			"HOKUTO_ARCH": targetArch,
+			"PATH":             filepath.Join(lfsRoot, "tools/bin") + ":/usr/bin:/bin",
+			"MAKEFLAGS":        fmt.Sprintf("-j%d", numCores),
+			"CONFIG_SITE":      filepath.Join(lfsRoot, "usr/share/config.site"),
+			"HOKUTO_ROOT":      lfsRoot,
+			"TMPDIR":           currentTmpDir,
+			"HOKUTO_ARCH":      targetArch,
+			"HOKUTO_BUILD_DIR": buildDir,
 		}
 
 	} else {
@@ -305,6 +348,9 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 		// 3. Select Compiler Flags
 		var cflagsVal, cxxflagsVal, ldflagsVal string
 
+		// Check if cross-compilation is enabled
+		isCross := cfg.Values["HOKUTO_CROSS_ARCH"] != ""
+
 		// Check if generic build is enabled (BinDir contains "/generic")
 		isGeneric := strings.Contains(BinDir, "/generic")
 
@@ -321,8 +367,8 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 				cxxflagsVal = cfg.Values["CXXFLAGS_GEN"]
 				ldflagsVal = cfg.Values["LDFLAGS"]
 			}
-		} else if isARM {
-			// Case A: ARM64
+		} else if isCross || isARM {
+			// Case A: ARM64 (either native ARM64 or cross-compiling to ARM64)
 			cflagsVal = cfg.Values["CFLAGS_ARM64"]
 			cxxflagsVal = cfg.Values["CXXFLAGS_ARM64"]
 			ldflagsVal = cfg.Values["LDFLAGS"]
@@ -392,10 +438,49 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 			"CONFIG_SITE":                ("/usr/share/config.site"),
 			"HOKUTO_ARCH":                targetArch,
 			"MULTILIB":                   multilibVal,
+			"HOKUTO_BUILD_DIR":           buildDir,
 		}
 
 		if buildPriority == "idle" || buildPriority == "superidle" {
 			defaults["HOKUTO_BUILD_PRIORITY"] = buildPriority
+		}
+
+		// Add cross-compilation environment variables if cross flag is set
+		// Note: This is only for normal builds, not bootstrap
+		if cfg.Values["HOKUTO_CROSS_ARCH"] != "" {
+			defaults["HOKUTO_CROSS"] = "1"
+			crossArch := cfg.Values["HOKUTO_CROSS_ARCH"]
+			defaults["HOKUTO_CARCH"] = crossArch
+
+			// Normalize architecture name for toolchain prefix
+			normalizedArch := crossArch
+			if normalizedArch == "arm64" {
+				normalizedArch = "aarch64"
+			}
+
+			// Set HOKUTO_ARCH to the normalized architecture for cross-compilation
+			defaults["HOKUTO_ARCH"] = normalizedArch
+
+			// Disable MULTILIB for cross-compilation
+			defaults["MULTILIB"] = "0"
+
+			// Replace compiler tools with cross-compilation toolchain (unless simple mode)
+			if cfg.Values["HOKUTO_CROSS_SIMPLE"] != "1" {
+				toolchainPrefix := normalizedArch + "-linux-gnu-"
+				defaults["CC"] = toolchainPrefix + "gcc"
+				defaults["AR"] = toolchainPrefix + "ar"
+				defaults["RANLIB"] = toolchainPrefix + "ranlib"
+			}
+			// In simple mode, keep normal compiler/linker settings (already set above)
+
+			// Set CROSS_PREFIX based on system flag
+			if cfg.Values["HOKUTO_CROSS_SYSTEM"] == "1" {
+				// System cross-compilation: use /usr/<arch>-linux-gnu
+				defaults["CROSS_PREFIX"] = fmt.Sprintf("/usr/%s-linux-gnu", normalizedArch)
+			} else {
+				// Regular cross-compilation: use /usr
+				defaults["CROSS_PREFIX"] = "/usr"
+			}
 		}
 	}
 
@@ -408,56 +493,58 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 		pkgName, version, buildDir, outputDir, buildExec)
 
 	// 1. Define the log file path
-	logFile, err := os.Create(filepath.Join(logDir, "build-log.txt"))
-	if err != nil {
-		// Handle the error (e.g., return it, or panic if log file creation is mandatory)
-		return 0, fmt.Errorf("failed to create build log file: %w", err)
-	}
-	defer logFile.Close() // Ensure the log file is closed when the function exits
+	logPath := filepath.Join(logDir, "build-log.txt")
+	// Ensure logDir exists (already created above, but ensure it's there)
+	// script will create the log file itself
 
-	cmd := exec.Command(buildScript, outputDir, version, pkgName)
+	// Use script command to create a PTY, preserving colors and progress bars
+	// Build the command string to execute
+	cmdStr := fmt.Sprintf("cd %s && %s %s %s %s", buildDir, buildScript, outputDir, version, pkgName)
+
+	// Use script to create PTY and preserve colors
+	// -q: quiet mode (don't print script start/end messages)
+	// -f: flush output immediately (for real-time viewing)
+	// -c: command to run
+	// script writes the PTY session to the log file automatically
+	// script also outputs to stdout/stderr, which we capture for console
+	cmd := exec.Command("script", "-q", "-f", "-c", cmdStr, logPath)
 	cmd.Dir = buildDir
-	cmd.Env = env
 
-	// 2. Define the base writers: always log to the file.
-	// The file writer must be included regardless of the Debug flag.
-	var stdoutWriters []io.Writer
-	var stderrWriters []io.Writer
+	// Set up environment with color support
+	cmd.Env = make([]string, len(env))
+	copy(cmd.Env, env)
 
-	// Always write to the log file
-	stdoutWriters = append(stdoutWriters, logFile)
-	stderrWriters = append(stderrWriters, logFile)
+	// Set TERM environment variable to ensure color support
+	cmd.Env = append(cmd.Env, "TERM=xterm-256color")
 
-	// 3. Conditionally add the console writers based on the Debug flag.
-	var consoleOutputWriter io.Writer = os.Stdout
-	var consoleErrorWriter io.Writer = os.Stderr
+	// Force color output for common build tools
+	cmd.Env = append(cmd.Env, "CARGO_TERM_COLOR=always") // Rust/Cargo
+	cmd.Env = append(cmd.Env, "CLICOLOR_FORCE=1")        // General Unix tools
+	cmd.Env = append(cmd.Env, "FORCE_COLOR=1")           // Node.js tools
 
-	// For interactive builds, we always want console output.
-	// For non-interactive, respect Debug/Verbose flags.
-	if !buildExec.Interactive && !Debug && !Verbose {
-		consoleOutputWriter = io.Discard
-		consoleErrorWriter = io.Discard
+	// script writes to the log file automatically (last argument)
+	// script also outputs to stdout/stderr (duplicate of log file content)
+	// Important: script needs valid stdout/stderr to create a PTY properly
+	// When verbose is disabled, redirect to /dev/null to suppress console output
+	// The log file will still contain all the output
+	if buildExec.Interactive || Verbose || Debug {
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+	} else {
+		// Suppress console output but give script valid file descriptors
+		devNull, err := os.OpenFile("/dev/null", os.O_WRONLY, 0)
+		if err != nil {
+			return 0, fmt.Errorf("failed to open /dev/null: %w", err)
+		}
+		defer devNull.Close()
+		cmd.Stdout = devNull
+		cmd.Stderr = devNull
 	}
-
-	// Add the console writers (either os.Stdout/os.Stderr or io.Discard)
-	stdoutWriters = append(stdoutWriters, consoleOutputWriter)
-	stderrWriters = append(stderrWriters, consoleErrorWriter)
-
-	// 4. Create the final MultiWriters
-	// io.MultiWriter combines all the writers in the slices.
-	cmd.Stdout = io.MultiWriter(stdoutWriters...)
-	cmd.Stderr = io.MultiWriter(stderrWriters...)
 
 	var runErr error // Use a single error variable for both paths
 
-	// NEW: Create a special executor for the build script that applies idle priority
-	buildScriptExec := &Executor{
-		Context:           buildExec.Context,
-		ShouldRunAsRoot:   buildExec.ShouldRunAsRoot,
-		ApplyIdlePriority: setIdlePriority, // Use the global flag here
-		Interactive:       buildExec.Interactive,
-	}
-
+	// Run script directly (not through Executor) to avoid TTY/PTY issues
+	// script needs direct access to the terminal to create a PTY
 	if !buildExec.Interactive {
 		// --- NON-INTERACTIVE PATH: Run with timer and title updates ---
 		setTerminalTitle(fmt.Sprintf("Starting %s", pkgName))
@@ -475,8 +562,12 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 					elapsed := time.Since(startTime).Truncate(time.Second)
 					title := fmt.Sprintf("Building: %s (%d/%d) elapsed: %s", pkgName, currentIndex, totalCount, elapsed)
 					setTerminalTitle(title)
-					colArrow.Print("-> ")
-					colSuccess.Printf("Building %s elapsed: %s\r", pkgName, elapsed)
+					// Only print elapsed time to console if not in verbose mode
+					// In verbose mode, the build output is already visible, so we only update the title
+					if !Verbose {
+						colArrow.Print("-> ")
+						colSuccess.Printf("Building %s elapsed: %s\r", pkgName, elapsed)
+					}
 
 				case <-doneCh:
 					fmt.Print("\r")
@@ -487,9 +578,16 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 			}
 		}()
 
-		// Run the build.
-		if err := buildScriptExec.Run(cmd); err != nil {
+		// Run script directly - it needs direct terminal access
+		// Note: script always returns 0, but writes the actual exit code to the log file
+		// We need to check the log file for COMMAND_EXIT_CODE
+		if err := cmd.Run(); err != nil {
 			runErr = fmt.Errorf("build failed: %w", err)
+		} else {
+			// Check the exit code from the log file
+			if exitCode := getScriptExitCode(logPath); exitCode != 0 {
+				runErr = fmt.Errorf("build script exited with code %d", exitCode)
+			}
 		}
 
 		// Stop ticker goroutine and wait.
@@ -499,8 +597,14 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 	} else {
 		// --- INTERACTIVE PATH: Run directly without any timers or title updates ---
 		// This gives the child process exclusive control of the terminal.
-		if err := buildScriptExec.Run(cmd); err != nil {
+		// Note: script always returns 0, but writes the actual exit code to the log file
+		if err := cmd.Run(); err != nil {
 			runErr = fmt.Errorf("build failed: %w", err)
+		} else {
+			// Check the exit code from the log file
+			if exitCode := getScriptExitCode(logPath); exitCode != 0 {
+				runErr = fmt.Errorf("build script exited with code %d", exitCode)
+			}
 		}
 	}
 
@@ -510,12 +614,7 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 		finalTitle := fmt.Sprintf("❌ FAILED: %s", pkgName)
 		setTerminalTitle(finalTitle)
 
-		// Flush the log file so tail sees everything written so far.
-		if logFile != nil {
-			_ = logFile.Sync()
-		}
-
-		// Path to the build log (we created this earlier as logFile)
+		// Path to the build log (script creates and writes to this file)
 		logPath := filepath.Join(logDir, "build-log.txt")
 
 		// If interactive, let user follow the log; otherwise show last N lines and continue.
@@ -544,8 +643,11 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 	elapsed := time.Since(startTime).Truncate(time.Second)
 	debugf("\n%s built successfully in %s, output in %s\n", pkgName, elapsed, outputDir)
 
-	// Create /var/db/hokuto/installed/<pkgName> inside the staging outputDir
-	installedDir := filepath.Join(outputDir, "var", "db", "hokuto", "installed", pkgName)
+	// Determine output package name (rename if cross-system is enabled)
+	outputPkgName := getOutputPackageName(pkgName, cfg)
+
+	// Create /var/db/hokuto/installed/<outputPkgName> inside the staging outputDir
+	installedDir := filepath.Join(outputDir, "var", "db", "hokuto", "installed", outputPkgName)
 	debugf("Creating metadata directory: %s\n", installedDir)
 	mkdirCmd := exec.Command("mkdir", "-p", installedDir)
 	if err := buildExec.Run(mkdirCmd); err != nil {
@@ -560,8 +662,8 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 		debugf("Library dependencies written to %s\n", libdepsFile)
 	}
 
-	// Generate depends
-	if err := generateDepends(pkgName, pkgDir, outputDir, rootDir, buildExec); err != nil {
+	// Generate depends (use outputPkgName for cross-system builds)
+	if err := generateDepends(outputPkgName, pkgDir, outputDir, rootDir, buildExec); err != nil {
 		return 0, fmt.Errorf("failed to generate depends: %v", err)
 	}
 	debugf("Depends written to %s\n", filepath.Join(installedDir, "depends"))
@@ -677,8 +779,8 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 		return 0, fmt.Errorf("failed to generate manifest: %v", err)
 	}
 
-	// Generate package archive
-	if err := createPackageTarball(pkgName, version, revision, outputDir, buildExec); err != nil {
+	// Generate package archive (using output package name if cross-system is enabled)
+	if err := createPackageTarball(outputPkgName, version, revision, outputDir, buildExec); err != nil {
 		return 0, fmt.Errorf("failed to package tarball: %v", err)
 	}
 
@@ -920,8 +1022,11 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 	// 3. Select Compiler Flags
 	var cflagsVal, cxxflagsVal, ldflagsVal string
 
-	if isARM {
-		// Case A: ARM64
+	// Check if cross-compilation is enabled
+	isCross := cfg.Values["HOKUTO_CROSS_ARCH"] != ""
+
+	if isCross || isARM {
+		// Case A: ARM64 (either native ARM64 or cross-compiling to ARM64)
 		cflagsVal = cfg.Values["CFLAGS_ARM64"]
 		cxxflagsVal = cfg.Values["CXXFLAGS_ARM64"]
 		ldflagsVal = cfg.Values["LDFLAGS"]
@@ -1017,56 +1122,58 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 		pkgName, version, buildDir, outputDir, buildExec)
 
 	// 1. Define the log file path
-	logFile, err := os.Create(filepath.Join(logDir, "build-log.txt"))
-	if err != nil {
-		// Handle the error (e.g., return it, or panic if log file creation is mandatory)
-		return fmt.Errorf("failed to create build log file: %w", err)
-	}
-	defer logFile.Close() // Ensure the log file is closed when the function exits
+	logPath := filepath.Join(logDir, "build-log.txt")
+	// Ensure logDir exists (already created above, but ensure it's there)
+	// script will create the log file itself
 
-	cmd := exec.Command(buildScript, outputDir, version, pkgName)
+	// Use script command to create a PTY, preserving colors and progress bars
+	// Build the command string to execute
+	cmdStr := fmt.Sprintf("cd %s && %s %s %s %s", buildDir, buildScript, outputDir, version, pkgName)
+
+	// Use script to create PTY and preserve colors
+	// -q: quiet mode (don't print script start/end messages)
+	// -f: flush output immediately (for real-time viewing)
+	// -c: command to run
+	// script writes the PTY session to the log file automatically
+	// script also outputs to stdout/stderr, which we capture for console
+	cmd := exec.Command("script", "-q", "-f", "-c", cmdStr, logPath)
 	cmd.Dir = buildDir
-	cmd.Env = env
 
-	// 2. Define the base writers: always log to the file.
-	// The file writer must be included regardless of the Debug flag.
-	var stdoutWriters []io.Writer
-	var stderrWriters []io.Writer
+	// Set up environment with color support
+	cmd.Env = make([]string, len(env))
+	copy(cmd.Env, env)
 
-	// Always write to the log file
-	stdoutWriters = append(stdoutWriters, logFile)
-	stderrWriters = append(stderrWriters, logFile)
+	// Set TERM environment variable to ensure color support
+	cmd.Env = append(cmd.Env, "TERM=xterm-256color")
 
-	// 3. Conditionally add the console writers based on the Debug flag.
-	var consoleOutputWriter io.Writer = os.Stdout
-	var consoleErrorWriter io.Writer = os.Stderr
+	// Force color output for common build tools
+	cmd.Env = append(cmd.Env, "CARGO_TERM_COLOR=always") // Rust/Cargo
+	cmd.Env = append(cmd.Env, "CLICOLOR_FORCE=1")        // General Unix tools
+	cmd.Env = append(cmd.Env, "FORCE_COLOR=1")           // Node.js tools
 
-	// For interactive builds, we always want console output.
-	// For non-interactive, respect Debug/Verbose flags.
-	if !buildExec.Interactive && !Debug && !Verbose {
-		consoleOutputWriter = io.Discard
-		consoleErrorWriter = io.Discard
+	// script writes to the log file automatically (last argument)
+	// script also outputs to stdout/stderr (duplicate of log file content)
+	// Important: script needs valid stdout/stderr to create a PTY properly
+	// When verbose is disabled, redirect to /dev/null to suppress console output
+	// The log file will still contain all the output
+	if buildExec.Interactive || Verbose || Debug {
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+	} else {
+		// Suppress console output but give script valid file descriptors
+		devNull, err := os.OpenFile("/dev/null", os.O_WRONLY, 0)
+		if err != nil {
+			return fmt.Errorf("failed to open /dev/null: %w", err)
+		}
+		defer devNull.Close()
+		cmd.Stdout = devNull
+		cmd.Stderr = devNull
 	}
-
-	// Add the console writers (either os.Stdout/os.Stderr or io.Discard)
-	stdoutWriters = append(stdoutWriters, consoleOutputWriter)
-	stderrWriters = append(stderrWriters, consoleErrorWriter)
-
-	// 4. Create the final MultiWriters
-	// io.MultiWriter combines all the writers in the slices.
-	cmd.Stdout = io.MultiWriter(stdoutWriters...)
-	cmd.Stderr = io.MultiWriter(stderrWriters...)
 
 	var runErr error // Use a single error variable for both paths
 
-	// NEW: Create a special executor for the build script that applies idle priority
-	buildScriptExec := &Executor{
-		Context:           buildExec.Context,
-		ShouldRunAsRoot:   buildExec.ShouldRunAsRoot,
-		ApplyIdlePriority: setIdlePriority, // Use the global flag here
-		Interactive:       buildExec.Interactive,
-	}
-
+	// Run script directly (not through Executor) to avoid TTY/PTY issues
+	// script needs direct access to the terminal to create a PTY
 	if !buildExec.Interactive {
 		// --- NON-INTERACTIVE PATH: Run with timer and title updates ---
 		setTerminalTitle(fmt.Sprintf("Rebuilding %s", pkgName))
@@ -1084,7 +1191,11 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 					elapsed := time.Since(startTime).Truncate(time.Second)
 					title := fmt.Sprintf("Rebuild %s elapsed: %s", pkgName, elapsed)
 					setTerminalTitle(title)
-					colInfo.Printf(" Building %s  elapsed: %s\r", pkgName, elapsed)
+					// Only print elapsed time to console if not in verbose mode
+					// In verbose mode, the build output is already visible, so we only update the title
+					if !Verbose {
+						colInfo.Printf(" Building %s  elapsed: %s\r", pkgName, elapsed)
+					}
 				case <-doneCh:
 					fmt.Print("\r")
 					return
@@ -1094,9 +1205,16 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 			}
 		}()
 
-		// Run the build.
-		if err := buildScriptExec.Run(cmd); err != nil {
+		// Run script directly - it needs direct terminal access
+		// Note: script always returns 0, but writes the actual exit code to the log file
+		// We need to check the log file for COMMAND_EXIT_CODE
+		if err := cmd.Run(); err != nil {
 			runErr = fmt.Errorf("build failed: %w", err)
+		} else {
+			// Check the exit code from the log file
+			if exitCode := getScriptExitCode(logPath); exitCode != 0 {
+				runErr = fmt.Errorf("build script exited with code %d", exitCode)
+			}
 		}
 
 		// Stop ticker goroutine and wait.
@@ -1104,8 +1222,14 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 		runWg.Wait()
 	} else {
 		// --- INTERACTIVE PATH: Run directly without timers or title updates ---
-		if err := buildScriptExec.Run(cmd); err != nil {
+		// Note: script always returns 0, but writes the actual exit code to the log file
+		if err := cmd.Run(); err != nil {
 			runErr = fmt.Errorf("build failed: %w", err)
+		} else {
+			// Check the exit code from the log file
+			if exitCode := getScriptExitCode(logPath); exitCode != 0 {
+				runErr = fmt.Errorf("build script exited with code %d", exitCode)
+			}
 		}
 	}
 
@@ -1117,12 +1241,7 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 		finalTitle := fmt.Sprintf("❌ FAILED: %s", pkgName)
 		setTerminalTitle(finalTitle)
 
-		// Flush the log file so tail sees everything written so far.
-		if logFile != nil {
-			_ = logFile.Sync()
-		}
-
-		// Path to the build log (we created this earlier as logFile)
+		// Path to the build log (script creates and writes to this file)
 		logPath := filepath.Join(logDir, "build-log.txt")
 
 		// If interactive, let user follow the log; otherwise show last N lines and continue.
@@ -1148,8 +1267,11 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 	elapsed := time.Since(startTime).Truncate(time.Second)
 	cPrintf(colNote, "\n%s built successfully in %s, output in %s\n", pkgName, elapsed, outputDir)
 
-	// Create /var/db/hokuto/installed/<pkgName> inside the staging outputDir
-	installedDir := filepath.Join(outputDir, "var", "db", "hokuto", "installed", pkgName)
+	// Determine output package name (rename if cross-system is enabled)
+	outputPkgName := getOutputPackageName(pkgName, cfg)
+
+	// Create /var/db/hokuto/installed/<outputPkgName> inside the staging outputDir
+	installedDir := filepath.Join(outputDir, "var", "db", "hokuto", "installed", outputPkgName)
 	debugf("Creating metadata directory: %s\n", installedDir)
 	mkdirCmd := exec.Command("mkdir", "-p", installedDir)
 	if err := buildExec.Run(mkdirCmd); err != nil {
@@ -1164,8 +1286,8 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 		debugf("Library dependencies written to %s\n", libdepsFile)
 	}
 
-	// Generate depends
-	if err := generateDepends(pkgName, pkgDir, outputDir, rootDir, buildExec); err != nil {
+	// Generate depends (use outputPkgName for cross-system builds)
+	if err := generateDepends(outputPkgName, pkgDir, outputDir, rootDir, buildExec); err != nil {
 		return fmt.Errorf("failed to generate depends: %v", err)
 	}
 	debugf("Depends written to %s\n", filepath.Join(installedDir, "depends"))
@@ -1305,6 +1427,7 @@ func handleBuildCommand(args []string, cfg *Config) {
 	var withRebuildsShort = buildCmd.Bool("r", false, "Alias for -rebuilds.")
 	var orderedBuild = buildCmd.Bool("ordered", false, "Force build order based on the target package's depends file.")
 	var genericBuild = buildCmd.Bool("generic", false, "Use _GEN flags and store packages in generic subfolder")
+	var crossArch = buildCmd.String("cross", "", "Enable cross-compilation for target architecture (e.g., arm64)")
 
 	// Custom usage function that excludes bootstrap flags from help
 	buildCmd.Usage = func() {
@@ -1362,6 +1485,39 @@ func handleBuildCommand(args []string, cfg *Config) {
 		}
 		if cfg.Values["CFLAGS_GEN_LTO"] != "" {
 			cfg.Values["CXXFLAGS_GEN_LTO"] = cfg.Values["CFLAGS_GEN_LTO"]
+		}
+	}
+
+	// Handle cross-compilation flag
+	if *crossArch != "" {
+		// Parse cross flag: format is "arch", "arch,system", or "arch,simple"
+		parts := strings.Split(*crossArch, ",")
+		crossArchValue := strings.TrimSpace(parts[0])
+		crossSystem := ""
+		if len(parts) > 1 {
+			crossSystem = strings.TrimSpace(parts[1])
+		}
+
+		// Validate architecture (currently only arm64 is valid)
+		if crossArchValue != "arm64" {
+			log.Fatalf("Error: Invalid cross-compilation architecture '%s'. Only 'arm64' is currently supported.", crossArchValue)
+		}
+
+		// Set BinDir to cross subdirectory
+		BinDir = CacheDir + "/bin/cross"
+		// Ensure directory exists
+		if err := os.MkdirAll(BinDir, 0o755); err != nil {
+			log.Fatalf("Failed to create cross bin directory: %v", err)
+		}
+		// Store cross architecture and system/simple flag in config for use in pkgBuild
+		if cfg.Values == nil {
+			cfg.Values = make(map[string]string)
+		}
+		cfg.Values["HOKUTO_CROSS_ARCH"] = crossArchValue
+		if crossSystem == "system" {
+			cfg.Values["HOKUTO_CROSS_SYSTEM"] = "1"
+		} else if crossSystem == "simple" {
+			cfg.Values["HOKUTO_CROSS_SIMPLE"] = "1"
 		}
 	}
 
@@ -1460,17 +1616,6 @@ func handleBuildCommand(args []string, cfg *Config) {
 			}
 		}
 
-		colArrow.Print("-> ")
-		// askForConfirmation defaults to "Yes"
-		if askForConfirmation(colInfo, "Enable Multilib support?") {
-			cfg.Values["HOKUTO_MULTILIB"] = "1"
-			colSuccess.Println("Multilib support enabled for bootstrap.")
-		} else {
-			// Ensure it is unset
-			cfg.Values["HOKUTO_MULTILIB"] = "0"
-			colWarn.Println("Multilib support disabled for bootstrap.")
-		}
-
 		// Architecture Selection & Auto-Toolchain Setup
 		colArrow.Print("-> ")
 		colInfo.Println("Select Target Architecture:")
@@ -1484,7 +1629,19 @@ func handleBuildCommand(args []string, cfg *Config) {
 		if strings.TrimSpace(archChoice) == "2" {
 			cfg.Values["HOKUTO_ARCH"] = "aarch64"
 			colSuccess.Println("Target set to AArch64.")
+			// Multilib is always disabled for aarch64
+			cfg.Values["HOKUTO_MULTILIB"] = "0"
+			colWarn.Println("Multilib support disabled for bootstrap.")
 		} else {
+			// x86_64 selected - ask about multilib
+			if askForConfirmation(colInfo, "Enable Multilib support?") {
+				cfg.Values["HOKUTO_MULTILIB"] = "1"
+				colSuccess.Println("Multilib support enabled for bootstrap.")
+			} else {
+				// Ensure it is unset
+				cfg.Values["HOKUTO_MULTILIB"] = "0"
+				colWarn.Println("Multilib support disabled for bootstrap.")
+			}
 			cfg.Values["HOKUTO_ARCH"] = "x86_64"
 			colSuccess.Println("Target set to x86_64.")
 		}
@@ -1552,11 +1709,17 @@ func handleBuildCommand(args []string, cfg *Config) {
 			}
 			totalElapsedTime += duration
 			// In bootstrap/alldeps mode, every built package is installed immediately.
-			version, _ := getRepoVersion(pkgName)
-			tarballPath := filepath.Join(BinDir, fmt.Sprintf("%s-%s.tar.zst", pkgName, version))
+			version, revision, err := getRepoVersion2(pkgName)
+			if err != nil {
+				failedBuilds[pkgName] = fmt.Errorf("failed to get version/revision: %w", err)
+				break
+			}
+			// Use output package name for tarball and installation (may be renamed for cross-system)
+			outputPkgName := getOutputPackageName(pkgName, cfg)
+			tarballPath := filepath.Join(BinDir, fmt.Sprintf("%s-%s-%s.tar.zst", outputPkgName, version, revision))
 			isCriticalAtomic.Store(1)
-			handlePreInstallUninstall(pkgName, cfg, RootExec)
-			if installErr := pkgInstall(tarballPath, pkgName, cfg, RootExec, true); installErr != nil {
+			handlePreInstallUninstall(outputPkgName, cfg, RootExec)
+			if installErr := pkgInstall(tarballPath, outputPkgName, cfg, RootExec, true); installErr != nil {
 				isCriticalAtomic.Store(0)
 				failedBuilds[pkgName] = fmt.Errorf("post-build installation failed: %w", installErr)
 				break // Fatal error
@@ -1593,12 +1756,14 @@ func handleBuildCommand(args []string, cfg *Config) {
 			if err != nil {
 				log.Fatalf("Error: could not get version for dependency %s: %v", depPkg, err)
 			}
-			tarballPath := filepath.Join(BinDir, fmt.Sprintf("%s-%s-%s.tar.zst", depPkg, version, revision))
+			// Use output package name for dependencies too (may be renamed for cross-system)
+			outputDepPkg := getOutputPackageName(depPkg, cfg)
+			tarballPath := filepath.Join(BinDir, fmt.Sprintf("%s-%s-%s.tar.zst", outputDepPkg, version, revision))
 			if _, err := os.Stat(tarballPath); err == nil {
 				if askForConfirmation(colInfo, "Dependency '%s' is missing. Use available binary package?", depPkg) {
 					isCriticalAtomic.Store(1)
-					handlePreInstallUninstall(depPkg, cfg, RootExec)
-					if err := pkgInstall(tarballPath, depPkg, cfg, RootExec, false); err != nil {
+					handlePreInstallUninstall(outputDepPkg, cfg, RootExec)
+					if err := pkgInstall(tarballPath, outputDepPkg, cfg, RootExec, false); err != nil {
 						isCriticalAtomic.Store(0)
 						log.Fatalf("Fatal error installing binary %s: %v", depPkg, err)
 					}
@@ -1714,21 +1879,31 @@ func handleBuildCommand(args []string, cfg *Config) {
 			failedBuilds = failedPass1
 
 			if len(targetsPass1) > 0 {
+				// Skip installation prompt and installation for cross-compilation without system flag
+				// (cross-compiled packages without system are not meant to be installed on build host)
+				isCrossWithoutSystem := cfg.Values["HOKUTO_CROSS_ARCH"] != "" && cfg.Values["HOKUTO_CROSS_SYSTEM"] != "1"
+
 				shouldInstall := *autoInstall
-				if !shouldInstall {
+				if !shouldInstall && !isCrossWithoutSystem {
 					sort.Strings(targetsPass1)
-					shouldInstall = askForConfirmation(colWarn, "-> Do you want to install the following built package(s): %s?", strings.Join(targetsPass1, ", "))
+					// Convert to output package names for display (may be renamed for cross-system)
+					outputPkgNames := make([]string, len(targetsPass1))
+					for i, pkg := range targetsPass1 {
+						outputPkgNames[i] = getOutputPackageName(pkg, cfg)
+					}
+					shouldInstall = askForConfirmation(colWarn, "-> Do you want to install the following built package(s): %s?", strings.Join(outputPkgNames, ", "))
 				}
-				if shouldInstall {
+				if shouldInstall && !isCrossWithoutSystem {
 					for _, finalPkg := range targetsPass1 {
 						if _, failed := failedBuilds[finalPkg]; failed {
 							continue
 						}
 						version, revision, _ := getRepoVersion2(finalPkg)
-						tarballPath := filepath.Join(BinDir, fmt.Sprintf("%s-%s-%s.tar.zst", finalPkg, version, revision))
+						outputFinalPkg := getOutputPackageName(finalPkg, cfg)
+						tarballPath := filepath.Join(BinDir, fmt.Sprintf("%s-%s-%s.tar.zst", outputFinalPkg, version, revision))
 						isCriticalAtomic.Store(1)
-						handlePreInstallUninstall(finalPkg, cfg, RootExec)
-						if err := pkgInstall(tarballPath, finalPkg, cfg, RootExec, false); err != nil {
+						handlePreInstallUninstall(outputFinalPkg, cfg, RootExec)
+						if err := pkgInstall(tarballPath, outputFinalPkg, cfg, RootExec, false); err != nil {
 							isCriticalAtomic.Store(0)
 							failedBuilds[finalPkg] = fmt.Errorf("final installation failed: %w", err)
 						} else {
@@ -1855,12 +2030,13 @@ func executeBuildPass(plan *BuildPlan, _ string, installAllTargets bool, cfg *Co
 				if installAllTargets || shouldInstallNow {
 					// Install the package immediately.
 					version, revision, _ := getRepoVersion2(pkgName)
-					tarballPath := filepath.Join(BinDir, fmt.Sprintf("%s-%s-%s.tar.zst", pkgName, version, revision))
+					outputPkgName := getOutputPackageName(pkgName, cfg)
+					tarballPath := filepath.Join(BinDir, fmt.Sprintf("%s-%s-%s.tar.zst", outputPkgName, version, revision))
 					isCriticalAtomic.Store(1)
-					handlePreInstallUninstall(pkgName, cfg, RootExec)
+					handlePreInstallUninstall(outputPkgName, cfg, RootExec)
 					colArrow.Print("-> ")
-					colSuccess.Printf("Installing: %s (%d/%d) Time: %s\n", pkgName, i+1, totalInPlan, duration.Truncate(time.Second))
-					if installErr := pkgInstall(tarballPath, pkgName, cfg, RootExec, true); installErr != nil {
+					colSuccess.Printf("Installing: %s (%d/%d) Time: %s\n", outputPkgName, i+1, totalInPlan, duration.Truncate(time.Second))
+					if installErr := pkgInstall(tarballPath, outputPkgName, cfg, RootExec, true); installErr != nil {
 						isCriticalAtomic.Store(0)
 						failed[pkgName] = fmt.Errorf("post-build installation failed: %w", installErr)
 						// We must 'continue' here to stop processing this package's post-build actions.
@@ -1942,10 +2118,11 @@ func executeBuildPass(plan *BuildPlan, _ string, installAllTargets bool, cfg *Co
 						totalElapsedTime += duration
 						// Install the newly rebuilt parent
 						version, revision, _ := getRepoVersion2(parent)
-						tarballPath := filepath.Join(BinDir, fmt.Sprintf("%s-%s-%s.tar.zst", parent, version, revision))
+						outputParent := getOutputPackageName(parent, cfg)
+						tarballPath := filepath.Join(BinDir, fmt.Sprintf("%s-%s-%s.tar.zst", outputParent, version, revision))
 						isCriticalAtomic.Store(1)
-						handlePreInstallUninstall(parent, cfg, RootExec)
-						if installErr := pkgInstall(tarballPath, parent, cfg, RootExec, true); installErr != nil {
+						handlePreInstallUninstall(outputParent, cfg, RootExec)
+						if installErr := pkgInstall(tarballPath, outputParent, cfg, RootExec, true); installErr != nil {
 							isCriticalAtomic.Store(0)
 							color.Danger.Printf("Installation of rebuilt '%s' failed: %v\n", parent, installErr)
 							failed[parent] = fmt.Errorf("install of rebuilt '%s' failed: %w", parent, installErr)
@@ -1979,11 +2156,12 @@ func executeBuildPass(plan *BuildPlan, _ string, installAllTargets bool, cfg *Co
 
 					// B. Install the newly rebuilt package automatically
 					version, revision, _ := getRepoVersion2(rebuildPkg)
-					tarballPath := filepath.Join(BinDir, fmt.Sprintf("%s-%s-%s.tar.zst", rebuildPkg, version, revision))
+					outputRebuildPkg := getOutputPackageName(rebuildPkg, cfg)
+					tarballPath := filepath.Join(BinDir, fmt.Sprintf("%s-%s-%s.tar.zst", outputRebuildPkg, version, revision))
 					isCriticalAtomic.Store(1)
-					handlePreInstallUninstall(rebuildPkg, cfg, RootExec)
+					handlePreInstallUninstall(outputRebuildPkg, cfg, RootExec)
 					// Always run this non-interactively
-					if installErr := pkgInstall(tarballPath, rebuildPkg, cfg, RootExec, true); installErr != nil {
+					if installErr := pkgInstall(tarballPath, outputRebuildPkg, cfg, RootExec, true); installErr != nil {
 						isCriticalAtomic.Store(0)
 						color.Danger.Printf("Installation of rebuilt '%s' failed: %v\n", rebuildPkg, installErr)
 						failed[pkgName] = fmt.Errorf("install of post-built '%s' failed: %w", rebuildPkg, installErr)

@@ -4,19 +4,15 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
 	"time"
 
-	"github.com/charmbracelet/bubbles/viewport"
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
+	"github.com/gdamore/tcell/v2"
+	"github.com/rivo/tview"
 )
-
-type buildLogMsg struct {
-	logs []logInfo
-}
 
 type logInfo struct {
 	path         string
@@ -26,205 +22,305 @@ type logInfo struct {
 	deleteAction string // The delete command to show
 }
 
-type tuiModel struct {
-	logs         []logInfo
-	viewports    []viewport.Model
-	prevContents []string // Track previous content to detect changes
-	activeIdx    int
-	width        int
-	height       int
-}
+var (
+	tuiApp         *tview.Application
+	tuiLogs        []logInfo
+	tuiActiveIdx   int
+	tuiHeaderBox   *tview.TextView
+	tuiLogView     *tview.TextView
+	tuiFooterBox   *tview.TextView
+	tuiFlex        *tview.Flex
+	tuiUpdateChan  chan []logInfo
+	tuiPrevContent string // Track previous content to detect changes
+)
 
 func runTUI() int {
-	m := newTUIModel()
+	// Initialize channels
+	tuiUpdateChan = make(chan []logInfo, 10)
 
-	p := tea.NewProgram(m, tea.WithAltScreen())
-	if _, err := p.Run(); err != nil {
+	// Create the application
+	tuiApp = tview.NewApplication()
+
+	// Create header box with border
+	tuiHeaderBox = tview.NewTextView().
+		SetDynamicColors(true).
+		SetWrap(false).
+		SetTextAlign(tview.AlignLeft)
+	tuiHeaderBox.SetBorder(true)
+	tuiHeaderBox.SetTitle("hokuto Build Log Viewer")
+
+	// Create log view (scrollable text view) with border
+	// SetDynamicColors(true) enables ANSI color code support (both tview format and ANSI escape sequences)
+	tuiLogView = tview.NewTextView().
+		SetDynamicColors(true).
+		SetWrap(false).
+		SetScrollable(true).
+		SetChangedFunc(func() {
+			tuiApp.Draw()
+		})
+	tuiLogView.SetBorder(true)
+
+	// Create footer box with border
+	tuiFooterBox = tview.NewTextView().
+		SetDynamicColors(true).
+		SetWrap(true).
+		SetTextAlign(tview.AlignLeft)
+	tuiFooterBox.SetBorder(true)
+
+	// Create flex layout: header (fixed) + log (flexible) + footer (fixed)
+	tuiFlex = tview.NewFlex().
+		SetDirection(tview.FlexRow).
+		AddItem(tuiHeaderBox, 3, 0, false). // Header: 3 lines (title + info + border)
+		AddItem(tuiLogView, 0, 1, true).    // Log: flexible, takes remaining space
+		AddItem(tuiFooterBox, 4, 0, false)  // Footer: fixed height (same as header)
+
+	// Set up key handlers
+	tuiFlex.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		key := event.Key()
+		rune := event.Rune()
+
+		// Handle special keys
+		switch key {
+		case tcell.KeyCtrlQ, tcell.KeyEsc:
+			tuiApp.Stop()
+			return nil
+		case tcell.KeyLeft:
+			if len(tuiLogs) > 0 {
+				tuiActiveIdx--
+				if tuiActiveIdx < 0 {
+					tuiActiveIdx = len(tuiLogs) - 1
+				}
+				updateTUI()
+			}
+			return nil
+		case tcell.KeyRight:
+			if len(tuiLogs) > 0 {
+				tuiActiveIdx++
+				if tuiActiveIdx >= len(tuiLogs) {
+					tuiActiveIdx = 0
+				}
+				updateTUI()
+			}
+			return nil
+		case tcell.KeyHome:
+			tuiLogView.ScrollToBeginning()
+			return nil
+		case tcell.KeyEnd:
+			tuiLogView.ScrollToEnd()
+			return nil
+		case tcell.KeyUp:
+			// Scroll log view up
+			row, _ := tuiLogView.GetScrollOffset()
+			if row > 0 {
+				tuiLogView.ScrollTo(row-1, 0)
+			}
+			return nil
+		case tcell.KeyDown:
+			// Scroll log view down
+			row, _ := tuiLogView.GetScrollOffset()
+			tuiLogView.ScrollTo(row+1, 0)
+			return nil
+		case tcell.KeyPgUp:
+			row, _ := tuiLogView.GetScrollOffset()
+			if row > 10 {
+				tuiLogView.ScrollTo(row-10, 0)
+			} else {
+				tuiLogView.ScrollToBeginning()
+			}
+			return nil
+		case tcell.KeyPgDn:
+			row, _ := tuiLogView.GetScrollOffset()
+			tuiLogView.ScrollTo(row+10, 0)
+			return nil
+		case tcell.KeyRune:
+			// Handle rune keys
+			switch rune {
+			case 'q':
+				tuiApp.Stop()
+				return nil
+			case 'd':
+				if tuiActiveIdx < len(tuiLogs) {
+					log := tuiLogs[tuiActiveIdx]
+					if log.canDelete {
+						os.RemoveAll(log.buildDir)
+						// Refresh logs
+						go func() {
+							logs := readAllBuildLogs()
+							tuiUpdateChan <- logs
+						}()
+					}
+				}
+				return nil
+			case 'o':
+				if tuiActiveIdx < len(tuiLogs) {
+					log := tuiLogs[tuiActiveIdx]
+					cmd := exec.Command("code", log.path)
+					_ = cmd.Start()
+				}
+				return nil
+			case 'h':
+				if len(tuiLogs) > 0 {
+					tuiActiveIdx--
+					if tuiActiveIdx < 0 {
+						tuiActiveIdx = len(tuiLogs) - 1
+					}
+					updateTUI()
+				}
+				return nil
+			case 'l':
+				if len(tuiLogs) > 0 {
+					tuiActiveIdx++
+					if tuiActiveIdx >= len(tuiLogs) {
+						tuiActiveIdx = 0
+					}
+					updateTUI()
+				}
+				return nil
+			}
+		}
+		return event
+	})
+
+	// Start log update goroutine
+	go func() {
+		ticker := time.NewTicker(400 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				logs := readAllBuildLogs()
+				select {
+				case tuiUpdateChan <- logs:
+				default:
+				}
+			}
+		}
+	}()
+
+	// Start update handler goroutine
+	go func() {
+		for logs := range tuiUpdateChan {
+			tuiLogs = logs
+			// Ensure activeIdx is valid
+			if tuiActiveIdx >= len(tuiLogs) && len(tuiLogs) > 0 {
+				tuiActiveIdx = len(tuiLogs) - 1
+			}
+			// Use QueueUpdateDraw to ensure thread-safe UI updates
+			tuiApp.QueueUpdateDraw(func() {
+				updateTUI()
+			})
+		}
+	}()
+
+	// Set root first
+	tuiApp.SetRoot(tuiFlex, true).SetFocus(tuiLogView)
+
+	// Initial update - must happen after setting root
+	logs := readAllBuildLogs()
+	tuiLogs = logs
+	if len(tuiLogs) > 0 {
+		tuiActiveIdx = 0
+	}
+	updateTUI()
+
+	// Run the application
+	if err := tuiApp.Run(); err != nil {
 		fmt.Fprintln(os.Stderr, "tui:", err)
 		return 1
 	}
 	return 0
 }
 
-func newTUIModel() *tuiModel {
-	m := &tuiModel{
-		logs:      []logInfo{},
-		viewports: []viewport.Model{},
-		activeIdx: 0,
+func updateTUI() {
+	if tuiApp == nil || tuiHeaderBox == nil || tuiLogView == nil || tuiFooterBox == nil {
+		return
 	}
 
-	return m
-}
-
-func (m *tuiModel) Init() tea.Cmd {
-	return tickBuildLog()
-}
-
-func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	switch msg := msg.(type) {
-	case tea.WindowSizeMsg:
-		m.width = msg.Width
-		m.height = msg.Height
-		m.resize()
-		return m, nil
-
-	case tea.KeyMsg:
-		switch msg.Type {
-		case tea.KeyCtrlQ, tea.KeyEsc:
-			return m, tea.Quit
-		case tea.KeyRunes:
-			// Check for 'q' to quit
-			if len(msg.Runes) == 1 && msg.Runes[0] == 'q' {
-				return m, tea.Quit
-			}
-			// Check for 'd' to delete build directory
-			if len(msg.Runes) == 1 && msg.Runes[0] == 'd' {
-				if m.activeIdx < len(m.logs) {
-					log := m.logs[m.activeIdx]
-					if log.canDelete {
-						// Delete the build directory
-						if err := os.RemoveAll(log.buildDir); err != nil {
-							// Error will be visible when logs refresh
-						}
-						// Immediately refresh logs to reflect deletion
-						return m, tickBuildLog()
-					}
-				}
-			}
-		case tea.KeyLeft:
-			// Switch to previous pane
-			if len(m.viewports) > 0 {
-				m.activeIdx--
-				if m.activeIdx < 0 {
-					m.activeIdx = len(m.viewports) - 1
-				}
-			}
-			return m, nil
-		case tea.KeyRight:
-			// Switch to next pane
-			if len(m.viewports) > 0 {
-				m.activeIdx++
-				if m.activeIdx >= len(m.viewports) {
-					m.activeIdx = 0
-				}
-			}
-			return m, nil
-		}
-		// Allow viewport scrolling for active pane
-		if len(m.viewports) > 0 && m.activeIdx < len(m.viewports) {
-			var cmd tea.Cmd
-			m.viewports[m.activeIdx], cmd = m.viewports[m.activeIdx].Update(msg)
-			return m, cmd
-		}
-		return m, nil
-
-	case buildLogMsg:
-		// Check if this is the first load or if logs changed
-		isFirstLoad := len(m.viewports) == 0
-		logsChanged := len(m.logs) != len(msg.logs)
-
-		// Update logs
-		m.logs = msg.logs
-
-		// Recreate viewports if number of logs changed
-		if logsChanged || isFirstLoad {
-			m.viewports = make([]viewport.Model, len(m.logs))
-			m.prevContents = make([]string, len(m.logs))
-			for i, log := range m.logs {
-				vp := viewport.New(m.width, m.height-3)
-				vp.SetContent(log.content)
-				vp.GotoBottom() // Only on first load or when logs change
-				m.viewports[i] = vp
-				m.prevContents[i] = log.content
-			}
-		} else {
-			// Update existing viewports, preserving scroll position unless content changed
-			for i, log := range m.logs {
-				if i < len(m.viewports) {
-					prevContent := m.prevContents[i]
-					// Only update if content actually changed
-					if log.content != prevContent {
-						// Check if user was at the bottom before update
-						wasAtBottom := m.viewports[i].AtBottom()
-
-						// Update content
-						m.viewports[i].SetContent(log.content)
-						m.prevContents[i] = log.content
-
-						// Only auto-scroll to bottom if user was already at bottom
-						if wasAtBottom {
-							m.viewports[i].GotoBottom()
-						}
-						// Otherwise preserve scroll position
-					}
-				}
-			}
-		}
-
-		// Ensure activeIdx is valid
-		if m.activeIdx >= len(m.viewports) && len(m.viewports) > 0 {
-			m.activeIdx = len(m.viewports) - 1
-		}
-		m.resize()
-		return m, tickBuildLog()
-	}
-
-	return m, nil
-}
-
-func (m *tuiModel) View() string {
-	header := lipgloss.NewStyle().Bold(true).Render("hokuto Build Log Viewer")
-
-	var paneTitle string
-	var body string
-
-	if len(m.logs) == 0 {
-		paneTitle = lipgloss.NewStyle().Faint(true).Render("No build logs found")
-		body = "No build log yet. Run 'hokuto build <package>' to start a build."
-	} else if m.activeIdx < len(m.viewports) {
-		log := m.logs[m.activeIdx]
-		titleText := fmt.Sprintf("Build Log %d/%d: %s", m.activeIdx+1, len(m.logs), log.path)
+	// Update header
+	var headerText strings.Builder
+	if len(tuiLogs) == 0 {
+		headerText.WriteString("[gray]No build logs found[white]")
+	} else if tuiActiveIdx < len(tuiLogs) {
+		log := tuiLogs[tuiActiveIdx]
+		titleText := fmt.Sprintf("Build Log %d/%d: %s", tuiActiveIdx+1, len(tuiLogs), log.path)
 		if log.canDelete {
-			deleteHint := lipgloss.NewStyle().Foreground(lipgloss.Color("1")).Faint(true).Render(
-				fmt.Sprintf(" | Press 'd' to delete: %s", log.deleteAction),
-			)
-			titleText += deleteHint
+			titleText += fmt.Sprintf(" | [red]Press 'd' to delete: %s[white]", log.deleteAction)
 		}
-		paneTitle = lipgloss.NewStyle().Faint(true).Render(titleText)
-		body = m.viewports[m.activeIdx].View()
+		headerText.WriteString(fmt.Sprintf("[gray]%s[white]", titleText))
 	} else {
-		paneTitle = lipgloss.NewStyle().Faint(true).Render("No active log")
-		body = ""
+		headerText.WriteString("[gray]No active log[white]")
+	}
+	tuiHeaderBox.SetText(headerText.String())
+
+	// Update log content
+	// Use ANSIWriter to convert ANSI escape sequences to tview color tags
+	if len(tuiLogs) == 0 {
+		tuiLogView.SetText("No build log yet. Run 'hokuto build <package>' to start a build.")
+		tuiPrevContent = ""
+	} else if tuiActiveIdx < len(tuiLogs) {
+		log := tuiLogs[tuiActiveIdx]
+		// Only update if content actually changed
+		if log.content != tuiPrevContent {
+			// Save current scroll position before clearing
+			row, _ := tuiLogView.GetScrollOffset()
+
+			// Check if we're at the bottom by trying to scroll down
+			// If we can't scroll down, we're at the bottom
+			tuiLogView.ScrollTo(row+1, 0)
+			newRow, _ := tuiLogView.GetScrollOffset()
+			wasAtBottom := (newRow == row)
+			// Restore original position
+			tuiLogView.ScrollTo(row, 0)
+
+			// Clear the view first
+			tuiLogView.Clear()
+			// Use ANSIWriter to convert ANSI escape sequences to tview color tags
+			// ANSIWriter wraps an io.Writer and converts ANSI codes to tview format
+			ansiWriter := tview.ANSIWriter(tuiLogView)
+			ansiWriter.Write([]byte(log.content))
+
+			// Only auto-scroll to bottom if user was already at bottom
+			if wasAtBottom {
+				tuiLogView.ScrollToEnd()
+			} else {
+				// Try to restore scroll position
+				// Calculate relative position based on content length
+				if len(tuiPrevContent) > 0 && len(log.content) > 0 {
+					// Calculate approximate line number based on content growth
+					prevLines := strings.Count(tuiPrevContent, "\n")
+					newLines := strings.Count(log.content, "\n")
+					if newLines > prevLines {
+						// Content grew, try to maintain relative position
+						// If we were at line X of Y, try to be at line X of (Y + growth)
+						linesAdded := newLines - prevLines
+						newRow := row + linesAdded
+						tuiLogView.ScrollTo(newRow, 0)
+					} else {
+						// Content didn't grow or shrunk, try to restore exact position
+						tuiLogView.ScrollTo(row, 0)
+					}
+				}
+			}
+
+			tuiPrevContent = log.content
+		}
+	} else {
+		tuiLogView.SetText("")
+		tuiPrevContent = ""
 	}
 
-	footerText := "Press 'q' or Ctrl+Q to quit | ← → to switch panes | ↑ ↓ to scroll"
-	if len(m.logs) > 0 && m.activeIdx < len(m.logs) && m.logs[m.activeIdx].canDelete {
-		footerText += " | 'd' to delete"
+	// Update footer
+	var footerSegments []string
+	footerSegments = append(footerSegments, "Press 'q' or Ctrl+Q to quit")
+	footerSegments = append(footerSegments, "← → (or h/l) to switch panes")
+	footerSegments = append(footerSegments, "↑ ↓ to scroll")
+	footerSegments = append(footerSegments, "Home/End to jump to start/end")
+	footerSegments = append(footerSegments, "'o' to open in VS Code")
+	if len(tuiLogs) > 0 && tuiActiveIdx < len(tuiLogs) && tuiLogs[tuiActiveIdx].canDelete {
+		footerSegments = append(footerSegments, "'d' to delete")
 	}
-	footer := lipgloss.NewStyle().Faint(true).Render(footerText)
-
-	// Build view
-	parts := []string{header, paneTitle, body, footer}
-	return strings.Join(parts, "\n")
-}
-
-func (m *tuiModel) resize() {
-	h := m.height - 3 // header(1) + paneTitle(1) + footer(1)
-	if h < 1 {
-		h = 1
-	}
-
-	for i := range m.viewports {
-		m.viewports[i].Width = m.width
-		m.viewports[i].Height = h
-	}
-}
-
-func tickBuildLog() tea.Cmd {
-	return tea.Tick(400*time.Millisecond, func(time.Time) tea.Msg {
-		logs := readAllBuildLogs()
-		return buildLogMsg{logs: logs}
-	})
+	footerText := strings.Join(footerSegments, " | ")
+	tuiFooterBox.SetText(fmt.Sprintf("[gray]%s[white]", footerText))
 }
 
 func readAllBuildLogs() []logInfo {
@@ -286,10 +382,10 @@ func readAllBuildLogs() []logInfo {
 		return ai.ModTime().After(aj.ModTime())
 	})
 
-	// Read all logs
+	// Read all logs (read entire file for infinite scrollback)
 	logs := make([]logInfo, 0, len(allPaths))
 	for _, path := range allPaths {
-		content, err := tailFileBytes(path, 128*1024)
+		content, err := readFullFile(path)
 		if err != nil {
 			content = fmt.Sprintf("failed to read log: %v", err)
 		}
@@ -356,26 +452,14 @@ func canDeleteBuildDir(buildDir string) (bool, string) {
 	return canDelete, deleteAction
 }
 
-func tailFileBytes(path string, maxBytes int64) (string, error) {
+// readFullFile reads the entire file for infinite scrollback support
+func readFullFile(path string) (string, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return "", err
 	}
 	defer f.Close()
 
-	info, err := f.Stat()
-	if err != nil {
-		return "", err
-	}
-
-	size := info.Size()
-	var start int64
-	if size > maxBytes {
-		start = size - maxBytes
-	}
-	if _, err := f.Seek(start, io.SeekStart); err != nil {
-		return "", err
-	}
 	b, err := io.ReadAll(f)
 	if err != nil {
 		return "", err

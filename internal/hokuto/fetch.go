@@ -156,43 +156,43 @@ func downloadFileWithOptions(originalURL, finalURL, destFile string, opt downloa
 			}
 			debugf("curl (quiet) failed, falling back to wget\n")
 		} else {
-			stderrPipe, err := cmd.StderrPipe()
-			if err != nil {
-				cmd.Stderr = os.Stderr
-			}
-			cmd.Stdout = os.Stdout
+		stderrPipe, err := cmd.StderrPipe()
+		if err != nil {
+			cmd.Stderr = os.Stderr
+		}
+		cmd.Stdout = os.Stdout
 
-			if err := cmd.Start(); err != nil {
-				return fmt.Errorf("failed to start curl: %w", err)
-			}
+		if err := cmd.Start(); err != nil {
+			return fmt.Errorf("failed to start curl: %w", err)
+		}
 
-			if stderrPipe != nil {
-				go func() {
-					reader := bufio.NewReader(stderrPipe)
-					blue := "\x1b[" + color.Blue.Code() + "m"
-					reset := "\x1b[0m"
-					for {
-						lineBytes, err := reader.ReadBytes('\r')
-						if len(lineBytes) > 0 {
-							line := string(lineBytes)
-							if strings.HasPrefix(strings.TrimSpace(line), "#") {
-								fmt.Fprintf(os.Stderr, "%s%s%s", blue, line, reset)
-							} else {
-								fmt.Fprint(os.Stderr, line)
-							}
-						}
-						if err != nil {
-							break
+		if stderrPipe != nil {
+			go func() {
+				reader := bufio.NewReader(stderrPipe)
+				blue := "\x1b[" + color.Blue.Code() + "m"
+				reset := "\x1b[0m"
+				for {
+					lineBytes, err := reader.ReadBytes('\r')
+					if len(lineBytes) > 0 {
+						line := string(lineBytes)
+						if strings.HasPrefix(strings.TrimSpace(line), "#") {
+							fmt.Fprintf(os.Stderr, "%s%s%s", blue, line, reset)
+						} else {
+							fmt.Fprint(os.Stderr, line)
 						}
 					}
-				}()
-			}
+					if err != nil {
+						break
+					}
+				}
+			}()
+		}
 
-			if err := cmd.Wait(); err != nil {
-				debugf("\ncurl failed, falling back to wget")
-			} else {
-				debugf("\nDownload successful with curl.")
-				return nil
+		if err := cmd.Wait(); err != nil {
+			debugf("\ncurl failed, falling back to wget")
+		} else {
+			debugf("\nDownload successful with curl.")
+			return nil
 			}
 		}
 	} else {
@@ -213,8 +213,8 @@ func downloadFileWithOptions(originalURL, finalURL, destFile string, opt downloa
 			cmd.Stdout = io.Discard
 			cmd.Stderr = io.Discard
 		} else {
-			cmd.Stdout = os.Stdout
-			cmd.Stderr = os.Stderr
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
 		}
 		if err := cmd.Run(); err == nil {
 			debugf("\nDownload successful with wget.")
@@ -420,15 +420,15 @@ func fetchSourcesWithOptions(pkgName, pkgDir string, processGit bool, quiet bool
 			destPath := filepath.Join(pkgLinkDir, repoName)
 			if _, err := os.Stat(destPath); os.IsNotExist(err) {
 				if !quiet {
-					cPrintf(colInfo, "Cloning git repository %s into %s\n", gitURL, destPath)
+				cPrintf(colInfo, "Cloning git repository %s into %s\n", gitURL, destPath)
 				}
 				cmd := exec.Command("git", "clone", gitURL, destPath)
 				if quiet && !Debug {
 					cmd.Stdout = io.Discard
 					cmd.Stderr = io.Discard
 				} else {
-					cmd.Stdout = os.Stdout
-					cmd.Stderr = os.Stderr
+				cmd.Stdout = os.Stdout
+				cmd.Stderr = os.Stderr
 				}
 				if err := cmd.Run(); err != nil {
 					return fmt.Errorf("git clone failed: %v", err)
@@ -439,8 +439,8 @@ func fetchSourcesWithOptions(pkgName, pkgDir string, processGit bool, quiet bool
 					cmd.Stdout = io.Discard
 					cmd.Stderr = io.Discard
 				} else {
-					cmd.Stdout = os.Stdout
-					cmd.Stderr = os.Stderr
+				cmd.Stdout = os.Stdout
+				cmd.Stderr = os.Stderr
 				}
 				cmd.Run()
 			}
@@ -453,8 +453,8 @@ func fetchSourcesWithOptions(pkgName, pkgDir string, processGit bool, quiet bool
 						cmd.Stdout = io.Discard
 						cmd.Stderr = io.Discard
 					} else {
-						cmd.Stdout = os.Stdout
-						cmd.Stderr = os.Stderr
+					cmd.Stdout = os.Stdout
+					cmd.Stderr = os.Stderr
 					}
 					cmd.Run()
 					cmd = exec.Command("git", "-C", destPath, "pull")
@@ -462,8 +462,8 @@ func fetchSourcesWithOptions(pkgName, pkgDir string, processGit bool, quiet bool
 						cmd.Stdout = io.Discard
 						cmd.Stderr = io.Discard
 					} else {
-						cmd.Stdout = os.Stdout
-						cmd.Stderr = os.Stderr
+					cmd.Stdout = os.Stdout
+					cmd.Stderr = os.Stderr
 					}
 					cmd.Run()
 				} else {
@@ -472,14 +472,14 @@ func fetchSourcesWithOptions(pkgName, pkgDir string, processGit bool, quiet bool
 						cmd.Stdout = io.Discard
 						cmd.Stderr = io.Discard
 					} else {
-						cmd.Stdout = os.Stdout
-						cmd.Stderr = os.Stderr
+					cmd.Stdout = os.Stdout
+					cmd.Stderr = os.Stderr
 					}
 					cmd.Run()
 				}
 			}
 			if !quiet {
-				cPrintf(colInfo, "Git repository ready: %s\n", destPath)
+			cPrintf(colInfo, "Git repository ready: %s\n", destPath)
 			}
 			continue // End git block
 		}
@@ -512,8 +512,8 @@ func fetchSourcesWithOptions(pkgName, pkgDir string, processGit bool, quiet bool
 
 		if _, err := os.Stat(cachePath); os.IsNotExist(err) {
 			if !quiet {
-				colArrow.Print("-> ")
-				colSuccess.Printf("Fetching source: %s\n", origFilename)
+			colArrow.Print("-> ")
+			colSuccess.Printf("Fetching source: %s\n", origFilename)
 			}
 			downloader := downloadFile
 			if quiet {

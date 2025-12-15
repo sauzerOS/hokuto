@@ -11,7 +11,7 @@ import (
 	"strings"
 )
 
-func resolveBinaryDependencies(pkgName string, visited map[string]bool, plan *[]string) error {
+func resolveBinaryDependencies(pkgName string, visited map[string]bool, plan *[]string, force bool) error {
 	// 1. Cycle detection
 	if visited[pkgName] {
 		return nil
@@ -21,7 +21,8 @@ func resolveBinaryDependencies(pkgName string, visited map[string]bool, plan *[]
 	// 2. Check if already installed
 	// If the package is already installed, we don't need to do anything for it
 	// or its dependencies (assuming installed packages are consistent).
-	if checkPackageExactMatch(pkgName) {
+	// Skip this check if force is enabled.
+	if !force && checkPackageExactMatch(pkgName) {
 		return nil
 	}
 
@@ -48,7 +49,7 @@ func resolveBinaryDependencies(pkgName string, visited map[string]bool, plan *[]
 			continue
 		}
 
-		if err := resolveBinaryDependencies(dep.Name, visited, plan); err != nil {
+		if err := resolveBinaryDependencies(dep.Name, visited, plan, force); err != nil {
 			return err
 		}
 	}

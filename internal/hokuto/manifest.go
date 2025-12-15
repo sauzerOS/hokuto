@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 )
 
@@ -304,6 +305,103 @@ func updateManifestWithNewFiles(stagingManifest, stagingManifest2 string) error 
 	// Run the command using the global RootExec
 	if err := RootExec.Run(cmd); err != nil {
 		return fmt.Errorf("failed to append to manifest file %s via RootExec: %w", stagingManifest, err)
+	}
+
+	return nil
+}
+
+// removeManifestEntries removes specified file paths from a manifest file.
+// filesToRemove is a map of file paths (relative to root) that should be removed from the manifest.
+func removeManifestEntries(manifestPath string, filesToRemove map[string]bool, execCtx *Executor) error {
+	// Check if manifest exists
+	if _, err := os.Stat(manifestPath); os.IsNotExist(err) {
+		return nil // No manifest to update
+	}
+
+	// Read the manifest
+	entries, err := parseManifest(manifestPath)
+	if err != nil {
+		return fmt.Errorf("failed to parse manifest: %w", err)
+	}
+
+	// Remove entries that are in filesToRemove
+	removed := false
+	for path := range entries {
+		// Normalize path for comparison (remove leading/trailing slashes, clean)
+		cleanPath := filepath.Clean(path)
+		// Also check without leading slash
+		cleanPathNoSlash := strings.TrimPrefix(cleanPath, "/")
+		if filesToRemove[cleanPath] || filesToRemove[cleanPathNoSlash] {
+			delete(entries, path)
+			removed = true
+		}
+	}
+
+	// If nothing was removed, we're done
+	if !removed {
+		return nil
+	}
+
+	// Write the updated manifest back
+	// Create a temporary file
+	tmpFile, err := os.CreateTemp("", "hokuto-manifest-remove-*.tmp")
+	if err != nil {
+		return fmt.Errorf("failed to create temp file: %w", err)
+	}
+	tmpPath := tmpFile.Name()
+	defer os.Remove(tmpPath)
+
+	// Write all remaining entries
+	// Sort entries for consistent output
+	var sortedPaths []string
+	for path := range entries {
+		sortedPaths = append(sortedPaths, path)
+	}
+	sort.Strings(sortedPaths)
+
+	// Separate directories, symlinks, and regular files
+	var dirs, symlinks, regularFiles []string
+	for _, path := range sortedPaths {
+		entry := entries[path]
+		if strings.HasSuffix(path, "/") {
+			dirs = append(dirs, path)
+		} else if entry.Checksum == "000000" {
+			symlinks = append(symlinks, path)
+		} else {
+			regularFiles = append(regularFiles, path)
+		}
+	}
+
+	// Write directories first, then symlinks, then regular files
+	for _, path := range dirs {
+		if _, err := fmt.Fprintf(tmpFile, "%s\n", path); err != nil {
+			tmpFile.Close()
+			return fmt.Errorf("failed to write directory entry: %w", err)
+		}
+	}
+	for _, path := range symlinks {
+		entry := entries[path]
+		if _, err := fmt.Fprintf(tmpFile, "%s  %s\n", path, entry.Checksum); err != nil {
+			tmpFile.Close()
+			return fmt.Errorf("failed to write symlink entry: %w", err)
+		}
+	}
+	for _, path := range regularFiles {
+		entry := entries[path]
+		if _, err := fmt.Fprintf(tmpFile, "%s  %s\n", path, entry.Checksum); err != nil {
+			tmpFile.Close()
+			return fmt.Errorf("failed to write file entry: %w", err)
+		}
+	}
+
+	if err := tmpFile.Close(); err != nil {
+		return fmt.Errorf("failed to close temp file: %w", err)
+	}
+
+	// Copy temp file to manifest location using executor for proper permissions
+	cpCmd := exec.Command("cp", tmpPath, manifestPath)
+	if err := execCtx.Run(cpCmd); err != nil {
+		return fmt.Errorf("failed to update manifest: %w", err)
 	}
 
 	return nil

@@ -7,6 +7,7 @@ import (
 	"bufio"
 	"bytes"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -232,6 +233,10 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 	// 3. Interactive handling of modified files
 	stdinReader := bufio.NewReader(os.Stdin)
 	skipAllPrompts := false // Flag to skip prompts for all remaining files
+	// Track files removed from staging due to conflicts (to remove from manifest later)
+	filesRemovedFromStaging := make(map[string]bool)
+	// Track files that were already handled in conflict checks (to skip duplicate prompts)
+	filesHandledInConflict := make(map[string]bool)
 	for _, file := range modifiedFiles {
 		stagingFile := filepath.Join(stagingDir, file)
 		currentFile := filepath.Join(rootDir, file) // file under the install root
@@ -251,6 +256,94 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 
 		if _, err := os.Stat(stagingFile); err == nil {
 			// file exists in staging
+
+			// --- NEW: Check for file conflict with another package ---
+			conflictPkg, conflictChecksumMatches, isSymlink, symlinkTarget := checkFileConflict(file, currentFile, pkgName, rootDir, execCtx)
+			if conflictPkg != "" && conflictChecksumMatches {
+				// File is already installed from another package and checksum matches
+				// Check if staging file (from new package) is a symlink or regular file
+				stagingIsSymlink := false
+				var stagingSymlinkTarget string
+				if stagingInfo, err := os.Lstat(stagingFile); err == nil && stagingInfo.Mode()&os.ModeSymlink != 0 {
+					stagingIsSymlink = true
+					if target, err := os.Readlink(stagingFile); err == nil {
+						stagingSymlinkTarget = target
+					}
+				}
+
+				// Show conflict-specific prompt
+				runDiffWithFallback(currentFile, stagingFile, true)
+				os.Stdout.Sync()
+
+				var input string
+				if !yes && !skipAllPrompts {
+					if isSymlink && symlinkTarget != "" {
+						// Existing file is a symlink
+						if stagingIsSymlink && stagingSymlinkTarget != "" {
+							cPrintf(colInfo, "Symlink %s -> %s already installed from %s package: [K]eep %s symlink, [u]se %s symlink: ", file, symlinkTarget, conflictPkg, conflictPkg, pkgName)
+						} else {
+							cPrintf(colInfo, "Symlink %s -> %s already installed from %s package: [K]eep %s symlink, [u]se %s file: ", file, symlinkTarget, conflictPkg, conflictPkg, pkgName)
+						}
+					} else {
+						// Existing file is a regular file
+						if stagingIsSymlink && stagingSymlinkTarget != "" {
+							cPrintf(colInfo, "File %s already installed from %s package: [K]eep %s file, [u]se %s symlink: ", file, conflictPkg, conflictPkg, pkgName)
+						} else {
+							cPrintf(colInfo, "File %s already installed from %s package: [K]eep %s file, [u]se %s file: ", file, conflictPkg, conflictPkg, pkgName)
+						}
+					}
+					os.Stdout.Sync()
+					response, err := stdinReader.ReadString('\n')
+					if err != nil {
+						response = "k" // Default to keep on read error
+					}
+					input = strings.TrimSpace(response)
+				}
+				if input == "" {
+					input = "k" // Default to keep if user presses enter or if in --yes mode
+				}
+				switch strings.ToLower(input) {
+				case "k":
+					// Keep the file from the other package - delete from staging
+					rmCmd := exec.Command("rm", "-f", stagingFile)
+					if err := execCtx.Run(rmCmd); err != nil {
+						return fmt.Errorf("failed to remove file from staging %s: %v", stagingFile, err)
+					}
+					// Track this file for manifest removal
+					filesRemovedFromStaging[file] = true
+					if isSymlink {
+						debugf("Kept symlink from %s package, removed from staging: %s -> %s\n", conflictPkg, file, symlinkTarget)
+					} else {
+						debugf("Kept file from %s package, removed from staging: %s\n", conflictPkg, file)
+					}
+					continue // Skip to next file
+				case "u":
+					// Use the new file from current package - mark as handled and skip modified file prompt
+					filesHandledInConflict[file] = true
+					// File stays in staging, continue to next file (skip modified file handling)
+					continue
+				default:
+					// Invalid input, default to keep
+					rmCmd := exec.Command("rm", "-f", stagingFile)
+					if err := execCtx.Run(rmCmd); err != nil {
+						return fmt.Errorf("failed to remove file from staging %s: %v", stagingFile, err)
+					}
+					// Track this file for manifest removal
+					filesRemovedFromStaging[file] = true
+					if isSymlink {
+						debugf("Kept symlink from %s package (invalid input), removed from staging: %s -> %s\n", conflictPkg, file, symlinkTarget)
+					} else {
+						debugf("Kept file from %s package (invalid input), removed from staging: %s\n", conflictPkg, file)
+					}
+					continue
+				}
+			}
+
+			// Skip if this file was already handled in conflict check
+			if filesHandledInConflict[file] {
+				continue
+			}
+
 			// Try to display diff, retry with root executor if permission denied
 			runDiffWithFallback(currentFile, stagingFile, true)
 			// Flush stdout to ensure diff output is visible before prompt
@@ -274,9 +367,30 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 			}
 			switch strings.ToLower(input) {
 			case "k":
-				cpCmd := exec.Command("cp", "--remove-destination", currentFile, stagingFile)
-				if err := execCtx.Run(cpCmd); err != nil {
-					return fmt.Errorf("failed to overwrite %s: %v", stagingFile, err)
+				// Check if currentFile is a symlink
+				currentInfo, err := os.Lstat(currentFile)
+				if err == nil && currentInfo.Mode()&os.ModeSymlink != 0 {
+					// It's a symlink - preserve it by reading the target and recreating the symlink
+					linkTarget, err := os.Readlink(currentFile)
+					if err != nil {
+						return fmt.Errorf("failed to read symlink %s: %v", currentFile, err)
+					}
+					// Remove existing file/symlink in staging if it exists (use executor for proper permissions)
+					rmCmd := exec.Command("rm", "-f", stagingFile)
+					if err := execCtx.Run(rmCmd); err != nil {
+						return fmt.Errorf("failed to remove existing file %s: %v", stagingFile, err)
+					}
+					// Recreate the symlink in staging using executor for proper permissions
+					lnCmd := exec.Command("ln", "-s", linkTarget, stagingFile)
+					if err := execCtx.Run(lnCmd); err != nil {
+						return fmt.Errorf("failed to recreate symlink %s -> %s: %v", stagingFile, linkTarget, err)
+					}
+				} else {
+					// It's a regular file - copy it normally
+					cpCmd := exec.Command("cp", "--remove-destination", currentFile, stagingFile)
+					if err := execCtx.Run(cpCmd); err != nil {
+						return fmt.Errorf("failed to overwrite %s: %v", stagingFile, err)
+					}
 				}
 			case "u":
 				// keep staging file as-is
@@ -395,6 +509,10 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 			}
 		}
 	}
+
+	// Note: Manifest entries for removed files will be cleaned up in checkStagingConflicts
+	// after the manifest is generated, to avoid modifying the tarball's manifest
+
 	// Generate updated manifest of staging
 	debugf("Generating staging manifest\n")
 	stagingManifest := stagingDir + "/var/db/hokuto/installed/" + pkgName + "/manifest"
@@ -427,6 +545,17 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 	rmCmd := exec.Command("rm", "-rf", stagingManifest2dir)
 	if err := execCtx.Run(rmCmd); err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to remove StagingManifest: %v", err)
+	}
+
+	// 3.5. Check for conflicts with existing files (for fresh installs only)
+	// Only run if package is not already installed (no installed manifest)
+	installedManifestPath := filepath.Join(rootDir, Installed, pkgName, "manifest")
+	if _, err := os.Stat(installedManifestPath); os.IsNotExist(err) {
+		// Package is not installed - check for conflicts with existing files
+		debugf("Checking for conflicts with existing files\n")
+		if err := checkStagingConflicts(pkgName, stagingDir, rootDir, stagingManifest, execCtx, yes, filesRemovedFromStaging, nil); err != nil {
+			return err
+		}
 	}
 
 	// 4. Determine obsolete files (compare manifests)
@@ -696,3 +825,277 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 // - execCtx: Executor that must have ShouldRunAsRoot=true (RootExec)
 // - force: ignore reverse-dep checks
 // - yes: assume confirmation
+
+// checkStagingConflicts checks for conflicts between files in staging and existing files in the target.
+// This handles fresh installs where the package is not installed but files may already exist.
+// filesHandledInConflict is optional and only used for tracking (can be nil for fresh installs).
+func checkStagingConflicts(pkgName, stagingDir, rootDir, stagingManifest string, execCtx *Executor, yes bool, filesRemovedFromStaging map[string]bool, filesHandledInConflict map[string]bool) error {
+	// Read the staging manifest
+	stagingData, err := os.ReadFile(stagingManifest)
+	if err != nil {
+		// No staging manifest (shouldn't happen, but handle gracefully)
+		return nil
+	}
+
+	// Build a map of file -> owner package once (instead of calling findOwnerPackage for each file)
+	// This is much more efficient when checking many files
+	fileOwnerMap := make(map[string]string)
+	entries, err := os.ReadDir(Installed)
+	if err == nil {
+		for _, e := range entries {
+			if !e.IsDir() {
+				continue
+			}
+			otherPkgName := e.Name()
+			if otherPkgName == pkgName {
+				continue // Skip current package
+			}
+			manifestPath := filepath.Join(Installed, otherPkgName, "manifest")
+			data, err := os.ReadFile(manifestPath)
+			if err != nil {
+				continue
+			}
+			scanner := bufio.NewScanner(bytes.NewReader(data))
+			for scanner.Scan() {
+				line := strings.TrimSpace(scanner.Text())
+				if line == "" || strings.HasSuffix(line, "/") {
+					continue
+				}
+				fields := strings.Fields(line)
+				if len(fields) == 0 {
+					continue
+				}
+				manifestFilePath := fields[0]
+				// Store both with and without leading slash for fast lookup
+				cleanPath := filepath.Clean(manifestFilePath)
+				cleanPathNoSlash := strings.TrimPrefix(cleanPath, "/")
+				fileOwnerMap[cleanPath] = otherPkgName
+				if cleanPathNoSlash != cleanPath {
+					fileOwnerMap[cleanPathNoSlash] = otherPkgName
+				}
+			}
+		}
+	}
+
+	// Helper function to run diff with root executor fallback if permission denied
+	runDiffWithFallback := func(file1, file2 string, outputToStdout bool) error {
+		// Helper to filter binary diff messages
+		printFiltered := func(out string) {
+			if strings.HasPrefix(out, "Binary files") && strings.Contains(out, "differ") {
+				if Debug {
+					fmt.Printf("%s\n", out)
+				}
+				return
+			}
+			if outputToStdout {
+				fmt.Print(out)
+			}
+		}
+
+		diffCmd := exec.Command("diff", "-u", file1, file2)
+		var out bytes.Buffer
+		diffCmd.Stdout = &out
+		diffCmd.Stderr = io.Discard
+
+		// Try with current executor first
+		err := execCtx.Run(diffCmd)
+		// diff returns exit code 1 when files differ (which is normal), >1 for errors
+		if err != nil {
+			// Check if it's a permission issue
+			if strings.Contains(err.Error(), "permission denied") || strings.Contains(out.String(), "Permission denied") {
+				// Try with root executor
+				rootDiffCmd := exec.Command("diff", "-u", file1, file2)
+				var rootOut bytes.Buffer
+				rootDiffCmd.Stdout = &rootOut
+				rootDiffCmd.Stderr = io.Discard
+				if rootErr := RootExec.Run(rootDiffCmd); rootErr == nil {
+					printFiltered(rootOut.String())
+					return nil
+				}
+			}
+			// If diff returns non-zero (files differ), that's expected, just print output
+			// Exit code 1 means files differ (normal), >1 means error
+			if exitError, ok := err.(*exec.ExitError); ok && exitError.ExitCode() == 1 {
+				printFiltered(out.String())
+				return nil
+			}
+			// Other errors - try to print what we have
+			if out.Len() > 0 {
+				printFiltered(out.String())
+			}
+			return nil // Don't fail on diff errors
+		}
+		printFiltered(out.String())
+		return nil
+	}
+
+	stdinReader := bufio.NewReader(os.Stdin)
+	skipAllPrompts := false
+
+	scanner := bufio.NewScanner(strings.NewReader(string(stagingData)))
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasSuffix(line, "/") {
+			continue // Skip directories
+		}
+
+		parts := strings.Fields(line)
+		if len(parts) == 0 {
+			continue
+		}
+		filePath := parts[0] // Path from manifest (may have leading slash)
+		// Normalize path: remove leading slash for comparison
+		filePathClean := strings.TrimPrefix(filePath, "/")
+		filePathClean = filepath.Clean(filePathClean)
+
+		stagingFile := filepath.Join(stagingDir, strings.TrimPrefix(filePath, "/"))
+		targetFile := filepath.Join(rootDir, strings.TrimPrefix(filePath, "/"))
+
+		// Check if file exists in target location
+		if _, err := os.Lstat(targetFile); os.IsNotExist(err) {
+			continue // File doesn't exist, no conflict
+		}
+
+		// File exists in target - check for conflicts using cached owner map
+		ownerPkg := fileOwnerMap[filePathClean]
+		if ownerPkg == "" {
+			// Try with leading slash
+			ownerPkg = fileOwnerMap[filePath]
+		}
+
+		// If file is owned by the current package, skip it (shouldn't happen for fresh installs, but handle gracefully)
+		if ownerPkg == pkgName {
+			continue
+		}
+
+		if ownerPkg != "" && ownerPkg != pkgName {
+			// File is owned by another package - apply conflict logic
+			// Only check checksum if we found an owner (avoid expensive checkFileConflict if not needed)
+			conflictPkg, conflictChecksumMatches, isSymlink, symlinkTarget := checkFileConflict(filePath, targetFile, pkgName, rootDir, execCtx)
+			if conflictPkg != "" && conflictChecksumMatches {
+				// Check if staging file (from new package) is a symlink or regular file
+				stagingIsSymlink := false
+				var stagingSymlinkTarget string
+				if stagingInfo, err := os.Lstat(stagingFile); err == nil && stagingInfo.Mode()&os.ModeSymlink != 0 {
+					stagingIsSymlink = true
+					if target, err := os.Readlink(stagingFile); err == nil {
+						stagingSymlinkTarget = target
+					}
+				}
+
+				// Show conflict-specific prompt
+				runDiffWithFallback(targetFile, stagingFile, true)
+				os.Stdout.Sync()
+
+				var input string
+				if !yes && !skipAllPrompts {
+					if isSymlink && symlinkTarget != "" {
+						// Existing file is a symlink
+						if stagingIsSymlink && stagingSymlinkTarget != "" {
+							cPrintf(colInfo, "Symlink %s -> %s already installed from %s package: [K]eep %s symlink, [u]se %s symlink: ", filePath, symlinkTarget, conflictPkg, conflictPkg, pkgName)
+						} else {
+							cPrintf(colInfo, "Symlink %s -> %s already installed from %s package: [K]eep %s symlink, [u]se %s file: ", filePath, symlinkTarget, conflictPkg, conflictPkg, pkgName)
+						}
+					} else {
+						// Existing file is a regular file
+						if stagingIsSymlink && stagingSymlinkTarget != "" {
+							cPrintf(colInfo, "File %s already installed from %s package: [K]eep %s file, [u]se %s symlink: ", filePath, conflictPkg, conflictPkg, pkgName)
+						} else {
+							cPrintf(colInfo, "File %s already installed from %s package: [K]eep %s file, [u]se %s file: ", filePath, conflictPkg, conflictPkg, pkgName)
+						}
+					}
+					os.Stdout.Sync()
+					response, err := stdinReader.ReadString('\n')
+					if err != nil {
+						response = "k" // Default to keep on read error
+					}
+					input = strings.TrimSpace(response)
+				}
+				if input == "" {
+					input = "k" // Default to keep if user presses enter or if in --yes mode
+				}
+				switch strings.ToLower(input) {
+				case "k":
+					// Keep the file from the other package - delete from staging
+					rmCmd := exec.Command("rm", "-f", stagingFile)
+					if err := execCtx.Run(rmCmd); err != nil {
+						return fmt.Errorf("failed to remove file from staging %s: %v", stagingFile, err)
+					}
+					// Track this file for manifest removal
+					filesRemovedFromStaging[filePath] = true
+					if isSymlink {
+						debugf("Kept symlink from %s package, removed from staging: %s -> %s\n", conflictPkg, filePath, symlinkTarget)
+					} else {
+						debugf("Kept file from %s package, removed from staging: %s\n", conflictPkg, filePath)
+					}
+					continue
+				case "u":
+					// Use the new file from current package - mark as handled if tracking map provided (file stays in staging)
+					if filesHandledInConflict != nil {
+						filesHandledInConflict[filePath] = true
+					}
+				default:
+					// Invalid input, default to keep
+					rmCmd := exec.Command("rm", "-f", stagingFile)
+					if err := execCtx.Run(rmCmd); err != nil {
+						return fmt.Errorf("failed to remove file from staging %s: %v", stagingFile, err)
+					}
+					filesRemovedFromStaging[filePath] = true
+					if isSymlink {
+						debugf("Kept symlink from %s package (invalid input), removed from staging: %s -> %s\n", conflictPkg, filePath, symlinkTarget)
+					} else {
+						debugf("Kept file from %s package (invalid input), removed from staging: %s\n", conflictPkg, filePath)
+					}
+					continue
+				}
+			}
+		} else {
+			// File exists but is not owned by any package - ask user what to do
+			runDiffWithFallback(targetFile, stagingFile, true)
+			os.Stdout.Sync()
+
+			var input string
+			if !yes && !skipAllPrompts {
+				cPrintf(colInfo, "File %s already exists (not managed by any package): [k]eep existing, [o]verwrite: ", filePath)
+				os.Stdout.Sync()
+				response, err := stdinReader.ReadString('\n')
+				if err != nil {
+					response = "o" // Default to overwrite on read error
+				}
+				input = strings.TrimSpace(response)
+			}
+			if input == "" {
+				input = "o" // Default to overwrite if user presses enter or if in --yes mode
+			}
+			switch strings.ToLower(input) {
+			case "k":
+				// Keep existing file - remove from staging
+				rmCmd := exec.Command("rm", "-f", stagingFile)
+				if err := execCtx.Run(rmCmd); err != nil {
+					return fmt.Errorf("failed to remove file from staging %s: %v", stagingFile, err)
+				}
+				filesRemovedFromStaging[filePath] = true
+				debugf("Kept existing unmanaged file, removed from staging: %s\n", filePath)
+			case "o":
+				// Overwrite - keep file in staging (will be installed)
+			default:
+				// Invalid input, default to overwrite
+				// File stays in staging
+			}
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("error reading staging manifest: %v", err)
+	}
+
+	// Remove entries from staging manifest for files that were removed from staging
+	if len(filesRemovedFromStaging) > 0 {
+		if err := removeManifestEntries(stagingManifest, filesRemovedFromStaging, execCtx); err != nil {
+			// Non-fatal, but log the error
+			debugf("Warning: failed to remove entries from staging manifest: %v\n", err)
+		}
+	}
+
+	return nil
+}

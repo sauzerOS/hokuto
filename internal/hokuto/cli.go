@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math/rand"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strings"
@@ -42,6 +43,7 @@ func printHelp() {
 		{"find, f", "<query>", "Find which package matches query string"},
 		{"new, n", "<pkg>", "Create a new package skeleton"},
 		{"edit, e", "<pkg>", "Edit a package's build files. -a (edit all files)"},
+		{"cd", "<pkg>", "Change directory to package repository directory"},
 		{"bootstrap", "<dir>", "Build a bootstrap rootfs in target directory"},
 		{"chroot", "<dir> [cmd...]", "Enter chroot and run command (default: /bin/bash)"},
 		{"cleanup", "[options]", "Cleanup: -sources, -bins, -orphans, -all"},
@@ -335,6 +337,7 @@ func Main() {
 		installCmd := flag.NewFlagSet("install", flag.ExitOnError)
 		var yes = installCmd.Bool("y", false, "Assume 'yes' to all prompts and overwrite modified files.")
 		var yesLong = installCmd.Bool("yes", false, "Assume 'yes' to all prompts and overwrite modified files.")
+		var force = installCmd.Bool("force", false, "Install even if package is already installed.")
 
 		if err := installCmd.Parse(os.Args[2:]); err != nil {
 			fmt.Fprintf(os.Stderr, "Error parsing install flags: %v\n", err)
@@ -384,14 +387,41 @@ func Main() {
 			pkgName := arg
 			userRequestedMap[pkgName] = true
 
-			// Recursively find missing dependencies
-			if err := resolveBinaryDependencies(pkgName, visited, &installPlan); err != nil {
+			// Recursively find missing dependencies (always check if deps are installed, force doesn't apply to deps)
+			if err := resolveBinaryDependencies(pkgName, visited, &installPlan, false); err != nil {
+				// Skip dependency resolution if source not found (e.g., renamed cross-system packages)
+				// The package can still be installed from tarball without source
+				if strings.Contains(err.Error(), "source not found in HOKUTO_PATH") {
+					// Add the package to install plan even without dependency resolution
+					// (it will be installed from tarball if available)
+					if !checkPackageExactMatch(pkgName) {
+						installPlan = append(installPlan, pkgName)
+					}
+					continue
+				}
 				fmt.Fprintf(os.Stderr, "Error resolving dependencies for %s: %v\n", pkgName, err)
 				os.Exit(1)
 			}
+
+			// If force is enabled, add the user-requested package even if it's already installed
+			// (dependencies are handled above and won't be added if already installed)
+			if *force {
+				// Check if package is already in plan (from dependency resolution)
+				alreadyInPlan := false
+				for _, pkg := range installPlan {
+					if pkg == pkgName {
+						alreadyInPlan = true
+						break
+					}
+				}
+				// If not in plan (because it's already installed), add it anyway when force is enabled
+				if !alreadyInPlan {
+					installPlan = append(installPlan, pkgName)
+				}
+			}
 		}
 
-		if len(installPlan) == 0 {
+		if len(installPlan) == 0 && !*force {
 			colArrow.Print("-> ")
 			colSuccess.Println("All packages and dependencies are already installed.")
 			os.Exit(0)
@@ -454,36 +484,56 @@ func Main() {
 				// Case B: Package Name (Auto-resolved or requested)
 				pkgName = arg
 				version, revision, err := getRepoVersion2(pkgName)
+				tarballFoundDirectly := false
 				if err != nil {
-					fmt.Fprintf(os.Stderr, "Error determining version for %s: %v\n", pkgName, err)
-					allSucceeded = false
-					continue
-				}
-				tarballPath = filepath.Join(BinDir, fmt.Sprintf("%s-%s-%s.tar.zst", pkgName, version, revision))
-
-				// 1. Check Local Cache
-				if _, err := os.Stat(tarballPath); err != nil {
-					foundOnMirror := false
-
-					// 2. Not in local cache? Try Mirror.
-					if BinaryMirror != "" {
-						if err := fetchBinaryPackage(pkgName, version, revision); err == nil {
-							foundOnMirror = true
+					// If source not found (e.g., renamed cross-system packages), try to find tarball
+					if strings.Contains(err.Error(), "not found") {
+						// Try to find the newest tarball matching this package name
+						foundTarball, foundVersion, foundRevision := findNewestTarball(pkgName)
+						if foundTarball != "" {
+							tarballPath = foundTarball
+							version = foundVersion
+							revision = foundRevision
+							tarballFoundDirectly = true
 						} else {
-							debugf("Mirror fetch failed for %s: %v\n", pkgName, err)
+							fmt.Fprintf(os.Stderr, "Error determining version for %s: %v\n", pkgName, err)
+							allSucceeded = false
+							continue
 						}
-					}
-
-					// 3. If still not found, error out.
-					if !foundOnMirror {
-						cPrintf(colWarn, "Error: Binary package not found for %s.\n", pkgName)
-						cPrintf(colInfo, "Expected path: %s\n", tarballPath)
-						if BinaryMirror != "" {
-							cPrintf(colInfo, "Mirror check failed or file missing on server.\n")
-						}
-						cPrintf(colInfo, "Tip: Run 'hokuto build %s' to create the binary.\n", pkgName)
+					} else {
+						fmt.Fprintf(os.Stderr, "Error determining version for %s: %v\n", pkgName, err)
 						allSucceeded = false
 						continue
+					}
+				} else {
+					tarballPath = filepath.Join(BinDir, fmt.Sprintf("%s-%s-%s.tar.zst", pkgName, version, revision))
+				}
+
+				// 1. Check Local Cache (skip if we already found the tarball directly)
+				if !tarballFoundDirectly {
+					if _, err := os.Stat(tarballPath); err != nil {
+						foundOnMirror := false
+
+						// 2. Not in local cache? Try Mirror.
+						if BinaryMirror != "" {
+							if err := fetchBinaryPackage(pkgName, version, revision); err == nil {
+								foundOnMirror = true
+							} else {
+								debugf("Mirror fetch failed for %s: %v\n", pkgName, err)
+							}
+						}
+
+						// 3. If still not found, error out.
+						if !foundOnMirror {
+							cPrintf(colWarn, "Error: Binary package not found for %s.\n", pkgName)
+							cPrintf(colInfo, "Expected path: %s\n", tarballPath)
+							if BinaryMirror != "" {
+								cPrintf(colInfo, "Mirror check failed or file missing on server.\n")
+							}
+							cPrintf(colInfo, "Tip: Run 'hokuto build %s' to create the binary.\n", pkgName)
+							allSucceeded = false
+							continue
+						}
 					}
 				}
 			}
@@ -625,15 +675,62 @@ func Main() {
 		}
 
 	case "new", "n":
-		if len(os.Args) < 3 {
-			fmt.Println("Usage: hokuto new <pkgname>")
+		newCmd := flag.NewFlagSet("new", flag.ExitOnError)
+		var here = newCmd.Bool("here", false, "Create package in current working directory")
+		if err := newCmd.Parse(os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "Error parsing new flags: %v\n", err)
 			os.Exit(1)
 		}
-		pkg := os.Args[2]
-		if err := newPackage(pkg); err != nil {
+		args := newCmd.Args()
+		if len(args) < 1 {
+			fmt.Println("Usage: hokuto new [-here] <pkgname>")
+			os.Exit(1)
+		}
+		pkg := args[0]
+		var targetDir string
+		if *here {
+			// Use current working directory
+			cwd, err := os.Getwd()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error getting current directory: %v\n", err)
+				os.Exit(1)
+			}
+			targetDir = cwd
+		} else {
+			// Use default newPackageDir
+			targetDir = ""
+		}
+		if err := newPackage(pkg, targetDir); err != nil {
 			fmt.Fprintln(os.Stderr, "Error:", err)
 			os.Exit(1)
 		}
+
+	case "cd":
+		if len(os.Args) < 3 {
+			fmt.Println("Usage: hokuto cd <pkgname>")
+			os.Exit(1)
+		}
+		pkgName := os.Args[2]
+		pkgDir, err := findPackageDir(pkgName)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: Package '%s' not found in any repository: %v\n", pkgName, err)
+			os.Exit(1)
+		}
+		// Spawn a shell in the package directory
+		shell := os.Getenv("SHELL")
+		if shell == "" {
+			shell = "/bin/bash"
+		}
+		cmd := exec.Command(shell)
+		cmd.Dir = pkgDir
+		cmd.Stdin = os.Stdin
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		if err := cmd.Run(); err != nil {
+			fmt.Fprintf(os.Stderr, "Error running shell: %v\n", err)
+			os.Exit(1)
+		}
+		os.Exit(0)
 
 	case "edit", "e":
 		if len(os.Args) < 3 {
@@ -666,4 +763,57 @@ func Main() {
 		exitCode = 1
 	}
 	os.Exit(exitCode)
+}
+
+// findNewestTarball finds the newest tarball matching the package name pattern
+// Returns (tarballPath, version, revision) or ("", "", "") if not found
+func findNewestTarball(pkgName string) (string, string, string) {
+	// Search in all possible bin directories
+	binDirs := []string{
+		BinDir,                    // Default bin directory
+		CacheDir + "/bin/generic", // Generic builds
+		CacheDir + "/bin/cross",   // Cross builds
+	}
+
+	var newestTarball string
+	var newestModTime time.Time
+	var foundVersion, foundRevision string
+
+	for _, binDir := range binDirs {
+		// Pattern: pkgname-*-*.tar.zst (new format) or pkgname-*.tar.zst (old format)
+		pattern := filepath.Join(binDir, pkgName+"-*.tar.zst")
+		matches, err := filepath.Glob(pattern)
+		if err != nil {
+			continue
+		}
+
+		for _, match := range matches {
+			info, err := os.Stat(match)
+			if err != nil {
+				continue
+			}
+
+			// Check if this is newer than what we've found so far
+			if newestTarball == "" || info.ModTime().After(newestModTime) {
+				newestTarball = match
+				newestModTime = info.ModTime()
+
+				// Parse version and revision from filename
+				base := filepath.Base(match)
+				nameWithoutExt := strings.TrimSuffix(base, ".tar.zst")
+				parts := strings.Split(nameWithoutExt, "-")
+				if len(parts) >= 3 {
+					// New format: pkgname-version-revision
+					foundVersion = parts[len(parts)-2]
+					foundRevision = parts[len(parts)-1]
+				} else if len(parts) >= 2 {
+					// Old format: pkgname-version (revision defaults to "1")
+					foundVersion = parts[len(parts)-1]
+					foundRevision = "1"
+				}
+			}
+		}
+	}
+
+	return newestTarball, foundVersion, foundRevision
 }

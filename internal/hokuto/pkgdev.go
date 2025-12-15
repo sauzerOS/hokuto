@@ -10,12 +10,18 @@ import (
 	"path/filepath"
 )
 
-func newPackage(pkgName string) error {
-	if newPackageDir == "" {
-		return fmt.Errorf("newPackageDir is not set")
+func newPackage(pkgName string, targetDir string) error {
+	var pkgDir string
+	if targetDir != "" {
+		// Use provided target directory (current working directory when -here is used)
+		pkgDir = filepath.Join(targetDir, pkgName)
+	} else {
+		// Use default newPackageDir
+		if newPackageDir == "" {
+			return fmt.Errorf("newPackageDir is not set")
+		}
+		pkgDir = filepath.Join(newPackageDir, pkgName)
 	}
-
-	pkgDir := filepath.Join(newPackageDir, pkgName)
 
 	// Don't overwrite existing package dir
 	if fi, err := os.Stat(pkgDir); err == nil {

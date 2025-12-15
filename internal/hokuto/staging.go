@@ -66,8 +66,14 @@ func removeObsoleteFiles(pkgName, stagingDir, rootDir string) ([]string, error) 
 
 		installedPath := filepath.Join(rootDir, path)
 
-		// if installed file exists on disk, schedule for deletion
+		// if installed file exists on disk, check if it's owned by another package
 		if fi, err := os.Lstat(installedPath); err == nil && !fi.IsDir() {
+			// Check if this file is owned by another package (excluding current package)
+			if isOwnedByAnotherPackage(path, pkgName) {
+				// File is owned by another package, don't delete it
+				continue
+			}
+			// File is not owned by another package, schedule for deletion
 			filesToDelete = append(filesToDelete, installedPath)
 		}
 	}
