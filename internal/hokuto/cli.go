@@ -272,30 +272,37 @@ func Main() {
 
 	case "checksum", "c":
 		force := false
+		unpack := false
 
 		if len(os.Args) < 3 {
-			fmt.Println("Usage: hokuto checksum <pkg1> [<pkg2> ...] [-f]")
+			fmt.Println("Usage: hokuto checksum <pkg1> [<pkg2> ...] [-f] [-unpack]")
 			return
 		}
 
 		// Collect args after the command
 		args := os.Args[2:]
 
-		// If last argument is -f, enable force and drop it from package list
-		if len(args) > 0 && args[len(args)-1] == "-f" {
-			force = true
-			args = args[:len(args)-1]
+		// Check for flags
+		for i := len(args) - 1; i >= 0; i-- {
+			switch args[i] {
+			case "-f":
+				force = true
+				args = append(args[:i], args[i+1:]...)
+			case "-unpack":
+				unpack = true
+				args = append(args[:i], args[i+1:]...)
+			}
 		}
 
 		if len(args) == 0 {
-			fmt.Println("Usage: hokuto checksum <pkg1> [<pkg2> ...] [-f]")
+			fmt.Println("Usage: hokuto checksum <pkg1> [<pkg2> ...] [-f] [-unpack]")
 			return
 		}
 
 		// args now contains one or more package names
 		var overallErr error
 		for _, pkg := range args {
-			if err := hokutoChecksum(pkg, force); err != nil {
+			if err := hokutoChecksum(pkg, force, unpack); err != nil {
 				fmt.Printf("Error for %s: %v\n", pkg, err)
 				overallErr = err
 				// continue to process remaining packages

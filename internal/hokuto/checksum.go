@@ -304,7 +304,7 @@ func verifyOrCreateChecksums(pkgName, pkgDir string, force bool) error {
 
 // checksum command
 
-func hokutoChecksum(pkgName string, force bool) error {
+func hokutoChecksum(pkgName string, force bool, unpack bool) error {
 
 	paths := strings.Split(repoPaths, ":")
 	var pkgDir string
@@ -326,6 +326,43 @@ func hokutoChecksum(pkgName string, force bool) error {
 	}
 	if err := verifyOrCreateChecksums(pkgName, pkgDir, force); err != nil {
 		return fmt.Errorf("error verifying checksums: %v", err)
+	}
+
+	// If -unpack flag is set, prepare sources in tmpdir
+	if unpack {
+		// Load config to get TMPDIR
+		cfg, err := loadConfig(ConfigFile)
+		if err != nil {
+			return fmt.Errorf("failed to load config: %v", err)
+		}
+
+		// Determine tmpdir (same logic as build command)
+		tmpDir := cfg.Values["TMPDIR"]
+		if tmpDir == "" {
+			tmpDir = "/var/tmp/hokuto"
+		}
+		currentTmpDir := tmpDir
+		// Check for noram file
+		tmpDirfile := filepath.Join(pkgDir, "noram")
+		if _, err := os.Stat(tmpDirfile); err == nil {
+			currentTmpDir = cfg.Values["TMPDIR2"]
+			if currentTmpDir == "" {
+				currentTmpDir = "/var/tmpdir"
+			}
+		}
+
+		// Create build directory in tmpdir
+		buildDir := filepath.Join(currentTmpDir, pkgName, "build")
+		if err := os.MkdirAll(buildDir, 0o755); err != nil {
+			return fmt.Errorf("failed to create build directory: %v", err)
+		}
+
+		// Prepare sources using UserExec (non-root)
+		if err := prepareSources(pkgName, pkgDir, buildDir, UserExec); err != nil {
+			return fmt.Errorf("failed to prepare sources: %v", err)
+		}
+
+		fmt.Printf("Sources unpacked for %s in %s\n", pkgName, buildDir)
 	}
 
 	return nil
