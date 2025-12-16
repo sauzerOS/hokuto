@@ -249,7 +249,28 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 	}
 
 	// Build environment
-	env := os.Environ()
+	// Start with a clean environment by filtering out variables that we intend to set.
+	// This prevents duplicate keys and ensures our values take precedence, especially
+	// if the underlying shell (like fish) behaves unexpectedly with duplicates.
+	sysEnv := os.Environ()
+	var env []string
+	filteredVars := map[string]bool{
+		"CFLAGS": true, "CXXFLAGS": true, "LDFLAGS": true,
+		"CC": true, "CXX": true, "AR": true, "NM": true, "RANLIB": true,
+		"MAKEFLAGS": true, "CMAKE_BUILD_PARALLEL_LEVEL": true,
+		"RUSTFLAGS": true, "GOFLAGS": true, "GOPATH": true,
+		"HOKUTO_ROOT": true, "TMPDIR": true, "CONFIG_SITE": true,
+		"HOKUTO_ARCH": true, "MULTILIB": true, "HOKUTO_BUILD_DIR": true,
+		"SHELL": true, // Critical: We will force SHELL to /bin/bash later
+	}
+
+	for _, e := range sysEnv {
+		k := strings.SplitN(e, "=", 2)[0]
+		if !filteredVars[k] {
+			env = append(env, e)
+		}
+	}
+
 	var defaults = map[string]string{}
 
 	if bootstrap {
@@ -300,6 +321,7 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 			"TMPDIR":           currentTmpDir,
 			"HOKUTO_ARCH":      targetArch,
 			"HOKUTO_BUILD_DIR": buildDir,
+			"SHELL":            "/bin/bash", // Force bash for consistency
 		}
 
 	} else {
@@ -367,8 +389,15 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 				cxxflagsVal = cfg.Values["CXXFLAGS_GEN"]
 				ldflagsVal = cfg.Values["LDFLAGS"]
 			}
-		} else if isCross || isARM {
-			// Case A: ARM64 (either native ARM64 or cross-compiling to ARM64)
+		} else if isCross {
+			// Case A: Cross-compilation
+			// Use generic flags to avoid issues where host compiler vs cross compiler
+			// might choke on specific architecture flags.
+			cflagsVal = "-O2 -pipe"
+			cxxflagsVal = "-O2 -pipe"
+			ldflagsVal = cfg.Values["LDFLAGS"]
+		} else if isARM {
+			// Case B: Native ARM64
 			cflagsVal = cfg.Values["CFLAGS_ARM64"]
 			cxxflagsVal = cfg.Values["CXXFLAGS_ARM64"]
 			ldflagsVal = cfg.Values["LDFLAGS"]
@@ -439,6 +468,7 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 			"HOKUTO_ARCH":                targetArch,
 			"MULTILIB":                   multilibVal,
 			"HOKUTO_BUILD_DIR":           buildDir,
+			"SHELL":                      "/bin/bash", // Force bash for consistency
 		}
 
 		if buildPriority == "idle" || buildPriority == "superidle" {
@@ -1025,8 +1055,15 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 	// Check if cross-compilation is enabled
 	isCross := cfg.Values["HOKUTO_CROSS_ARCH"] != ""
 
-	if isCross || isARM {
-		// Case A: ARM64 (either native ARM64 or cross-compiling to ARM64)
+	if isCross {
+		// Case A: Cross-compilation
+		// Use generic flags to avoid issues where host compiler vs cross compiler
+		// might choke on specific architecture flags.
+		cflagsVal = "-O2 -pipe"
+		cxxflagsVal = "-O2 -pipe"
+		ldflagsVal = cfg.Values["LDFLAGS"]
+	} else if isARM {
+		// Case B: Native ARM64
 		cflagsVal = cfg.Values["CFLAGS_ARM64"]
 		cxxflagsVal = cfg.Values["CXXFLAGS_ARM64"]
 		ldflagsVal = cfg.Values["LDFLAGS"]
@@ -1082,7 +1119,19 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 	// --- END REFACTORED FLAG LOGIC ---
 
 	// Prepare Environment Array
-	env := os.Environ()
+	// Filter sysEnv again for consistency, although this function is used for rebuilds
+	sysEnv := os.Environ()
+	var env []string
+	filteredVars := map[string]bool{
+		"CFLAGS": true, "CXXFLAGS": true, "LDFLAGS": true,
+		"SHELL": true, // Force to bash
+	}
+	for _, e := range sysEnv {
+		k := strings.SplitN(e, "=", 2)[0]
+		if !filteredVars[k] {
+			env = append(env, e)
+		}
+	}
 
 	// Prepend oldLibsDir to PATH and LD_LIBRARY_PATH for tools run by the Executor
 	// This allows system tools (tar, rsync, cp) used by the Executor to function,
@@ -1103,6 +1152,9 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 	currentLdLibPath := os.Getenv("LD_LIBRARY_PATH")
 	newLdLibPath := fmt.Sprintf("LD_LIBRARY_PATH=%s:%s:%s", oldLibLib, oldLibUsrLib, currentLdLibPath)
 	env = append(env, newLdLibPath)
+
+	// Update defaults with SHELL
+	defaults["SHELL"] = "/bin/bash"
 
 	// 5. Final loop to assemble the environment array
 	for k, def := range defaults {

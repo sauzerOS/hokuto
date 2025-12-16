@@ -115,6 +115,11 @@ func initConfig(cfg *Config) {
 		cfg.DefaultLTO = true
 	}
 
+	EnableMultilib = false
+	if cfg.Values["HOKUTO_MULTILIB"] == "1" {
+		EnableMultilib = true
+	}
+
 	// Load the GNU mirror URL if it's set in the config
 	if mirror, exists := cfg.Values["GNU_MIRROR"]; exists && mirror != "" {
 		gnuMirrorURL = strings.TrimRight(mirror, "/") // Remove trailing slash if present

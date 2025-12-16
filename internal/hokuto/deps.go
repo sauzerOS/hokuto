@@ -49,6 +49,11 @@ func resolveBinaryDependencies(pkgName string, visited map[string]bool, plan *[]
 			continue
 		}
 
+		// FILTER: Ignore 32-bit dependencies if multilib is disabled
+		if !EnableMultilib && strings.HasSuffix(dep.Name, "-32") {
+			continue
+		}
+
 		if err := resolveBinaryDependencies(dep.Name, visited, plan, force); err != nil {
 			return err
 		}
@@ -120,6 +125,11 @@ func resolveMissingDeps(pkgName string, processed map[string]bool, missing *[]st
 		depName := dep.Name
 		// Safety check: a package cannot depend on itself.
 		if depName == pkgName {
+			continue
+		}
+
+		// FILTER: Ignore 32-bit dependencies if multilib is disabled
+		if !EnableMultilib && strings.HasSuffix(depName, "-32") {
 			continue
 		}
 
@@ -301,6 +311,11 @@ func resolveBuildPlan(targetPackages []string, userRequestedPackages map[string]
 				continue
 			}
 
+			// FILTER: Ignore 32-bit dependencies if multilib is disabled
+			if !EnableMultilib && strings.HasSuffix(dep.Name, "-32") {
+				continue
+			}
+
 			// Conditionally handle the 'rebuild' flag
 			if withRebuilds && dep.Rebuild {
 				// This is a post-build action. Add it to the map for the current package.
@@ -476,6 +491,11 @@ func getPackageDependenciesForward(pkgName string) ([]string, error) {
 				continue
 			}
 
+			// FILTER: Ignore 32-bit dependencies if multilib is disabled
+			if !EnableMultilib && strings.HasSuffix(depName, "-32") {
+				continue
+			}
+
 			// Version constraint checking (same as resolveMissingDeps)
 			if dep.Op != "" && isPackageInstalled(depName) {
 				if installedVer, ok := getInstalledVersion(depName); ok {
@@ -549,6 +569,10 @@ func getInstalledDeps(pkgName string) ([]string, error) {
 		// Parse "pkgname>=1.0" -> "pkgname"
 		name, _, _, _, _, _ := parseDepToken(line)
 		if name != "" && name != pkgName {
+			// FILTER: Ignore 32-bit dependencies if multilib is disabled
+			if !EnableMultilib && strings.HasSuffix(name, "-32") {
+				continue
+			}
 			deps = append(deps, name)
 		}
 	}

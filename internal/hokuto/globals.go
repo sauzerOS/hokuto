@@ -32,6 +32,7 @@ var (
 	newPackageDir        string
 	setIdlePriority      bool
 	buildPriority        string
+	EnableMultilib       bool
 	ConfigFile           = "/etc/hokuto.conf"
 	gnuMirrorURL         string
 	gnuOriginalURL       = "https://ftp.gnu.org/gnu"
