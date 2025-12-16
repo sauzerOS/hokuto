@@ -53,6 +53,60 @@ func getScriptExitCode(logPath string) int {
 	return exitCode
 }
 
+// sanitizeFlagsForCrossCompilation removes -march=native and -mtune=native from flags
+// and replaces them with appropriate target architecture flags when cross-compiling
+func sanitizeFlagsForCrossCompilation(flags string, targetArch string) string {
+	if flags == "" {
+		return flags
+	}
+
+	// Split flags into individual tokens to handle them properly
+	flagList := strings.Fields(flags)
+	var sanitizedFlags []string
+
+	// Remove -march=native and -mtune=native, and also remove any x86-64 specific flags
+	for _, flag := range flagList {
+		if flag == "-march=native" || flag == "-mtune=native" {
+			continue // Skip these flags
+		}
+		// Also remove x86-64 specific flags when cross-compiling
+		if strings.HasPrefix(flag, "-march=x86-64") || strings.HasPrefix(flag, "-march=x86_64") {
+			continue
+		}
+		sanitizedFlags = append(sanitizedFlags, flag)
+	}
+
+	flags = strings.Join(sanitizedFlags, " ")
+
+	// If cross-compiling to ARM64, add appropriate ARM64 flags if not already present
+	if targetArch == "arm64" || targetArch == "aarch64" {
+		// Check if -march is already specified
+		hasMarch := false
+		for _, flag := range sanitizedFlags {
+			if strings.HasPrefix(flag, "-march=") {
+				hasMarch = true
+				break
+			}
+		}
+		if !hasMarch {
+			flags = "-march=armv8-a " + flags
+		}
+		// Check if -mtune is already specified
+		hasMtune := false
+		for _, flag := range sanitizedFlags {
+			if strings.HasPrefix(flag, "-mtune=") {
+				hasMtune = true
+				break
+			}
+		}
+		if !hasMtune {
+			flags = "-mtune=generic " + flags
+		}
+	}
+
+	return strings.TrimSpace(flags)
+}
+
 // getOutputPackageName returns the output package name, which may be renamed for cross-system builds
 func getOutputPackageName(pkgName string, cfg *Config) string {
 	if cfg.Values["HOKUTO_CROSS_SYSTEM"] == "1" && cfg.Values["HOKUTO_CROSS_ARCH"] != "" {
@@ -249,28 +303,16 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 	}
 
 	// Build environment
-	// Start with a clean environment by filtering out variables that we intend to set.
-	// This prevents duplicate keys and ensures our values take precedence, especially
-	// if the underlying shell (like fish) behaves unexpectedly with duplicates.
-	sysEnv := os.Environ()
-	var env []string
-	filteredVars := map[string]bool{
-		"CFLAGS": true, "CXXFLAGS": true, "LDFLAGS": true,
-		"CC": true, "CXX": true, "AR": true, "NM": true, "RANLIB": true,
-		"MAKEFLAGS": true, "CMAKE_BUILD_PARALLEL_LEVEL": true,
-		"RUSTFLAGS": true, "GOFLAGS": true, "GOPATH": true,
-		"HOKUTO_ROOT": true, "TMPDIR": true, "CONFIG_SITE": true,
-		"HOKUTO_ARCH": true, "MULTILIB": true, "HOKUTO_BUILD_DIR": true,
-		"SHELL": true, // Critical: We will force SHELL to /bin/bash later
-	}
-
-	for _, e := range sysEnv {
-		k := strings.SplitN(e, "=", 2)[0]
-		if !filteredVars[k] {
-			env = append(env, e)
+	// Start with environment, but filter out CFLAGS/CXXFLAGS/LDFLAGS to avoid conflicts
+	// Our defaults should take precedence
+	env := []string{}
+	for _, e := range os.Environ() {
+		// Skip CFLAGS, CXXFLAGS, and LDFLAGS from environment - we'll set them from defaults
+		if strings.HasPrefix(e, "CFLAGS=") || strings.HasPrefix(e, "CXXFLAGS=") || strings.HasPrefix(e, "LDFLAGS=") {
+			continue
 		}
+		env = append(env, e)
 	}
-
 	var defaults = map[string]string{}
 
 	if bootstrap {
@@ -321,7 +363,6 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 			"TMPDIR":           currentTmpDir,
 			"HOKUTO_ARCH":      targetArch,
 			"HOKUTO_BUILD_DIR": buildDir,
-			"SHELL":            "/bin/bash", // Force bash for consistency
 		}
 
 	} else {
@@ -389,15 +430,8 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 				cxxflagsVal = cfg.Values["CXXFLAGS_GEN"]
 				ldflagsVal = cfg.Values["LDFLAGS"]
 			}
-		} else if isCross {
-			// Case A: Cross-compilation
-			// Use generic flags to avoid issues where host compiler vs cross compiler
-			// might choke on specific architecture flags.
-			cflagsVal = "-O2 -pipe"
-			cxxflagsVal = "-O2 -pipe"
-			ldflagsVal = cfg.Values["LDFLAGS"]
-		} else if isARM {
-			// Case B: Native ARM64
+		} else if isCross || isARM {
+			// Case A: ARM64 (either native ARM64 or cross-compiling to ARM64)
 			cflagsVal = cfg.Values["CFLAGS_ARM64"]
 			cxxflagsVal = cfg.Values["CXXFLAGS_ARM64"]
 			ldflagsVal = cfg.Values["LDFLAGS"]
@@ -414,11 +448,22 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 		}
 
 		// Fallbacks
+		// When cross-compiling, if CFLAGS_ARM64 is not set, fall back to CFLAGS (which will be sanitized)
 		if cflagsVal == "" {
-			cflagsVal = defaultCFLAGS
+			if isCross {
+				cflagsVal = cfg.Values["CFLAGS"]
+			}
+			if cflagsVal == "" {
+				cflagsVal = defaultCFLAGS
+			}
 		}
 		if cxxflagsVal == "" {
-			cxxflagsVal = cflagsVal
+			if isCross {
+				cxxflagsVal = cfg.Values["CXXFLAGS"]
+			}
+			if cxxflagsVal == "" {
+				cxxflagsVal = cflagsVal
+			}
 		}
 		if ldflagsVal == "" {
 			ldflagsVal = defaultLDFLAGS
@@ -430,6 +475,18 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 		cflagsVal = strings.ReplaceAll(cflagsVal, "LTOJOBS", ltoJobString)
 		cxxflagsVal = strings.ReplaceAll(cxxflagsVal, "LTOJOBS", ltoJobString)
 		ldflagsVal = strings.ReplaceAll(ldflagsVal, "LTOJOBS", ltoJobString)
+
+		// --- FIX: Sanitize flags for cross-compilation ---
+		// Remove -march=native and -mtune=native when cross-compiling
+		if isCross {
+			crossArch := cfg.Values["HOKUTO_CROSS_ARCH"]
+			normalizedArch := crossArch
+			if normalizedArch == "arm64" {
+				normalizedArch = "aarch64"
+			}
+			cflagsVal = sanitizeFlagsForCrossCompilation(cflagsVal, normalizedArch)
+			cxxflagsVal = sanitizeFlagsForCrossCompilation(cxxflagsVal, normalizedArch)
+		}
 
 		// 4. Apply Linker Logic (Mold)
 		// ----------------------------
@@ -468,7 +525,6 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 			"HOKUTO_ARCH":                targetArch,
 			"MULTILIB":                   multilibVal,
 			"HOKUTO_BUILD_DIR":           buildDir,
-			"SHELL":                      "/bin/bash", // Force bash for consistency
 		}
 
 		if buildPriority == "idle" || buildPriority == "superidle" {
@@ -560,6 +616,10 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 	if buildExec.Interactive || Verbose || Debug {
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
+		// Forward stdin in interactive mode so user can respond to prompts
+		if buildExec.Interactive {
+			cmd.Stdin = os.Stdin
+		}
 	} else {
 		// Suppress console output but give script valid file descriptors
 		devNull, err := os.OpenFile("/dev/null", os.O_WRONLY, 0)
@@ -1055,15 +1115,8 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 	// Check if cross-compilation is enabled
 	isCross := cfg.Values["HOKUTO_CROSS_ARCH"] != ""
 
-	if isCross {
-		// Case A: Cross-compilation
-		// Use generic flags to avoid issues where host compiler vs cross compiler
-		// might choke on specific architecture flags.
-		cflagsVal = "-O2 -pipe"
-		cxxflagsVal = "-O2 -pipe"
-		ldflagsVal = cfg.Values["LDFLAGS"]
-	} else if isARM {
-		// Case B: Native ARM64
+	if isCross || isARM {
+		// Case A: ARM64 (either native ARM64 or cross-compiling to ARM64)
 		cflagsVal = cfg.Values["CFLAGS_ARM64"]
 		cxxflagsVal = cfg.Values["CXXFLAGS_ARM64"]
 		ldflagsVal = cfg.Values["LDFLAGS"]
@@ -1080,11 +1133,22 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 	}
 
 	// Fallbacks
+	// When cross-compiling, if CFLAGS_ARM64 is not set, fall back to CFLAGS (which will be sanitized)
 	if cflagsVal == "" {
-		cflagsVal = defaultCFLAGS
+		if isCross {
+			cflagsVal = cfg.Values["CFLAGS"]
+		}
+		if cflagsVal == "" {
+			cflagsVal = defaultCFLAGS
+		}
 	}
 	if cxxflagsVal == "" {
-		cxxflagsVal = cflagsVal
+		if isCross {
+			cxxflagsVal = cfg.Values["CXXFLAGS"]
+		}
+		if cxxflagsVal == "" {
+			cxxflagsVal = cflagsVal
+		}
 	}
 	if ldflagsVal == "" {
 		ldflagsVal = defaultLDFLAGS
@@ -1096,6 +1160,18 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 	cflagsVal = strings.ReplaceAll(cflagsVal, "LTOJOBS", ltoJobString)
 	cxxflagsVal = strings.ReplaceAll(cxxflagsVal, "LTOJOBS", ltoJobString)
 	ldflagsVal = strings.ReplaceAll(ldflagsVal, "LTOJOBS", ltoJobString)
+
+	// --- FIX: Sanitize flags for cross-compilation ---
+	// Remove -march=native and -mtune=native when cross-compiling
+	if isCross {
+		crossArch := cfg.Values["HOKUTO_CROSS_ARCH"]
+		normalizedArch := crossArch
+		if normalizedArch == "arm64" {
+			normalizedArch = "aarch64"
+		}
+		cflagsVal = sanitizeFlagsForCrossCompilation(cflagsVal, normalizedArch)
+		cxxflagsVal = sanitizeFlagsForCrossCompilation(cxxflagsVal, normalizedArch)
+	}
 
 	// 4. Apply Linker Logic (Mold)
 	// ----------------------------
@@ -1119,18 +1195,15 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 	// --- END REFACTORED FLAG LOGIC ---
 
 	// Prepare Environment Array
-	// Filter sysEnv again for consistency, although this function is used for rebuilds
-	sysEnv := os.Environ()
-	var env []string
-	filteredVars := map[string]bool{
-		"CFLAGS": true, "CXXFLAGS": true, "LDFLAGS": true,
-		"SHELL": true, // Force to bash
-	}
-	for _, e := range sysEnv {
-		k := strings.SplitN(e, "=", 2)[0]
-		if !filteredVars[k] {
-			env = append(env, e)
+	// Start with environment, but filter out CFLAGS/CXXFLAGS/LDFLAGS to avoid conflicts
+	// Our defaults should take precedence
+	env := []string{}
+	for _, e := range os.Environ() {
+		// Skip CFLAGS, CXXFLAGS, and LDFLAGS from environment - we'll set them from defaults
+		if strings.HasPrefix(e, "CFLAGS=") || strings.HasPrefix(e, "CXXFLAGS=") || strings.HasPrefix(e, "LDFLAGS=") {
+			continue
 		}
+		env = append(env, e)
 	}
 
 	// Prepend oldLibsDir to PATH and LD_LIBRARY_PATH for tools run by the Executor
@@ -1152,9 +1225,6 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 	currentLdLibPath := os.Getenv("LD_LIBRARY_PATH")
 	newLdLibPath := fmt.Sprintf("LD_LIBRARY_PATH=%s:%s:%s", oldLibLib, oldLibUsrLib, currentLdLibPath)
 	env = append(env, newLdLibPath)
-
-	// Update defaults with SHELL
-	defaults["SHELL"] = "/bin/bash"
 
 	// 5. Final loop to assemble the environment array
 	for k, def := range defaults {
@@ -1211,6 +1281,10 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 	if buildExec.Interactive || Verbose || Debug {
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
+		// Forward stdin in interactive mode so user can respond to prompts
+		if buildExec.Interactive {
+			cmd.Stdin = os.Stdin
+		}
 	} else {
 		// Suppress console output but give script valid file descriptors
 		devNull, err := os.OpenFile("/dev/null", os.O_WRONLY, 0)
