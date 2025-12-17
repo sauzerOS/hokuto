@@ -547,15 +547,12 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 		fmt.Fprintf(os.Stderr, "Failed to remove StagingManifest: %v", err)
 	}
 
-	// 3.5. Check for conflicts with existing files (for fresh installs only)
-	// Only run if package is not already installed (no installed manifest)
-	installedManifestPath := filepath.Join(rootDir, Installed, pkgName, "manifest")
-	if _, err := os.Stat(installedManifestPath); os.IsNotExist(err) {
-		// Package is not installed - check for conflicts with existing files
-		debugf("Checking for conflicts with existing files\n")
-		if err := checkStagingConflicts(pkgName, stagingDir, rootDir, stagingManifest, execCtx, yes, filesRemovedFromStaging, nil); err != nil {
-			return err
-		}
+	// 3.5. Check for conflicts with existing files (for both fresh installs and upgrades)
+	// This handles cases where files exist on disk but are not tracked by any package
+	// (e.g., user chose to "keep existing" during a previous install)
+	debugf("Checking for conflicts with existing files\n")
+	if err := checkStagingConflicts(pkgName, stagingDir, rootDir, stagingManifest, execCtx, yes, filesRemovedFromStaging, nil); err != nil {
+		return err
 	}
 
 	// 4. Determine obsolete files (compare manifests)
@@ -840,6 +837,30 @@ func checkStagingConflicts(pkgName, stagingDir, rootDir, stagingManifest string,
 	// Build a map of file -> owner package once (instead of calling findOwnerPackage for each file)
 	// This is much more efficient when checking many files
 	fileOwnerMap := make(map[string]string)
+	// Also build a set of files owned by the current package (for upgrade scenarios)
+	currentPkgFiles := make(map[string]bool)
+	
+	// First, check if current package is installed and build its file set
+	installedManifestPath := filepath.Join(rootDir, Installed, pkgName, "manifest")
+	if data, err := os.ReadFile(installedManifestPath); err == nil {
+		scanner := bufio.NewScanner(bytes.NewReader(data))
+		for scanner.Scan() {
+			line := strings.TrimSpace(scanner.Text())
+			if line == "" || strings.HasSuffix(line, "/") {
+				continue
+			}
+			fields := strings.Fields(line)
+			if len(fields) == 0 {
+				continue
+			}
+			manifestFilePath := fields[0]
+			cleanPath := filepath.Clean(manifestFilePath)
+			cleanPathNoSlash := strings.TrimPrefix(cleanPath, "/")
+			currentPkgFiles[cleanPath] = true
+			currentPkgFiles[cleanPathNoSlash] = true
+		}
+	}
+	
 	entries, err := os.ReadDir(Installed)
 	if err == nil {
 		for _, e := range entries {
@@ -848,7 +869,7 @@ func checkStagingConflicts(pkgName, stagingDir, rootDir, stagingManifest string,
 			}
 			otherPkgName := e.Name()
 			if otherPkgName == pkgName {
-				continue // Skip current package
+				continue // Skip current package (already handled above)
 			}
 			manifestPath := filepath.Join(Installed, otherPkgName, "manifest")
 			data, err := os.ReadFile(manifestPath)
@@ -957,15 +978,16 @@ func checkStagingConflicts(pkgName, stagingDir, rootDir, stagingManifest string,
 		}
 
 		// File exists in target - check for conflicts using cached owner map
+		// First check if file is owned by current package (normal upgrade scenario)
+		if currentPkgFiles[filePathClean] || currentPkgFiles[filePath] {
+			// File is in current package's manifest - this is a normal upgrade, skip conflict check
+			continue
+		}
+		
 		ownerPkg := fileOwnerMap[filePathClean]
 		if ownerPkg == "" {
 			// Try with leading slash
 			ownerPkg = fileOwnerMap[filePath]
-		}
-
-		// If file is owned by the current package, skip it (shouldn't happen for fresh installs, but handle gracefully)
-		if ownerPkg == pkgName {
-			continue
 		}
 
 		if ownerPkg != "" && ownerPkg != pkgName {
