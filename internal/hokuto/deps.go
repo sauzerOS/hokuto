@@ -4,14 +4,19 @@ package hokuto
 // No behavior changes intended.
 
 import (
+	"bufio"
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 )
 
-func resolveBinaryDependencies(pkgName string, visited map[string]bool, plan *[]string, force bool) error {
+// Cache for resolved alternative dependencies to avoid prompting multiple times
+var alternativeDepCache = make(map[string]string)
+
+func resolveBinaryDependencies(pkgName string, visited map[string]bool, plan *[]string, force bool, yes bool) error {
 	// 1. Cycle detection
 	if visited[pkgName] {
 		return nil
@@ -54,7 +59,17 @@ func resolveBinaryDependencies(pkgName string, visited map[string]bool, plan *[]
 			continue
 		}
 
-		if err := resolveBinaryDependencies(dep.Name, visited, plan, force); err != nil {
+		// Resolve alternative dependencies if present
+		depName := dep.Name
+		if len(dep.Alternatives) > 0 {
+			resolved, err := resolveAlternativeDep(dep, yes)
+			if err != nil {
+				return fmt.Errorf("failed to resolve alternative dependency for %s: %w", pkgName, err)
+			}
+			depName = resolved
+		}
+
+		if err := resolveBinaryDependencies(depName, visited, plan, force, yes); err != nil {
 			return err
 		}
 	}
@@ -123,6 +138,16 @@ func resolveMissingDeps(pkgName string, processed map[string]bool, missing *[]st
 	// version check to happen.
 	for _, dep := range dependencies {
 		depName := dep.Name
+
+		// Resolve alternative dependencies if present
+		if len(dep.Alternatives) > 0 {
+			resolved, err := resolveAlternativeDep(dep, false) // resolveMissingDeps doesn't have yes flag, use false
+			if err != nil {
+				return fmt.Errorf("failed to resolve alternative dependency: %w", err)
+			}
+			depName = resolved
+		}
+
 		// Safety check: a package cannot depend on itself.
 		if depName == pkgName {
 			continue
@@ -200,21 +225,187 @@ func parseDependsFile(pkgDir string) ([]DepSpec, error) {
 			continue
 		}
 
-		// Correctly capture all return values from the updated token parser.
-		name, op, ver, optional, rebuild, makeDep := parseDepToken(line)
-		if name != "" {
-			dependencies = append(dependencies, DepSpec{
-				Name:     name,
-				Op:       op,
-				Version:  ver,
-				Optional: optional, // Correctly assign the 'optional' flag.
-				Rebuild:  rebuild,
-				Make:     makeDep,
-			})
+		// Check if this line contains alternative dependencies (using |)
+		if strings.Contains(line, "|") {
+			// Parse alternative dependencies
+			altDeps, err := parseAlternativeDeps(line)
+			if err != nil {
+				return nil, fmt.Errorf("failed to parse alternative dependencies: %w", err)
+			}
+			dependencies = append(dependencies, altDeps...)
+		} else {
+			// Regular dependency parsing
+			name, op, ver, optional, rebuild, makeDep := parseDepToken(line)
+			if name != "" {
+				dependencies = append(dependencies, DepSpec{
+					Name:         name,
+					Op:           op,
+					Version:      ver,
+					Optional:     optional,
+					Rebuild:      rebuild,
+					Make:         makeDep,
+					Alternatives: nil,
+				})
+			}
 		}
 	}
 
 	return dependencies, nil
+}
+
+// parseAlternativeDeps parses a line with alternative dependencies like "rust | rustup make"
+// Returns a single DepSpec with Alternatives populated
+func parseAlternativeDeps(line string) ([]DepSpec, error) {
+	// Split by | to get alternatives
+	parts := strings.Split(line, "|")
+	if len(parts) < 2 {
+		return nil, fmt.Errorf("invalid alternative dependency syntax: expected 'pkg1 | pkg2'")
+	}
+
+	// Extract flags from the entire line (they apply to all alternatives)
+	fields := strings.Fields(line)
+	var optional, rebuild, makeDep bool
+	var alternatives []string
+
+	// Parse each part separated by |
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		// Extract package name (first field of this part)
+		partFields := strings.Fields(part)
+		if len(partFields) > 0 {
+			pkgName := partFields[0]
+			alternatives = append(alternatives, pkgName)
+		}
+	}
+
+	// Check for flags in the entire line
+	for _, field := range fields {
+		switch field {
+		case "optional":
+			optional = true
+		case "rebuild":
+			rebuild = true
+		case "make":
+			makeDep = true
+		}
+	}
+
+	if len(alternatives) < 2 {
+		return nil, fmt.Errorf("alternative dependency must have at least 2 options")
+	}
+
+	// Create DepSpec with first alternative as Name and all in Alternatives
+	return []DepSpec{{
+		Name:         alternatives[0],
+		Op:           "",
+		Version:      "",
+		Optional:     optional,
+		Rebuild:      rebuild,
+		Make:         makeDep,
+		Alternatives: alternatives,
+	}}, nil
+}
+
+// resolveAlternativeDep resolves an alternative dependency by checking which alternatives are available
+// and prompting the user to choose. Returns the chosen package name.
+// Uses a cache to avoid prompting multiple times for the same alternative set.
+func resolveAlternativeDep(dep DepSpec, yes bool) (string, error) {
+	if len(dep.Alternatives) < 2 {
+		// Not an alternative dependency, return the name as-is
+		return dep.Name, nil
+	}
+
+	// Create a cache key from the sorted alternatives
+	// This ensures the same set of alternatives always maps to the same key
+	sortedAlts := make([]string, len(dep.Alternatives))
+	copy(sortedAlts, dep.Alternatives)
+	sort.Strings(sortedAlts)
+	cacheKey := strings.Join(sortedAlts, "|")
+
+	// Check cache first
+	if cached, ok := alternativeDepCache[cacheKey]; ok {
+		// Verify the cached choice is still available
+		if isPackageInstalled(cached) {
+			return cached, nil
+		}
+		// Check if can be found in repos
+		if _, err := findPackageDir(cached); err == nil {
+			return cached, nil
+		}
+		// Cached choice is no longer available, remove from cache and continue
+		delete(alternativeDepCache, cacheKey)
+	}
+
+	// Check which alternatives are available (installed or can be found in repos)
+	var available []string
+	for _, altName := range dep.Alternatives {
+		// Check if installed
+		if isPackageInstalled(altName) {
+			available = append(available, altName)
+			continue
+		}
+		// Check if can be found in repos
+		if _, err := findPackageDir(altName); err == nil {
+			available = append(available, altName)
+		}
+	}
+
+	if len(available) == 0 {
+		return "", fmt.Errorf("none of the alternative dependencies are available: %s", strings.Join(dep.Alternatives, ", "))
+	}
+
+	// If only one is available, use it automatically and cache it
+	if len(available) == 1 {
+		alternativeDepCache[cacheKey] = available[0]
+		return available[0], nil
+	}
+
+	// Multiple alternatives available - prompt user
+	if yes {
+		// In --yes mode, use the first available alternative and cache it
+		alternativeDepCache[cacheKey] = available[0]
+		return available[0], nil
+	}
+
+	// Prompt user to choose
+	fmt.Printf("\nPackage requires one of the following dependencies:\n")
+	for i, alt := range available {
+		status := ""
+		if isPackageInstalled(alt) {
+			status = " (installed)"
+		}
+		fmt.Printf("  %d) %s%s\n", i+1, alt, status)
+	}
+	fmt.Printf("Choose dependency [1-%d] (default: 1): ", len(available))
+
+	stdinReader := bufio.NewReader(os.Stdin)
+	response, err := stdinReader.ReadString('\n')
+	if err != nil {
+		// Default to first option on read error
+		alternativeDepCache[cacheKey] = available[0]
+		return available[0], nil
+	}
+
+	response = strings.TrimSpace(response)
+	if response == "" {
+		// Default to first option
+		alternativeDepCache[cacheKey] = available[0]
+		return available[0], nil
+	}
+
+	choice, err := strconv.Atoi(response)
+	if err != nil || choice < 1 || choice > len(available) {
+		// Invalid choice, default to first option
+		alternativeDepCache[cacheKey] = available[0]
+		return available[0], nil
+	}
+
+	chosen := available[choice-1]
+	alternativeDepCache[cacheKey] = chosen
+	return chosen, nil
 }
 
 // parseDepToken parses tokens like "pkg", "pkg<=1.2.3 optional", "pkg rebuild" and returns name, op, version, and flags.
@@ -307,30 +498,41 @@ func resolveBuildPlan(targetPackages []string, userRequestedPackages map[string]
 
 		// Process all dependencies recursively first.
 		for _, dep := range deps {
-			if dep.Name == pkgName {
+			depName := dep.Name
+
+			// Resolve alternative dependencies if present
+			if len(dep.Alternatives) > 0 {
+				resolved, err := resolveAlternativeDep(dep, false) // Use false for build (no yes flag available)
+				if err != nil {
+					return fmt.Errorf("failed to resolve alternative dependency for %s: %w", pkgName, err)
+				}
+				depName = resolved
+			}
+
+			if depName == pkgName {
 				continue
 			}
 
 			// FILTER: Ignore 32-bit dependencies if multilib is disabled
-			if !EnableMultilib && strings.HasSuffix(dep.Name, "-32") {
+			if !EnableMultilib && strings.HasSuffix(depName, "-32") {
 				continue
 			}
 
 			// Conditionally handle the 'rebuild' flag
 			if withRebuilds && dep.Rebuild {
 				// This is a post-build action. Add it to the map for the current package.
-				plan.PostBuildRebuilds[pkgName] = append(plan.PostBuildRebuilds[pkgName], dep.Name)
+				plan.PostBuildRebuilds[pkgName] = append(plan.PostBuildRebuilds[pkgName], depName)
 
 			} else if dep.Optional {
-				if !isPackageInstalled(dep.Name) {
+				if !isPackageInstalled(depName) {
 					// Record that pkgName needs an inline rebuild because an optional dep is missing.
-					plan.PostRebuilds[pkgName] = append(plan.PostRebuilds[pkgName], dep.Name)
+					plan.PostRebuilds[pkgName] = append(plan.PostRebuilds[pkgName], depName)
 				}
 			}
 
 			// CRITICAL: Always process the dependency to ensure it gets into the build order at least once.
 			// This covers normal deps, optional deps, and 'rebuild' deps (when withRebuilds is off).
-			if err := processPkg(dep.Name); err != nil {
+			if err := processPkg(depName); err != nil {
 				return err
 			}
 		}
@@ -486,6 +688,15 @@ func getPackageDependenciesForward(pkgName string) ([]string, error) {
 		for _, dep := range dependencies {
 			depName := dep.Name
 
+			// Resolve alternative dependencies if present
+			if len(dep.Alternatives) > 0 {
+				resolved, err := resolveAlternativeDep(dep, false) // Use false for build (no yes flag available)
+				if err != nil {
+					return fmt.Errorf("failed to resolve alternative dependency: %w", err)
+				}
+				depName = resolved
+			}
+
 			// Safety check: a package cannot depend on itself
 			if depName == currentPkg {
 				continue
@@ -582,12 +793,13 @@ func getInstalledDeps(pkgName string) ([]string, error) {
 // executeMountCommand accepts the FULL destination path (e.g., /var/tmp/lfs/dev/tty)
 
 type DepSpec struct {
-	Name     string
-	Op       string // one of: "<=", ">=", "==", "<", ">", or empty for no constraint
-	Version  string
-	Optional bool
-	Rebuild  bool
-	Make     bool // True if dependency is only needed at build time
+	Name         string
+	Op           string // one of: "<=", ">=", "==", "<", ">", or empty for no constraint
+	Version      string
+	Optional     bool
+	Rebuild      bool
+	Make         bool     // True if dependency is only needed at build time
+	Alternatives []string // List of alternative package names (e.g., ["rust", "rustup"] for "rust | rustup")
 }
 
 // parseDependsFile reads the package's depends file and returns a list of dependency specs.

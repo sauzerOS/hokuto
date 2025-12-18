@@ -402,7 +402,7 @@ func Main() {
 			userRequestedMap[pkgName] = true
 
 			// Recursively find missing dependencies (always check if deps are installed, force doesn't apply to deps)
-			if err := resolveBinaryDependencies(pkgName, visited, &installPlan, false); err != nil {
+			if err := resolveBinaryDependencies(pkgName, visited, &installPlan, false, effectiveYes); err != nil {
 				// Skip dependency resolution if source not found (e.g., renamed cross-system packages)
 				// The package can still be installed from tarball without source
 				if strings.Contains(err.Error(), "source not found in HOKUTO_PATH") {
