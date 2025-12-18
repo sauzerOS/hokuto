@@ -78,31 +78,9 @@ func sanitizeFlagsForCrossCompilation(flags string, targetArch string) string {
 
 	flags = strings.Join(sanitizedFlags, " ")
 
-	// If cross-compiling to ARM64, add appropriate ARM64 flags if not already present
-	if targetArch == "arm64" || targetArch == "aarch64" {
-		// Check if -march is already specified
-		hasMarch := false
-		for _, flag := range sanitizedFlags {
-			if strings.HasPrefix(flag, "-march=") {
-				hasMarch = true
-				break
-			}
-		}
-		if !hasMarch {
-			flags = "-march=armv8-a " + flags
-		}
-		// Check if -mtune is already specified
-		hasMtune := false
-		for _, flag := range sanitizedFlags {
-			if strings.HasPrefix(flag, "-mtune=") {
-				hasMtune = true
-				break
-			}
-		}
-		if !hasMtune {
-			flags = "-mtune=generic " + flags
-		}
-	}
+	// If cross-compiling to ARM64, we do NOT add specific flags anymore.
+	// The build script might use the host compiler, which wouldn't understand -march=armv8-a if the host is x86.
+	// We want generic flags only.
 
 	return strings.TrimSpace(flags)
 }
@@ -430,8 +408,16 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 				cxxflagsVal = cfg.Values["CXXFLAGS_GEN"]
 				ldflagsVal = cfg.Values["LDFLAGS"]
 			}
-		} else if isCross || isARM {
-			// Case A: ARM64 (either native ARM64 or cross-compiling to ARM64)
+		} else if isCross {
+			// Case: Cross-compilation
+			// Use generic flags to ensure compatibility with host compiler
+			cflagsVal = "-O2 -pipe -mtune=generic"
+			cxxflagsVal = "-O2 -pipe -mtune=generic"
+			ldflagsVal = cfg.Values["LDFLAGS"]
+		} else if isARM {
+			// Case A: Native ARM64 build ONLY
+			// We only use CFLAGS_ARM64 (which might have -mcpu=native etc) if we are actually building ON ARM
+			// and NOT doing a cross-compile.
 			cflagsVal = cfg.Values["CFLAGS_ARM64"]
 			cxxflagsVal = cfg.Values["CXXFLAGS_ARM64"]
 			ldflagsVal = cfg.Values["LDFLAGS"]
@@ -570,8 +556,20 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 		}
 	}
 
-	for k, v := range defaults {
+	// Sort keys for deterministic order
+	keys := make([]string, 0, len(defaults))
+	for k := range defaults {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	var envVarsBuilder strings.Builder
+	for _, k := range keys {
+		v := defaults[k]
 		env = append(env, fmt.Sprintf("%s=%s", k, v))
+		// Escape single quotes for the command string
+		vEscaped := strings.ReplaceAll(v, "'", "'\\''")
+		envVarsBuilder.WriteString(fmt.Sprintf("%s='%s' ", k, vEscaped))
 	}
 
 	// Run build script
@@ -585,7 +583,11 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 
 	// Use script command to create a PTY, preserving colors and progress bars
 	// Build the command string to execute
-	cmdStr := fmt.Sprintf("cd %s && %s %s %s %s", buildDir, buildScript, outputDir, version, pkgName)
+	// FIX: We prepend the environment variables to the command string explicitly.
+	// This ensures that even if 'script' spawns a shell that sources .bashrc (resetting flags),
+	// our flags take precedence for the actual build command.
+	cmdStr := fmt.Sprintf("cd %s && %s%s %s %s %s",
+		buildDir, envVarsBuilder.String(), buildScript, outputDir, version, pkgName)
 
 	// Use script to create PTY and preserve colors
 	// -q: quiet mode (don't print script start/end messages)
