@@ -1038,7 +1038,10 @@ func checkStagingConflicts(pkgName, stagingDir, rootDir, stagingManifest string,
 				}
 				switch strings.ToLower(input) {
 				case "k":
-					// Keep the file from the other package - delete from staging
+					// Keep the file from the other package - save new file as alternative and delete from staging
+					if err := saveAlternative(pkgName, filePath, conflictPkg, conflictPkg, stagingFile, execCtx); err != nil {
+						debugf("Warning: failed to save alternative: %v\n", err)
+					}
 					rmCmd := exec.Command("rm", "-f", stagingFile)
 					if err := execCtx.Run(rmCmd); err != nil {
 						return fmt.Errorf("failed to remove file from staging %s: %v", stagingFile, err)
@@ -1046,18 +1049,30 @@ func checkStagingConflicts(pkgName, stagingDir, rootDir, stagingManifest string,
 					// Track this file for manifest removal
 					filesRemovedFromStaging[filePath] = true
 					if isSymlink {
-						debugf("Kept symlink from %s package, removed from staging: %s -> %s\n", conflictPkg, filePath, symlinkTarget)
+						debugf("Kept symlink from %s package, saved new file as alternative, removed from staging: %s -> %s\n", conflictPkg, filePath, symlinkTarget)
 					} else {
-						debugf("Kept file from %s package, removed from staging: %s\n", conflictPkg, filePath)
+						debugf("Kept file from %s package, saved new file as alternative, removed from staging: %s\n", conflictPkg, filePath)
 					}
 					continue
 				case "u":
-					// Use the new file from current package - mark as handled if tracking map provided (file stays in staging)
+					// Use the new file from current package - save existing file as alternative
+					debugf("Saving alternative for %s: pkgName=%s, conflictPkg=%s, targetFile=%s\n", filePath, pkgName, conflictPkg, targetFile)
+					if err := saveAlternative(pkgName, filePath, conflictPkg, conflictPkg, targetFile, execCtx); err != nil {
+						fmt.Fprintf(os.Stderr, "Warning: failed to save alternative for %s: %v\n", filePath, err)
+						debugf("Warning: failed to save alternative: %v\n", err)
+					} else {
+						debugf("Successfully saved alternative for %s\n", filePath)
+					}
+					// Mark as handled if tracking map provided (file stays in staging)
 					if filesHandledInConflict != nil {
 						filesHandledInConflict[filePath] = true
 					}
+					debugf("Using new file from %s, saved existing file from %s as alternative: %s\n", pkgName, conflictPkg, filePath)
 				default:
 					// Invalid input, default to keep
+					if err := saveAlternative(pkgName, filePath, conflictPkg, conflictPkg, stagingFile, execCtx); err != nil {
+						debugf("Warning: failed to save alternative: %v\n", err)
+					}
 					rmCmd := exec.Command("rm", "-f", stagingFile)
 					if err := execCtx.Run(rmCmd); err != nil {
 						return fmt.Errorf("failed to remove file from staging %s: %v", stagingFile, err)
@@ -1072,37 +1087,61 @@ func checkStagingConflicts(pkgName, stagingDir, rootDir, stagingManifest string,
 				}
 			}
 		} else {
-			// File exists but is not owned by any package - ask user what to do
+			// File exists but is not owned by any package - save as alternative and ask user which to use
 			runDiffWithFallback(targetFile, stagingFile, true)
 			os.Stdout.Sync()
 
 			var input string
 			if !yes && !skipAllPrompts {
-				cPrintf(colInfo, "File %s already exists (not managed by any package): [k]eep existing, [o]verwrite: ", filePath)
+				cPrintf(colInfo, "File %s already exists (not managed by any package): [o]riginal, [n]ew: ", filePath)
 				os.Stdout.Sync()
 				response, err := stdinReader.ReadString('\n')
 				if err != nil {
-					response = "o" // Default to overwrite on read error
+					response = "o" // Default to original on read error
 				}
 				input = strings.TrimSpace(response)
 			}
 			if input == "" {
-				input = "o" // Default to overwrite if user presses enter or if in --yes mode
+				input = "o" // Default to original if user presses enter or if in --yes mode
 			}
 			switch strings.ToLower(input) {
-			case "k":
-				// Keep existing file - remove from staging
+			case "o":
+				// Use original file - save new file (from staging) as alternative
+				debugf("Saving alternative for %s: pkgName=%s, filePath=%s, stagingFile=%s\n", filePath, pkgName, filePath, stagingFile)
+				if err := saveAlternative(pkgName, filePath, pkgName, "no package", stagingFile, execCtx); err != nil {
+					fmt.Fprintf(os.Stderr, "Warning: failed to save alternative for %s: %v\n", filePath, err)
+					debugf("Warning: failed to save alternative: %v\n", err)
+				} else {
+					debugf("Successfully saved alternative for %s\n", filePath)
+				}
 				rmCmd := exec.Command("rm", "-f", stagingFile)
 				if err := execCtx.Run(rmCmd); err != nil {
 					return fmt.Errorf("failed to remove file from staging %s: %v", stagingFile, err)
 				}
 				filesRemovedFromStaging[filePath] = true
-				debugf("Kept existing unmanaged file, removed from staging: %s\n", filePath)
-			case "o":
-				// Overwrite - keep file in staging (will be installed)
+				debugf("Kept existing unmanaged file, saved new file as alternative, removed from staging: %s\n", filePath)
+			case "n":
+				// Use alternative (new file) - save current file (original) as alternative
+				// The new file from current package will be installed, so OriginalPkg should be the current package
+				debugf("Saving alternative for %s: pkgName=%s, filePath=%s, targetFile=%s\n", filePath, pkgName, filePath, targetFile)
+				if err := saveAlternative(pkgName, filePath, "no package", pkgName, targetFile, execCtx); err != nil {
+					fmt.Fprintf(os.Stderr, "Warning: failed to save alternative for %s: %v\n", filePath, err)
+					debugf("Warning: failed to save alternative: %v\n", err)
+				} else {
+					debugf("Successfully saved alternative for %s\n", filePath)
+				}
+				// File stays in staging (will be installed)
+				debugf("Using new file, saved existing file as alternative: %s\n", filePath)
 			default:
-				// Invalid input, default to overwrite
-				// File stays in staging
+				// Invalid input, default to original
+				if err := saveAlternative(pkgName, filePath, pkgName, "no package", stagingFile, execCtx); err != nil {
+					debugf("Warning: failed to save alternative: %v\n", err)
+				}
+				rmCmd := exec.Command("rm", "-f", stagingFile)
+				if err := execCtx.Run(rmCmd); err != nil {
+					return fmt.Errorf("failed to remove file from staging %s: %v", stagingFile, err)
+				}
+				filesRemovedFromStaging[filePath] = true
 			}
 		}
 	}

@@ -47,6 +47,7 @@ func printHelp() {
 		{"bootstrap", "<dir>", "Build a bootstrap rootfs in target directory"},
 		{"chroot", "<dir> [cmd...]", "Enter chroot and run command (default: /bin/bash)"},
 		{"cleanup", "[options]", "Cleanup: -sources, -bins, -orphans, -all"},
+		{"alt", "[pkg]", "Manage file alternatives. List packages with alternatives or show/switch alternatives for a package"},
 	}
 
 	// --- Dynamic Padding Logic ---
@@ -213,6 +214,12 @@ func Main() {
 		// Pass 'cfg' to the function
 		if err := handleCleanupCommand(os.Args[2:], cfg); err != nil {
 			fmt.Fprintf(os.Stderr, "Cleanup failed: %v\n", err)
+			os.Exit(1)
+		}
+
+	case "alt":
+		if err := handleAlternativesCommand(os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "Alternatives command failed: %v\n", err)
 			os.Exit(1)
 		}
 
