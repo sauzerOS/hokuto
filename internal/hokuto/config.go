@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"log"
 	"os"
+	"path/filepath"
 	"strings"
 )
 
@@ -142,5 +143,7 @@ func initConfig(cfg *Config) {
 	BinDir = CacheDir + "/bin"
 	CacheStore = SourcesDir + "/_cache"
 	Installed = rootDir + "/var/db/hokuto/installed"
+	WorldFile = filepath.Join(rootDir, "/var/db/hokuto/world")
+	WorldMakeFile = filepath.Join(rootDir, "/var/db/hokuto/world_make")
 	newPackageDir = "/repo/sauzeros/extra" // default for 'hokuto new'
 }

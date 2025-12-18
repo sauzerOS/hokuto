@@ -540,6 +540,7 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 			if cfg.Values["HOKUTO_CROSS_SIMPLE"] != "1" {
 				toolchainPrefix := normalizedArch + "-linux-gnu-"
 				defaults["CC"] = toolchainPrefix + "gcc"
+				defaults["CXX"] = toolchainPrefix + "g++"
 				defaults["AR"] = toolchainPrefix + "ar"
 				defaults["RANLIB"] = toolchainPrefix + "ranlib"
 			}
