@@ -403,9 +403,10 @@ func getModifiedFiles(pkgName, rootDir string, execCtx *Executor) ([]string, err
 
 		relPath := parts[0]
 		relSlash := filepath.ToSlash(relPath)
-		// Skip any manifest entry that refers to the package's installed manifest
-		// Matches both "var/db/.../installed/<pkg>/manifest" and "/var/db/.../installed/<pkg>/manifest"
-		if strings.HasSuffix(relSlash, "/installed/"+pkgName+"/manifest") {
+		// Skip all metadata files under var/db/hokuto (internal package metadata)
+		// Handles both "var/db/hokuto/..." and "/var/db/hokuto/..." paths
+		cleanSlash := strings.TrimPrefix(relSlash, "/")
+		if strings.HasPrefix(cleanSlash, "var/db/hokuto/") {
 			continue
 		}
 
@@ -468,7 +469,10 @@ func getModifiedFiles(pkgName, rootDir string, execCtx *Executor) ([]string, err
 
 		relPath := parts[0]
 		relSlash := filepath.ToSlash(relPath)
-		if strings.HasSuffix(relSlash, "/installed/"+pkgName+"/manifest") {
+		// Skip all metadata files under var/db/hokuto (internal package metadata)
+		// Handles both "var/db/hokuto/..." and "/var/db/hokuto/..." paths
+		cleanSlash := strings.TrimPrefix(relSlash, "/")
+		if strings.HasPrefix(cleanSlash, "var/db/hokuto/") {
 			continue
 		}
 
