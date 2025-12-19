@@ -839,7 +839,7 @@ func checkStagingConflicts(pkgName, stagingDir, rootDir, stagingManifest string,
 	fileOwnerMap := make(map[string]string)
 	// Also build a set of files owned by the current package (for upgrade scenarios)
 	currentPkgFiles := make(map[string]bool)
-	
+
 	// First, check if current package is installed and build its file set
 	installedManifestPath := filepath.Join(rootDir, Installed, pkgName, "manifest")
 	if data, err := os.ReadFile(installedManifestPath); err == nil {
@@ -860,7 +860,7 @@ func checkStagingConflicts(pkgName, stagingDir, rootDir, stagingManifest string,
 			currentPkgFiles[cleanPathNoSlash] = true
 		}
 	}
-	
+
 	entries, err := os.ReadDir(Installed)
 	if err == nil {
 		for _, e := range entries {
@@ -969,6 +969,11 @@ func checkStagingConflicts(pkgName, stagingDir, rootDir, stagingManifest string,
 		filePathClean := strings.TrimPrefix(filePath, "/")
 		filePathClean = filepath.Clean(filePathClean)
 
+		// Ignore internal metadata files
+		if strings.Contains(filePathClean, "var/db/hokuto") {
+			continue
+		}
+
 		stagingFile := filepath.Join(stagingDir, strings.TrimPrefix(filePath, "/"))
 		targetFile := filepath.Join(rootDir, strings.TrimPrefix(filePath, "/"))
 
@@ -983,7 +988,7 @@ func checkStagingConflicts(pkgName, stagingDir, rootDir, stagingManifest string,
 			// File is in current package's manifest - this is a normal upgrade, skip conflict check
 			continue
 		}
-		
+
 		ownerPkg := fileOwnerMap[filePathClean]
 		if ownerPkg == "" {
 			// Try with leading slash
