@@ -340,6 +340,8 @@ func resolveAlternativeDep(dep DepSpec, yes bool) (string, error) {
 	}
 
 	// Check which alternatives are available (installed or can be found in repos)
+	// Separate installed from available in repos for priority handling
+	var installed []string
 	var available []string
 	for _, altName := range dep.Alternatives {
 		// FILTER: Ignore 32-bit dependencies if multilib is disabled
@@ -347,8 +349,9 @@ func resolveAlternativeDep(dep DepSpec, yes bool) (string, error) {
 			continue
 		}
 
-		// Check if installed
+		// Check if installed first (prioritize installed)
 		if isPackageInstalled(altName) {
+			installed = append(installed, altName)
 			available = append(available, altName)
 			continue
 		}
@@ -362,13 +365,19 @@ func resolveAlternativeDep(dep DepSpec, yes bool) (string, error) {
 		return "", fmt.Errorf("none of the alternative dependencies are available: %s", strings.Join(dep.Alternatives, ", "))
 	}
 
-	// If only one is available, use it automatically and cache it
+	// If any are installed, automatically use the first installed one
+	if len(installed) > 0 {
+		alternativeDepCache[cacheKey] = installed[0]
+		return installed[0], nil
+	}
+
+	// If only one is available (and not installed), use it automatically and cache it
 	if len(available) == 1 {
 		alternativeDepCache[cacheKey] = available[0]
 		return available[0], nil
 	}
 
-	// Multiple alternatives available - prompt user
+	// Multiple alternatives available (none installed) - prompt user
 	if yes {
 		// In --yes mode, use the first available alternative and cache it
 		alternativeDepCache[cacheKey] = available[0]

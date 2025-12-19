@@ -49,8 +49,15 @@ func removeObsoleteFiles(pkgName, stagingDir, rootDir string) ([]string, error) 
 
 	var filesToDelete []string
 
+	// Build an index of file ownership once (for all packages except current)
+	// This avoids scanning all manifests for each file
+	debugf("Building file ownership index...\n")
+	fileOwnerIndex := buildFileOwnerIndex(pkgName)
+	debugf("File ownership index built (indexed %d files)\n", len(fileOwnerIndex))
+
 	// Scan installed manifest; add files missing from staging manifest
 	iscanner := bufio.NewScanner(strings.NewReader(string(installedData)))
+	filesChecked := 0
 	for iscanner.Scan() {
 		line := strings.TrimSpace(iscanner.Text())
 		if line == "" || strings.HasSuffix(line, "/") {
@@ -68,8 +75,26 @@ func removeObsoleteFiles(pkgName, stagingDir, rootDir string) ([]string, error) 
 
 		// if installed file exists on disk, check if it's owned by another package
 		if fi, err := os.Lstat(installedPath); err == nil && !fi.IsDir() {
-			// Check if this file is owned by another package (excluding current package)
-			if isOwnedByAnotherPackage(path, pkgName) {
+			filesChecked++
+			if filesChecked%1000 == 0 {
+				debugf("Checked %d obsolete files...\n", filesChecked)
+			}
+
+			// Check if this file is owned by another package using the index
+			// Try both with and without leading slash for matching
+			normalizedPath := filepath.Clean(path)
+			normalizedPathNoSlash := strings.TrimPrefix(normalizedPath, "/")
+			normalizedPathWithSlash := "/" + normalizedPathNoSlash
+
+			if _, owned := fileOwnerIndex[normalizedPath]; owned {
+				// File is owned by another package, don't delete it
+				continue
+			}
+			if _, owned := fileOwnerIndex[normalizedPathWithSlash]; owned {
+				// File is owned by another package, don't delete it
+				continue
+			}
+			if _, owned := fileOwnerIndex[normalizedPathNoSlash]; owned {
 				// File is owned by another package, don't delete it
 				continue
 			}
@@ -77,11 +102,79 @@ func removeObsoleteFiles(pkgName, stagingDir, rootDir string) ([]string, error) 
 			filesToDelete = append(filesToDelete, installedPath)
 		}
 	}
+	debugf("Finished checking obsolete files (checked %d files, %d to delete)\n", filesChecked, len(filesToDelete))
 	if err := iscanner.Err(); err != nil {
 		return nil, fmt.Errorf("error reading installed manifest: %v", err)
 	}
 
 	return filesToDelete, nil
+}
+
+// buildFileOwnerIndex builds a map of file paths (normalized) to package names
+// for all installed packages except excludePkg. This allows O(1) lookups instead
+// of scanning all manifests for each file.
+func buildFileOwnerIndex(excludePkg string) map[string]string {
+	index := make(map[string]string)
+
+	entries, err := os.ReadDir(Installed)
+	if err != nil {
+		return index
+	}
+
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		pkgName := e.Name()
+		// Skip the excluded package
+		if pkgName == excludePkg {
+			continue
+		}
+
+		manifestPath := filepath.Join(Installed, pkgName, "manifest")
+		data, err := os.ReadFile(manifestPath)
+		if err != nil {
+			continue // skip unreadable manifests
+		}
+
+		scanner := bufio.NewScanner(strings.NewReader(string(data)))
+		for scanner.Scan() {
+			line := strings.TrimSpace(scanner.Text())
+			if line == "" || strings.HasSuffix(line, "/") {
+				continue
+			}
+			fields := strings.Fields(line)
+			if len(fields) == 0 {
+				continue
+			}
+			manifestPath := fields[0]
+
+			// Normalize the path and add to index
+			// Handle both "/usr/bin/file" and "usr/bin/file" formats consistently
+			normalizedPath := filepath.Clean(manifestPath)
+			// Also add normalized path without leading slash for matching
+			normalizedPathNoSlash := strings.TrimPrefix(normalizedPath, "/")
+			normalizedPathWithSlash := "/" + normalizedPathNoSlash
+
+			// Store in index with both formats (with and without leading slash)
+			// Store the first package that owns this file (in case of duplicates)
+			if _, exists := index[normalizedPath]; !exists {
+				index[normalizedPath] = pkgName
+			}
+			if normalizedPath != normalizedPathWithSlash {
+				if _, exists := index[normalizedPathWithSlash]; !exists {
+					index[normalizedPathWithSlash] = pkgName
+				}
+			}
+			if normalizedPath != normalizedPathNoSlash && normalizedPathNoSlash != "" {
+				if _, exists := index[normalizedPathNoSlash]; !exists {
+					index[normalizedPathNoSlash] = pkgName
+				}
+			}
+		}
+	}
+
+	return index
 }
 
 // rsyncStaging syncs the contents of stagingDir into rootDir.
