@@ -125,6 +125,11 @@ func isOwnedByAnotherPackage(filePath, excludePkg string) bool {
 func checkFileConflict(filePath, currentFileAbsPath, currentPackage, rootDir string, execCtx *Executor) (string, bool, bool, string) {
 	searchPath := filepath.Clean(filePath)
 
+	// Ignore internal metadata files
+	if strings.Contains(searchPath, "/var/db/hokuto/") || strings.HasPrefix(searchPath, "var/db/hokuto/") {
+		return "", false, false, ""
+	}
+
 	// Check if currentFile is a symlink
 	currentInfo, err := os.Lstat(currentFileAbsPath)
 	isSymlink := false
