@@ -187,12 +187,57 @@ func updateRepos() {
 
 		// Capture output for logging and error checking
 		output, err := cmd.CombinedOutput()
+		outputStr := strings.TrimSpace(string(output))
 
 		if err != nil {
-			fmt.Printf("Error pulling repo %s: %v\nOutput:\n%s\n", dir, err, strings.TrimSpace(string(output)))
+			// Check if the error is due to local changes that would be overwritten
+			if strings.Contains(outputStr, "would be overwritten by merge") {
+				colArrow.Print("-> ")
+				colWarn.Printf("Repository %s has local changes that would be overwritten.\n", dir)
+				colArrow.Print("-> ")
+				fmt.Printf("Output:\n%s\n", outputStr)
+
+				// Prompt user to discard local changes
+				if askForConfirmation(colWarn, "Discard local changes and pull updates from remote?") {
+					// Reset local changes
+					resetCmd := exec.Command("git", "reset", "--hard", "HEAD")
+					resetCmd.Dir = dir
+					resetOutput, resetErr := resetCmd.CombinedOutput()
+					if resetErr != nil {
+						fmt.Printf("Error resetting repository %s: %v\nOutput:\n%s\n", dir, resetErr, strings.TrimSpace(string(resetOutput)))
+						continue
+					}
+
+					// Clean untracked files that might conflict
+					cleanCmd := exec.Command("git", "clean", "-fd")
+					cleanCmd.Dir = dir
+					cleanOutput, cleanErr := cleanCmd.CombinedOutput()
+					if cleanErr != nil {
+						fmt.Printf("Warning: Error cleaning repository %s: %v\nOutput:\n%s\n", dir, cleanErr, strings.TrimSpace(string(cleanOutput)))
+					}
+
+					// Retry git pull
+					retryCmd := exec.Command("git", "pull")
+					retryCmd.Dir = dir
+					retryOutput, retryErr := retryCmd.CombinedOutput()
+					retryOutputStr := strings.TrimSpace(string(retryOutput))
+
+					if retryErr != nil {
+						fmt.Printf("Error pulling repo %s after reset: %v\nOutput:\n%s\n", dir, retryErr, retryOutputStr)
+					} else {
+						colArrow.Print("-> ")
+						colSuccess.Printf("Successfully pulled repo %s after discarding local changes\nOutput:\n%s\n", dir, retryOutputStr)
+					}
+				} else {
+					colArrow.Print("-> ")
+					colWarn.Printf("Skipping repository %s (local changes preserved)\n", dir)
+				}
+			} else {
+				fmt.Printf("Error pulling repo %s: %v\nOutput:\n%s\n", dir, err, outputStr)
+			}
 		} else {
 			colArrow.Print("-> ")
-			colSuccess.Printf("Successfully pulled repo %s\nOutput:\n%s\n", dir, strings.TrimSpace(string(output)))
+			colSuccess.Printf("Successfully pulled repo %s\nOutput:\n%s\n", dir, outputStr)
 		}
 	}
 }

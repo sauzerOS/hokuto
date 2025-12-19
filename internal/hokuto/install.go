@@ -952,6 +952,8 @@ func checkStagingConflicts(pkgName, stagingDir, rootDir, stagingManifest string,
 
 	stdinReader := bufio.NewReader(os.Stdin)
 	skipAllPrompts := false
+	useOriginalForAll := false // Flag to use original for all remaining alternatives
+	useNewForAll := false      // Flag to use new for all remaining alternatives
 
 	scanner := bufio.NewScanner(strings.NewReader(string(stagingData)))
 	for scanner.Scan() {
@@ -1097,14 +1099,27 @@ func checkStagingConflicts(pkgName, stagingDir, rootDir, stagingManifest string,
 			os.Stdout.Sync()
 
 			var input string
-			if !yes && !skipAllPrompts {
-				cPrintf(colInfo, "File %s already exists (not managed by any package): [o]riginal, [n]ew: ", filePath)
+			// Determine action based on flags or user input
+			if useOriginalForAll {
+				input = "o"
+			} else if useNewForAll {
+				input = "n"
+			} else if !yes && !skipAllPrompts {
+				cPrintf(colInfo, "File %s already exists (not managed by any package): [o]riginal, [n]ew, use [O]riginal for all, use [N]ew for all: ", filePath)
 				os.Stdout.Sync()
 				response, err := stdinReader.ReadString('\n')
 				if err != nil {
 					response = "o" // Default to original on read error
 				}
 				input = strings.TrimSpace(response)
+				// Check for uppercase "O" or "N" for "all" flags before converting to lowercase
+				if input == "O" {
+					useOriginalForAll = true
+					input = "o"
+				} else if input == "N" {
+					useNewForAll = true
+					input = "n"
+				}
 			}
 			if input == "" {
 				input = "o" // Default to original if user presses enter or if in --yes mode
