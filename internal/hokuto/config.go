@@ -5,6 +5,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 )
 
@@ -116,9 +117,17 @@ func initConfig(cfg *Config) {
 		cfg.DefaultLTO = true
 	}
 
+	// Multilib is only supported on x86_64 architecture
+	// Automatically disable for aarch64 and other architectures
 	EnableMultilib = false
-	if cfg.Values["HOKUTO_MULTILIB"] == "1" {
-		EnableMultilib = true
+	if runtime.GOARCH == "amd64" || runtime.GOARCH == "386" {
+		// Only enable multilib if explicitly requested and on x86_64/386
+		if cfg.Values["HOKUTO_MULTILIB"] == "1" {
+			EnableMultilib = true
+		}
+	} else if cfg.Values["HOKUTO_MULTILIB"] == "1" {
+		// Warn if multilib is requested on unsupported architecture
+		log.Printf("Warning: Multilib is not supported on %s architecture, disabling", runtime.GOARCH)
 	}
 
 	// Load the GNU mirror URL if it's set in the config

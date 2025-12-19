@@ -342,6 +342,11 @@ func resolveAlternativeDep(dep DepSpec, yes bool) (string, error) {
 	// Check which alternatives are available (installed or can be found in repos)
 	var available []string
 	for _, altName := range dep.Alternatives {
+		// FILTER: Ignore 32-bit dependencies if multilib is disabled
+		if !EnableMultilib && strings.HasSuffix(altName, "-32") {
+			continue
+		}
+
 		// Check if installed
 		if isPackageInstalled(altName) {
 			available = append(available, altName)
