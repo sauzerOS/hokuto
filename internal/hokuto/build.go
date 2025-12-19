@@ -671,15 +671,27 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 			}
 		}()
 
-		// Run script through Executor to respect ShouldRunAsRoot (for asroot packages)
+		// Run script - use Executor only when root is needed (for asroot packages)
+		// For normal builds, run directly to preserve TTY/PTY access
 		// Note: script always returns 0, but writes the actual exit code to the log file
 		// We need to check the log file for COMMAND_EXIT_CODE
-		if err := buildExec.Run(cmd); err != nil {
-			runErr = fmt.Errorf("build failed: %w", err)
+		if buildExec.ShouldRunAsRoot {
+			if err := buildExec.Run(cmd); err != nil {
+				runErr = fmt.Errorf("build failed: %w", err)
+			} else {
+				// Check the exit code from the log file
+				if exitCode := getScriptExitCode(logPath); exitCode != 0 {
+					runErr = fmt.Errorf("build script exited with code %d", exitCode)
+				}
+			}
 		} else {
-			// Check the exit code from the log file
-			if exitCode := getScriptExitCode(logPath); exitCode != 0 {
-				runErr = fmt.Errorf("build script exited with code %d", exitCode)
+			if err := cmd.Run(); err != nil {
+				runErr = fmt.Errorf("build failed: %w", err)
+			} else {
+				// Check the exit code from the log file
+				if exitCode := getScriptExitCode(logPath); exitCode != 0 {
+					runErr = fmt.Errorf("build script exited with code %d", exitCode)
+				}
 			}
 		}
 
@@ -688,15 +700,26 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 		runWg.Wait()
 
 	} else {
-		// --- INTERACTIVE PATH: Run through Executor to respect ShouldRunAsRoot (for asroot packages)
+		// --- INTERACTIVE PATH: Use Executor only when root is needed (for asroot packages)
 		// This gives the child process exclusive control of the terminal.
 		// Note: script always returns 0, but writes the actual exit code to the log file
-		if err := buildExec.Run(cmd); err != nil {
-			runErr = fmt.Errorf("build failed: %w", err)
+		if buildExec.ShouldRunAsRoot {
+			if err := buildExec.Run(cmd); err != nil {
+				runErr = fmt.Errorf("build failed: %w", err)
+			} else {
+				// Check the exit code from the log file
+				if exitCode := getScriptExitCode(logPath); exitCode != 0 {
+					runErr = fmt.Errorf("build script exited with code %d", exitCode)
+				}
+			}
 		} else {
-			// Check the exit code from the log file
-			if exitCode := getScriptExitCode(logPath); exitCode != 0 {
-				runErr = fmt.Errorf("build script exited with code %d", exitCode)
+			if err := cmd.Run(); err != nil {
+				runErr = fmt.Errorf("build failed: %w", err)
+			} else {
+				// Check the exit code from the log file
+				if exitCode := getScriptExitCode(logPath); exitCode != 0 {
+					runErr = fmt.Errorf("build script exited with code %d", exitCode)
+				}
 			}
 		}
 	}
@@ -1301,8 +1324,8 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 
 	var runErr error // Use a single error variable for both paths
 
-	// Run script through Executor to respect ShouldRunAsRoot (for asroot packages)
-	// The Executor handles privilege escalation (sudo) when needed while preserving TTY/PTY access
+	// Run script - use Executor only when root is needed (for asroot packages)
+	// For normal builds, run directly to preserve TTY/PTY access
 	if !buildExec.Interactive {
 		// --- NON-INTERACTIVE PATH: Run with timer and title updates ---
 		setTerminalTitle(fmt.Sprintf("Rebuilding %s", pkgName))
@@ -1334,15 +1357,27 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 			}
 		}()
 
-		// Run script through Executor to respect ShouldRunAsRoot (for asroot packages)
+		// Run script - use Executor only when root is needed (for asroot packages)
+		// For normal builds, run directly to preserve TTY/PTY access
 		// Note: script always returns 0, but writes the actual exit code to the log file
 		// We need to check the log file for COMMAND_EXIT_CODE
-		if err := buildExec.Run(cmd); err != nil {
-			runErr = fmt.Errorf("build failed: %w", err)
+		if buildExec.ShouldRunAsRoot {
+			if err := buildExec.Run(cmd); err != nil {
+				runErr = fmt.Errorf("build failed: %w", err)
+			} else {
+				// Check the exit code from the log file
+				if exitCode := getScriptExitCode(logPath); exitCode != 0 {
+					runErr = fmt.Errorf("build script exited with code %d", exitCode)
+				}
+			}
 		} else {
-			// Check the exit code from the log file
-			if exitCode := getScriptExitCode(logPath); exitCode != 0 {
-				runErr = fmt.Errorf("build script exited with code %d", exitCode)
+			if err := cmd.Run(); err != nil {
+				runErr = fmt.Errorf("build failed: %w", err)
+			} else {
+				// Check the exit code from the log file
+				if exitCode := getScriptExitCode(logPath); exitCode != 0 {
+					runErr = fmt.Errorf("build script exited with code %d", exitCode)
+				}
 			}
 		}
 
@@ -1350,14 +1385,25 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 		close(doneCh)
 		runWg.Wait()
 	} else {
-		// --- INTERACTIVE PATH: Run through Executor to respect ShouldRunAsRoot (for asroot packages)
+		// --- INTERACTIVE PATH: Use Executor only when root is needed (for asroot packages)
 		// Note: script always returns 0, but writes the actual exit code to the log file
-		if err := buildExec.Run(cmd); err != nil {
-			runErr = fmt.Errorf("build failed: %w", err)
+		if buildExec.ShouldRunAsRoot {
+			if err := buildExec.Run(cmd); err != nil {
+				runErr = fmt.Errorf("build failed: %w", err)
+			} else {
+				// Check the exit code from the log file
+				if exitCode := getScriptExitCode(logPath); exitCode != 0 {
+					runErr = fmt.Errorf("build script exited with code %d", exitCode)
+				}
+			}
 		} else {
-			// Check the exit code from the log file
-			if exitCode := getScriptExitCode(logPath); exitCode != 0 {
-				runErr = fmt.Errorf("build script exited with code %d", exitCode)
+			if err := cmd.Run(); err != nil {
+				runErr = fmt.Errorf("build failed: %w", err)
+			} else {
+				// Check the exit code from the log file
+				if exitCode := getScriptExitCode(logPath); exitCode != 0 {
+					runErr = fmt.Errorf("build script exited with code %d", exitCode)
+				}
 			}
 		}
 	}
