@@ -62,6 +62,19 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 
 	// Special handling for glibc: direct extraction without staging or checks
 	if pkgName == "glibc" {
+		// Check lock for glibc by parsing version from filename
+		base := filepath.Base(tarballPath)
+		nameWithoutExt := strings.TrimSuffix(base, ".tar.zst")
+		parts := strings.Split(nameWithoutExt, "-")
+		if len(parts) >= 3 {
+			version := parts[len(parts)-2]
+			if err := checkLock(pkgName, version); err != nil {
+				colArrow.Print("-> ")
+				colError.Println(err)
+				return err
+			}
+		}
+
 		colArrow.Print("-> ")
 		colSuccess.Println("Installing glibc using direct extraction method")
 
@@ -247,9 +260,23 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 	// Check for asroot file in the staging directory metadata (embedded during build)
 	stagingMetadataDir := filepath.Join(stagingDir, "var", "db", "hokuto", "installed", pkgName)
 	asRootFile := filepath.Join(stagingMetadataDir, "asroot")
+	versionFile := filepath.Join(stagingMetadataDir, "version")
 	needsRootBuild := false
 	if _, err := os.Stat(asRootFile); err == nil {
 		needsRootBuild = true
+	}
+
+	// Check if package version is locked
+	if data, err := os.ReadFile(versionFile); err == nil {
+		fields := strings.Fields(string(data))
+		if len(fields) > 0 {
+			version := fields[0]
+			if err := checkLock(pkgName, version); err != nil {
+				colArrow.Print("-> ")
+				colError.Println(err)
+				return err
+			}
+		}
 	}
 
 	// Use appropriate executor for modified files detection

@@ -277,3 +277,43 @@ func findPackageDir(pkgName string) (string, error) {
 	}
 	return "", fmt.Errorf("not found in any repository")
 }
+
+// readLockFile reads /etc/hokuto.lock and returns a map of package name -> locked version.
+// Returns an empty map if the file doesn't exist or on error (errors are silently ignored).
+func readLockFile() map[string]string {
+	locked := make(map[string]string)
+	data, err := os.ReadFile(LockFile)
+	if err != nil {
+		// File doesn't exist or can't be read - return empty map
+		return locked
+	}
+
+	scanner := bufio.NewScanner(strings.NewReader(string(data)))
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		// Parse line: "package-name version"
+		fields := strings.Fields(line)
+		if len(fields) >= 2 {
+			pkgName := fields[0]
+			version := fields[1]
+			locked[pkgName] = version
+		}
+	}
+
+	return locked
+}
+
+// checkLock returns an error if the package is locked at a lower version than the target version.
+func checkLock(pkgName, version string) error {
+	locked := readLockFile()
+	if lockedVersion, ok := locked[pkgName]; ok {
+		if compareVersions(lockedVersion, version) < 0 {
+			return fmt.Errorf("package %s is locked at version %s (locked in %s), refusing to install higher version %s", pkgName, lockedVersion, LockFile, version)
+		}
+	}
+	return nil
+}

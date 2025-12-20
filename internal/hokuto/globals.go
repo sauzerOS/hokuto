@@ -51,6 +51,7 @@ var (
 	embeddedAssets embed.FS
 	WorldFile      = "/var/db/hokuto/world"
 	WorldMakeFile  = "/var/db/hokuto/world_make"
+	LockFile       = "/etc/hokuto.lock"
 )
 
 // color helpers

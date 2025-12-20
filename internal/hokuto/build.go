@@ -129,6 +129,29 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 		return 0, fmt.Errorf("package %s not found in HOKUTO_PATH", pkgName)
 	}
 
+	// Read version and revision early for lock check
+	versionFile := filepath.Join(pkgDir, "version")
+	versionData, err := os.ReadFile(versionFile)
+	if err != nil {
+		return 0, fmt.Errorf("failed to read version file: %v", err)
+	}
+	fields := strings.Fields(string(versionData))
+	if len(fields) == 0 {
+		return 0, fmt.Errorf("version file is empty")
+	}
+	version := fields[0]
+	revision := "1" // Default revision if not specified
+	if len(fields) >= 2 {
+		revision = fields[1]
+	}
+
+	// Check if package version is locked
+	if err := checkLock(pkgName, version); err != nil {
+		colArrow.Print("-> ")
+		colWarn.Println(err)
+		colWarn.Println("Permitting build, but installation will be blocked.")
+	}
+
 	// Special handling: Uninstall python before building/updating if it's already installed
 	if pkgName == "python" && isPackageInstalled("python") {
 		colArrow.Print("-> ")
@@ -228,21 +251,7 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 		shouldLTO = false // Override the global setting for this package only
 	}
 
-	// Read version and revision
-	versionFile := filepath.Join(pkgDir, "version")
-	versionData, err := os.ReadFile(versionFile)
-	if err != nil {
-		return 0, fmt.Errorf("failed to read version file: %v", err)
-	}
-	fields := strings.Fields(string(versionData))
-	if len(fields) == 0 {
-		return 0, fmt.Errorf("version file is empty")
-	}
-	version := fields[0]
-	revision := "1" // Default revision if not specified
-	if len(fields) >= 2 {
-		revision = fields[1]
-	}
+	// (Version and revision were already read at the beginning of the function for the lock check)
 
 	// Build script
 	buildScript := filepath.Join(pkgDir, "build")
