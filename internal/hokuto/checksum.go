@@ -507,5 +507,3 @@ func b3sumBatch(paths []string, maxWorkers int) (map[string]string, error) {
 
 	return results, nil
 }
-
-// Helper to read a file as root if needed

@@ -295,7 +295,6 @@ func extractTar(realPath, dest string) error {
 }
 
 // unpackTarballFallback extracts a .tar.zst into dest using pure-Go.
-
 func unpackTarballFallback(tarballPath, dest string) error {
 	f, err := os.Open(tarballPath)
 	if err != nil {
@@ -353,7 +352,6 @@ func unpackTarballFallback(tarballPath, dest string) error {
 
 // createPackageTarball creates a .tar.zst archive of outputDir into BinDir.
 // It uses system tar if available, otherwise falls back to pure-Go tar+zstd.
-
 func createPackageTarball(pkgName, pkgVer, pkgRev, outputDir string, execCtx *Executor) error {
 	// Ensure BinDir exists
 	if err := os.MkdirAll(BinDir, 0o755); err != nil {

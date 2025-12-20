@@ -382,7 +382,3 @@ func handleOrphanCleanup(cfg *Config) {
 		colSuccess.Println("No unneeded build dependencies found.")
 	}
 }
-
-// resolveBinaryDependencies recursively finds missing dependencies for a package.
-// It populates 'plan' with the names of packages that need to be installed, in topological order.
-// 'visited' tracks packages processed in this specific resolution pass to prevent cycles.

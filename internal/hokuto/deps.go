@@ -16,6 +16,10 @@ import (
 // Cache for resolved alternative dependencies to avoid prompting multiple times
 var alternativeDepCache = make(map[string]string)
 
+// resolveBinaryDependencies recursively finds missing dependencies for a package.
+// It populates 'plan' with the names of packages that need to be installed, in topological order.
+// 'visited' tracks packages processed in this specific resolution pass to prevent cycles.
+
 func resolveBinaryDependencies(pkgName string, visited map[string]bool, plan *[]string, force bool, yes bool) error {
 	// 1. Cycle detection
 	if visited[pkgName] {
@@ -648,8 +652,10 @@ func compareVersions(a, b string) int {
 	return 0
 }
 
-// stripPackage recursively walks outputDir and runs the 'strip' command on every executable file found,
-// executing the stripping concurrently to maximize speed.
+// getPackageDependenciesForward recursively collects all dependencies for a package
+// in forward order (as they appear in depends files).
+// Duplicates are only allowed for "gcc" - all other packages are added once.
+// This is used with the --alldeps flag to rebuild everything including duplicates.
 
 func getPackageDependenciesForward(pkgName string) ([]string, error) {
 	var result []string
@@ -804,8 +810,6 @@ func getInstalledDeps(pkgName string) ([]string, error) {
 	return deps, nil
 }
 
-// executeMountCommand accepts the FULL destination path (e.g., /var/tmp/lfs/dev/tty)
-
 type DepSpec struct {
 	Name         string
 	Op           string // one of: "<=", ">=", "==", "<", ">", or empty for no constraint
@@ -815,5 +819,3 @@ type DepSpec struct {
 	Make         bool     // True if dependency is only needed at build time
 	Alternatives []string // List of alternative package names (e.g., ["rust", "rustup"] for "rust | rustup")
 }
-
-// parseDependsFile reads the package's depends file and returns a list of dependency specs.

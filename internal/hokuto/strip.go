@@ -143,7 +143,3 @@ func stripPackage(outputDir string, buildExec *Executor) error {
 
 	return nil
 }
-
-// list of essential directories that should never be removed by rmdir.
-// These are absolute paths expected to be found under the HOKUTO_ROOT.
-// We use a map for O(1) lookup.

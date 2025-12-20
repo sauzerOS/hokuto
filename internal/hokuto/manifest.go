@@ -406,7 +406,3 @@ func removeManifestEntries(manifestPath string, filesToRemove map[string]bool, e
 
 	return nil
 }
-
-// getRepoVersion reads pkgname/version from repoPaths and returns the version string.
-// The version file format is: "<version> <revision>", e.g. "1.0 1".
-// We only care about the first field (the version).

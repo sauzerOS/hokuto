@@ -74,7 +74,3 @@ func handleCleanupCommand(args []string, cfg *Config) error {
 
 	return nil
 }
-
-// checkPackageExactMatch checks if a package with the exact name is installed.
-// Returns true only if the package directory exists with an exact name match.
-// This is designed for use in build scripts: exit 0 = found, exit 1 = not found.

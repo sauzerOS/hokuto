@@ -1346,7 +1346,8 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 					// Only print elapsed time to console if not in verbose mode
 					// In verbose mode, the build output is already visible, so we only update the title
 					if !Verbose {
-						colInfo.Printf(" Building %s  elapsed: %s\r", pkgName, elapsed)
+						colArrow.Print("-> ")
+						colSuccess.Printf("Building %s elapsed: %s\r", pkgName, elapsed)
 					}
 				case <-doneCh:
 					fmt.Print("\r")
@@ -1440,7 +1441,7 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 
 	// success
 	elapsed := time.Since(startTime).Truncate(time.Second)
-	cPrintf(colNote, "\n%s built successfully in %s, output in %s\n", pkgName, elapsed, outputDir)
+	debugf("\n%s built successfully in %s, output in %s\n", pkgName, elapsed, outputDir)
 
 	// Determine output package name (rename if cross-system is enabled)
 	outputPkgName := getOutputPackageName(pkgName, cfg)
@@ -1578,7 +1579,7 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 		return fmt.Errorf("failed to generate manifest: %v", err)
 	}
 
-	cPrintf(colNote, "%s rebuilt successfully, output in %s\n", pkgName, outputDir)
+	debugf("%s rebuilt successfully, output in %s\n", pkgName, outputDir)
 	//Set title to success status
 	finalTitle := fmt.Sprintf("✅ SUCCESS: %s", pkgName)
 	setTerminalTitle(finalTitle)
@@ -1587,6 +1588,8 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 	return nil
 }
 
+// handleBuildCommand orchestrates the entire build process, intelligently selecting the
+// correct dependency resolution strategy based on the build mode (normal, bootstrap, or alldeps).
 func handleBuildCommand(args []string, cfg *Config) {
 	// --- 1. Flag Parsing & Initial Setup ---
 	buildCmd := flag.NewFlagSet("build", flag.ExitOnError)
@@ -2357,8 +2360,3 @@ func executeBuildPass(plan *BuildPlan, _ string, installAllTargets bool, cfg *Co
 	}
 	return failed, successfullyBuiltTargets, totalElapsedTime
 }
-
-// getPackageDependenciesForward recursively collects all dependencies for a package
-// in forward order (as they appear in depends files).
-// Duplicates are only allowed for "gcc" - all other packages are added once.
-// This is used with the --alldeps flag to rebuild everything including duplicates.

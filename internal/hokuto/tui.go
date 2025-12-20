@@ -185,14 +185,11 @@ func runTUI() int {
 	go func() {
 		ticker := time.NewTicker(400 * time.Millisecond)
 		defer ticker.Stop()
-		for {
+		for range ticker.C {
+			logs := readAllBuildLogs()
 			select {
-			case <-ticker.C:
-				logs := readAllBuildLogs()
-				select {
-				case tuiUpdateChan <- logs:
-				default:
-				}
+			case tuiUpdateChan <- logs:
+			default:
 			}
 		}
 	}()

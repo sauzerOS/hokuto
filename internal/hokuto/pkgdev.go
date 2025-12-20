@@ -132,5 +132,3 @@ func editPackage(pkgName string, openAll bool) error {
 
 	return cmd.Run()
 }
-
-// newHttpClient creates and returns an http.Client.

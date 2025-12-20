@@ -388,6 +388,3 @@ func pkgUninstall(pkgName string, cfg *Config, execCtx *Executor, force, yes boo
 	}
 	return nil
 }
-
-// handleBuildCommand orchestrates the entire build process, intelligently selecting the
-// correct dependency resolution strategy based on the build mode (normal, bootstrap, or alldeps).

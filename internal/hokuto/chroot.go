@@ -12,6 +12,10 @@ import (
 	"time"
 )
 
+// ExecuteChroot executes the target command inside the chroot environment.
+// It relies on the external 'chroot' binary, which is automatically wrapped
+// with 'sudo' (if needed) and run via the Executor.Run method.
+
 func (e *Executor) ExecuteChroot(targetDir string, cmdArgs []string) (int, error) {
 	// First check if systemd-run is available
 	_, err := exec.LookPath("systemd-run")
@@ -217,9 +221,3 @@ func runChrootCommand(args []string, execCtx *Executor) (exitCode int) {
 	exitCode = finalCode
 	return
 }
-
-// getPackageDependenciesToUninstall returns a list of package names to uninstall
-// before installing the given package. For Python/Cython packages, it returns the
-// package name itself. For specific packages, it returns their associated dependencies.
-// Returns an empty slice if no uninstallation is needed.
-// This fixes issues with broken pip versions during upgrades and removes bootstrap packages when required.

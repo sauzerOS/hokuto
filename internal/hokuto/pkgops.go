@@ -529,8 +529,6 @@ func executePostInstall(pkgName, rootDir string, execCtx *Executor, cfg *Config)
 	return nil
 }
 
-// ManifestEntry represents a single line in the manifest file.
-
 func getPackageDependenciesToUninstall(name string) []string {
 	switch name {
 	case "gcc":
@@ -565,6 +563,8 @@ func getPackageDependenciesToUninstall(name string) []string {
 		return []string{"21-hokuto"}
 	case "cython":
 		return []string{name}
+	case "dbus-python":
+		return []string{name}
 	case "meson":
 		return []string{name}
 	case "libvirt-python":
@@ -582,6 +582,8 @@ func getPackageDependenciesToUninstall(name string) []string {
 	case "btrfs-progs":
 		return []string{name}
 	case "arandr":
+		return []string{name}
+	case "cursor":
 		return []string{name}
 	default:
 		if strings.HasPrefix(name, "python-") || strings.HasPrefix(name, "cython-") {
@@ -613,7 +615,7 @@ func handlePreInstallUninstall(pkgName string, cfg *Config, execCtx *Executor) {
 	if len(depsToActuallyUninstall) > 0 {
 		colArrow.Print("-> ")
 		// The message is now more accurate, as it only lists packages we KNOW are installed.
-		colWarn.Printf("Uninstalling conflicting installed packages for %s: %v\n", pkgName, strings.Join(depsToActuallyUninstall, ", "))
+		colWarn.Printf("Uninstalling %s: %v\n", pkgName, strings.Join(depsToActuallyUninstall, ", "))
 
 		for _, dep := range depsToActuallyUninstall {
 			// Use force and yes flags to ensure silent, non-interactive uninstallation.
@@ -626,5 +628,3 @@ func handlePreInstallUninstall(pkgName string, cfg *Config, execCtx *Executor) {
 		}
 	}
 }
-
-// handleCleanupCommand handles the 'cleanup' subcommand

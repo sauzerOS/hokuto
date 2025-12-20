@@ -12,6 +12,10 @@ import (
 	"sync"
 )
 
+// PostInstallTasks runs common system cache updates after package installs.
+// It uses a worker pool to execute tasks with limited concurrency,
+// preventing I/O contention and providing a significant speedup.
+
 func PostInstallTasks(e *Executor) error {
 	colArrow.Print("-> ")
 	colSuccess.Println("Executing post-install tasks")
@@ -103,5 +107,3 @@ func PostInstallTasks(e *Executor) error {
 
 	return nil
 }
-
-// build package

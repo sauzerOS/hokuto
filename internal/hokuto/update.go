@@ -17,6 +17,10 @@ import (
 	"github.com/gookit/color"
 )
 
+// getRepoVersion reads pkgname/version from repoPaths and returns the version string.
+// The version file format is: "<version> <revision>", e.g. "1.0 1".
+// We only care about the first field (the version).
+
 func getRepoVersion(pkgName string) (string, error) {
 	// 1. Split the repoPaths string by the colon (':') separator.
 	paths := strings.Split(repoPaths, ":")
@@ -642,5 +646,3 @@ func getInstalledVersion(pkgName string) (string, bool) {
 	}
 	return fields[0], true
 }
-
-// versionSatisfies checks if installed satisfies op refVersion.

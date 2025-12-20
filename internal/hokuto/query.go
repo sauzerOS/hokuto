@@ -251,5 +251,3 @@ func findPackagesByManifestString(query string) error {
 	}
 	return nil
 }
-
-// addToWorld adds a package to the world file if it's not already there.

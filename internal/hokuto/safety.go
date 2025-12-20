@@ -3,6 +3,7 @@ package hokuto
 // Code in this file was split out of main.go for readability.
 // No behavior changes intended.
 
+// Directories that should NEVER be removed
 var forbiddenSystemDirs = map[string]struct{}{
 	"/bin":   {},
 	"/lib":   {},
@@ -58,7 +59,6 @@ var forbiddenSystemDirs = map[string]struct{}{
 
 // list of essential directories that should NEVER be removed, nor should any of their contents.
 // These use a prefix check (recursive protection).
-
 var forbiddenSystemDirsRecursive = map[string]struct{}{
 	"/boot":      {},
 	"/dev":       {},

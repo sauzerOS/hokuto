@@ -135,7 +135,3 @@ func (e *Executor) BindMount(source, dest, options string) error {
 
 	return nil
 }
-
-// ExecuteChroot executes the target command inside the chroot environment.
-// It relies on the external 'chroot' binary, which is automatically wrapped
-// with 'sudo' (if needed) and run via the Executor.Run method.

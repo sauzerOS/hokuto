@@ -17,6 +17,47 @@ import (
 	"github.com/gookit/color"
 )
 
+// getRebuildTriggers parses /etc/hokuto.rebuild and returns packages that should
+// be rebuilt when the given trigger package is installed.
+// Format: triggerpkg pkg1 pkg2 pkg3...
+// Returns empty slice if no triggers found or file doesn't exist.
+func getRebuildTriggers(triggerPkg string, rootDir string) []string {
+	rebuildFilePath := filepath.Join(rootDir, "etc/hokuto.rebuild")
+	if rootDir == "/" {
+		rebuildFilePath = "/etc/hokuto.rebuild"
+	}
+
+	data, err := readFileAsRoot(rebuildFilePath)
+	if err != nil {
+		// File doesn't exist or can't be read - that's fine, just return empty
+		return nil
+	}
+
+	var packagesToRebuild []string
+	scanner := bufio.NewScanner(bytes.NewReader(data))
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		// Skip empty lines and comments
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue // Need at least trigger package and one package to rebuild
+		}
+
+		// First field is the trigger package
+		if fields[0] == triggerPkg {
+			// Return all packages after the trigger
+			packagesToRebuild = append(packagesToRebuild, fields[1:]...)
+			break // Found matching trigger, no need to continue
+		}
+	}
+
+	return packagesToRebuild
+}
+
 func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes bool) error {
 
 	// Special handling for glibc: direct extraction without staging or checks
@@ -707,6 +748,59 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 	colSuccess.Println("Executing package post-install script")
 	if err := executePostInstall(pkgName, rootDir, execCtx, cfg); err != nil {
 		fmt.Printf("warning: post-install for %s returned error: %v\n", pkgName, err)
+	}
+
+	// 7.5. Check for rebuild triggers from /etc/hokuto.rebuild
+	rebuildTriggerPkgs := getRebuildTriggers(pkgName, rootDir)
+	if len(rebuildTriggerPkgs) > 0 {
+		colArrow.Print("-> ")
+		colSuccess.Print("DKMS trigger: ")
+		cPrintf(colNote, "%s\n", strings.Join(rebuildTriggerPkgs, " "))
+		shouldRebuild := yes // Default to true if --yes flag is set
+		if !yes {
+			// Use custom prompt to match requested format
+			colArrow.Print("-> ")
+			colWarn.Printf("Rebuild the packages? [Y/n]")
+			os.Stdout.Sync()
+			response, err := stdinReader.ReadString('\n')
+			if err != nil {
+				shouldRebuild = false // Default to no on read error
+			} else {
+				response = strings.ToLower(strings.TrimSpace(response))
+				shouldRebuild = response == "y" || response == "yes" || response == ""
+			}
+		}
+
+		if shouldRebuild {
+			for _, rebuildPkg := range rebuildTriggerPkgs {
+				debugf("\n--- Rebuilding %s (triggered by %s) ---\n", rebuildPkg, pkgName)
+
+				// Pass empty string for oldLibsDir since this is a trigger-based rebuild, not a library dependency rebuild
+				if err := pkgBuildRebuild(rebuildPkg, cfg, execCtx, ""); err != nil {
+					failed = append(failed, fmt.Sprintf("rebuild of %s (triggered by %s) failed: %v", rebuildPkg, pkgName, err))
+					cPrintf(colWarn, "WARNING: Rebuild of %s failed: %v\n", rebuildPkg, err)
+					continue
+				}
+
+				rebuildOutputDir := filepath.Join(tmpDir, rebuildPkg, "output")
+
+				if err := rsyncStaging(rebuildOutputDir, rootDir, execCtx); err != nil {
+					failed = append(failed, fmt.Sprintf("failed to sync rebuilt package %s to root: %v", rebuildPkg, err))
+					cPrintf(colWarn, "WARNING: Failed to sync rebuilt package %s to root: %v\n", rebuildPkg, err)
+					continue
+				}
+
+				rmCmd := exec.Command("rm", "-rf", filepath.Join(tmpDir, rebuildPkg))
+				if err := execCtx.Run(rmCmd); err != nil {
+					fmt.Fprintf(os.Stderr, "failed to cleanup rebuild tmpdirs for %s: %v\n", rebuildPkg, err)
+				}
+				colArrow.Print("-> ")
+				cPrintf(colSuccess, "Rebuild of %s finished and installed.\n", rebuildPkg)
+			}
+		} else {
+			colArrow.Print("-> ")
+			cPrintf(colInfo, "Skipping rebuild of %s\n", strings.Join(rebuildTriggerPkgs, ", "))
+		}
 	}
 
 	// --- Rebuild Affected Packages (Step 8) ---

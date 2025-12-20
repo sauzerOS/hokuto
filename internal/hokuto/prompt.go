@@ -45,6 +45,3 @@ func askForConfirmation(p colorPrinter, format string, a ...any) bool {
 		cPrintln(colWarn, "Invalid input.")
 	}
 }
-
-// findOwnerPackage searches installed manifests for the exact file path
-// and returns the name of the package that owns it.

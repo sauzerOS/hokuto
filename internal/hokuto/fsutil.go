@@ -539,6 +539,3 @@ func readFileAsRoot(path string) ([]byte, error) {
 	}
 	return out, nil
 }
-
-// Helper to compute b3sum of a file, using system b3sum binary if available,
-// otherwise falling back to the internal Go BLAKE3 implementation.
