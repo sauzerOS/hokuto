@@ -105,6 +105,11 @@ func initConfig(cfg *Config) {
 		tmpDir = "/tmp"
 	}
 
+	HokutoTmpDir = cfg.Values["TMPDIR"]
+	if HokutoTmpDir == "" {
+		HokutoTmpDir = "/tmp"
+	}
+
 	cfg.DefaultStrip = true
 	WantStrip := cfg.Values["HOKUTO_STRIP"]
 	if WantStrip == "0" {

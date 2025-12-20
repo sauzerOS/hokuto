@@ -22,51 +22,21 @@ import (
 // We only care about the first field (the version).
 
 func getRepoVersion(pkgName string) (string, error) {
-	// 1. Split the repoPaths string by the colon (':') separator.
-	paths := strings.Split(repoPaths, ":")
-
-	var lastErr error
-
-	// 2. Iterate over all individual repository paths.
-	for _, repoPath := range paths {
-		// Trim any potential whitespace from the path
-		repoPath = strings.TrimSpace(repoPath)
-		if repoPath == "" {
-			continue // Skip empty paths
-		}
-
-		// 3. Construct the full path to the version file.
-		// filepath.Join handles the correct path separators (e.g., '/' or '\')
-		versionFile := filepath.Join(repoPath, pkgName, "version")
-
-		// 4. Attempt to read the file.
-		data, err := os.ReadFile(versionFile)
-		if err == nil {
-			// File found and read successfully. Process the content.
-			fields := strings.Fields(string(data))
-			if len(fields) == 0 {
-				// If the file is empty, this path is considered invalid but we can stop here.
-				return "", fmt.Errorf("invalid version file format (empty file) for %s in path %s", pkgName, repoPath)
-			}
-
-			// Successfully found the version. Return it immediately.
-			return fields[0], nil
-		} else if !os.IsNotExist(err) {
-			// If we hit an error other than "file not found," it's a serious issue
-			// (e.g., permission denied) so we'll record it and continue trying other paths
-			// but keep the error to return if no file is found anywhere.
-			lastErr = fmt.Errorf("could not read version file for %s in path %s: %w", pkgName, repoPath, err)
-		}
-		// If os.IsNotExist(err) is true, we just continue to the next path.
+	pkgDir, err := findPackageDir(pkgName)
+	if err != nil {
+		return "", fmt.Errorf("package %s not found in HOKUTO_PATH: %v", pkgName, err)
 	}
 
-	// 5. If the loop completes without finding a valid version file,
-	// return the last non-FileNotFound error if one occurred, otherwise
-	// return a generic "not found" error.
-	if lastErr != nil {
-		return "", lastErr
+	versionFile := filepath.Join(pkgDir, "version")
+	data, err := os.ReadFile(versionFile)
+	if err != nil {
+		return "", fmt.Errorf("could not read version file for %s at %s: %w", pkgName, versionFile, err)
 	}
-	return "", fmt.Errorf("version file for %s not found in any of the specified paths", pkgName)
+	fields := strings.Fields(string(data))
+	if len(fields) == 0 {
+		return "", fmt.Errorf("invalid version file format (empty file) for %s at %s", pkgName, versionFile)
+	}
+	return fields[0], nil
 }
 
 // getRepoVersion2 reads pkgname/version from repoPaths and returns the version string,
@@ -75,60 +45,27 @@ func getRepoVersion(pkgName string) (string, error) {
 // used for the update check
 
 func getRepoVersion2(pkgName string) (version string, revision string, err error) {
-	// 1. Split the repoPaths string by the colon (':') separator.
-	paths := strings.Split(repoPaths, ":")
-
-	var lastErr error
-
-	// 2. Iterate over all individual repository paths.
-	for _, repoPath := range paths {
-		// Trim any potential whitespace from the path
-		repoPath = strings.TrimSpace(repoPath)
-		if repoPath == "" {
-			continue // Skip empty paths
-		}
-
-		// 3. Construct the full path to the version file.
-		versionFile := filepath.Join(repoPath, pkgName, "version")
-
-		// 4. Attempt to read the file.
-		data, err := os.ReadFile(versionFile)
-		if err == nil {
-			// File found and read successfully. Process the content.
-			fields := strings.Fields(string(data))
-
-			if len(fields) < 1 {
-				// File exists but is empty/invalid
-				return "", "", fmt.Errorf("invalid version file format (missing version) for %s in path %s", pkgName, repoPath)
-			}
-
-			// Extract the version (first field)
-			pkgVersion := fields[0]
-
-			// Extract the revision (second field). If missing, default to "0" or "1"
-			// based on your package system's convention. Assuming default to "1" is safest
-			// to avoid false updates if older packages didn't have a revision number.
-			pkgRevision := "1" // Default revision if only one field is present
-			if len(fields) >= 2 {
-				pkgRevision = fields[1]
-			}
-
-			// Successfully found the version and revision. Return them immediately.
-			return pkgVersion, pkgRevision, nil
-		} else if !os.IsNotExist(err) {
-			// If we hit an error other than "file not found," record it.
-			lastErr = fmt.Errorf("could not read version file for %s in path %s: %w", pkgName, repoPath, err)
-		}
-		// If os.IsNotExist(err) is true, we just continue to the next path.
+	pkgDir, err := findPackageDir(pkgName)
+	if err != nil {
+		return "", "", fmt.Errorf("package %s not found in HOKUTO_PATH: %v", pkgName, err)
 	}
 
-	// 5. If the loop completes without finding a valid version file,
-	// return the last non-FileNotFound error if one occurred, otherwise
-	// return a generic "not found" error.
-	if lastErr != nil {
-		return "", "", lastErr
+	versionFile := filepath.Join(pkgDir, "version")
+	data, err := os.ReadFile(versionFile)
+	if err != nil {
+		return "", "", fmt.Errorf("could not read version file for %s at %s: %w", pkgName, versionFile, err)
 	}
-	return "", "", fmt.Errorf("version file for %s not found in any of the specified paths", pkgName)
+	fields := strings.Fields(string(data))
+	if len(fields) < 1 {
+		return "", "", fmt.Errorf("invalid version file format (missing version) for %s at %s", pkgName, versionFile)
+	}
+	pkgVersion := fields[0]
+	pkgRevision := "1" // Default revision if only one field is present
+	if len(fields) >= 2 {
+		pkgRevision = fields[1]
+	}
+
+	return pkgVersion, pkgRevision, nil
 }
 
 // getBaseRepoPath extracts the base repository path (e.g., "/repo/reponame1")

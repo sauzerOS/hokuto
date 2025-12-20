@@ -264,6 +264,11 @@ func checkPackageExactMatch(pkgName string) bool {
 
 // findPackageDir locates the package source directory in repoPaths.
 func findPackageDir(pkgName string) (string, error) {
+	// Check for versioned package override (e.g., pkg@1.0.0)
+	if dir, ok := versionedPkgDirs[pkgName]; ok {
+		return dir, nil
+	}
+
 	paths := strings.Split(repoPaths, ":")
 	for _, repoPath := range paths {
 		repoPath = strings.TrimSpace(repoPath)

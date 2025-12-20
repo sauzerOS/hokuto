@@ -628,3 +628,162 @@ func handlePreInstallUninstall(pkgName string, cfg *Config, execCtx *Executor) {
 		}
 	}
 }
+
+// prepareVersionedPackage handles package requests with a version (e.g., pkg@1.0.0).
+// It searches the Git history for the specified version, extracts the package files
+// to a temporary directory, and sets an override in versionedPkgDirs.
+func prepareVersionedPackage(arg string) (string, error) {
+	if !strings.Contains(arg, "@") {
+		return arg, nil
+	}
+	parts := strings.SplitN(arg, "@", 2)
+	pkgName := parts[0]
+	targetVersion := parts[1]
+
+	// 1. Find the current package directory to identify the repo
+	pkgDir, err := findPackageDir(pkgName)
+	if err != nil {
+		return arg, fmt.Errorf("could not find base package %s: %w", pkgName, err)
+	}
+
+	// 2. Identify the Git root and relative path
+	gitRootCmd := exec.Command("git", "rev-parse", "--show-toplevel")
+	gitRootCmd.Dir = pkgDir
+	gitRootOut, err := gitRootCmd.Output()
+	if err != nil {
+		return arg, fmt.Errorf("package directory %s is not in a Git repository: %w", pkgDir, err)
+	}
+	gitRoot := strings.TrimSpace(string(gitRootOut))
+
+	relPath, err := filepath.Rel(gitRoot, pkgDir)
+	if err != nil {
+		return arg, fmt.Errorf("failed to determine relative path for package: %w", err)
+	}
+
+	// 3. Search Git history for the version
+	// We look for commits that modified the version file.
+	logCmd := exec.Command("git", "log", "--all", "-S", targetVersion, "--format=%H", "--", filepath.Join(relPath, "version"))
+	logCmd.Dir = gitRoot
+	logOut, err := logCmd.Output()
+	if err != nil {
+		return arg, fmt.Errorf("failed to search git history for %s: %w", arg, err)
+	}
+
+	commits := strings.Fields(string(logOut))
+	var foundCommit string
+	for _, commit := range commits {
+		// Verify the version file at this commit contains the exact target version as the first field
+		showCmd := exec.Command("git", "show", fmt.Sprintf("%s:%s/version", commit, relPath))
+		showCmd.Dir = gitRoot
+		showOut, err := showCmd.Output()
+		if err != nil {
+			continue
+		}
+		fields := strings.Fields(string(showOut))
+		if len(fields) > 0 && fields[0] == targetVersion {
+			foundCommit = commit
+			break
+		}
+	}
+
+	if foundCommit == "" {
+		// Fallback: search all commits for the version file if pickaxe (-S) didn't find it
+		logCmdFallback := exec.Command("git", "log", "--all", "--format=%H", "--", filepath.Join(relPath, "version"))
+		logCmdFallback.Dir = gitRoot
+		logOutFallback, _ := logCmdFallback.Output()
+		commitsFallback := strings.Fields(string(logOutFallback))
+		for _, commit := range commitsFallback {
+			showCmd := exec.Command("git", "show", fmt.Sprintf("%s:%s/version", commit, relPath))
+			showCmd.Dir = gitRoot
+			showOut, err := showCmd.Output()
+			if err != nil {
+				continue
+			}
+			fields := strings.Fields(string(showOut))
+			if len(fields) > 0 && fields[0] == targetVersion {
+				foundCommit = commit
+				break
+			}
+		}
+	}
+
+	if foundCommit == "" {
+		return arg, fmt.Errorf("version %s for package %s not found in Git history", targetVersion, pkgName)
+	}
+
+	// 4. Extract the package files from the commit
+	tmpBase := filepath.Join(HokutoTmpDir, "tmprepo")
+	os.MkdirAll(tmpBase, 0o755)
+
+	finalTmpDir := filepath.Join(tmpBase, fmt.Sprintf("%s-%s-%s", pkgName, targetVersion, foundCommit[:8]))
+	// If already extracted, we can reuse it
+	if _, err := os.Stat(finalTmpDir); err == nil {
+		versionedPkgDirs[pkgName] = finalTmpDir
+		return pkgName, nil
+	}
+
+	if err := os.MkdirAll(finalTmpDir, 0755); err != nil {
+		return arg, fmt.Errorf("failed to create temporary directory %s: %w", finalTmpDir, err)
+	}
+
+	// 5. Extract all tracked files using git ls-tree and git show
+	// This avoids issues with .gitattributes export-ignore or archive settings.
+	lsCmd := exec.Command("git", "ls-tree", "-r", foundCommit+":"+relPath)
+	lsCmd.Dir = gitRoot
+	lsOut, err := lsCmd.Output()
+	if err != nil {
+		return arg, fmt.Errorf("failed to list files in git history for %s: %w", relPath, err)
+	}
+
+	scanner := bufio.NewScanner(bytes.NewReader(lsOut))
+	for scanner.Scan() {
+		line := scanner.Text()
+		// Format: <mode> <type> <hash>\t<file>
+		parts := strings.SplitN(line, "\t", 2)
+		if len(parts) < 2 {
+			continue
+		}
+		infoFields := strings.Fields(parts[0])
+		if len(infoFields) < 3 {
+			continue
+		}
+		modeStr := infoFields[0]
+		fileName := parts[1]
+
+		targetFilePath := filepath.Join(finalTmpDir, fileName)
+		os.MkdirAll(filepath.Dir(targetFilePath), 0o755)
+
+		showCmd := exec.Command("git", "show", fmt.Sprintf("%s:%s/%s", foundCommit, relPath, fileName))
+		showCmd.Dir = gitRoot
+
+		outF, err := os.Create(targetFilePath)
+		if err != nil {
+			return arg, fmt.Errorf("failed to create file %s: %w", targetFilePath, err)
+		}
+
+		showCmd.Stdout = outF
+		if err := showCmd.Run(); err != nil {
+			outF.Close()
+			return arg, fmt.Errorf("failed to extract file %s from git: %w", fileName, err)
+		}
+		outF.Close()
+
+		// Set execution bits if the file was executable in Git
+		// Git file modes: 100644 (normal), 100755 (executable)
+		if modeStr == "100755" {
+			os.Chmod(targetFilePath, 0o755)
+		} else {
+			os.Chmod(targetFilePath, 0o644)
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return arg, fmt.Errorf("error reading git ls-tree output: %w", err)
+	}
+
+	versionedPkgDirs[pkgName] = finalTmpDir
+	colArrow.Print("-> ")
+	colSuccess.Printf("Extracted %s@%s from commit %s into temporary directory\n", pkgName, targetVersion, foundCommit[:8])
+
+	return pkgName, nil
+}

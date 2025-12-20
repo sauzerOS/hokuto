@@ -181,6 +181,34 @@ func Main() {
 	mergeEnvOverrides(cfg)
 	initConfig(cfg)
 
+	// 4.5 Handle versioned package requests (pkg@version)
+	// This allows commands like 'build gcc@1.2.3' to work by extracting the old version from Git history.
+	if len(os.Args) >= 2 {
+		cmd := os.Args[1]
+		// List of commands that support package name arguments and should handle @version
+		versionedSupportedCmds := map[string]bool{
+			"build": true, "b": true, "checksum": true, "c": true, "edit": true, "e": true, "cd": true,
+			"install": true, "i": true, "manifest": true, "m": true, "uninstall": true, "r": true, "remove": true,
+		}
+
+		if versionedSupportedCmds[cmd] {
+			for i := 2; i < len(os.Args); i++ {
+				arg := os.Args[i]
+				// Basic check to see if it's a versioned package request and not a flag or file path
+				if strings.Contains(arg, "@") && !strings.HasPrefix(arg, "-") && !strings.HasSuffix(arg, ".tar.zst") && !strings.Contains(arg, "/") {
+					pkgName, err := prepareVersionedPackage(arg)
+					if err == nil {
+						os.Args[i] = pkgName // Replace gcc@1.2.3 with gcc in Args
+					} else {
+						// Only fail if it's not a direct tarball path (already checked above, but to be safe)
+						fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+						os.Exit(1)
+					}
+				}
+			}
+		}
+	}
+
 	// 5. CHECK IF ROOT PRIVILEGES ARE NEEDED
 	if needsRootPrivileges(os.Args[1:]) {
 		if err := authenticateOnce(); err != nil {

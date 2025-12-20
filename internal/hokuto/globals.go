@@ -24,6 +24,7 @@ var (
 	Installed            string
 	repoPaths            string
 	tmpDir               string
+	HokutoTmpDir         string
 	WantStrip            string
 	WantDebug            string
 	Debug                bool
@@ -48,10 +49,11 @@ var (
 	//go:embed assets/*.png
 	embeddedImages embed.FS
 	//go:embed assets/ca-bundle.crt
-	embeddedAssets embed.FS
-	WorldFile      = "/var/db/hokuto/world"
-	WorldMakeFile  = "/var/db/hokuto/world_make"
-	LockFile       = "/etc/hokuto.lock"
+	embeddedAssets   embed.FS
+	WorldFile        = "/var/db/hokuto/world"
+	WorldMakeFile    = "/var/db/hokuto/world_make"
+	LockFile         = "/etc/hokuto.lock"
+	versionedPkgDirs = make(map[string]string) // pkgName@version -> tmpDir
 )
 
 // color helpers

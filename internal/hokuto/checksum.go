@@ -306,19 +306,9 @@ func verifyOrCreateChecksums(pkgName, pkgDir string, force bool) error {
 
 func hokutoChecksum(pkgName string, force bool, unpack bool) error {
 
-	paths := strings.Split(repoPaths, ":")
-	var pkgDir string
-	found := false
-	for _, repo := range paths {
-		tryPath := filepath.Join(repo, pkgName)
-		if info, err := os.Stat(tryPath); err == nil && info.IsDir() {
-			pkgDir = tryPath
-			found = true
-			break
-		}
-	}
-	if !found {
-		return fmt.Errorf("package %s not found in HOKUTO_PATH", pkgName)
+	pkgDir, err := findPackageDir(pkgName)
+	if err != nil {
+		return fmt.Errorf("package %s not found in HOKUTO_PATH: %v", pkgName, err)
 	}
 
 	if err := fetchSources(pkgName, pkgDir, false); err != nil {

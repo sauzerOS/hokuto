@@ -55,7 +55,7 @@ func getScriptExitCode(logPath string) int {
 
 // sanitizeFlagsForCrossCompilation removes -march=native and -mtune=native from flags
 // and replaces them with appropriate target architecture flags when cross-compiling
-func sanitizeFlagsForCrossCompilation(flags string, targetArch string) string {
+func sanitizeFlagsForCrossCompilation(flags string, _ string) string {
 	if flags == "" {
 		return flags
 	}
@@ -114,19 +114,9 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 	// Track build time
 	startTime := time.Now()
 
-	paths := strings.Split(repoPaths, ":")
-	var pkgDir string
-	found := false
-	for _, repo := range paths {
-		tryPath := filepath.Join(repo, pkgName)
-		if info, err := os.Stat(tryPath); err == nil && info.IsDir() {
-			pkgDir = tryPath
-			found = true
-			break
-		}
-	}
-	if !found {
-		return 0, fmt.Errorf("package %s not found in HOKUTO_PATH", pkgName)
+	pkgDir, err := findPackageDir(pkgName)
+	if err != nil {
+		return 0, fmt.Errorf("package %s not found in HOKUTO_PATH: %v", pkgName, err)
 	}
 
 	// Read version and revision early for lock check
@@ -1725,9 +1715,10 @@ func handleBuildCommand(args []string, cfg *Config) {
 			cfg.Values = make(map[string]string)
 		}
 		cfg.Values["HOKUTO_CROSS_ARCH"] = crossArchValue
-		if crossSystem == "system" {
+		switch crossSystem {
+		case "system":
 			cfg.Values["HOKUTO_CROSS_SYSTEM"] = "1"
-		} else if crossSystem == "simple" {
+		case "simple":
 			cfg.Values["HOKUTO_CROSS_SIMPLE"] = "1"
 		}
 	}
