@@ -4,11 +4,13 @@ package hokuto
 // No behavior changes intended.
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"runtime"
+	"strings"
 	"sync"
 )
 
@@ -19,6 +21,9 @@ import (
 func PostInstallTasks(e *Executor) error {
 	colArrow.Print("-> ")
 	colSuccess.Println("Executing post-install tasks")
+
+	var mu sync.Mutex
+	var errs []error
 	tasks := []struct {
 		name string
 		args []string
@@ -37,6 +42,37 @@ func PostInstallTasks(e *Executor) error {
 		{"gtk-update-icon-cache", []string{"-q", "-t", "-f", "/usr/share/icons/hicolor"}},
 	}
 
+	// Run systemctl, systemd-sysusers, and systemd-tmpfiles sequentially first.
+	// These tools have inter-dependencies and should not be run in parallel.
+	sequentialTasks := []struct {
+		name string
+		args []string
+	}{
+		{"systemctl", []string{"daemon-reload"}},
+		{"systemd-sysusers", nil},
+		{"systemd-tmpfiles", []string{"--create"}},
+	}
+
+	for _, task := range sequentialTasks {
+		if _, err := exec.LookPath(task.name); err == nil {
+			cmd := exec.Command(task.name, task.args...)
+			cmd.Stdout = io.Discard
+			var stderr bytes.Buffer
+			cmd.Stderr = &stderr
+			cmd.Stdin = nil
+			if err := e.Run(cmd); err != nil {
+				debugf("%s failed: %v\n", task.name, err)
+				mu.Lock()
+				errMsg := fmt.Errorf("%s failed: %w", task.name, err)
+				if stderr.Len() > 0 {
+					errMsg = fmt.Errorf("%s failed: %w\n  %s", task.name, err, strings.TrimSpace(stderr.String()))
+				}
+				errs = append(errs, errMsg)
+				mu.Unlock()
+			}
+		}
+	}
+
 	// --- Worker Pool Implementation ---
 
 	// Use a number of workers based on CPU count, but cap it to prevent thrashing.
@@ -49,13 +85,29 @@ func PostInstallTasks(e *Executor) error {
 		numWorkers = 1
 	}
 
+	// Filter out the sequential tasks from the parallel pool
+	parallelTasks := make([]struct {
+		name string
+		args []string
+	}, 0, len(tasks)-len(sequentialTasks))
+	for _, task := range tasks {
+		isSequential := false
+		for _, seqTask := range sequentialTasks {
+			if task.name == seqTask.name {
+				isSequential = true
+				break
+			}
+		}
+		if !isSequential {
+			parallelTasks = append(parallelTasks, task)
+		}
+	}
+
 	jobs := make(chan struct {
 		name string
 		args []string
-	}, len(tasks))
+	}, len(parallelTasks))
 	var wg sync.WaitGroup
-	var mu sync.Mutex
-	var errs []error
 
 	// Start the worker goroutines.
 	for w := 0; w < numWorkers; w++ {
@@ -69,14 +121,20 @@ func PostInstallTasks(e *Executor) error {
 					continue
 				}
 
-				cmd := exec.CommandContext(e.Context, job.name, job.args...)
+				// Create command without context first - e.Run will create the final command with context
+				cmd := exec.Command(job.name, job.args...)
 				cmd.Stdout = io.Discard
-				cmd.Stderr = io.Discard
+				var stderr bytes.Buffer
+				cmd.Stderr = &stderr
 				cmd.Stdin = nil
 
 				if err := e.Run(cmd); err != nil {
 					mu.Lock()
-					errs = append(errs, fmt.Errorf("%s failed: %w", job.name, err))
+					errMsg := fmt.Errorf("%s failed: %w", job.name, err)
+					if stderr.Len() > 0 {
+						errMsg = fmt.Errorf("%s failed: %w\n  %s", job.name, err, strings.TrimSpace(stderr.String()))
+					}
+					errs = append(errs, errMsg)
 					mu.Unlock()
 				}
 
@@ -88,7 +146,7 @@ func PostInstallTasks(e *Executor) error {
 	}
 
 	// Feed all the jobs into the channel.
-	for _, task := range tasks {
+	for _, task := range parallelTasks {
 		jobs <- task
 	}
 	// Close the channel to signal to the workers that no more jobs are coming.

@@ -1040,7 +1040,15 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 	if err != nil {
 		return fmt.Errorf("failed to read version file: %v", err)
 	}
-	version := strings.Fields(string(versionData))[0]
+	fields := strings.Fields(string(versionData))
+	if len(fields) == 0 {
+		return fmt.Errorf("version file for %s is empty", pkgName)
+	}
+	version := fields[0]
+	revision := "1" // Default revision if not specified
+	if len(fields) >= 2 {
+		revision = fields[1]
+	}
 
 	// Build script
 	buildScript := filepath.Join(pkgDir, "build")
@@ -1579,12 +1587,28 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 		return fmt.Errorf("failed to generate manifest: %v", err)
 	}
 
-	debugf("%s rebuilt successfully, output in %s\n", pkgName, outputDir)
+	// Normalize ownership to root:root if the build was NOT run as root.
+	// This ensures that when rsyncStaging copies these files to the root filesystem,
+	// they have the correct system ownership.
+	if !buildExec.ShouldRunAsRoot {
+		debugf("Normalizing ownership of output directory to root:root\n")
+		chownCmd := exec.Command("chown", "-R", "0:0", outputDir)
+		if err := RootExec.Run(chownCmd); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to normalize ownership of %s: %v\n", outputDir, err)
+		}
+	}
+
+	// Generate package archive (using output package name if cross-system is enabled)
+	// This ensures the binary cache is kept in sync with the rebuild.
+	if err := createPackageTarball(outputPkgName, version, revision, outputDir, buildExec); err != nil {
+		return fmt.Errorf("failed to package tarball: %v", err)
+	}
+
 	//Set title to success status
 	finalTitle := fmt.Sprintf("✅ SUCCESS: %s", pkgName)
 	setTerminalTitle(finalTitle)
 
-	// Key difference: Skip tarball creation and cleanup to allow pkgInstall to sync and clean up.
+	// Note: We skip cleanup of outputDir here to allow pkgInstall to sync from it.
 	return nil
 }
 
