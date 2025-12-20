@@ -660,9 +660,9 @@ func prepareVersionedPackage(arg string) (string, error) {
 		return arg, fmt.Errorf("failed to determine relative path for package: %w", err)
 	}
 
-	// 3. Search Git history for the version
-	// We look for commits that modified the version file.
-	logCmd := exec.Command("git", "log", "--all", "-S", targetVersion, "--format=%H", "--", filepath.Join(relPath, "version"))
+	// 3. Search Git history for the newest commit that has this version
+	// We list all commits that touched the package directory, newest first.
+	logCmd := exec.Command("git", "log", "--all", "--format=%H", "--", relPath)
 	logCmd.Dir = gitRoot
 	logOut, err := logCmd.Output()
 	if err != nil {
@@ -672,7 +672,7 @@ func prepareVersionedPackage(arg string) (string, error) {
 	commits := strings.Fields(string(logOut))
 	var foundCommit string
 	for _, commit := range commits {
-		// Verify the version file at this commit contains the exact target version as the first field
+		// Check the version file at this commit
 		showCmd := exec.Command("git", "show", fmt.Sprintf("%s:%s/version", commit, relPath))
 		showCmd.Dir = gitRoot
 		showOut, err := showCmd.Output()
@@ -683,27 +683,6 @@ func prepareVersionedPackage(arg string) (string, error) {
 		if len(fields) > 0 && fields[0] == targetVersion {
 			foundCommit = commit
 			break
-		}
-	}
-
-	if foundCommit == "" {
-		// Fallback: search all commits for the version file if pickaxe (-S) didn't find it
-		logCmdFallback := exec.Command("git", "log", "--all", "--format=%H", "--", filepath.Join(relPath, "version"))
-		logCmdFallback.Dir = gitRoot
-		logOutFallback, _ := logCmdFallback.Output()
-		commitsFallback := strings.Fields(string(logOutFallback))
-		for _, commit := range commitsFallback {
-			showCmd := exec.Command("git", "show", fmt.Sprintf("%s:%s/version", commit, relPath))
-			showCmd.Dir = gitRoot
-			showOut, err := showCmd.Output()
-			if err != nil {
-				continue
-			}
-			fields := strings.Fields(string(showOut))
-			if len(fields) > 0 && fields[0] == targetVersion {
-				foundCommit = commit
-				break
-			}
 		}
 	}
 
