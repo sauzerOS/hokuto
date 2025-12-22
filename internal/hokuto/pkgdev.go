@@ -8,7 +8,59 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 )
+
+func applySubstitutions(content, version, pkgName string) string {
+	sepFunc := func(r rune) bool {
+		return r == '.' || r == '_' || r == '-'
+	}
+	parts := strings.FieldsFunc(version, sepFunc)
+
+	major := ""
+	majorMinor := ""
+	if len(parts) > 0 {
+		major = parts[0]
+		majorMinor = parts[0]
+		if len(parts) > 1 {
+			majorMinor = parts[0] + "." + parts[1]
+		}
+	}
+
+	// SQLite version format: Mmmppee (Major, Minor, Patch, Extra)
+	// Example: 3.51.1 -> 3510100
+	sqliteVer := ""
+	if len(parts) > 0 {
+		var v [4]int
+		for i := 0; i < len(parts) && i < 4; i++ {
+			fmt.Sscanf(parts[i], "%d", &v[i])
+		}
+		sqliteVer = fmt.Sprintf("%d%02d%02d%02d", v[0], v[1], v[2], v[3])
+	}
+
+	r := strings.NewReplacer(
+		"${version}", version,
+		"${version-clean}", strings.ReplaceAll(version, "_", "."),
+		"${version_}", strings.ReplaceAll(version, ".", "_"),
+		"${version-}", strings.ReplaceAll(version, ".", "-"),
+		"${version-major}", major,
+		"${version-major-minor}", majorMinor,
+		"${version-sqlite}", sqliteVer,
+		"${pkgname}", pkgName,
+	)
+	return r.Replace(content)
+}
+
+func runEditor(editor string, files ...string) error {
+	if len(files) == 0 {
+		return nil
+	}
+	cmd := exec.Command(editor, files...)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
+}
 
 func newPackage(pkgName string, targetDir string) error {
 	var pkgDir string
@@ -98,37 +150,67 @@ func editPackage(pkgName string, openAll bool) error {
 	}
 
 	if pkgDirEd == "" {
-		// Instead of creating, just return an error
 		return fmt.Errorf("package %s not found in any repo path", pkgName)
 	}
 
-	// --- Files to open
-	var relFiles []string
-	if openAll {
-		relFiles = []string{"version", "sources", "build", "depends"}
-	} else {
-		relFiles = []string{"version", "sources"}
-	}
+	versionPath := filepath.Join(pkgDirEd, "version")
+	sourcesPath := filepath.Join(pkgDirEd, "sources")
+	dotSourcesPath := filepath.Join(pkgDirEd, ".sources")
 
-	var filesToOpen []string
-	for _, f := range relFiles {
-		full := filepath.Join(pkgDirEd, f)
-		// Ensure file exists
-		if _, err := os.Stat(full); os.IsNotExist(err) {
-			if err := os.WriteFile(full, nil, 0o644); err != nil {
-				return fmt.Errorf("failed to create %s: %v", full, err)
-			}
-		} else if err != nil {
-			return fmt.Errorf("failed to stat %s: %v", full, err)
+	// 1. Open version file in editor (current behaviour)
+	if _, err := os.Stat(versionPath); os.IsNotExist(err) {
+		if err := os.WriteFile(versionPath, nil, 0o644); err != nil {
+			return fmt.Errorf("failed to create %s: %v", versionPath, err)
 		}
-		filesToOpen = append(filesToOpen, full)
+	}
+	if err := runEditor(editor, versionPath); err != nil {
+		return fmt.Errorf("editor failed for version file: %v", err)
 	}
 
-	// Launch editor with all files
-	cmd := exec.Command(editor, filesToOpen...)
-	cmd.Stdin = os.Stdin
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+	// 2. Read .sources and update sources if it exists
+	if _, err := os.Stat(dotSourcesPath); err == nil {
+		versionData, err := os.ReadFile(versionPath)
+		if err != nil {
+			return fmt.Errorf("failed to read version file: %v", err)
+		}
+		versionFields := strings.Fields(string(versionData))
+		if len(versionFields) == 0 {
+			return fmt.Errorf("version file is empty")
+		}
+		version := versionFields[0]
 
-	return cmd.Run()
+		dotSourcesData, err := os.ReadFile(dotSourcesPath)
+		if err != nil {
+			return fmt.Errorf("failed to read .sources file: %v", err)
+		}
+
+		updatedSources := applySubstitutions(string(dotSourcesData), version, pkgName)
+		if err := os.WriteFile(sourcesPath, []byte(updatedSources), 0o644); err != nil {
+			return fmt.Errorf("failed to write updated sources file: %v", err)
+		}
+	} else if _, err := os.Stat(sourcesPath); os.IsNotExist(err) {
+		// Ensure sources exists even if no .sources
+		if err := os.WriteFile(sourcesPath, nil, 0o644); err != nil {
+			return fmt.Errorf("failed to create sources file: %v", err)
+		}
+	}
+
+	// 3. Open sources file in editor for review (and others if openAll)
+	var filesToOpen []string
+	if openAll {
+		filesToOpen = []string{sourcesPath, filepath.Join(pkgDirEd, "build"), filepath.Join(pkgDirEd, "depends")}
+	} else {
+		filesToOpen = []string{sourcesPath}
+	}
+
+	// Ensure files exist
+	for _, f := range filesToOpen {
+		if _, err := os.Stat(f); os.IsNotExist(err) {
+			if err := os.WriteFile(f, nil, 0o644); err != nil {
+				return fmt.Errorf("failed to create %s: %v", f, err)
+			}
+		}
+	}
+
+	return runEditor(editor, filesToOpen...)
 }
