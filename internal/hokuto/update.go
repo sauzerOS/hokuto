@@ -486,7 +486,43 @@ func checkForUpgrades(_ context.Context, cfg *Config) error {
 		colArrow.Print("\n-> ")
 		colSuccess.Printf("Executing update for: %s (%d/%d)\n", pkgName, i+1, totalToUpdate)
 
-		// A. Directly call pkgBuild within the current process
+		// 0. Check for binary package first (Local Cache or Mirror)
+		version, revision, err := getRepoVersion2(pkgName)
+		if err != nil {
+			color.Danger.Printf("Failed to get version/revision for %s: %v\n", pkgName, err)
+			failedPackages = append(failedPackages, pkgName)
+			continue
+		}
+
+		tarballName := fmt.Sprintf("%s-%s-%s.tar.zst", pkgName, version, revision)
+		tarballPath := filepath.Join(BinDir, tarballName)
+
+		foundBinary := false
+		if _, err := os.Stat(tarballPath); err == nil {
+			colArrow.Print("-> ")
+			colSuccess.Printf("Using cached binary package: %s\n", tarballName)
+			foundBinary = true
+		} else if BinaryMirror != "" {
+			if err := fetchBinaryPackage(pkgName, version, revision); err == nil {
+				foundBinary = true
+			}
+		}
+
+		if foundBinary {
+			isCriticalAtomic.Store(1)
+			handlePreInstallUninstall(pkgName, cfg, RootExec)
+			if err := pkgInstall(tarballPath, pkgName, cfg, RootExec, false); err != nil {
+				isCriticalAtomic.Store(0)
+				color.Danger.Printf("Binary installation failed for %s: %v. Falling back to build.\n", pkgName, err)
+			} else {
+				isCriticalAtomic.Store(0)
+				colArrow.Print("-> ")
+				colSuccess.Printf("Package %s updated from binary successfully.\n", pkgName)
+				continue // Successfully updated from binary, move to next package
+			}
+		}
+
+		// A. Fallback: Directly call pkgBuild within the current process
 		// We pass UserExec because pkgBuild itself creates the appropriate
 		// privileged or unprivileged build-specific executor.
 		duration, err := pkgBuild(pkgName, cfg, UserExec, false, i+1, totalToUpdate)
@@ -496,15 +532,8 @@ func checkForUpgrades(_ context.Context, cfg *Config) error {
 			continue // <<< IMPORTANT: Move to the next package on failure
 		}
 		totalUpdateDuration += duration
-		// B. If build is successful, install the package
-		version, revision, err := getRepoVersion2(pkgName)
-		if err != nil {
-			color.Danger.Printf("Failed to get version/revision for %s: %v\n", pkgName, err)
-			failedPackages = append(failedPackages, pkgName)
-			continue
-		}
-		tarballPath := filepath.Join(BinDir, fmt.Sprintf("%s-%s-%s.tar.zst", pkgName, version, revision))
 
+		// B. If build is successful, install the package
 		// Set critical section for the installation phase
 		isCriticalAtomic.Store(1)
 		handlePreInstallUninstall(pkgName, cfg, RootExec)
