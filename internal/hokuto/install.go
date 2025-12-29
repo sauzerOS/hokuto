@@ -7,7 +7,6 @@ import (
 	"bufio"
 	"bytes"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -1019,63 +1018,28 @@ func checkStagingConflicts(pkgName, stagingDir, rootDir, stagingManifest string,
 		}
 	}
 
-	// Helper function to run diff with root executor fallback if permission denied
-	runDiffWithFallback := func(file1, file2 string, outputToStdout bool) error {
-		// Helper to filter binary diff messages
-		printFiltered := func(out string) {
-			if strings.HasPrefix(out, "Binary files") && strings.Contains(out, "differ") {
-				if Debug {
-					fmt.Printf("%s\n", out)
-				}
-				return
-			}
-			if outputToStdout {
-				fmt.Print(out)
-			}
-		}
-
-		diffCmd := exec.Command("diff", "-u", file1, file2)
-		var out bytes.Buffer
-		diffCmd.Stdout = &out
-		diffCmd.Stderr = io.Discard
-
-		// Try with current executor first
-		err := execCtx.Run(diffCmd)
-		// diff returns exit code 1 when files differ (which is normal), >1 for errors
-		if err != nil {
-			// Check if it's a permission issue
-			if strings.Contains(err.Error(), "permission denied") || strings.Contains(out.String(), "Permission denied") {
-				// Try with root executor
-				rootDiffCmd := exec.Command("diff", "-u", file1, file2)
-				var rootOut bytes.Buffer
-				rootDiffCmd.Stdout = &rootOut
-				rootDiffCmd.Stderr = io.Discard
-				if rootErr := RootExec.Run(rootDiffCmd); rootErr == nil {
-					printFiltered(rootOut.String())
-					return nil
-				}
-			}
-			// If diff returns non-zero (files differ), that's expected, just print output
-			// Exit code 1 means files differ (normal), >1 means error
-			if exitError, ok := err.(*exec.ExitError); ok && exitError.ExitCode() == 1 {
-				printFiltered(out.String())
-				return nil
-			}
-			// Other errors - try to print what we have
-			if out.Len() > 0 {
-				printFiltered(out.String())
-			}
-			return nil // Don't fail on diff errors
-		}
-		printFiltered(out.String())
-		return nil
-	}
-
 	stdinReader := bufio.NewReader(os.Stdin)
 	skipAllPrompts := false
-	useOriginalForAll := false // Flag to use original for all remaining alternatives
-	useNewForAll := false      // Flag to use new for all remaining alternatives
+	useOriginalForAll := false  // Flag to use original for all remaining alternatives (unmanaged)
+	useNewForAll := false       // Flag to use new for all remaining alternatives (unmanaged)
+	keepAllConflicts := false   // Flag to keep all conflicting files items (package conflicts)
+	useNewAllConflicts := false // Flag to use new file for all conflicting items (package conflicts)
 
+	// Data structure to collect conflicts grouped by conflicting package
+	type conflictInfo struct {
+		filePath             string
+		stagingFile          string
+		targetFile           string
+		conflictPkg          string
+		isSymlink            bool
+		symlinkTarget        string
+		stagingIsSymlink     bool
+		stagingSymlinkTarget string
+	}
+	conflictsByPkg := make(map[string][]conflictInfo)
+	unmanagedConflicts := []conflictInfo{}
+
+	// First pass: collect all conflicts
 	scanner := bufio.NewScanner(strings.NewReader(string(stagingData)))
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
@@ -1119,176 +1083,175 @@ func checkStagingConflicts(pkgName, stagingDir, rootDir, stagingManifest string,
 		}
 
 		if ownerPkg != "" && ownerPkg != pkgName {
-			// File is owned by another package - apply conflict logic
-			// Only check checksum if we found an owner (avoid expensive checkFileConflict if not needed)
-			conflictPkg, conflictChecksumMatches, isSymlink, symlinkTarget := checkFileConflict(filePath, targetFile, pkgName, rootDir, execCtx)
-			if conflictPkg != "" && conflictChecksumMatches {
-				// Check if staging file (from new package) is a symlink or regular file
-				stagingIsSymlink := false
-				var stagingSymlinkTarget string
-				if stagingInfo, err := os.Lstat(stagingFile); err == nil && stagingInfo.Mode()&os.ModeSymlink != 0 {
-					stagingIsSymlink = true
-					if target, err := os.Readlink(stagingFile); err == nil {
-						stagingSymlinkTarget = target
-					}
+			// File is owned by another package - this is a conflict
+			// Check if the target file is a symlink
+			isSymlink := false
+			var symlinkTarget string
+			if targetInfo, err := os.Lstat(targetFile); err == nil && targetInfo.Mode()&os.ModeSymlink != 0 {
+				isSymlink = true
+				if target, err := os.Readlink(targetFile); err == nil {
+					symlinkTarget = target
 				}
+			}
 
-				// Show conflict-specific prompt
-				runDiffWithFallback(targetFile, stagingFile, true)
-				os.Stdout.Sync()
+			// Check if staging file is a symlink
+			stagingIsSymlink := false
+			var stagingSymlinkTarget string
+			if stagingInfo, err := os.Lstat(stagingFile); err == nil && stagingInfo.Mode()&os.ModeSymlink != 0 {
+				stagingIsSymlink = true
+				if target, err := os.Readlink(stagingFile); err == nil {
+					stagingSymlinkTarget = target
+				}
+			}
 
-				var input string
-				if !yes && !skipAllPrompts {
-					if isSymlink && symlinkTarget != "" {
-						// Existing file is a symlink
-						if stagingIsSymlink && stagingSymlinkTarget != "" {
-							cPrintf(colInfo, "Symlink %s -> %s already installed from %s package: [K]eep %s symlink, [u]se %s symlink: ", filePath, symlinkTarget, conflictPkg, conflictPkg, pkgName)
-						} else {
-							cPrintf(colInfo, "Symlink %s -> %s already installed from %s package: [K]eep %s symlink, [u]se %s file: ", filePath, symlinkTarget, conflictPkg, conflictPkg, pkgName)
-						}
-					} else {
-						// Existing file is a regular file
-						if stagingIsSymlink && stagingSymlinkTarget != "" {
-							cPrintf(colInfo, "File %s already installed from %s package: [K]eep %s file, [u]se %s symlink: ", filePath, conflictPkg, conflictPkg, pkgName)
-						} else {
-							cPrintf(colInfo, "File %s already installed from %s package: [K]eep %s file, [u]se %s file: ", filePath, conflictPkg, conflictPkg, pkgName)
-						}
-					}
-					os.Stdout.Sync()
-					response, err := stdinReader.ReadString('\n')
-					if err != nil {
-						response = "k" // Default to keep on read error
-					}
-					input = strings.TrimSpace(response)
-				}
-				if input == "" {
-					input = "k" // Default to keep if user presses enter or if in --yes mode
-				}
-				switch strings.ToLower(input) {
-				case "k":
-					// Keep the file from the other package - save new file as alternative and delete from staging
-					if err := saveAlternative(pkgName, filePath, conflictPkg, conflictPkg, stagingFile, execCtx); err != nil {
-						debugf("Warning: failed to save alternative: %v\n", err)
-					}
-					rmCmd := exec.Command("rm", "-f", stagingFile)
-					if err := execCtx.Run(rmCmd); err != nil {
-						return fmt.Errorf("failed to remove file from staging %s: %v", stagingFile, err)
-					}
-					// Track this file for manifest removal
-					filesRemovedFromStaging[filePath] = true
-					if isSymlink {
-						debugf("Kept symlink from %s package, saved new file as alternative, removed from staging: %s -> %s\n", conflictPkg, filePath, symlinkTarget)
-					} else {
-						debugf("Kept file from %s package, saved new file as alternative, removed from staging: %s\n", conflictPkg, filePath)
-					}
-					continue
-				case "u":
-					// Use the new file from current package - save existing file as alternative
-					debugf("Saving alternative for %s: pkgName=%s, conflictPkg=%s, targetFile=%s\n", filePath, pkgName, conflictPkg, targetFile)
-					if err := saveAlternative(pkgName, filePath, conflictPkg, conflictPkg, targetFile, execCtx); err != nil {
-						fmt.Fprintf(os.Stderr, "Warning: failed to save alternative for %s: %v\n", filePath, err)
-						debugf("Warning: failed to save alternative: %v\n", err)
-					} else {
-						debugf("Successfully saved alternative for %s\n", filePath)
-					}
-					// Mark as handled if tracking map provided (file stays in staging)
-					if filesHandledInConflict != nil {
-						filesHandledInConflict[filePath] = true
-					}
-					debugf("Using new file from %s, saved existing file from %s as alternative: %s\n", pkgName, conflictPkg, filePath)
-				default:
-					// Invalid input, default to keep
-					if err := saveAlternative(pkgName, filePath, conflictPkg, conflictPkg, stagingFile, execCtx); err != nil {
-						debugf("Warning: failed to save alternative: %v\n", err)
-					}
-					rmCmd := exec.Command("rm", "-f", stagingFile)
-					if err := execCtx.Run(rmCmd); err != nil {
-						return fmt.Errorf("failed to remove file from staging %s: %v", stagingFile, err)
-					}
-					filesRemovedFromStaging[filePath] = true
-					if isSymlink {
-						debugf("Kept symlink from %s package (invalid input), removed from staging: %s -> %s\n", conflictPkg, filePath, symlinkTarget)
-					} else {
-						debugf("Kept file from %s package (invalid input), removed from staging: %s\n", conflictPkg, filePath)
-					}
-					continue
-				}
-			}
-		} else {
-			// File exists but is not owned by any package - save as alternative and ask user which to use
-			runDiffWithFallback(targetFile, stagingFile, true)
-			os.Stdout.Sync()
-
-			var input string
-			// Determine action based on flags or user input
-			if useOriginalForAll {
-				input = "o"
-			} else if useNewForAll {
-				input = "n"
-			} else if !yes && !skipAllPrompts {
-				cPrintf(colInfo, "File %s already exists (not managed by any package): [o]riginal, [n]ew, use [O]riginal for all, use [N]ew for all: ", filePath)
-				os.Stdout.Sync()
-				response, err := stdinReader.ReadString('\n')
-				if err != nil {
-					response = "o" // Default to original on read error
-				}
-				input = strings.TrimSpace(response)
-				// Check for uppercase "O" or "N" for "all" flags before converting to lowercase
-				if input == "O" {
-					useOriginalForAll = true
-					input = "o"
-				} else if input == "N" {
-					useNewForAll = true
-					input = "n"
-				}
-			}
-			if input == "" {
-				input = "o" // Default to original if user presses enter or if in --yes mode
-			}
-			switch strings.ToLower(input) {
-			case "o":
-				// Use original file - save new file (from staging) as alternative
-				debugf("Saving alternative for %s: pkgName=%s, filePath=%s, stagingFile=%s\n", filePath, pkgName, filePath, stagingFile)
-				if err := saveAlternative(pkgName, filePath, pkgName, "no package", stagingFile, execCtx); err != nil {
-					fmt.Fprintf(os.Stderr, "Warning: failed to save alternative for %s: %v\n", filePath, err)
-					debugf("Warning: failed to save alternative: %v\n", err)
-				} else {
-					debugf("Successfully saved alternative for %s\n", filePath)
-				}
-				rmCmd := exec.Command("rm", "-f", stagingFile)
-				if err := execCtx.Run(rmCmd); err != nil {
-					return fmt.Errorf("failed to remove file from staging %s: %v", stagingFile, err)
-				}
-				filesRemovedFromStaging[filePath] = true
-				debugf("Kept existing unmanaged file, saved new file as alternative, removed from staging: %s\n", filePath)
-			case "n":
-				// Use alternative (new file) - save current file (original) as alternative
-				// The new file from current package will be installed, so OriginalPkg should be the current package
-				debugf("Saving alternative for %s: pkgName=%s, filePath=%s, targetFile=%s\n", filePath, pkgName, filePath, targetFile)
-				if err := saveAlternative(pkgName, filePath, "no package", pkgName, targetFile, execCtx); err != nil {
-					fmt.Fprintf(os.Stderr, "Warning: failed to save alternative for %s: %v\n", filePath, err)
-					debugf("Warning: failed to save alternative: %v\n", err)
-				} else {
-					debugf("Successfully saved alternative for %s\n", filePath)
-				}
-				// File stays in staging (will be installed)
-				debugf("Using new file, saved existing file as alternative: %s\n", filePath)
-			default:
-				// Invalid input, default to original
-				if err := saveAlternative(pkgName, filePath, pkgName, "no package", stagingFile, execCtx); err != nil {
-					debugf("Warning: failed to save alternative: %v\n", err)
-				}
-				rmCmd := exec.Command("rm", "-f", stagingFile)
-				if err := execCtx.Run(rmCmd); err != nil {
-					return fmt.Errorf("failed to remove file from staging %s: %v", stagingFile, err)
-				}
-				filesRemovedFromStaging[filePath] = true
-			}
+			conflictsByPkg[ownerPkg] = append(conflictsByPkg[ownerPkg], conflictInfo{
+				filePath:             filePath,
+				stagingFile:          stagingFile,
+				targetFile:           targetFile,
+				conflictPkg:          ownerPkg,
+				isSymlink:            isSymlink,
+				symlinkTarget:        symlinkTarget,
+				stagingIsSymlink:     stagingIsSymlink,
+				stagingSymlinkTarget: stagingSymlinkTarget,
+			})
+		} else if ownerPkg == "" {
+			// File exists but is not owned by any package
+			unmanagedConflicts = append(unmanagedConflicts, conflictInfo{
+				filePath:    filePath,
+				stagingFile: stagingFile,
+				targetFile:  targetFile,
+				conflictPkg: "",
+			})
 		}
 	}
 
 	if err := scanner.Err(); err != nil {
 		return fmt.Errorf("error reading staging manifest: %v", err)
+	}
+
+	// Second pass: prompt once per conflicting package
+	for conflictPkg, conflicts := range conflictsByPkg {
+		var input string
+		// Check batch flags first - if already set, skip prompt
+		if keepAllConflicts {
+			input = "k"
+		} else if useNewAllConflicts {
+			input = "n"
+		} else if !yes && !skipAllPrompts {
+			// Display all conflicting files
+			cPrintf(colWarn, "Conflicting file(s) detected from %s package:\n", conflictPkg)
+			for _, c := range conflicts {
+				colArrow.Print("-> ")
+				colInfo.Println(c.filePath)
+			}
+			cPrintf(colInfo, "[K]eep %s, use [N]ew %s: ", conflictPkg, pkgName)
+			os.Stdout.Sync()
+			response, err := stdinReader.ReadString('\n')
+			if err != nil {
+				response = "k" // Default to keep on read error
+			}
+			input = strings.ToLower(strings.TrimSpace(response))
+			if input == "" {
+				input = "k" // Default to keep
+			}
+			// Set batch flag for remaining conflicts
+			if input == "k" {
+				keepAllConflicts = true
+			} else if input == "n" {
+				useNewAllConflicts = true
+			} else {
+				// Invalid input, default to keep all
+				keepAllConflicts = true
+				input = "k"
+			}
+		} else {
+			input = "k" // Default to keep in --yes mode
+			keepAllConflicts = true
+		}
+
+		// Apply choice to all files in this conflict group
+		for _, c := range conflicts {
+			switch input {
+			case "k":
+				if err := saveAlternative(pkgName, c.filePath, pkgName, c.conflictPkg, c.stagingFile, execCtx); err != nil {
+					debugf("Warning: failed to save alternative: %v\n", err)
+				}
+				rmCmd := exec.Command("rm", "-f", c.stagingFile)
+				if err := execCtx.Run(rmCmd); err != nil {
+					return fmt.Errorf("failed to remove file from staging %s: %v", c.stagingFile, err)
+				}
+				filesRemovedFromStaging[c.filePath] = true
+				debugf("Kept file from %s package, saved new file as alternative: %s\n", c.conflictPkg, c.filePath)
+			case "n":
+				if err := saveAlternative(pkgName, c.filePath, c.conflictPkg, pkgName, c.targetFile, execCtx); err != nil {
+					fmt.Fprintf(os.Stderr, "Warning: failed to save alternative for %s: %v\n", c.filePath, err)
+					debugf("Warning: failed to save alternative: %v\n", err)
+				} else {
+					debugf("Successfully saved alternative for %s\n", c.filePath)
+				}
+				if filesHandledInConflict != nil {
+					filesHandledInConflict[c.filePath] = true
+				}
+				debugf("Using new file from %s, saved existing file from %s as alternative: %s\n", pkgName, c.conflictPkg, c.filePath)
+			}
+		}
+	}
+
+	// Handle unmanaged file conflicts
+	if len(unmanagedConflicts) > 0 {
+		var input string
+		if useOriginalForAll {
+			input = "k"
+		} else if useNewForAll {
+			input = "n"
+		} else if !yes && !skipAllPrompts {
+			cPrintf(colWarn, "Conflicting file(s) detected (unmanaged):\n")
+			for _, c := range unmanagedConflicts {
+				colArrow.Print("-> ")
+				colInfo.Println(c.filePath)
+			}
+			cPrintf(colInfo, "[K]eep original, use [N]ew %s: ", pkgName)
+			os.Stdout.Sync()
+			response, err := stdinReader.ReadString('\n')
+			if err != nil {
+				response = "k"
+			}
+			input = strings.ToLower(strings.TrimSpace(response))
+			if input == "" {
+				input = "k"
+			}
+			if input == "k" {
+				useOriginalForAll = true
+			} else if input == "n" {
+				useNewForAll = true
+			} else {
+				useOriginalForAll = true
+				input = "k"
+			}
+		} else {
+			input = "k"
+			useOriginalForAll = true
+		}
+
+		for _, c := range unmanagedConflicts {
+			switch input {
+			case "k":
+				if err := saveAlternative(pkgName, c.filePath, pkgName, "no package", c.stagingFile, execCtx); err != nil {
+					debugf("Warning: failed to save alternative: %v\n", err)
+				}
+				rmCmd := exec.Command("rm", "-f", c.stagingFile)
+				if err := execCtx.Run(rmCmd); err != nil {
+					return fmt.Errorf("failed to remove file from staging %s: %v", c.stagingFile, err)
+				}
+				filesRemovedFromStaging[c.filePath] = true
+				debugf("Kept existing unmanaged file, saved new file as alternative: %s\n", c.filePath)
+			case "n":
+				if err := saveAlternative(pkgName, c.filePath, "no package", pkgName, c.targetFile, execCtx); err != nil {
+					debugf("Warning: failed to save alternative: %v\n", err)
+				}
+				debugf("Using new file, saved existing file as alternative: %s\n", c.filePath)
+			}
+		}
 	}
 
 	// Remove entries from staging manifest for files that were removed from staging

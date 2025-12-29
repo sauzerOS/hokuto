@@ -14,10 +14,11 @@ import (
 
 // AlternativeInfo stores metadata about an alternative file
 type AlternativeInfo struct {
-	FilePath    string `json:"file_path"`    // Path where the file is installed (e.g., /bin/file1)
-	SourcePkg   string `json:"source_pkg"`   // Package that provided the alternative (or "no package" if unmanaged)
-	OriginalPkg string `json:"original_pkg"` // Original package that owns the file (empty if no owner)
-	IsActive    bool   `json:"is_active"`    // Whether the alternative is currently active
+	FilePath      string `json:"file_path"`                // Path where the file is installed (e.g., /bin/file1)
+	SourcePkg     string `json:"source_pkg"`               // Package that provided the alternative (or "no package" if unmanaged)
+	OriginalPkg   string `json:"original_pkg"`             // Original package that owns the file (empty if no owner)
+	IsActive      bool   `json:"is_active"`                // Whether the alternative is currently active
+	SymlinkTarget string `json:"symlink_target,omitempty"` // Target path if this is a symlink (empty for regular files)
 	// File stat information for restoration (original file's permissions)
 	Mode string `json:"mode"` // Original file permissions in octal (e.g., "0755")
 	UID  int    `json:"uid"`  // Original file User ID
@@ -44,9 +45,24 @@ func saveAlternative(pkgName, filePath, sourcePkg, originalPkg, sourceFile strin
 	altDir := getAlternativesDir(pkgName)
 	debugf("saveAlternative: pkgName=%s, filePath=%s, altDir=%s, sourceFile=%s\n", pkgName, filePath, altDir, sourceFile)
 
-	// Check if source file exists
-	if _, err := os.Stat(sourceFile); os.IsNotExist(err) {
+	// Check if source file exists (use Lstat to not follow symlinks)
+	sourceInfo, err := os.Lstat(sourceFile)
+	if os.IsNotExist(err) {
 		return fmt.Errorf("source file does not exist: %s", sourceFile)
+	}
+	if err != nil {
+		return fmt.Errorf("failed to stat source file: %w", err)
+	}
+
+	// Check if source file is a symlink
+	isSymlink := sourceInfo.Mode()&os.ModeSymlink != 0
+	var symlinkTarget string
+	if isSymlink {
+		symlinkTarget, err = os.Readlink(sourceFile)
+		if err != nil {
+			return fmt.Errorf("failed to read symlink target: %w", err)
+		}
+		debugf("Source file is a symlink: %s -> %s\n", sourceFile, symlinkTarget)
 	}
 
 	// Create directory using executor (may need root permissions)
@@ -62,7 +78,8 @@ func saveAlternative(pkgName, filePath, sourcePkg, originalPkg, sourceFile strin
 	altFilePath := filepath.Join(altDir, altFileName)
 	debugf("Copying %s to %s\n", sourceFile, altFilePath)
 
-	cpCmd := exec.Command("cp", sourceFile, altFilePath)
+	// Use cp -a to preserve symlinks (--no-dereference) and all attributes
+	cpCmd := exec.Command("cp", "-a", sourceFile, altFilePath)
 	if err := execCtx.Run(cpCmd); err != nil {
 		return fmt.Errorf("failed to copy alternative file from %s to %s: %w", sourceFile, altFilePath, err)
 	}
@@ -108,13 +125,14 @@ func saveAlternative(pkgName, filePath, sourcePkg, originalPkg, sourceFile strin
 
 	// Add or update the alternative info
 	alternatives[filePath] = &AlternativeInfo{
-		FilePath:    filePath,
-		SourcePkg:   sourcePkg,
-		OriginalPkg: originalPkg,
-		IsActive:    false, // Not active by default, user needs to switch
-		Mode:        mode,
-		UID:         uid,
-		GID:         gid,
+		FilePath:      filePath,
+		SourcePkg:     sourcePkg,
+		OriginalPkg:   originalPkg,
+		IsActive:      false,         // Not active by default, user needs to switch
+		SymlinkTarget: symlinkTarget, // Empty for regular files, target path for symlinks
+		Mode:          mode,
+		UID:           uid,
+		GID:           gid,
 	}
 
 	// Save metadata - write to temp file first, then copy with executor
@@ -199,8 +217,8 @@ func switchToAlternative(pkgName, filePath string, execCtx *Executor) error {
 	altFilePath := getAlternativeFilePath(pkgName, filePath)
 	targetFile := filepath.Join(rootDir, strings.TrimPrefix(filePath, "/"))
 
-	// Check if alternative file exists
-	if _, err := os.Stat(altFilePath); os.IsNotExist(err) {
+	// Check if alternative file exists (use Lstat to not follow symlinks)
+	if _, err := os.Lstat(altFilePath); os.IsNotExist(err) {
 		return fmt.Errorf("alternative file not found: %s", altFilePath)
 	}
 
@@ -246,7 +264,8 @@ func switchToAlternative(pkgName, filePath string, execCtx *Executor) error {
 		}
 
 		// Backup current file - use root executor (may need root permissions)
-		cpCmd := exec.Command("cp", targetFile, backupFilePath)
+		// Use cp -a to preserve symlinks
+		cpCmd := exec.Command("cp", "-a", targetFile, backupFilePath)
 		if err := RootExec.Run(cpCmd); err != nil {
 			return fmt.Errorf("failed to backup current file: %w", err)
 		}
@@ -293,7 +312,8 @@ func switchToAlternative(pkgName, filePath string, execCtx *Executor) error {
 	}
 
 	// Copy alternative file to target location - use root executor (may need root permissions)
-	cpCmd := exec.Command("cp", altFilePath, targetFile)
+	// Use cp -a to preserve symlinks
+	cpCmd := exec.Command("cp", "-a", altFilePath, targetFile)
 	if err := RootExec.Run(cpCmd); err != nil {
 		return fmt.Errorf("failed to install alternative file: %w", err)
 	}
@@ -385,13 +405,14 @@ func switchToOriginal(pkgName, filePath string, execCtx *Executor) error {
 	backupFilePath := filepath.Join(backupDir, backupFileName)
 	targetFile := filepath.Join(rootDir, strings.TrimPrefix(filePath, "/"))
 
-	// Check if backup exists
-	if _, err := os.Stat(backupFilePath); os.IsNotExist(err) {
+	// Check if backup exists (use Lstat to not follow symlinks)
+	if _, err := os.Lstat(backupFilePath); os.IsNotExist(err) {
 		return fmt.Errorf("original file backup not found: %s", backupFilePath)
 	}
 
 	// Restore original file from backup - use root executor (may need root permissions)
-	cpCmd := exec.Command("cp", backupFilePath, targetFile)
+	// Use cp -a to preserve symlinks
+	cpCmd := exec.Command("cp", "-a", backupFilePath, targetFile)
 	if err := RootExec.Run(cpCmd); err != nil {
 		return fmt.Errorf("failed to restore original file: %w", err)
 	}
@@ -509,13 +530,30 @@ func restoreAlternativesOnUninstall(pkgName string, execCtx *Executor, hRoot str
 
 		if alt.IsActive {
 			// Active: we're using the alternative, need to restore original from backup
-			checkPkg = alt.SourcePkg
-			// Don't restore if the alternative is from the package being uninstalled
-			if checkPkg == pkgName {
-				shouldRestore = false
-			} else if checkPkg == "no package" {
+			// The original file belongs to OriginalPkg
+			if alt.SourcePkg == pkgName {
+				// Alternative is from the package being uninstalled
+				// We should restore the ORIGINAL file (from backup) if OriginalPkg is still available
+				checkPkg = alt.OriginalPkg
+				if checkPkg == "" || checkPkg == "no package" {
+					shouldRestore = true
+				} else {
+					originalPkgDir := filepath.Join(hRoot, "var", "db", "hokuto", "installed", checkPkg)
+					if _, err := os.Stat(originalPkgDir); err == nil {
+						shouldRestore = true
+					}
+				}
+			} else if alt.SourcePkg == "no package" {
+				checkPkg = alt.SourcePkg
 				shouldRestore = true
+			} else if alt.OriginalPkg == pkgName {
+				// The backup contains the package being uninstalled
+				// We should keep the current file (which is from SourcePkg)
+				// Mark current file to keep
+				checkPkg = pkgName
+				shouldRestore = false
 			} else {
+				checkPkg = alt.SourcePkg
 				sourcePkgDir := filepath.Join(hRoot, "var", "db", "hokuto", "installed", checkPkg)
 				if _, err := os.Stat(sourcePkgDir); err == nil {
 					shouldRestore = true
@@ -588,7 +626,8 @@ func restoreAlternativesOnUninstall(pkgName string, execCtx *Executor, hRoot str
 					continue
 				}
 
-				cpCmd := exec.Command("cp", altFilePath, targetFile)
+				// Use cp -a to preserve symlinks
+				cpCmd := exec.Command("cp", "-a", altFilePath, targetFile)
 				if err := RootExec.Run(cpCmd); err != nil {
 					debugf("Warning: failed to restore alternative file for %s: %v\n", filePath, err)
 					continue
@@ -719,9 +758,13 @@ func handleAlternativesCommand(args []string) error {
 		} else {
 			hasInactive = true
 			colArrow.Print("-> ")
-			// When alternative is inactive, current file is from the package storing the alternative (pkgName)
-			// This is the package that installed the file that's currently in use
-			colInfo.Printf("%s using file from %s package\n", filePath, pkgName)
+			// When alternative is inactive, current file is from OriginalPkg (if set) or pkgName
+			// It's the file KEPT or RESTORED to its original place
+			src := pkgName
+			if alt.OriginalPkg != "" {
+				src = alt.OriginalPkg
+			}
+			colInfo.Printf("%s using file from %s package\n", filePath, src)
 		}
 	}
 
