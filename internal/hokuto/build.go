@@ -556,6 +556,15 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 		}
 	}
 
+	// Ensure CROSS_PREFIX is available and defaults to /usr if not set
+	if _, ok := defaults["CROSS_PREFIX"]; !ok {
+		if val, envSet := os.LookupEnv("CROSS_PREFIX"); envSet {
+			defaults["CROSS_PREFIX"] = val
+		} else {
+			defaults["CROSS_PREFIX"] = "/usr"
+		}
+	}
+
 	// Sort keys for deterministic order
 	keys := make([]string, 0, len(defaults))
 	for k := range defaults {
