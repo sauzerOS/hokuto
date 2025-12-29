@@ -110,6 +110,12 @@ func newPackage(pkgName string, targetDir string) error {
 		return fmt.Errorf("failed to create sources file: %w", err)
 	}
 
+	// 4) .sources file: mode 0644, empty
+	dotsourcesPath := filepath.Join(pkgDir, ".sources")
+	if err := os.WriteFile(dotsourcesPath, []byte(""), 0o644); err != nil {
+		return fmt.Errorf("failed to create sources file: %w", err)
+	}
+
 	// Success messages
 	cPrintln(colInfo, "=> Creating build file.")
 	cPrintln(colInfo, "=> Creating version file with ' 1'.")
@@ -167,7 +173,17 @@ func editPackage(pkgName string, openAll bool) error {
 		return fmt.Errorf("editor failed for version file: %v", err)
 	}
 
-	// 2. Read .sources and update sources if it exists
+	// 2. Open .sources in editor
+	if _, err := os.Stat(dotSourcesPath); os.IsNotExist(err) {
+		if err := os.WriteFile(dotSourcesPath, nil, 0o644); err != nil {
+			return fmt.Errorf("failed to create %s: %v", dotSourcesPath, err)
+		}
+	}
+	if err := runEditor(editor, dotSourcesPath); err != nil {
+		return fmt.Errorf("editor failed for .sources file: %v", err)
+	}
+
+	// 3. Read .sources and update sources if it exists
 	if _, err := os.Stat(dotSourcesPath); err == nil {
 		versionData, err := os.ReadFile(versionPath)
 		if err != nil {
@@ -195,7 +211,7 @@ func editPackage(pkgName string, openAll bool) error {
 		}
 	}
 
-	// 3. Open sources file in editor for review (and others if openAll)
+	// 4. Open sources file in editor for review (and others if openAll)
 	var filesToOpen []string
 	if openAll {
 		filesToOpen = []string{sourcesPath, filepath.Join(pkgDirEd, "build"), filepath.Join(pkgDirEd, "depends")}
