@@ -579,9 +579,15 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 	// 1. Define the log file path
 	logPath := filepath.Join(logDir, "build-log.txt")
 	// Ensure logDir exists (already created above, but ensure it's there)
-	// script will create the log file itself
 
-	// Use script command to create a PTY, preserving colors and progress bars
+	// Check if /bin/script exists
+	useScript := false
+	if _, err := os.Stat("/bin/script"); err == nil {
+		useScript = true
+	} else {
+		debugf("/bin/script not found, falling back to direct execution\n")
+	}
+
 	// Build the command string to execute
 	// FIX: We prepend the environment variables to the command string explicitly.
 	// This ensures that even if 'script' spawns a shell that sources .bashrc (resetting flags),
@@ -589,20 +595,39 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 	cmdStr := fmt.Sprintf("cd %s && %s%s %s %s %s",
 		buildDir, envVarsBuilder.String(), buildScript, outputDir, version, pkgName)
 
-	// Use script to create PTY and preserve colors
-	// -q: quiet mode (don't print script start/end messages)
-	// -f: flush output immediately (for real-time viewing)
-	// -c: command to run
-	// script writes the PTY session to the log file automatically
-	// script also outputs to stdout/stderr, which we capture for console
-	cmd := exec.Command("script", "-q", "-f", "-c", cmdStr, logPath)
-	cmd.Dir = buildDir
+	var cmd *exec.Cmd
+	var logFile *os.File
 
-	// Set up environment with color support
+	if useScript {
+		// Use script to create PTY and preserve colors
+		// -q: quiet mode (don't print script start/end messages)
+		// -f: flush output immediately (for real-time viewing)
+		// -c: command to run
+		// script writes the PTY session to the log file automatically
+		// script also outputs to stdout/stderr, which we capture for console
+		cmd = exec.Command("script", "-q", "-f", "-c", cmdStr, logPath)
+		cmd.Dir = buildDir
+	} else {
+		// Fallback: Execute directly with sh
+		cmd = exec.Command("sh", "-c", cmdStr)
+		cmd.Dir = buildDir
+
+		// We need to handle logging manually since we aren't using script
+		var err error
+		logFile, err = os.Create(logPath)
+		if err != nil {
+			return 0, fmt.Errorf("failed to create log file: %w", err)
+		}
+		// Defer close is tricky here because we want to close it after run,
+		// but we can close it at the end of the function or after wait.
+		// For now we'll close it after cmd.Run() returns.
+	}
+
+	// Set up environment
 	cmd.Env = make([]string, len(env))
 	copy(cmd.Env, env)
 
-	// Set TERM environment variable to ensure color support
+	// Set TERM environment variable (even for fallback, though less effective without PTY)
 	cmd.Env = append(cmd.Env, "TERM=xterm-256color")
 
 	// Force color output for common build tools
@@ -610,33 +635,52 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 	cmd.Env = append(cmd.Env, "CLICOLOR_FORCE=1")        // General Unix tools
 	cmd.Env = append(cmd.Env, "FORCE_COLOR=1")           // Node.js tools
 
-	// script writes to the log file automatically (last argument)
-	// script also outputs to stdout/stderr (duplicate of log file content)
-	// Important: script needs valid stdout/stderr to create a PTY properly
-	// When verbose is disabled, redirect to /dev/null to suppress console output
-	// The log file will still contain all the output
-	if buildExec.Interactive || Verbose || Debug {
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-		// Forward stdin in interactive mode so user can respond to prompts
-		if buildExec.Interactive {
-			cmd.Stdin = os.Stdin
+	// Handle Stdout/Stderr and Logging
+	if useScript {
+		// script writes to the log file automatically (last argument)
+		// script also outputs to stdout/stderr (duplicate of log file content)
+		// Important: script needs valid stdout/stderr to create a PTY properly
+		// When verbose is disabled, redirect to /dev/null to suppress console output
+		// The log file will still contain all the output
+		if buildExec.Interactive || Verbose || Debug {
+			cmd.Stdout = os.Stdout
+			cmd.Stderr = os.Stderr
+			// Forward stdin in interactive mode so user can respond to prompts
+			if buildExec.Interactive {
+				cmd.Stdin = os.Stdin
+			}
+		} else {
+			// Suppress console output but give script valid file descriptors
+			devNull, err := os.OpenFile("/dev/null", os.O_WRONLY, 0)
+			if err != nil {
+				return 0, fmt.Errorf("failed to open /dev/null: %w", err)
+			}
+			defer devNull.Close()
+			cmd.Stdout = devNull
+			cmd.Stderr = devNull
 		}
 	} else {
-		// Suppress console output but give script valid file descriptors
-		devNull, err := os.OpenFile("/dev/null", os.O_WRONLY, 0)
-		if err != nil {
-			return 0, fmt.Errorf("failed to open /dev/null: %w", err)
+		// Fallback path: We must write to logFile AND optionally to stdout/stderr
+		var outputWriter io.Writer
+		if buildExec.Interactive || Verbose || Debug {
+			outputWriter = io.MultiWriter(os.Stdout, logFile)
+			// Forward stdin in interactive mode
+			if buildExec.Interactive {
+				cmd.Stdin = os.Stdin
+			}
+		} else {
+			outputWriter = logFile
 		}
-		defer devNull.Close()
-		cmd.Stdout = devNull
-		cmd.Stderr = devNull
+		cmd.Stdout = outputWriter
+		cmd.Stderr = outputWriter
 	}
 
 	var runErr error // Use a single error variable for both paths
 
-	// Run script through Executor to respect ShouldRunAsRoot (for asroot packages)
-	// The Executor handles privilege escalation (sudo) when needed while preserving TTY/PTY access
+	// Run command
+	// Note: For 'script', it always returns 0, so we check the log file for exit code.
+	// For fallback, cmd.Run() returns the actual error if exit code != 0.
+
 	if !buildExec.Interactive {
 		// --- NON-INTERACTIVE PATH: Run with timer and title updates ---
 		setTerminalTitle(fmt.Sprintf("Starting %s", pkgName))
@@ -670,27 +714,32 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 			}
 		}()
 
-		// Run script - use Executor only when root is needed (for asroot packages)
-		// For normal builds, run directly to preserve TTY/PTY access
-		// Note: script always returns 0, but writes the actual exit code to the log file
-		// We need to check the log file for COMMAND_EXIT_CODE
+		// Run
 		if buildExec.ShouldRunAsRoot {
 			if err := buildExec.Run(cmd); err != nil {
-				runErr = fmt.Errorf("build failed: %w", err)
-			} else {
-				// Check the exit code from the log file
-				if exitCode := getScriptExitCode(logPath); exitCode != 0 {
-					runErr = fmt.Errorf("build script exited with code %d", exitCode)
+				// If using script, err might only be about the script launcher failing, not the build itself
+				// If NOT using script, err is the actual build failure
+				if !useScript {
+					runErr = fmt.Errorf("build failed: %w", err)
+				} else {
+					runErr = fmt.Errorf("script execution failed: %w", err)
 				}
 			}
 		} else {
 			if err := cmd.Run(); err != nil {
-				runErr = fmt.Errorf("build failed: %w", err)
-			} else {
-				// Check the exit code from the log file
-				if exitCode := getScriptExitCode(logPath); exitCode != 0 {
-					runErr = fmt.Errorf("build script exited with code %d", exitCode)
+				if !useScript {
+					runErr = fmt.Errorf("build failed: %w", err)
+				} else {
+					runErr = fmt.Errorf("script execution failed: %w", err)
 				}
+			}
+		}
+
+		// Check exit code for script ONLY if runErr is nil so far (or if we want to double check script logic)
+		// If useScript is true, cmd.Run() usually says "success" even if build failed, so we MUST check log.
+		if useScript && runErr == nil {
+			if exitCode := getScriptExitCode(logPath); exitCode != 0 {
+				runErr = fmt.Errorf("build script exited with code %d", exitCode)
 			}
 		}
 
@@ -699,28 +748,35 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 		runWg.Wait()
 
 	} else {
-		// --- INTERACTIVE PATH: Use Executor only when root is needed (for asroot packages)
-		// This gives the child process exclusive control of the terminal.
-		// Note: script always returns 0, but writes the actual exit code to the log file
+		// --- INTERACTIVE PATH ---
 		if buildExec.ShouldRunAsRoot {
 			if err := buildExec.Run(cmd); err != nil {
-				runErr = fmt.Errorf("build failed: %w", err)
-			} else {
-				// Check the exit code from the log file
-				if exitCode := getScriptExitCode(logPath); exitCode != 0 {
-					runErr = fmt.Errorf("build script exited with code %d", exitCode)
+				if !useScript {
+					runErr = fmt.Errorf("build failed: %w", err)
+				} else {
+					runErr = fmt.Errorf("script execution failed: %w", err)
 				}
 			}
 		} else {
 			if err := cmd.Run(); err != nil {
-				runErr = fmt.Errorf("build failed: %w", err)
-			} else {
-				// Check the exit code from the log file
-				if exitCode := getScriptExitCode(logPath); exitCode != 0 {
-					runErr = fmt.Errorf("build script exited with code %d", exitCode)
+				if !useScript {
+					runErr = fmt.Errorf("build failed: %w", err)
+				} else {
+					runErr = fmt.Errorf("script execution failed: %w", err)
 				}
 			}
 		}
+
+		if useScript && runErr == nil {
+			if exitCode := getScriptExitCode(logPath); exitCode != 0 {
+				runErr = fmt.Errorf("build script exited with code %d", exitCode)
+			}
+		}
+	}
+
+	// Close log file if we opened it manually
+	if logFile != nil {
+		logFile.Close()
 	}
 
 	if runErr != nil {
