@@ -621,7 +621,7 @@ func restoreAlternativesOnUninstall(pkgName string, execCtx *Executor, hRoot str
 				altFilePath := getAlternativeFilePath(pkgName, filePath)
 				targetFile := filepath.Join(hRoot, strings.TrimPrefix(filePath, "/"))
 
-				if _, err := os.Stat(altFilePath); os.IsNotExist(err) {
+				if _, err := os.Lstat(altFilePath); os.IsNotExist(err) {
 					debugf("Warning: alternative file not found for %s: %s\n", filePath, altFilePath)
 					continue
 				}
