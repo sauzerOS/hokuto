@@ -362,6 +362,16 @@ func createPackageTarball(pkgName, pkgVer, pkgRev, outputDir string, execCtx *Ex
 
 	// --- Try system tar first ---
 	if _, err := exec.LookPath("tar"); err == nil {
+		// FIX: Correct ownership of the root directory '.' in the archive.
+		// If we are building as root, the outputDir itself might still be owned by the user who started the build.
+		// We must ensure the root of the package is owned by root:root.
+		if execCtx.ShouldRunAsRoot {
+			chownCmd := exec.Command("chown", "0:0", outputDir)
+			if err := execCtx.Run(chownCmd); err != nil {
+				return fmt.Errorf("failed to chown outputDir to root: %v", err)
+			}
+		}
+
 		args := []string{"--zstd", "-cf", tarballPath, "-C", outputDir, "."}
 		if !execCtx.ShouldRunAsRoot {
 			args = append(args, "--owner=0", "--group=0", "--numeric-owner")

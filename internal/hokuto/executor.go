@@ -74,7 +74,8 @@ func (e *Executor) ensureSudo() error {
 // and calls ensureSudo() to avoid unnecessary password prompts.
 func (e *Executor) Run(cmd *exec.Cmd) error {
 	// --- Phase 0: wire up stdio ---
-	if cmd.Stdin == nil {
+	// --- Phase 0: wire up stdio ---
+	if cmd.Stdin == nil && e.Interactive {
 		cmd.Stdin = os.Stdin
 	}
 	if cmd.Stdout == nil {
