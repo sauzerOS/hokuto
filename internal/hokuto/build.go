@@ -607,144 +607,187 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 	var cmd *exec.Cmd
 	var logFile *os.File
 
-	if useScript {
-		// Use script to create PTY and preserve colors
-		// -q: quiet mode (don't print script start/end messages)
-		// -f: flush output immediately (for real-time viewing)
-		// -c: command to run
-		// script writes the PTY session to the log file automatically
-		// script also outputs to stdout/stderr, which we capture for console
-		cmd = exec.Command("script", "-q", "-f", "-c", cmdStr, logPath)
-		cmd.Dir = buildDir
-	} else {
-		// Fallback: Execute directly with sh
-		cmd = exec.Command("sh", "-c", cmdStr)
-		cmd.Dir = buildDir
+	var runErr error // Use a single error variable for both paths, declared outside loop for later use
 
-		// We need to handle logging manually since we aren't using script
-		var err error
-		logFile, err = os.Create(logPath)
-		if err != nil {
-			return 0, fmt.Errorf("failed to create log file: %w", err)
-		}
-		// Defer close is tricky here because we want to close it after run,
-		// but we can close it at the end of the function or after wait.
-		// For now we'll close it after cmd.Run() returns.
-	}
-
-	// Set up environment
-	cmd.Env = make([]string, len(env))
-	copy(cmd.Env, env)
-
-	// Set TERM environment variable (even for fallback, though less effective without PTY)
-	cmd.Env = append(cmd.Env, "TERM=xterm-256color")
-
-	// Force color output for common build tools
-	cmd.Env = append(cmd.Env, "CARGO_TERM_COLOR=always") // Rust/Cargo
-	cmd.Env = append(cmd.Env, "CLICOLOR_FORCE=1")        // General Unix tools
-	cmd.Env = append(cmd.Env, "FORCE_COLOR=1")           // Node.js tools
-
-	// Handle Stdout/Stderr and Logging
-	if useScript {
-		// script writes to the log file automatically (last argument)
-		// script also outputs to stdout/stderr (duplicate of log file content)
-		// Important: script needs valid stdout/stderr to create a PTY properly
-		// When verbose is disabled, redirect to /dev/null to suppress console output
-		// The log file will still contain all the output
-		if buildExec.Interactive || Verbose || Debug {
-			cmd.Stdout = os.Stdout
-			cmd.Stderr = os.Stderr
-			// Forward stdin in interactive mode so user can respond to prompts
-			if buildExec.Interactive {
-				cmd.Stdin = os.Stdin
-			}
+	// Loop for fallback mechanism: if script fails, retry without it
+	for {
+		if useScript {
+			// Use script to create PTY and preserve colors
+			// -q: quiet mode (don't print script start/end messages)
+			// -f: flush output immediately (for real-time viewing)
+			// -c: command to run
+			// script writes the PTY session to the log file automatically
+			// script also outputs to stdout/stderr, which we capture for console
+			cmd = exec.Command("script", "-q", "-f", "-c", cmdStr, logPath)
+			cmd.Dir = buildDir
 		} else {
-			// Suppress console output but give script valid file descriptors
-			devNull, err := os.OpenFile("/dev/null", os.O_WRONLY, 0)
+			// Fallback: Execute directly with sh
+			cmd = exec.Command("sh", "-c", cmdStr)
+			cmd.Dir = buildDir
+
+			// We need to handle logging manually since we aren't using script
+			// Close previous logFile if it exists (though it shouldn't in this flow)
+			if logFile != nil {
+				logFile.Close()
+			}
+			var err error
+			logFile, err = os.Create(logPath)
 			if err != nil {
-				return 0, fmt.Errorf("failed to open /dev/null: %w", err)
+				return 0, fmt.Errorf("failed to create log file: %w", err)
 			}
-			defer devNull.Close()
-			cmd.Stdout = devNull
-			cmd.Stderr = devNull
+			// Defer close is tricky here because we want to close it after run,
+			// but we can close it at the end of the function or after wait.
+			// For now we'll close it after cmd.Run() returns.
 		}
-	} else {
-		// Fallback path: We must write to logFile AND optionally to stdout/stderr
-		var outputWriter io.Writer
-		if buildExec.Interactive || Verbose || Debug {
-			outputWriter = io.MultiWriter(os.Stdout, logFile)
-			// Forward stdin in interactive mode
-			if buildExec.Interactive {
-				cmd.Stdin = os.Stdin
+
+		// Set up environment
+		cmd.Env = make([]string, len(env))
+		copy(cmd.Env, env)
+
+		// Set TERM environment variable (even for fallback, though less effective without PTY)
+		cmd.Env = append(cmd.Env, "TERM=xterm-256color")
+
+		// Force color output for common build tools
+		cmd.Env = append(cmd.Env, "CARGO_TERM_COLOR=always") // Rust/Cargo
+		cmd.Env = append(cmd.Env, "CLICOLOR_FORCE=1")        // General Unix tools
+		cmd.Env = append(cmd.Env, "FORCE_COLOR=1")           // Node.js tools
+
+		// Handle Stdout/Stderr and Logging
+		if useScript {
+			// script writes to the log file automatically (last argument)
+			// script also outputs to stdout/stderr (duplicate of log file content)
+			// Important: script needs valid stdout/stderr to create a PTY properly
+			// When verbose is disabled, redirect to /dev/null to suppress console output
+			// The log file will still contain all the output
+			if buildExec.Interactive || Verbose || Debug {
+				cmd.Stdout = os.Stdout
+				cmd.Stderr = os.Stderr
+				// Forward stdin in interactive mode so user can respond to prompts
+				if buildExec.Interactive {
+					cmd.Stdin = os.Stdin
+				}
+			} else {
+				// Suppress console output but give script valid file descriptors
+				devNull, err := os.OpenFile("/dev/null", os.O_WRONLY, 0)
+				if err != nil {
+					return 0, fmt.Errorf("failed to open /dev/null: %w", err)
+				}
+				defer devNull.Close()
+				cmd.Stdout = devNull
+				cmd.Stderr = devNull
 			}
 		} else {
-			outputWriter = logFile
+			// Fallback path: We must write to logFile AND optionally to stdout/stderr
+			var outputWriter io.Writer
+			if buildExec.Interactive || Verbose || Debug {
+				outputWriter = io.MultiWriter(os.Stdout, logFile)
+				// Forward stdin in interactive mode
+				if buildExec.Interactive {
+					cmd.Stdin = os.Stdin
+				}
+			} else {
+				outputWriter = logFile
+			}
+			cmd.Stdout = outputWriter
+			cmd.Stderr = outputWriter
 		}
-		cmd.Stdout = outputWriter
-		cmd.Stderr = outputWriter
-	}
 
-	var runErr error // Use a single error variable for both paths
+		// Reset runErr for this attempt
+		runErr = nil
 
-	// Run command
-	// Note: For 'script', it always returns 0, so we check the log file for exit code.
-	// For fallback, cmd.Run() returns the actual error if exit code != 0.
+		// Run command
+		// Note: For 'script', it always returns 0, so we check the log file for exit code.
+		// For fallback, cmd.Run() returns the actual error if exit code != 0.
 
-	if !buildExec.Interactive {
-		// --- NON-INTERACTIVE PATH: Run with timer and title updates ---
-		setTerminalTitle(fmt.Sprintf("Starting %s", pkgName))
-		doneCh := make(chan struct{})
-		var runWg sync.WaitGroup
-		runWg.Add(1)
+		if !buildExec.Interactive {
+			// --- NON-INTERACTIVE PATH: Run with timer and title updates ---
+			setTerminalTitle(fmt.Sprintf("Starting %s", pkgName))
+			doneCh := make(chan struct{})
+			var runWg sync.WaitGroup
+			runWg.Add(1)
 
-		go func() {
-			defer runWg.Done()
-			ticker := time.NewTicker(time.Second)
-			defer ticker.Stop()
-			for {
-				select {
-				case <-ticker.C:
-					elapsed := time.Since(startTime).Truncate(time.Second)
-					title := fmt.Sprintf("Building: %s (%d/%d) elapsed: %s", pkgName, currentIndex, totalCount, elapsed)
-					setTerminalTitle(title)
-					// Only print elapsed time to console if not in verbose mode
-					// In verbose mode, the build output is already visible, so we only update the title
-					if !Verbose {
-						colArrow.Print("-> ")
-						colSuccess.Printf("Building %s elapsed: %s\r", pkgName, elapsed)
+			go func() {
+				defer runWg.Done()
+				ticker := time.NewTicker(time.Second)
+				defer ticker.Stop()
+				for {
+					select {
+					case <-ticker.C:
+						elapsed := time.Since(startTime).Truncate(time.Second)
+						title := fmt.Sprintf("Building: %s (%d/%d) elapsed: %s", pkgName, currentIndex, totalCount, elapsed)
+						setTerminalTitle(title)
+						// Only print elapsed time to console if not in verbose mode
+						// In verbose mode, the build output is already visible, so we only update the title
+						if !Verbose {
+							colArrow.Print("-> ")
+							colSuccess.Printf("Building %s elapsed: %s\r", pkgName, elapsed)
+						}
+
+					case <-doneCh:
+						fmt.Print("\r")
+						return
+					case <-buildExec.Context.Done():
+						return
 					}
+				}
+			}()
 
-				case <-doneCh:
-					fmt.Print("\r")
-					return
-				case <-buildExec.Context.Done():
-					return
+			// Run
+			if buildExec.ShouldRunAsRoot {
+				if err := buildExec.Run(cmd); err != nil {
+					// If using script, err might only be about the script launcher failing, not the build itself
+					// If NOT using script, err is the actual build failure
+					if !useScript {
+						runErr = fmt.Errorf("build failed: %w", err)
+					} else {
+						runErr = fmt.Errorf("script execution failed: %w", err)
+					}
+				}
+			} else {
+				if err := cmd.Run(); err != nil {
+					if !useScript {
+						runErr = fmt.Errorf("build failed: %w", err)
+					} else {
+						runErr = fmt.Errorf("script execution failed: %w", err)
+					}
 				}
 			}
-		}()
 
-		// Run
-		if buildExec.ShouldRunAsRoot {
-			if err := buildExec.Run(cmd); err != nil {
-				// If using script, err might only be about the script launcher failing, not the build itself
-				// If NOT using script, err is the actual build failure
-				if !useScript {
-					runErr = fmt.Errorf("build failed: %w", err)
-				} else {
-					runErr = fmt.Errorf("script execution failed: %w", err)
-				}
-			}
+			// Stop ticker goroutine and wait.
+			close(doneCh)
+			runWg.Wait()
+
 		} else {
-			if err := cmd.Run(); err != nil {
-				if !useScript {
-					runErr = fmt.Errorf("build failed: %w", err)
-				} else {
-					runErr = fmt.Errorf("script execution failed: %w", err)
+			// --- INTERACTIVE PATH ---
+			if buildExec.ShouldRunAsRoot {
+				if err := buildExec.Run(cmd); err != nil {
+					if !useScript {
+						runErr = fmt.Errorf("build failed: %w", err)
+					} else {
+						runErr = fmt.Errorf("script execution failed: %w", err)
+					}
+				}
+			} else {
+				if err := cmd.Run(); err != nil {
+					if !useScript {
+						runErr = fmt.Errorf("build failed: %w", err)
+					} else {
+						runErr = fmt.Errorf("script execution failed: %w", err)
+					}
 				}
 			}
 		}
 
-		// Check exit code for script ONLY if runErr is nil so far (or if we want to double check script logic)
+		// CHECK FOR FALLBACK CONDITION
+		// If we used script and it failed (runErr != nil), it means script itself failed (e.g. no PTY).
+		// We should try again without script.
+		if useScript && runErr != nil {
+			debugf("Script execution failed (%v), falling back to direct execution...\n", runErr)
+			useScript = false
+			continue // Retry loop
+		}
+
+		// Check exit code for script ONLY if runErr is nil so far
 		// If useScript is true, cmd.Run() usually says "success" even if build failed, so we MUST check log.
 		if useScript && runErr == nil {
 			if exitCode := getScriptExitCode(logPath); exitCode != 0 {
@@ -752,35 +795,8 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 			}
 		}
 
-		// Stop ticker goroutine and wait.
-		close(doneCh)
-		runWg.Wait()
-
-	} else {
-		// --- INTERACTIVE PATH ---
-		if buildExec.ShouldRunAsRoot {
-			if err := buildExec.Run(cmd); err != nil {
-				if !useScript {
-					runErr = fmt.Errorf("build failed: %w", err)
-				} else {
-					runErr = fmt.Errorf("script execution failed: %w", err)
-				}
-			}
-		} else {
-			if err := cmd.Run(); err != nil {
-				if !useScript {
-					runErr = fmt.Errorf("build failed: %w", err)
-				} else {
-					runErr = fmt.Errorf("script execution failed: %w", err)
-				}
-			}
-		}
-
-		if useScript && runErr == nil {
-			if exitCode := getScriptExitCode(logPath); exitCode != 0 {
-				runErr = fmt.Errorf("build script exited with code %d", exitCode)
-			}
-		}
+		// If we get here, valid attempt completed (success or failure wasn't a script-system-failure)
+		break
 	}
 
 	// Close log file if we opened it manually
