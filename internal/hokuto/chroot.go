@@ -25,7 +25,10 @@ func (e *Executor) ExecuteChroot(targetDir string, cmdArgs []string) (int, error
 		unitName := "hokuto-chroot-" + filepath.Base(targetDir) + "-" + suffix
 		sdArgs := []string{
 			"systemd-run", "--pty",
-			"--setenv=TERM=xterm",
+			"--setenv=TERM=xterm-256color",
+			"--setenv=HOME=/root",
+			"--setenv=SHELL=/bin/bash",
+			"--setenv=PATH=/usr/sbin:/usr/bin:/sbin:/bin",
 			"--unit=" + unitName,
 			"--description=hokuto chroot " + targetDir,
 			"--property=RootDirectory=" + targetDir,
@@ -50,6 +53,15 @@ func (e *Executor) ExecuteChroot(targetDir string, cmdArgs []string) (int, error
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
+
+	// Set default environment variables for the chroot session.
+	// This ensures commands like 'cd' work (HOME) and TTY applications behave correctly (TERM).
+	cmd.Env = []string{
+		"HOME=/root",
+		"TERM=xterm-256color",
+		"PATH=/usr/sbin:/usr/bin:/sbin:/bin",
+		"SHELL=/bin/bash",
+	}
 
 	if err := e.Run(cmd); err != nil {
 		return 1, fmt.Errorf("error running chroot fallback: %w", err)
@@ -154,16 +166,17 @@ func runChrootCommand(args []string, execCtx *Executor) (exitCode int) {
 	}
 
 	// 5. /dev/pts (devpts)
-	if err := m("devpts", "dev/pts", "devpts", "mode=0620,gid=5,nosuid,noexec", false); err != nil {
+	// Added ptmxmode=0666 to ensure the ptmx node in devpts is accessible.
+	if err := m("devpts", "dev/pts", "devpts", "mode=0620,gid=5,nosuid,noexec,ptmxmode=0666", false); err != nil {
 		fmt.Printf("[FATAL] Failed to mount /dev/pts: %v\n", err)
 		return
 	}
 
 	// 6. Bind mount essential TTY/device nodes (The ioctl fix)
-	if err := m("/dev/ptmx", "dev/ptmx", "", "", true); err != nil { // <-- This now correctly creates a file placeholder
-		fmt.Printf("[FATAL] Failed to bind /dev/ptmx: %v\n", err)
-		return
-	}
+	// NOTE: We do NOT bind mount /dev/ptmx anymore. We rely on the /dev/ptmx node provided
+	// by the devtmpfs mount at /dev, which should point to the correct PTY subsystem.
+	// Binding the host's /dev/ptmx can cause "No such file or directory" errors if
+	// the chroot's devpts instance doesn't match the host's expectation.
 	if err := m("/dev/tty", "dev/tty", "", "", true); err != nil {
 		fmt.Printf("[FATAL] Failed to bind /dev/tty: %v\n", err)
 		return
