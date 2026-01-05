@@ -36,7 +36,7 @@ func printHelp() {
 		{"list, ls", "[pkg]", "List installed packages, optionally filter by name"},
 		{"checksum, c", "<pkg>", "Fetch sources and generate checksum file for a package. -f (force redwonload of sources)"},
 		{"build, b", "<pkg...>", "Build package(s). -a (auto-install), -i (half cpu cores), -ii (one cpu core), --alldeps"},
-		{"install, i", "<pkg...>", "Install pre-built packages from the binary cache or a specified .tar.zst file"},
+		{"install, i", "<pkg...>", "Install pre-built packages from the binary cache or a specified .tar.zst file. -nodeps (ignore dependencies)"},
 		{"uninstall, r", "<pkg...>", "Uninstall package(s). -f (force), -y (skip confirmation)"},
 		{"update, u", "[options]", "Update repositories and check for upgrades. Options: -i (half cpu cores), -ii (one cpu core)"},
 		{"manifest, m", "<pkg>", "Show the file list for an installed package"},
@@ -380,6 +380,7 @@ func Main() {
 		var yes = installCmd.Bool("y", false, "Assume 'yes' to all prompts and overwrite modified files.")
 		var yesLong = installCmd.Bool("yes", false, "Assume 'yes' to all prompts and overwrite modified files.")
 		var force = installCmd.Bool("force", false, "Install even if package is already installed.")
+		var nodeps = installCmd.Bool("nodeps", false, "Ignore dependencies.")
 
 		if err := installCmd.Parse(os.Args[2:]); err != nil {
 			fmt.Fprintf(os.Stderr, "Error parsing install flags: %v\n", err)
@@ -429,20 +430,31 @@ func Main() {
 			pkgName := arg
 			userRequestedMap[pkgName] = true
 
-			// Recursively find missing dependencies (always check if deps are installed, force doesn't apply to deps)
-			if err := resolveBinaryDependencies(pkgName, visited, &installPlan, false, effectiveYes); err != nil {
-				// Skip dependency resolution if source not found (e.g., renamed cross-system packages)
-				// The package can still be installed from tarball without source
-				if strings.Contains(err.Error(), "source not found in HOKUTO_PATH") {
-					// Add the package to install plan even without dependency resolution
-					// (it will be installed from tarball if available)
-					if !checkPackageExactMatch(pkgName) {
-						installPlan = append(installPlan, pkgName)
-					}
-					continue
+			if *nodeps {
+				// Bypass dependency resolution if -nodeps is set
+				// But still need to add the package itself if not installed, or if force is used
+				if !checkPackageExactMatch(pkgName) || *force {
+					installPlan = append(installPlan, pkgName)
+				} else {
+					colArrow.Print("-> ")
+					colSuccess.Printf("Package %s is already installed. Skipping (use -force to reinstall).\n", pkgName)
 				}
-				fmt.Fprintf(os.Stderr, "Error resolving dependencies for %s: %v\n", pkgName, err)
-				os.Exit(1)
+			} else {
+				// Recursively find missing dependencies (always check if deps are installed, force doesn't apply to deps)
+				if err := resolveBinaryDependencies(pkgName, visited, &installPlan, false, effectiveYes); err != nil {
+					// Skip dependency resolution if source not found (e.g., renamed cross-system packages)
+					// The package can still be installed from tarball without source
+					if strings.Contains(err.Error(), "source not found in HOKUTO_PATH") {
+						// Add the package to install plan even without dependency resolution
+						// (it will be installed from tarball if available)
+						if !checkPackageExactMatch(pkgName) {
+							installPlan = append(installPlan, pkgName)
+						}
+						continue
+					}
+					fmt.Fprintf(os.Stderr, "Error resolving dependencies for %s: %v\n", pkgName, err)
+					os.Exit(1)
+				}
 			}
 
 			// If force is enabled, add the user-requested package even if it's already installed
