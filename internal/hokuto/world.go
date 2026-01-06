@@ -324,21 +324,33 @@ func handleOrphanCleanup(cfg *Config) {
 	if len(orphans) > 0 {
 		sort.Strings(orphans)
 		colArrow.Print("-> ")
-		colWarn.Printf("Found %d runtime orphan package(s).\n", len(orphans))
+		colWarn.Printf("Found %d runtime orphan package(s):\n", len(orphans))
+		colArrow.Print("-> ")
+		fmt.Println(strings.Join(orphans, " "))
 
-		for _, pkg := range orphans {
-			if askForConfirmation(colWarn, "Remove runtime orphan %s?", pkg) {
+		var toRemove []string
+		if askForConfirmation(colArrow, "Remove all?") {
+			toRemove = orphans
+		} else {
+			for _, pkg := range orphans {
+				if askForConfirmation(colArrow, "Remove %s?", pkg) {
+					toRemove = append(toRemove, pkg)
+				}
+			}
+		}
+
+		if len(toRemove) > 0 {
+			for i, pkg := range toRemove {
 				colArrow.Print("-> ")
 				colSuccess.Printf("Removing: ")
-				colNote.Printf("%s\n", pkg)
+				colNote.Printf("%s", pkg)
+				colSuccess.Printf(" [%d/%d]\n", i+1, len(toRemove))
 				if err := pkgUninstall(pkg, cfg, RootExec, true, true); err != nil {
 					color.Danger.Printf("Failed to remove %s: %v\n", pkg, err)
 				} else {
 					removeFromWorld(pkg)
 					removeFromWorldMake(pkg) // Remove from make world too if present
 				}
-			} else {
-				cPrintf(colInfo, "Skipped %s\n", pkg)
 			}
 		}
 	} else {
@@ -359,13 +371,27 @@ func handleOrphanCleanup(cfg *Config) {
 	if len(makeOrphans) > 0 {
 		sort.Strings(makeOrphans)
 		colArrow.Print("-> ")
-		colWarn.Printf("Found %d unneeded build dependency package(s).\n", len(makeOrphans))
+		colWarn.Printf("Found %d unneeded build dependency package(s):\n", len(makeOrphans))
+		colArrow.Print("-> ")
+		fmt.Println(strings.Join(makeOrphans, " "))
 
-		for _, pkg := range makeOrphans {
-			if askForConfirmation(colWarn, "Remove build dependency %s?", pkg) {
+		var toRemove []string
+		if askForConfirmation(colArrow, "Remove all?") {
+			toRemove = makeOrphans
+		} else {
+			for _, pkg := range makeOrphans {
+				if askForConfirmation(colArrow, "Remove build dependency %s?", pkg) {
+					toRemove = append(toRemove, pkg)
+				}
+			}
+		}
+
+		if len(toRemove) > 0 {
+			for i, pkg := range toRemove {
 				colArrow.Print("-> ")
 				colSuccess.Printf("Removing: ")
-				colNote.Printf("%s\n", pkg)
+				colNote.Printf("%s", pkg)
+				colSuccess.Printf(" [%d/%d]\n", i+1, len(toRemove))
 				if err := pkgUninstall(pkg, cfg, RootExec, true, true); err != nil {
 					color.Danger.Printf("Failed to remove %s: %v\n", pkg, err)
 				} else {
@@ -373,8 +399,6 @@ func handleOrphanCleanup(cfg *Config) {
 					// Also try to remove from world just in case of state desync
 					removeFromWorld(pkg)
 				}
-			} else {
-				cPrintf(colInfo, "Skipped %s\n", pkg)
 			}
 		}
 	} else {
