@@ -362,57 +362,41 @@ func hokutoChecksum(pkgName string, force bool, unpack bool) error {
 // It includes a security check to prevent path traversal attacks (Zip Slip).
 
 func b3sum(path string, execCtx *Executor) (string, error) {
-	// First try the system b3sum binary
-	if _, err := exec.LookPath("b3sum"); err == nil {
-		cmd := exec.Command("b3sum", path)
-
-		var out bytes.Buffer
-		cmd.Stdout = &out
-		// ** FIX: Discard stderr to silence "No such file or directory" messages. **
-		// The error will still be propagated by execCtx.Run if b3sum fails.
-		cmd.Stderr = io.Discard
-
-		if err := execCtx.Run(cmd); err == nil {
-			fields := strings.Fields(out.String())
-			if len(fields) > 0 {
-				return fields[0], nil
-			}
-			// fall through to internal if no output
+	// 1. Try to read directly (Native Go).
+	// This covers:
+	// - User running as themselves reading their own files.
+	// - User running as themselves reading world-readable system files (install checks).
+	// - Root running as root reading anything.
+	f, err := os.Open(path)
+	if err == nil {
+		defer f.Close()
+		h := blake3.New(32, nil)
+		if _, err := io.Copy(h, f); err == nil {
+			return fmt.Sprintf("%x", h.Sum(nil)), nil
 		}
-		// If system b3sum fails, we'll fall through to the internal implementation.
 	}
 
-	// Fallback: internal Go BLAKE3 with privilege awareness
-	if execCtx.ShouldRunAsRoot {
+	// 2. Fallback: Privileged Read via Executor
+	// Only if native read failed due to permissions AND we can escalate.
+	if err != nil && os.IsPermission(err) && execCtx.ShouldRunAsRoot {
 		catCmd := exec.Command("cat", path)
 		var out bytes.Buffer
 		catCmd.Stdout = &out
-		// Also discard stderr for cat, in case the file disappears.
 		catCmd.Stderr = io.Discard
 
-		if err := execCtx.Run(catCmd); err != nil {
-			return "", fmt.Errorf("failed to read file with elevated privileges: %w", err)
+		if runErr := execCtx.Run(catCmd); runErr == nil {
+			h := blake3.New(32, nil)
+			if _, hashErr := h.Write(out.Bytes()); hashErr == nil {
+				return fmt.Sprintf("%x", h.Sum(nil)), nil
+			}
+			return "", fmt.Errorf("failed to hash privileged data: %v", runErr)
 		}
-
-		h := blake3.New(32, nil)
-		if _, err := h.Write(out.Bytes()); err != nil {
-			return "", fmt.Errorf("failed to hash file data: %w", err)
-		}
-		return fmt.Sprintf("%x", h.Sum(nil)), nil
 	}
 
-	// Non-privileged read (existing code)
-	f, err := os.Open(path)
 	if err != nil {
 		return "", fmt.Errorf("failed to open file for blake3: %w", err)
 	}
-	defer f.Close()
-
-	h := blake3.New(32, nil)
-	if _, err := io.Copy(h, f); err != nil {
-		return "", fmt.Errorf("failed to hash file with blake3: %w", err)
-	}
-	return fmt.Sprintf("%x", h.Sum(nil)), nil
+	return "", fmt.Errorf("failed to hash file with blake3")
 }
 
 // b3sumFast computes BLAKE3 for a file, using the system `b3sum` if available,
