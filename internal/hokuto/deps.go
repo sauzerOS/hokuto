@@ -73,6 +73,15 @@ func resolveBinaryDependencies(pkgName string, visited map[string]bool, plan *[]
 			depName = resolved
 		}
 
+		// Check if any installed package (including name-MAJOR) satisfies the dependency
+		if !force {
+			satisfying := findInstalledSatisfying(depName, dep.Op, dep.Version)
+			if satisfying != "" {
+				// Dependency satisfied by an installed package
+				continue
+			}
+		}
+
 		if err := resolveBinaryDependencies(depName, visited, plan, force, yes); err != nil {
 			return err
 		}
@@ -101,32 +110,9 @@ func resolveMissingDeps(pkgName string, processed map[string]bool, missing *[]st
 	// It must be moved to the end.
 
 	// --- 3. Find the Package Source Directory (pkgDir) ---
-	// Assuming repoPaths comes from cfg.RepoPaths or a global var,
-	// and we must find the package in one of them.
-
-	paths := strings.Split(repoPaths, ":") // Use cfg if available
-	var pkgDir string
-	var found bool
-
-	for _, repoPath := range paths {
-		repoPath = strings.TrimSpace(repoPath)
-		if repoPath == "" {
-			continue
-		}
-
-		currentPkgDir := filepath.Join(repoPath, pkgName)
-
-		// Check if the package source exists at this location.
-		if info, err := os.Stat(currentPkgDir); err == nil && info.IsDir() {
-			pkgDir = currentPkgDir
-			found = true
-			break // Found it! Stop checking other repoPaths.
-		}
-	}
-
-	if !found {
-		// If we checked all repoPaths and didn't find the source, return an error.
-		return fmt.Errorf("package source not found in any repository path for %s", pkgName)
+	pkgDir, err := findPackageDir(pkgName)
+	if err != nil {
+		return fmt.Errorf("package source not found in any repository: %w", err)
 	}
 
 	// --- 4. Parse the depends file (Now that we have the confirmed pkgDir) ---
@@ -162,26 +148,24 @@ func resolveMissingDeps(pkgName string, processed map[string]bool, missing *[]st
 			continue
 		}
 
-		// If a version constraint exists and the dependency is already installed,
-		// enforce the constraint before proceeding.
-		if dep.Op != "" && isPackageInstalled(depName) {
-			if installedVer, ok := getInstalledVersion(depName); ok {
-				if !versionSatisfies(installedVer, dep.Op, dep.Version) {
-					// Build an error message tailored to the operator
-					switch dep.Op {
-					case "<=":
-						return fmt.Errorf("error %s version %s or lower required for build (installed %s)", depName, dep.Version, installedVer)
-					case ">=":
-						return fmt.Errorf("error %s version %s or higher required for build (installed %s)", depName, dep.Version, installedVer)
-					case "==":
-						// This case will now be triggered for python-sip
-						return fmt.Errorf("error %s version exactly %s required for build (installed %s)", depName, dep.Version, installedVer)
-					case "<":
-						return fmt.Errorf("error %s version lower than %s required for build (installed %s)", depName, dep.Version, installedVer)
-					case ">":
-						return fmt.Errorf("error %s version greater than %s required for build (installed %s)", depName, dep.Version, installedVer)
-					default:
-						return fmt.Errorf("error %s version constraint %s%s not satisfied (installed %s)", depName, dep.Op, dep.Version, installedVer)
+		// CHECK VERSION CONSTRAINTS & FETCH IF NEEDED
+		if dep.Op != "" && dep.Version != "" {
+			// 1. Check if any satisfying package is ALREADY INSTALLED (including renamed ones)
+			satisfyingPkg := findInstalledSatisfying(depName, dep.Op, dep.Version)
+			if satisfyingPkg != "" {
+				// Great, a satisfying version is already installed (maybe it's depName-MAJOR)
+				depName = satisfyingPkg
+			} else {
+				// 2. Not installed or doesn't satisfy. Check the current repository version.
+				repoVer, _, err := getRepoVersion2(depName)
+				if err == nil {
+					if !versionSatisfies(repoVer, dep.Op, dep.Version) {
+						// Repo version doesn't satisfy. Fetch from git history.
+						renamed, err := prepareVersionedPackage(fmt.Sprintf("%s@%s%s", depName, dep.Op, dep.Version))
+						if err != nil {
+							return fmt.Errorf("failed to prepare versioned package %s@%s%s: %w", depName, dep.Op, dep.Version, err)
+						}
+						depName = renamed
 					}
 				}
 			}
@@ -354,9 +338,10 @@ func resolveAlternativeDep(dep DepSpec, yes bool) (string, error) {
 		}
 
 		// Check if installed first (prioritize installed)
-		if isPackageInstalled(altName) {
-			installed = append(installed, altName)
-			available = append(available, altName)
+		// Alternatives currently don't support version constraints, but we check if ANY version is installed
+		if sat := findInstalledSatisfying(altName, "", ""); sat != "" {
+			installed = append(installed, sat)
+			available = append(available, sat)
 			continue
 		}
 		// Check if can be found in repos
@@ -540,19 +525,28 @@ func resolveBuildPlan(targetPackages []string, userRequestedPackages map[string]
 			// If the dependency has a specific version constraint (e.g. == 0.14.0),
 			// and the current repo version doesn't match, we try to fetch it from history.
 			if dep.Op != "" && dep.Version != "" {
-				// We now support all standard operators (==, <=, >=, <, >)
-				repoVer, _, err := getRepoVersion2(depName)
-				if err == nil {
-					if !versionSatisfies(repoVer, dep.Op, dep.Version) {
-						// The repo has a different version / doesn't satisfy constraint.
-						// Attempt to fetch a satisfying version from git history.
-						colArrow.Print("-> ")
-						colSuccess.Printf("Repo version %s of %s does not match constraint %s%s. Fetching from git history\n", repoVer, depName, dep.Op, dep.Version)
+				// 1. Check if any satisfying package is ALREADY INSTALLED (including renamed ones)
+				satisfyingPkg := findInstalledSatisfying(depName, dep.Op, dep.Version)
+				if satisfyingPkg != "" {
+					// Great, a satisfying version is already installed (maybe it's depName-MAJOR)
+					depName = satisfyingPkg
+				} else {
+					// 2. Not installed. Check the current repository version.
+					// We now support all standard operators (==, <=, >=, <, >)
+					repoVer, _, err := getRepoVersion2(depName)
+					if err == nil {
+						if !versionSatisfies(repoVer, dep.Op, dep.Version) {
+							// The repo has a different version / doesn't satisfy constraint.
+							// Attempt to fetch a satisfying version from git history.
+							colArrow.Print("-> ")
+							colSuccess.Printf("Repo version %s of %s does not match constraint %s%s. Fetching from git history\n", repoVer, depName, dep.Op, dep.Version)
 
-						// Pass the full constraint (e.g. "pkg@<=5.0.0") to prepareVersionedPackage
-						_, err := prepareVersionedPackage(fmt.Sprintf("%s@%s%s", depName, dep.Op, dep.Version))
-						if err != nil {
-							return fmt.Errorf("failed to prepare versioned package %s@%s%s: %w", depName, dep.Op, dep.Version, err)
+							// Pass the full constraint (e.g. "pkg@<=5.0.0") to prepareVersionedPackage
+							renamed, err := prepareVersionedPackage(fmt.Sprintf("%s@%s%s", depName, dep.Op, dep.Version))
+							if err != nil {
+								return fmt.Errorf("failed to prepare versioned package %s@%s%s: %w", depName, dep.Op, dep.Version, err)
+							}
+							depName = renamed
 						}
 					}
 				}

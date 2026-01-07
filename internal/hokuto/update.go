@@ -558,25 +558,8 @@ func checkForUpgrades(_ context.Context, cfg *Config) error {
 // It assumes cfg is passed in, as it's needed for the recursive call.
 
 func isPackageInstalled(pkgName string) bool {
-	// Simply defer to the silent checker.
-	return checkPackageExists(pkgName)
-}
-
-func getInstalledVersion(pkgName string) (string, bool) {
-	// Installed root directory is stored in global variable Installed
-	versionPath := filepath.Join(Installed, pkgName, "version")
-	b, err := os.ReadFile(versionPath)
-	if err != nil {
-		return "", false
-	}
-	v := strings.TrimSpace(string(b))
-	if v == "" {
-		return "", false
-	}
-	// Extract just the version (first field), as version files can contain multiple fields like "3.6.5 1"
-	fields := strings.Fields(v)
-	if len(fields) == 0 {
-		return "", false
-	}
-	return fields[0], true
+	// Use findInstalledSatisfying to support renamed packages (pkg-MAJOR)
+	// If it's already a renamed name, findInstalledSatisfying will catch it.
+	// If it's a base name, findInstalledSatisfying will find ANY version of it.
+	return findInstalledSatisfying(pkgName, "", "") != ""
 }

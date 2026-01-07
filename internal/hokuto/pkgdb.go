@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 )
 
@@ -280,7 +281,68 @@ func findPackageDir(pkgName string) (string, error) {
 			return pkgDir, nil
 		}
 	}
+
+	// FALLBACK: Check if it's already installed.
+	// This is crucial for resolving dependencies of renamed packages (pkg-MAJOR)
+	// which only exist in the installed database and have no source in repositories.
+	if checkPackageExactMatch(pkgName) {
+		return filepath.Join(Installed, pkgName), nil
+	}
+
 	return "", fmt.Errorf("not found in any repository")
+}
+
+func findInstalledSatisfying(name, op, refVersion string) string {
+	// 1. Check the exact package name
+	if checkPackageExactMatch(name) {
+		ver, ok := getInstalledVersion(name)
+		if ok && (op == "" || refVersion == "" || versionSatisfies(ver, op, refVersion)) {
+			return name
+		}
+	}
+
+	// 2. Scan for name-MAJOR versions
+	entries, err := os.ReadDir(Installed)
+	if err != nil {
+		return ""
+	}
+
+	prefix := name + "-"
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		pkgName := e.Name()
+		if strings.HasPrefix(pkgName, prefix) {
+			// Check if the suffix is a major version (integer)
+			suffix := strings.TrimPrefix(pkgName, prefix)
+			if _, err := strconv.Atoi(suffix); err == nil {
+				ver, ok := getInstalledVersion(pkgName)
+				if ok && (op == "" || refVersion == "" || versionSatisfies(ver, op, refVersion)) {
+					return pkgName
+				}
+			}
+		}
+	}
+
+	return ""
+}
+
+func getInstalledVersion(pkgName string) (string, bool) {
+	versionFile := filepath.Join(Installed, pkgName, "version")
+	if data, err := os.ReadFile(versionFile); err == nil {
+		v := strings.TrimSpace(string(data))
+		if v == "" {
+			return "", false
+		}
+		// Extract just the version (first field)
+		fields := strings.Fields(v)
+		if len(fields) == 0 {
+			return "", false
+		}
+		return fields[0], true
+	}
+	return "", false
 }
 
 // readLockFile reads /etc/hokuto.lock and returns a map of package name -> locked version.

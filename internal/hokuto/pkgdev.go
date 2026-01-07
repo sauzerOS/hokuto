@@ -175,8 +175,19 @@ func editPackage(pkgName string, openAll bool) error {
 
 	// 2. Open .sources in editor
 	if _, err := os.Stat(dotSourcesPath); os.IsNotExist(err) {
-		if err := os.WriteFile(dotSourcesPath, nil, 0o644); err != nil {
-			return fmt.Errorf("failed to create %s: %v", dotSourcesPath, err)
+		// If .sources doesn't exist yet, try to create it by copying from sources
+		if _, err := os.Stat(sourcesPath); err == nil {
+			sourcesData, err := os.ReadFile(sourcesPath)
+			if err == nil {
+				if err := os.WriteFile(dotSourcesPath, sourcesData, 0o644); err != nil {
+					return fmt.Errorf("failed to copy sources to %s: %v", dotSourcesPath, err)
+				}
+			}
+		} else {
+			// If sources also doesn't exist, create an empty .sources
+			if err := os.WriteFile(dotSourcesPath, nil, 0o644); err != nil {
+				return fmt.Errorf("failed to create %s: %v", dotSourcesPath, err)
+			}
 		}
 	}
 	if err := runEditor(editor, dotSourcesPath); err != nil {

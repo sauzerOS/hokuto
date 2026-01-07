@@ -692,6 +692,7 @@ func prepareVersionedPackage(arg string) (string, error) {
 
 	commits := strings.Fields(string(logOut))
 	var foundCommit string
+	var foundVersion string
 	for _, commit := range commits {
 		// Check the version file at this commit
 		showCmd := exec.Command("git", "show", fmt.Sprintf("%s:%s/version", commit, relPath))
@@ -706,6 +707,7 @@ func prepareVersionedPackage(arg string) (string, error) {
 			// Check if this version satisfies the constraint
 			if versionSatisfies(commitVer, op, ver) {
 				foundCommit = commit
+				foundVersion = commitVer
 				break
 			}
 		}
@@ -715,6 +717,13 @@ func prepareVersionedPackage(arg string) (string, error) {
 		return arg, fmt.Errorf("version %s for package %s not found in Git history", targetVersionStr, pkgName)
 	}
 
+	// Rename the package to pkgname-MAJOR for parallel version installation
+	major := strings.Split(foundVersion, ".")[0]
+	renamedPkgName := pkgName
+	if major != "" {
+		renamedPkgName = fmt.Sprintf("%s-%s", pkgName, major)
+	}
+
 	// 4. Extract the package files from the commit
 	tmpBase := filepath.Join(HokutoTmpDir, "tmprepo")
 	os.MkdirAll(tmpBase, 0o755)
@@ -722,8 +731,8 @@ func prepareVersionedPackage(arg string) (string, error) {
 	finalTmpDir := filepath.Join(tmpBase, fmt.Sprintf("%s-%s-%s", pkgName, ver, foundCommit[:8]))
 	// If already extracted, we can reuse it
 	if _, err := os.Stat(finalTmpDir); err == nil {
-		versionedPkgDirs[pkgName] = finalTmpDir
-		return pkgName, nil
+		versionedPkgDirs[renamedPkgName] = finalTmpDir
+		return renamedPkgName, nil
 	}
 
 	if err := os.MkdirAll(finalTmpDir, 0755); err != nil {
@@ -785,9 +794,9 @@ func prepareVersionedPackage(arg string) (string, error) {
 		return arg, fmt.Errorf("error reading git ls-tree output: %w", err)
 	}
 
-	versionedPkgDirs[pkgName] = finalTmpDir
+	versionedPkgDirs[renamedPkgName] = finalTmpDir
 	colArrow.Print("-> ")
-	colSuccess.Printf("Extracted %s@%s from commit %s into temporary directory\n", pkgName, targetVersionStr, foundCommit[:8])
+	colSuccess.Printf("Extracted %s@%s (as %s) from commit %s into temporary directory\n", pkgName, foundVersion, renamedPkgName, foundCommit[:8])
 
-	return pkgName, nil
+	return renamedPkgName, nil
 }

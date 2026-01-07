@@ -5,7 +5,6 @@ package hokuto
 
 import (
 	"archive/tar"
-	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -2252,19 +2251,37 @@ func executeBuildPass(plan *BuildPlan, _ string, installAllTargets bool, cfg *Co
 				isSatisfied := false
 
 				// Helper to check if a package is available (installed or just built)
-				checkPkg := func(name string) bool {
-					return isPackageInstalled(name) || builtThisPass[name]
+				isDepAvailable := func(name string, op string, ver string) bool {
+					// 1. Check if it was built this pass (using exact name)
+					if builtThisPass[name] {
+						return true
+					}
+
+					// 2. Check if any satisfying package is installed (including renamed ones)
+					if sat := findInstalledSatisfying(name, op, ver); sat != "" {
+						return true
+					}
+
+					// 3. Fallback: if it was built this pass under a renamed name,
+					// we need to check if that renamed name satisfies the constraint.
+					// This is complex, but for now we can check if any key in builtThisPass
+					// matches name-MAJOR if we can derive MAJOR from the constraint.
+					// However, if it was built this pass, it was also INSTALLED,
+					// so findInstalledSatisfying should have caught it.
+					// The only edge case is if it's built but not yet installed (not possible in current sequential flow).
+
+					return false
 				}
 
 				if len(dep.Alternatives) > 0 {
 					for _, alt := range dep.Alternatives {
-						if checkPkg(alt) {
+						if isDepAvailable(alt, "", "") {
 							isSatisfied = true
 							break
 						}
 					}
 				} else {
-					if checkPkg(dep.Name) {
+					if isDepAvailable(dep.Name, dep.Op, dep.Version) {
 						isSatisfied = true
 					}
 				}
@@ -2495,7 +2512,38 @@ func executeBuildPass(plan *BuildPlan, _ string, installAllTargets bool, cfg *Co
 	}
 	for _, pkg := range toBuild {
 		if _, exists := failed[pkg]; !exists {
-			failed[pkg] = errors.New("blocked by a failed dependency")
+			// Find which dependency is missing to provide a better error message
+			pkgDir, _ := findPackageDir(pkg)
+			deps, _ := parseDependsFile(pkgDir)
+			missingDep := "unknown"
+			for _, dep := range deps {
+				if dep.Optional {
+					continue
+				}
+
+				isSatisfied := false
+				if len(dep.Alternatives) > 0 {
+					for _, alt := range dep.Alternatives {
+						if builtThisPass[alt] || findInstalledSatisfying(alt, "", "") != "" {
+							isSatisfied = true
+							break
+						}
+					}
+				} else {
+					if builtThisPass[dep.Name] || findInstalledSatisfying(dep.Name, dep.Op, dep.Version) != "" {
+						isSatisfied = true
+					}
+				}
+
+				if !isSatisfied {
+					missingDep = dep.Name
+					if dep.Op != "" {
+						missingDep = fmt.Sprintf("%s%s%s", dep.Name, dep.Op, dep.Version)
+					}
+					break
+				}
+			}
+			failed[pkg] = fmt.Errorf("dependency not satisfied: %s", missingDep)
 		}
 	}
 	return failed, successfullyBuiltTargets, totalElapsedTime
