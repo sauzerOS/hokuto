@@ -47,6 +47,7 @@ func printHelp() {
 		{"bootstrap", "<dir>", "Build a bootstrap rootfs in target directory"},
 		{"chroot", "<dir> [cmd...]", "Enter chroot and run command (default: /bin/bash)"},
 		{"cleanup", "[options]", "Cleanup: -sources, -bins, -orphans, -all"},
+		{"python-rebuild", "", "Rebuild all python packages"},
 		{"alt", "[pkg]", "Manage file alternatives. List packages with alternatives or show/switch alternatives for a package"},
 	}
 
@@ -242,6 +243,12 @@ func Main() {
 		// Pass 'cfg' to the function
 		if err := handleCleanupCommand(os.Args[2:], cfg); err != nil {
 			fmt.Fprintf(os.Stderr, "Cleanup failed: %v\n", err)
+			os.Exit(1)
+		}
+
+	case "python-rebuild":
+		if err := handlePythonRebuildCommand(cfg); err != nil {
+			fmt.Fprintf(os.Stderr, "Python rebuild failed: %v\n", err)
 			os.Exit(1)
 		}
 
