@@ -113,7 +113,10 @@ func verifyOrCreateChecksums(pkgName, pkgDir string, force bool) error {
 		for scanner.Scan() {
 			parts := strings.Fields(strings.TrimSpace(scanner.Text()))
 			if len(parts) >= 2 {
-				existing[parts[1]] = parts[0] // map[filename] = checksum
+				// Checksum is first, filename is the rest
+				checksum := parts[0]
+				filename := strings.Join(parts[1:], " ")
+				existing[filename] = checksum
 			}
 		}
 		f.Close()

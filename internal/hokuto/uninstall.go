@@ -88,11 +88,14 @@ func pkgUninstall(pkgName string, cfg *Config, execCtx *Executor, force, yes boo
 		} else {
 			// Use strings.Fields() to robustly handle any amount of whitespace
 			fields := strings.Fields(line)
-			if len(fields) > 0 {
-				pathInManifest = fields[0]
-			}
 			if len(fields) > 1 {
-				expectedSum = fields[1]
+				// The last field is the checksum
+				expectedSum = fields[len(fields)-1]
+				// Everything before is the path
+				pathInManifest = strings.Join(fields[:len(fields)-1], " ")
+			} else if len(fields) == 1 {
+				// Fallback/Error case: treat single field as path (no checksum?)
+				pathInManifest = fields[0]
 			}
 		}
 

@@ -224,8 +224,17 @@ func parseManifest(filePath string) (map[string]ManifestEntry, error) {
 			return nil, fmt.Errorf("invalid manifest line format: %s", line)
 		}
 
-		path := fields[0]
-		checksum := fields[1]
+		// The manifest format is: FILENAME  CHECKSUM
+		// Since filenames can contain spaces, we can't just take fields[0].
+		// However, the checksum (BLAKE3) is a fixed hex string without spaces, always at the end.
+		checksum := fields[len(fields)-1]
+
+		// The path is everything before the checksum.
+		// We can reconstruct it by joining the fields, or more safely, by string manipulation.
+		// Doing it by index is safer to preserve exact spacing in the filename if needed,
+		// though standard fields split consumes extra whitespace.
+		// Given we used Fields() to split, let's rejoin all but the last.
+		path := strings.Join(fields[:len(fields)-1], " ")
 
 		entries[path] = ManifestEntry{Path: path, Checksum: checksum}
 	}

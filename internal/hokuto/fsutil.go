@@ -422,7 +422,11 @@ func getModifiedFiles(pkgName, rootDir string, execCtx *Executor) ([]string, err
 			continue
 		}
 
-		relPath := parts[0]
+		// Checksum is the last field
+		expectedSum := parts[len(parts)-1]
+		// Path is everything before
+		relPath := strings.Join(parts[:len(parts)-1], " ")
+
 		relSlash := filepath.ToSlash(relPath)
 		// Skip all metadata files under var/db/hokuto (internal package metadata)
 		// Handles both "var/db/hokuto/..." and "/var/db/hokuto/..." paths
@@ -434,7 +438,7 @@ func getModifiedFiles(pkgName, rootDir string, execCtx *Executor) ([]string, err
 		absPath := filepath.Join(rootDir, relPath)
 
 		// Skip entries with 000000 hash (symlinks)
-		if len(parts) > 1 && parts[1] == "000000" {
+		if expectedSum == "000000" {
 			continue
 		}
 
@@ -488,7 +492,11 @@ func getModifiedFiles(pkgName, rootDir string, execCtx *Executor) ([]string, err
 			continue
 		}
 
-		relPath := parts[0]
+		// Checksum is the last field
+		expectedSum := parts[len(parts)-1]
+		// Path is everything before
+		relPath := strings.Join(parts[:len(parts)-1], " ")
+
 		relSlash := filepath.ToSlash(relPath)
 		// Skip all metadata files under var/db/hokuto (internal package metadata)
 		// Handles both "var/db/hokuto/..." and "/var/db/hokuto/..." paths
@@ -498,7 +506,7 @@ func getModifiedFiles(pkgName, rootDir string, execCtx *Executor) ([]string, err
 		}
 
 		// Skip entries with 000000 hash (symlinks)
-		if parts[1] == "000000" {
+		if expectedSum == "000000" {
 			continue
 		}
 
