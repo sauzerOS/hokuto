@@ -638,7 +638,28 @@ func prepareVersionedPackage(arg string) (string, error) {
 	}
 	parts := strings.SplitN(arg, "@", 2)
 	pkgName := parts[0]
-	targetVersion := parts[1]
+	targetVersionStr := parts[1]
+
+	// Parse operator and version from targetVersionStr
+	// e.g. "<=5.0.0" -> op="<=", ver="5.0.0"
+	// e.g. "5.0.0" -> op="", ver="5.0.0" (implied ==)
+	op := ""
+	ver := targetVersionStr
+	ops := []string{"<=", ">=", "==", "<", ">"}
+	for _, o := range ops {
+		if strings.HasPrefix(targetVersionStr, o) {
+			op = o
+			ver = strings.TrimPrefix(targetVersionStr, o)
+			break
+		}
+	}
+	// If no operator found, assume exact match if it looks like a version,
+	// but if it was passed without one, we treat it as strict string equality
+	// unless we want to enforce "==" logic. Using versionSatisfies with "=="
+	// is robust.
+	if op == "" {
+		op = "=="
+	}
 
 	// 1. Find the current package directory to identify the repo
 	pkgDir, err := findPackageDir(pkgName)
@@ -680,21 +701,25 @@ func prepareVersionedPackage(arg string) (string, error) {
 			continue
 		}
 		fields := strings.Fields(string(showOut))
-		if len(fields) > 0 && fields[0] == targetVersion {
-			foundCommit = commit
-			break
+		if len(fields) > 0 {
+			commitVer := fields[0]
+			// Check if this version satisfies the constraint
+			if versionSatisfies(commitVer, op, ver) {
+				foundCommit = commit
+				break
+			}
 		}
 	}
 
 	if foundCommit == "" {
-		return arg, fmt.Errorf("version %s for package %s not found in Git history", targetVersion, pkgName)
+		return arg, fmt.Errorf("version %s for package %s not found in Git history", targetVersionStr, pkgName)
 	}
 
 	// 4. Extract the package files from the commit
 	tmpBase := filepath.Join(HokutoTmpDir, "tmprepo")
 	os.MkdirAll(tmpBase, 0o755)
 
-	finalTmpDir := filepath.Join(tmpBase, fmt.Sprintf("%s-%s-%s", pkgName, targetVersion, foundCommit[:8]))
+	finalTmpDir := filepath.Join(tmpBase, fmt.Sprintf("%s-%s-%s", pkgName, ver, foundCommit[:8]))
 	// If already extracted, we can reuse it
 	if _, err := os.Stat(finalTmpDir); err == nil {
 		versionedPkgDirs[pkgName] = finalTmpDir
@@ -762,7 +787,7 @@ func prepareVersionedPackage(arg string) (string, error) {
 
 	versionedPkgDirs[pkgName] = finalTmpDir
 	colArrow.Print("-> ")
-	colSuccess.Printf("Extracted %s@%s from commit %s into temporary directory\n", pkgName, targetVersion, foundCommit[:8])
+	colSuccess.Printf("Extracted %s@%s from commit %s into temporary directory\n", pkgName, targetVersionStr, foundCommit[:8])
 
 	return pkgName, nil
 }

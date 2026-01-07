@@ -540,23 +540,19 @@ func resolveBuildPlan(targetPackages []string, userRequestedPackages map[string]
 			// If the dependency has a specific version constraint (e.g. == 0.14.0),
 			// and the current repo version doesn't match, we try to fetch it from history.
 			if dep.Op != "" && dep.Version != "" {
-				// We only auto-fetch for Exact Match (==) for now as it's the safest assumption
-				// for "I need this specific version".
-				// Range constraints (>=, <=) are usually satisfied by the latest version or
-				// imply a minimum that the latest usually covers.
-				if dep.Op == "==" {
-					repoVer, _, err := getRepoVersion2(depName)
-					if err == nil {
-						if !versionSatisfies(repoVer, dep.Op, dep.Version) {
-							// The repo has a different version (e.g., 0.15.0) than required (0.14.0).
-							// Attempt to fetch the old version from git history.
-							colArrow.Print("-> ")
-							colWarn.Printf("Repo version %s of %s does not match constraint %s%s. Attempting to fetch from history...\n", repoVer, depName, dep.Op, dep.Version)
+				// We now support all standard operators (==, <=, >=, <, >)
+				repoVer, _, err := getRepoVersion2(depName)
+				if err == nil {
+					if !versionSatisfies(repoVer, dep.Op, dep.Version) {
+						// The repo has a different version / doesn't satisfy constraint.
+						// Attempt to fetch a satisfying version from git history.
+						colArrow.Print("-> ")
+						colSuccess.Printf("Repo version %s of %s does not match constraint %s%s. Fetching from git history\n", repoVer, depName, dep.Op, dep.Version)
 
-							_, err := prepareVersionedPackage(fmt.Sprintf("%s@%s", depName, dep.Version))
-							if err != nil {
-								return fmt.Errorf("failed to prepare versioned package %s@%s: %w", depName, dep.Version, err)
-							}
+						// Pass the full constraint (e.g. "pkg@<=5.0.0") to prepareVersionedPackage
+						_, err := prepareVersionedPackage(fmt.Sprintf("%s@%s%s", depName, dep.Op, dep.Version))
+						if err != nil {
+							return fmt.Errorf("failed to prepare versioned package %s@%s%s: %w", depName, dep.Op, dep.Version, err)
 						}
 					}
 				}
