@@ -473,7 +473,7 @@ func b3sumBatch(paths []string, maxWorkers int) (map[string]string, error) {
 			semaphore <- struct{}{}        // acquire
 			defer func() { <-semaphore }() // release
 
-			checksum, err := b3sumFast(p)
+			checksum, err := blake3SumFile(p)
 
 			mu.Lock()
 			if err != nil {

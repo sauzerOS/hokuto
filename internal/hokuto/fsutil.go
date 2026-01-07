@@ -26,6 +26,27 @@ type fileMetadata struct {
 // It can print the prompt with a specific color style if p is not nil.
 
 func lstatViaExecutor(path string, execCtx *Executor) (string, error) {
+	if !execCtx.ShouldRunAsRoot {
+		info, err := os.Lstat(path)
+		if err != nil {
+			return "", fmt.Errorf("failed to lstat %s: %v", path, err)
+		}
+		mode := info.Mode()
+		if mode&os.ModeSymlink != 0 {
+			return "symbolic link", nil
+		}
+		if mode.IsDir() {
+			return "directory", nil
+		}
+		if mode.IsRegular() {
+			if info.Size() == 0 {
+				return "regular empty file", nil
+			}
+			return "regular file", nil
+		}
+		return "unknown", nil
+	}
+
 	cmd := exec.Command("stat", "-c", "%F", path)
 	var out bytes.Buffer
 	cmd.Stdout = &out
