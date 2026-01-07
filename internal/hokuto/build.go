@@ -2245,10 +2245,45 @@ func executeBuildPass(plan *BuildPlan, _ string, installAllTargets bool, cfg *Co
 			pkgDir, _ := findPackageDir(pkgName)
 			deps, _ := parseDependsFile(pkgDir)
 			for _, dep := range deps {
-				if !dep.Optional && !isPackageInstalled(dep.Name) {
-					if _, hasFailed := failed[dep.Name]; hasFailed {
-						failed[pkgName] = fmt.Errorf("blocked by failed dependency '%s'", dep.Name)
+				if dep.Optional {
+					continue
+				}
+
+				isSatisfied := false
+
+				// Helper to check if a package is available (installed or just built)
+				checkPkg := func(name string) bool {
+					return isPackageInstalled(name) || builtThisPass[name]
+				}
+
+				if len(dep.Alternatives) > 0 {
+					for _, alt := range dep.Alternatives {
+						if checkPkg(alt) {
+							isSatisfied = true
+							break
+						}
 					}
+				} else {
+					if checkPkg(dep.Name) {
+						isSatisfied = true
+					}
+				}
+
+				if !isSatisfied {
+					// Check if we are blocked by a SPECIFIC failure in the alternatives
+					if len(dep.Alternatives) > 0 {
+						for _, alt := range dep.Alternatives {
+							if _, hasFailed := failed[alt]; hasFailed {
+								failed[pkgName] = fmt.Errorf("blocked by failed dependency '%s'", alt)
+								break
+							}
+						}
+					} else {
+						if _, hasFailed := failed[dep.Name]; hasFailed {
+							failed[pkgName] = fmt.Errorf("blocked by failed dependency '%s'", dep.Name)
+						}
+					}
+
 					canBuild = false
 					break
 				}
