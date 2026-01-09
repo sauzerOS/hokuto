@@ -312,44 +312,32 @@ func checkDependencyBlocks(pkgName string, newVersion string, installedPackages 
 			continue
 		}
 
-		// Read the depends file for this installed package
-		dependsPath := filepath.Join(Installed, installedPkgName, "depends")
-		data, err := os.ReadFile(dependsPath)
+		// Use findPackageDir to locate the package metadata.
+		// This ensures we prioritize repository metadata (NEW depends) over installed metadata.
+		pkgDir, err := findPackageDir(installedPkgName)
 		if err != nil {
-			// No depends file or can't read it - skip
+			// If we can't find metadata, skip it.
 			continue
 		}
 
-		// Parse the depends file
-		scanner := bufio.NewScanner(strings.NewReader(string(data)))
-		for scanner.Scan() {
-			line := strings.TrimSpace(scanner.Text())
-			if line == "" || strings.HasPrefix(line, "#") {
-				continue
-			}
+		// Parse the dependencies using the established helper
+		deps, err := parseDependsFile(pkgDir)
+		if err != nil {
+			continue
+		}
 
-			// Parse dependency spec (e.g., "python-sabctools==8.2.6")
-			name, op, ver, _, _, _ := parseDepToken(line)
-			if name != pkgName {
+		for _, dep := range deps {
+			if dep.Name != pkgName {
 				continue
 			}
 
 			// If there's a version constraint, check if the new version violates it
-			if op != "" && ver != "" {
-				// Check if the new version is higher than the required version
-				// If the constraint is ==, <=, or <, and new version is higher, it's blocked
-				if op == "==" {
-					// Exact version required - any other version is blocked
-					if ver != newVersion {
-						return installedPkgName
-					}
-				} else if op == "<=" || op == "<" {
-					// Maximum version constraint - if new version is higher, it's blocked
-					if compareVersions(newVersion, ver) > 0 {
-						return installedPkgName
-					}
+			if dep.Op != "" && dep.Version != "" {
+				// We check if the new version satisfies the constraint.
+				// If not, it's blocked.
+				if !versionSatisfies(newVersion, dep.Op, dep.Version) {
+					return installedPkgName
 				}
-				// For >= and >, we allow the update (new version satisfies the constraint)
 			}
 		}
 	}
@@ -470,9 +458,20 @@ func checkForUpgrades(_ context.Context, cfg *Config) error {
 		return nil
 	}
 
+	// 5. Build order and dependency resolution for the updates
+	userRequestedMap := make(map[string]bool)
+	for _, pkg := range pkgNames {
+		userRequestedMap[pkg] = true
+	}
+
+	plan, err := resolveBuildPlan(pkgNames, userRequestedMap, false)
+	if err != nil {
+		return fmt.Errorf("failed to resolve upgrade plan: %w", err)
+	}
+	// Use the ordered plan instead of the unordered list
+	pkgNames = plan.Order
+
 	// Launch background prefetcher for SUBSEQUENT packages.
-	// We skip the first one (pkgNames[0]) because the main thread builds it immediately,
-	// so prefetching it creates unnecessary race conditions/double logs.
 	if len(pkgNames) > 1 {
 		go prefetchSources(pkgNames[1:])
 	}
@@ -484,7 +483,13 @@ func checkForUpgrades(_ context.Context, cfg *Config) error {
 
 	for i, pkgName := range pkgNames {
 		colArrow.Print("\n-> ")
-		colSuccess.Printf("Executing update for: %s (%d/%d)\n", pkgName, i+1, totalToUpdate)
+		if userRequestedMap[pkgName] {
+			colSuccess.Printf("Executing update for:")
+			colInfo.Printf(" %s (%d/%d)\n", pkgName, i+1, totalToUpdate)
+		} else {
+			colSuccess.Printf("Installing dependency:")
+			colInfo.Printf(" %s (%d/%d)\n", pkgName, i+1, totalToUpdate)
+		}
 
 		// 0. Check for binary package first (Local Cache or Mirror)
 		version, revision, err := getRepoVersion2(pkgName)
@@ -494,7 +499,8 @@ func checkForUpgrades(_ context.Context, cfg *Config) error {
 			continue
 		}
 
-		tarballName := fmt.Sprintf("%s-%s-%s.tar.zst", pkgName, version, revision)
+		outputPkgName := getOutputPackageName(pkgName, cfg)
+		tarballName := fmt.Sprintf("%s-%s-%s.tar.zst", outputPkgName, version, revision)
 		tarballPath := filepath.Join(BinDir, tarballName)
 
 		foundBinary := false
@@ -510,40 +516,65 @@ func checkForUpgrades(_ context.Context, cfg *Config) error {
 
 		if foundBinary {
 			isCriticalAtomic.Store(1)
-			handlePreInstallUninstall(pkgName, cfg, RootExec)
-			if err := pkgInstall(tarballPath, pkgName, cfg, RootExec, false); err != nil {
+			handlePreInstallUninstall(outputPkgName, cfg, RootExec)
+			if err := pkgInstall(tarballPath, outputPkgName, cfg, RootExec, false); err != nil {
 				isCriticalAtomic.Store(0)
-				color.Danger.Printf("Binary installation failed for %s: %v. Falling back to build.\n", pkgName, err)
+				color.Danger.Printf("Binary installation failed for %s: %v. Falling back to build.\n", outputPkgName, err)
 			} else {
 				isCriticalAtomic.Store(0)
 				colArrow.Print("-> ")
-				colSuccess.Printf("Package %s updated from binary successfully.\n", pkgName)
+				if userRequestedMap[pkgName] {
+					colSuccess.Printf("Package")
+					colInfo.Printf(" %s ", outputPkgName)
+					colSuccess.Printf("updated from binary successfully.\n")
+				} else {
+					colSuccess.Printf("Dependency")
+					colInfo.Printf(" %s ", outputPkgName)
+					colSuccess.Printf("installed successfully.\n")
+				}
+				// If it was a requested update, add to world
+				if userRequestedMap[pkgName] {
+					addToWorld(pkgName)
+				}
 				continue // Successfully updated from binary, move to next package
 			}
 		}
 
 		// A. Fallback: Directly call pkgBuild within the current process
-		// We pass UserExec because pkgBuild itself creates the appropriate
-		// privileged or unprivileged build-specific executor.
 		duration, err := pkgBuild(pkgName, cfg, UserExec, false, i+1, totalToUpdate)
 		if err != nil {
 			color.Danger.Printf("Build failed for %s: %v\n", pkgName, err)
 			failedPackages = append(failedPackages, pkgName)
-			continue // <<< IMPORTANT: Move to the next package on failure
+			continue
 		}
 		totalUpdateDuration += duration
 
 		// B. If build is successful, install the package
-		// Set critical section for the installation phase
 		isCriticalAtomic.Store(1)
-		handlePreInstallUninstall(pkgName, cfg, RootExec)
-		if err := pkgInstall(tarballPath, pkgName, cfg, RootExec, false); err != nil {
-			isCriticalAtomic.Store(0) // Unset on failure
-			color.Danger.Printf("Installation failed for %s: %v\n", pkgName, err)
+		handlePreInstallUninstall(outputPkgName, cfg, RootExec)
+		if err := pkgInstall(tarballPath, outputPkgName, cfg, RootExec, false); err != nil {
+			isCriticalAtomic.Store(0)
+			color.Danger.Printf("Installation failed for %s: %v\n", outputPkgName, err)
 			failedPackages = append(failedPackages, pkgName)
 			continue
 		}
-		isCriticalAtomic.Store(0) // Unset on success
+		isCriticalAtomic.Store(0)
+
+		colArrow.Print("-> ")
+		if userRequestedMap[pkgName] {
+			colSuccess.Printf("Package")
+			colInfo.Printf(" %s ", outputPkgName)
+			colSuccess.Printf("updated successfully.\n")
+		} else {
+			colSuccess.Printf("Dependency")
+			colInfo.Printf(" %s ", outputPkgName)
+			colSuccess.Printf("installed successfully.\n")
+		}
+
+		// Add to World if it was a requested update
+		if userRequestedMap[pkgName] {
+			addToWorld(pkgName)
+		}
 	}
 
 	if len(failedPackages) > 0 {

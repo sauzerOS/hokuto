@@ -1210,7 +1210,7 @@ func checkStagingConflicts(pkgName, stagingDir, rootDir, stagingManifest string,
 				colArrow.Print("-> ")
 				colInfo.Println(c.filePath)
 			}
-			cPrintf(colInfo, "Use [N]ew %s, keep original: ", pkgName)
+			cPrintf(colInfo, "Use [N]ew %s, [k]eep original: ", pkgName)
 			os.Stdout.Sync()
 			response, err := stdinReader.ReadString('\n')
 			if err != nil {
@@ -1220,11 +1220,12 @@ func checkStagingConflicts(pkgName, stagingDir, rootDir, stagingManifest string,
 			if input == "" {
 				input = "n"
 			}
-			if input == "k" || input == "o" {
+			switch input {
+			case "k", "o":
 				useOriginalForAll = true
-			} else if input == "n" {
+			case "n":
 				useNewForAll = true
-			} else {
+			default:
 				useNewForAll = true
 				input = "n"
 			}
