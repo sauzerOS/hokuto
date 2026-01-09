@@ -598,6 +598,21 @@ func getPackageDependenciesToUninstall(name string) []string {
 // before attempting removal.
 
 func handlePreInstallUninstall(pkgName string, cfg *Config, execCtx *Executor) {
+	// 1. Check if a -bin version of this package is already installed
+	// (e.g., if we are installing 'make', check for 'make-bin')
+	binPkgName := pkgName + "-bin"
+	if !strings.HasSuffix(pkgName, "-bin") && checkPackageExactMatch(binPkgName) {
+		if askForConfirmation(colWarn, "-> Uninstall conflicting package '%s'?", binPkgName) {
+			if err := pkgUninstall(binPkgName, cfg, execCtx, true, true); err != nil {
+				cPrintf(colWarn, "Warning: failed to uninstall conflicting package %s: %v\n", binPkgName, err)
+			} else {
+				colArrow.Print("-> ")
+				colSuccess.Printf("Uninstalled conflicting package %s successfully.\n", binPkgName)
+				removeFromWorld(binPkgName)
+			}
+		}
+	}
+
 	potentialDepsToUninstall := getPackageDependenciesToUninstall(pkgName)
 
 	// --- FIX: Filter the list to only include packages that are actually installed ---

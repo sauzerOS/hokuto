@@ -356,7 +356,10 @@ func Main() {
 		}
 
 	case "build", "b":
-		handleBuildCommand(os.Args[2:], cfg)
+		if err := handleBuildCommand(os.Args[2:], cfg); err != nil {
+			fmt.Fprintf(os.Stderr, "Build failed: %v\n", err)
+			os.Exit(1)
+		}
 
 	case "bootstrap":
 		// 1. Verify that the bootstrap directory is provided.
@@ -380,7 +383,10 @@ func Main() {
 		colSuccess.Printf("Starting bootstrap process in directory: %s\n", bootstrapDirArg)
 
 		// 3. Call the generic build handler with the constructed arguments.
-		handleBuildCommand(buildArgs, cfg)
+		if err := handleBuildCommand(buildArgs, cfg); err != nil {
+			fmt.Fprintf(os.Stderr, "Bootstrap failed: %v\n", err)
+			os.Exit(1)
+		}
 
 	case "install", "i":
 		installCmd := flag.NewFlagSet("install", flag.ExitOnError)
@@ -512,7 +518,7 @@ func Main() {
 		allSucceeded := true
 
 		// Iterate through the calculated plan
-		for _, arg := range installPlan {
+		for i, arg := range installPlan {
 			var tarballPath, pkgName string
 
 			if strings.HasSuffix(arg, ".tar.zst") {
@@ -602,7 +608,8 @@ func Main() {
 			handlePreInstallUninstall(pkgName, cfg, RootExec)
 
 			colArrow.Print("-> ")
-			colSuccess.Printf("Installing %s from %s\n", pkgName, tarballPath)
+			colSuccess.Printf("Installing:")
+			colNote.Printf(" %s (%d/%d)\n", pkgName, i+1, len(installPlan))
 
 			if err := pkgInstall(tarballPath, pkgName, cfg, RootExec, effectiveYes); err != nil {
 				fmt.Fprintf(os.Stderr, "Error installing package %s: %v\n", pkgName, err)

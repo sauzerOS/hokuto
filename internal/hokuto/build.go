@@ -1693,7 +1693,7 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 
 // handleBuildCommand orchestrates the entire build process, intelligently selecting the
 // correct dependency resolution strategy based on the build mode (normal, bootstrap, or alldeps).
-func handleBuildCommand(args []string, cfg *Config) {
+func handleBuildCommand(args []string, cfg *Config) error {
 	// --- 1. Flag Parsing & Initial Setup ---
 	buildCmd := flag.NewFlagSet("build", flag.ExitOnError)
 	var autoInstall = buildCmd.Bool("a", false, "Automatically install the package(s) after successful build.")
@@ -1736,8 +1736,7 @@ func handleBuildCommand(args []string, cfg *Config) {
 	}
 
 	if err := buildCmd.Parse(args); err != nil {
-		fmt.Fprintf(os.Stderr, "Error parsing build flags: %v\n", err)
-		os.Exit(1)
+		return fmt.Errorf("error parsing build flags: %v", err)
 	}
 
 	effectiveRebuilds := *withRebuilds || *withRebuildsShort
@@ -1758,7 +1757,7 @@ func handleBuildCommand(args []string, cfg *Config) {
 		BinDir = CacheDir + "/bin/generic"
 		// Ensure directory exists
 		if err := os.MkdirAll(BinDir, 0o755); err != nil {
-			log.Fatalf("Failed to create generic bin directory: %v", err)
+			return fmt.Errorf("failed to create generic bin directory: %v", err)
 		}
 		// Set CXXFLAGS_GEN and CXXFLAGS_GEN_LTO to match CFLAGS_GEN and CFLAGS_GEN_LTO
 		if cfg.Values["CFLAGS_GEN"] != "" {
@@ -1781,14 +1780,14 @@ func handleBuildCommand(args []string, cfg *Config) {
 
 		// Validate architecture (currently only arm64 is valid)
 		if crossArchValue != "arm64" {
-			log.Fatalf("Error: Invalid cross-compilation architecture '%s'. Only 'arm64' is currently supported.", crossArchValue)
+			return fmt.Errorf("error: invalid cross-compilation architecture '%s'. only 'arm64' is currently supported", crossArchValue)
 		}
 
 		// Set BinDir to cross subdirectory
 		BinDir = CacheDir + "/bin/cross"
 		// Ensure directory exists
 		if err := os.MkdirAll(BinDir, 0o755); err != nil {
-			log.Fatalf("Failed to create cross bin directory: %v", err)
+			return fmt.Errorf("failed to create cross bin directory: %v", err)
 		}
 		// Store cross architecture and system/simple flag in config for use in pkgBuild
 		if cfg.Values == nil {
@@ -1806,7 +1805,7 @@ func handleBuildCommand(args []string, cfg *Config) {
 	// --- Bootstrap Repository & Path Setup ---
 	if *bootstrap {
 		if *bootstrapDir == "" {
-			log.Fatal("Error: bootstrap requires bootstrap-dir")
+			return fmt.Errorf("error: bootstrap requires bootstrap-dir")
 		}
 		if cfg.Values == nil {
 			cfg.Values = make(map[string]string)
@@ -1828,17 +1827,17 @@ func handleBuildCommand(args []string, cfg *Config) {
 			colSuccess.Printf("Downloading bootstrap repo from %s\n", url)
 			resp, err := http.Get(url)
 			if err != nil {
-				log.Fatalf("failed to download bootstrap repo: %v", err)
+				return fmt.Errorf("failed to download bootstrap repo: %v", err)
 			}
 			defer resp.Body.Close()
 
 			out, err := os.Create(tmpFile)
 			if err != nil {
-				log.Fatalf("failed to create temp file: %v", err)
+				return fmt.Errorf("failed to create temp file: %v", err)
 			}
 			if _, err := io.Copy(out, resp.Body); err != nil {
 				out.Close()
-				log.Fatalf("failed to save bootstrap archive: %v", err)
+				return fmt.Errorf("failed to save bootstrap archive: %v", err)
 			}
 			out.Close()
 
@@ -1848,18 +1847,18 @@ func handleBuildCommand(args []string, cfg *Config) {
 
 			extractDir := filepath.Join(os.TempDir(), "repo")
 			if err := os.MkdirAll(extractDir, 0o755); err != nil {
-				log.Fatalf("failed to create extract dir %s: %v", extractDir, err)
+				return fmt.Errorf("failed to create extract dir %s: %v", extractDir, err)
 			}
 
 			f, err := os.Open(tmpFile)
 			if err != nil {
-				log.Fatalf("failed to open downloaded archive: %v", err)
+				return fmt.Errorf("failed to open downloaded archive: %v", err)
 			}
 			defer f.Close()
 
 			xzr, err := xz.NewReader(f)
 			if err != nil {
-				log.Fatalf("failed to create xz reader: %v", err)
+				return fmt.Errorf("failed to create xz reader: %v", err)
 			}
 			tr := tar.NewReader(xzr)
 			for {
@@ -1868,30 +1867,30 @@ func handleBuildCommand(args []string, cfg *Config) {
 					break
 				}
 				if err != nil {
-					log.Fatalf("error reading tar: %v", err)
+					return fmt.Errorf("error reading tar: %v", err)
 				}
 				target := filepath.Join(extractDir, hdr.Name)
 				switch hdr.Typeflag {
 				case tar.TypeDir:
 					if err := os.MkdirAll(target, os.FileMode(hdr.Mode)); err != nil {
-						log.Fatalf("failed to create dir %s: %v", target, err)
+						return fmt.Errorf("failed to create dir %s: %v", target, err)
 					}
 				case tar.TypeReg:
 					if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
-						log.Fatalf("failed to create parent dir: %v", err)
+						return fmt.Errorf("failed to create parent dir: %v", err)
 					}
 					outFile, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, os.FileMode(hdr.Mode))
 					if err != nil {
-						log.Fatalf("failed to create file %s: %v", target, err)
+						return fmt.Errorf("failed to create file %s: %v", target, err)
 					}
 					if _, err := io.Copy(outFile, tr); err != nil {
 						outFile.Close()
-						log.Fatalf("failed to write file %s: %v", target, err)
+						return fmt.Errorf("failed to write file %s: %v", target, err)
 					}
 					outFile.Close()
 				case tar.TypeSymlink:
 					if err := os.Symlink(hdr.Linkname, target); err != nil && !os.IsExist(err) {
-						log.Fatalf("failed to create symlink %s -> %s: %v", target, hdr.Linkname, err)
+						return fmt.Errorf("failed to create symlink %s -> %s: %v", target, hdr.Linkname, err)
 					}
 					log.Printf("Bootstrap repo unpacked successfully into /tmp/repo")
 				}
@@ -1934,7 +1933,7 @@ func handleBuildCommand(args []string, cfg *Config) {
 	packagesToProcess := buildCmd.Args()
 	if len(packagesToProcess) == 0 {
 		buildCmd.Usage()
-		os.Exit(1)
+		return fmt.Errorf("no packages specified")
 	}
 	userRequestedMap := make(map[string]bool)
 	for _, pkg := range packagesToProcess {
@@ -1954,7 +1953,7 @@ func handleBuildCommand(args []string, cfg *Config) {
 		for _, pkgName := range packagesToProcess {
 			deps, err := getPackageDependenciesForward(pkgName)
 			if err != nil {
-				log.Fatalf("Error resolving forward dependencies for %s: %v", pkgName, err)
+				return fmt.Errorf("error resolving forward dependencies for %s: %v", pkgName, err)
 			}
 			fullBuildList = append(fullBuildList, deps...)
 			fullBuildList = append(fullBuildList, pkgName) // Add the target itself
@@ -2001,6 +2000,9 @@ func handleBuildCommand(args []string, cfg *Config) {
 			tarballPath := filepath.Join(BinDir, fmt.Sprintf("%s-%s-%s.tar.zst", outputPkgName, version, revision))
 			isCriticalAtomic.Store(1)
 			handlePreInstallUninstall(outputPkgName, cfg, RootExec)
+			colArrow.Print("-> ")
+			colSuccess.Printf("Installing:")
+			colNote.Printf(" %s (%d/%d)\n", outputPkgName, i+1, totalBuildCount)
 			if installErr := pkgInstall(tarballPath, outputPkgName, cfg, RootExec, true); installErr != nil {
 				isCriticalAtomic.Store(0)
 				failedBuilds[pkgName] = fmt.Errorf("post-build installation failed: %w", installErr)
@@ -2022,7 +2024,7 @@ func handleBuildCommand(args []string, cfg *Config) {
 		var missingDeps []string
 		for _, pkgName := range packagesToProcess {
 			if err := resolveMissingDeps(pkgName, masterProcessed, &missingDeps); err != nil {
-				log.Fatalf("Error resolving dependencies for %s: %v", pkgName, err)
+				return fmt.Errorf("error resolving dependencies for %s: %v", pkgName, err)
 			}
 		}
 		packagesThatMustBeBuilt := make(map[string]bool)
@@ -2036,7 +2038,7 @@ func handleBuildCommand(args []string, cfg *Config) {
 			}
 			version, revision, err := getRepoVersion2(depPkg)
 			if err != nil {
-				log.Fatalf("Error: could not get version for dependency %s: %v", depPkg, err)
+				return fmt.Errorf("error: could not get version for dependency %s: %v", depPkg, err)
 			}
 			// Use output package name for dependencies too (may be renamed for cross-system)
 			outputDepPkg := getOutputPackageName(depPkg, cfg)
@@ -2047,7 +2049,7 @@ func handleBuildCommand(args []string, cfg *Config) {
 					handlePreInstallUninstall(outputDepPkg, cfg, RootExec)
 					if err := pkgInstall(tarballPath, outputDepPkg, cfg, RootExec, false); err != nil {
 						isCriticalAtomic.Store(0)
-						log.Fatalf("Fatal error installing binary %s: %v", depPkg, err)
+						return fmt.Errorf("fatal error installing binary %s: %v", depPkg, err)
 					}
 					isCriticalAtomic.Store(0)
 				} else {
@@ -2060,7 +2062,7 @@ func handleBuildCommand(args []string, cfg *Config) {
 
 		if len(packagesThatMustBeBuilt) == 0 {
 			fmt.Println("All packages and dependencies are already installed.")
-			os.Exit(0)
+			return nil
 		}
 		// Set the total count for the summary.
 		totalBuildCount = len(packagesThatMustBeBuilt)
@@ -2074,11 +2076,11 @@ func handleBuildCommand(args []string, cfg *Config) {
 
 			pkgDir, err := findPackageDir(targetMetaPackage)
 			if err != nil {
-				log.Fatalf("Cannot find source for target package '%s': %v", targetMetaPackage, err)
+				return fmt.Errorf("cannot find source for target package '%s': %v", targetMetaPackage, err)
 			}
 			orderedTopLevelDeps, err := parseDependsFile(pkgDir)
 			if err != nil {
-				log.Fatalf("Cannot parse depends file for '%s': %v", targetMetaPackage, err)
+				return fmt.Errorf("cannot parse depends file for '%s': %v", targetMetaPackage, err)
 			}
 
 			// Add the meta-package itself to the list to be processed last
@@ -2096,7 +2098,7 @@ func handleBuildCommand(args []string, cfg *Config) {
 
 				plan, err := resolveBuildPlan([]string{pkgName}, userRequestedMap, effectiveRebuilds)
 				if err != nil {
-					log.Fatalf("Error generating build plan for '%s': %v", pkgName, err)
+					return fmt.Errorf("error generating build plan for '%s': %v", pkgName, err)
 				}
 				if len(plan.Order) == 0 {
 					colSuccess.Printf("Package '%s' is already built and up to date. Skipping.\n\n", pkgName)
@@ -2132,11 +2134,11 @@ func handleBuildCommand(args []string, cfg *Config) {
 			colSuccess.Println("Generating Build Plan")
 			initialPlan, err := resolveBuildPlan(buildListInput, userRequestedMap, effectiveRebuilds)
 			if err != nil {
-				log.Fatalf("Error generating build plan: %v", err)
+				return fmt.Errorf("error generating build plan: %v", err)
 			}
 			if len(initialPlan.Order) == 0 {
 				fmt.Println("All packages are up to date. Nothing to build.")
-				os.Exit(0)
+				return nil
 			}
 
 			colArrow.Print("-> ")
@@ -2176,7 +2178,7 @@ func handleBuildCommand(args []string, cfg *Config) {
 					shouldInstall = askForConfirmation(colWarn, "-> Do you want to install the following built package(s): %s?", strings.Join(outputPkgNames, ", "))
 				}
 				if shouldInstall && !isCrossWithoutSystem {
-					for _, finalPkg := range targetsPass1 {
+					for i, finalPkg := range targetsPass1 {
 						if _, failed := failedBuilds[finalPkg]; failed {
 							continue
 						}
@@ -2185,6 +2187,9 @@ func handleBuildCommand(args []string, cfg *Config) {
 						tarballPath := filepath.Join(BinDir, fmt.Sprintf("%s-%s-%s.tar.zst", outputFinalPkg, version, revision))
 						isCriticalAtomic.Store(1)
 						handlePreInstallUninstall(outputFinalPkg, cfg, RootExec)
+						colArrow.Print("-> ")
+						colSuccess.Printf("Installing:")
+						colNote.Printf(" %s (%d/%d)\n", outputFinalPkg, i+1, len(targetsPass1))
 						if err := pkgInstall(tarballPath, outputFinalPkg, cfg, RootExec, false); err != nil {
 							isCriticalAtomic.Store(0)
 							failedBuilds[finalPkg] = fmt.Errorf("final installation failed: %w", err)
@@ -2207,7 +2212,7 @@ BuildSummary:
 	if len(failedBuilds) == 0 {
 		colArrow.Print("-> ")
 		colSuccess.Printf("All packages built and installed successfully (%d/%d) Time: %s\n", totalBuildCount, totalBuildCount, totalElapsedTime.Truncate(time.Second))
-		os.Exit(0)
+		return nil
 	}
 	color.Danger.Print("-> ")
 	color.Danger.Println("Failed or Blocked Packages:")
@@ -2220,7 +2225,7 @@ BuildSummary:
 		color.Debug.Printf("  - %-20s: %v\n", pkg, failedBuilds[pkg])
 	}
 	fmt.Println()
-	os.Exit(1)
+	return fmt.Errorf("some packages failed to build")
 }
 
 // Helper for HandleBuildCommand to execute a single build pass based on the provided BuildPlan.
@@ -2370,7 +2375,8 @@ func executeBuildPass(plan *BuildPlan, _ string, installAllTargets bool, cfg *Co
 					isCriticalAtomic.Store(1)
 					handlePreInstallUninstall(outputPkgName, cfg, RootExec)
 					colArrow.Print("-> ")
-					colSuccess.Printf("Installing: %s (%d/%d) Time: %s\n", outputPkgName, i+1, totalInPlan, duration.Truncate(time.Second))
+					colSuccess.Printf("Installing:")
+					colNote.Printf(" %s (%d/%d) Time: %s\n", outputPkgName, i+1, totalInPlan, duration.Truncate(time.Second))
 					if installErr := pkgInstall(tarballPath, outputPkgName, cfg, RootExec, true); installErr != nil {
 						isCriticalAtomic.Store(0)
 						failed[pkgName] = fmt.Errorf("post-build installation failed: %w", installErr)

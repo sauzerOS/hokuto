@@ -289,7 +289,7 @@ func findPackageDir(pkgName string) (string, error) {
 		return filepath.Join(Installed, pkgName), nil
 	}
 
-	return "", fmt.Errorf("not found in any repository")
+	return "", fmt.Errorf("package %s not found in any repository", pkgName)
 }
 
 func findInstalledSatisfying(name, op, refVersion string) string {

@@ -42,6 +42,7 @@ func handlePythonRebuildCommand(cfg *Config) error {
 			"btrfs-progs":           true,
 			"arandr":                true,
 			"gobject-introspection": true,
+			"cython":                true,
 		}
 
 		if strings.Contains(pkgName, "python") || extraPkgs[pkgName] {
@@ -95,7 +96,9 @@ func handlePythonRebuildCommand(cfg *Config) error {
 	// 3. Build python-build-tools first
 	colArrow.Print("-> ")
 	colSuccess.Println("Building python-build-tools")
-	handleBuildCommand([]string{"-a", "python-build-tools"}, cfg)
+	if err := handleBuildCommand([]string{"-a", "python-build-tools"}, cfg); err != nil {
+		return fmt.Errorf("failed to build python-build-tools: %w", err)
+	}
 
 	// 4. Rebuild the rest of the packages
 	colArrow.Print("-> ")
@@ -112,7 +115,9 @@ func handlePythonRebuildCommand(cfg *Config) error {
 	if len(remainingPkgs) > 0 {
 		// We pass "-a" to auto-install the packages after build, restoring them to the system.
 		buildArgs := append([]string{"-a"}, remainingPkgs...)
-		handleBuildCommand(buildArgs, cfg)
+		if err := handleBuildCommand(buildArgs, cfg); err != nil {
+			return fmt.Errorf("failed to rebuild remaining python packages: %w", err)
+		}
 	}
 
 	return nil

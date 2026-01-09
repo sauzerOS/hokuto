@@ -112,7 +112,7 @@ func resolveMissingDeps(pkgName string, processed map[string]bool, missing *[]st
 	// --- 3. Find the Package Source Directory (pkgDir) ---
 	pkgDir, err := findPackageDir(pkgName)
 	if err != nil {
-		return fmt.Errorf("package source not found in any repository: %w", err)
+		return err
 	}
 
 	// --- 4. Parse the depends file (Now that we have the confirmed pkgDir) ---
