@@ -1137,42 +1137,42 @@ func checkStagingConflicts(pkgName, stagingDir, rootDir, stagingManifest string,
 			input = "k"
 		} else if useNewAllConflicts {
 			input = "n"
-		} else if !yes && !skipAllPrompts {
+		} else if !skipAllPrompts {
 			// Display all conflicting files
 			cPrintf(colWarn, "Conflicting file(s) detected from %s package:\n", conflictPkg)
 			for _, c := range conflicts {
 				colArrow.Print("-> ")
 				colInfo.Println(c.filePath)
 			}
-			cPrintf(colInfo, "[K]eep %s, use [N]ew %s: ", conflictPkg, pkgName)
+			cPrintf(colInfo, "Use [N]ew %s, keep [o]riginal %s: ", pkgName, conflictPkg)
 			os.Stdout.Sync()
 			response, err := stdinReader.ReadString('\n')
 			if err != nil {
-				response = "k" // Default to keep on read error
+				response = "n" // Default to new on read error
 			}
 			input = strings.ToLower(strings.TrimSpace(response))
 			if input == "" {
-				input = "k" // Default to keep
+				input = "n" // Default to new
 			}
 			// Set batch flag for remaining conflicts
-			if input == "k" {
+			if input == "k" || input == "o" {
 				keepAllConflicts = true
 			} else if input == "n" {
 				useNewAllConflicts = true
 			} else {
-				// Invalid input, default to keep all
-				keepAllConflicts = true
-				input = "k"
+				// Invalid input, default to new
+				useNewAllConflicts = true
+				input = "n"
 			}
 		} else {
-			input = "k" // Default to keep in --yes mode
-			keepAllConflicts = true
+			input = "n" // Default to new in --yes mode
+			useNewAllConflicts = true
 		}
 
 		// Apply choice to all files in this conflict group
 		for _, c := range conflicts {
 			switch input {
-			case "k":
+			case "k", "o":
 				if err := saveAlternative(pkgName, c.filePath, pkgName, c.conflictPkg, c.stagingFile, execCtx); err != nil {
 					debugf("Warning: failed to save alternative: %v\n", err)
 				}
@@ -1204,38 +1204,38 @@ func checkStagingConflicts(pkgName, stagingDir, rootDir, stagingManifest string,
 			input = "k"
 		} else if useNewForAll {
 			input = "n"
-		} else if !yes && !skipAllPrompts {
+		} else if !skipAllPrompts {
 			cPrintf(colWarn, "Conflicting file(s) detected (unmanaged):\n")
 			for _, c := range unmanagedConflicts {
 				colArrow.Print("-> ")
 				colInfo.Println(c.filePath)
 			}
-			cPrintf(colInfo, "[K]eep original, use [N]ew %s: ", pkgName)
+			cPrintf(colInfo, "Use [N]ew %s, keep original: ", pkgName)
 			os.Stdout.Sync()
 			response, err := stdinReader.ReadString('\n')
 			if err != nil {
-				response = "k"
+				response = "n"
 			}
 			input = strings.ToLower(strings.TrimSpace(response))
 			if input == "" {
-				input = "k"
+				input = "n"
 			}
-			if input == "k" {
+			if input == "k" || input == "o" {
 				useOriginalForAll = true
 			} else if input == "n" {
 				useNewForAll = true
 			} else {
-				useOriginalForAll = true
-				input = "k"
+				useNewForAll = true
+				input = "n"
 			}
 		} else {
-			input = "k"
-			useOriginalForAll = true
+			input = "n"
+			useNewForAll = true
 		}
 
 		for _, c := range unmanagedConflicts {
 			switch input {
-			case "k":
+			case "k", "o":
 				if err := saveAlternative(pkgName, c.filePath, pkgName, "no package", c.stagingFile, execCtx); err != nil {
 					debugf("Warning: failed to save alternative: %v\n", err)
 				}
