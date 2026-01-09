@@ -2253,6 +2253,11 @@ func executeBuildPass(plan *BuildPlan, _ string, installAllTargets bool, cfg *Co
 					continue
 				}
 
+				// FILTER: Ignore 32-bit dependencies if multilib is disabled
+				if !EnableMultilib && strings.HasSuffix(dep.Name, "-32") {
+					continue
+				}
+
 				isSatisfied := false
 
 				// Helper to check if a package is available (installed or just built)
@@ -2524,6 +2529,11 @@ func executeBuildPass(plan *BuildPlan, _ string, installAllTargets bool, cfg *Co
 			missingDep := "unknown"
 			for _, dep := range deps {
 				if dep.Optional {
+					continue
+				}
+
+				// FILTER: Ignore 32-bit dependencies if multilib is disabled
+				if !EnableMultilib && strings.HasSuffix(dep.Name, "-32") {
 					continue
 				}
 
