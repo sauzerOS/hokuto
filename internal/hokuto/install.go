@@ -58,6 +58,9 @@ func getRebuildTriggers(triggerPkg string, rootDir string) []string {
 }
 
 func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes bool) error {
+	colArrow.Print("-> ")
+	colSuccess.Printf("Installing")
+	colNote.Printf(" %s\n", pkgName)
 
 	// Special handling for glibc: direct extraction without staging or checks
 	if pkgName == "glibc" {

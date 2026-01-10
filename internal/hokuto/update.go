@@ -511,6 +511,9 @@ func checkForUpgrades(_ context.Context, cfg *Config) error {
 		} else if BinaryMirror != "" {
 			if err := fetchBinaryPackage(pkgName, version, revision); err == nil {
 				foundBinary = true
+			} else {
+				colArrow.Print("-> ")
+				colSuccess.Println("Binary not found on mirror, building package locally")
 			}
 		}
 

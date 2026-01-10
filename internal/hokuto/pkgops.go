@@ -630,7 +630,9 @@ func handlePreInstallUninstall(pkgName string, cfg *Config, execCtx *Executor) {
 	if len(depsToActuallyUninstall) > 0 {
 		colArrow.Print("-> ")
 		// The message is now more accurate, as it only lists packages we KNOW are installed.
-		colWarn.Printf("Uninstalling %s: %v\n", pkgName, strings.Join(depsToActuallyUninstall, ", "))
+		colSuccess.Printf("Uninstalling")
+		colNote.Printf(" %v", strings.Join(depsToActuallyUninstall, ", "))
+		colSuccess.Printf(" to avoid install conflicts\n")
 
 		for _, dep := range depsToActuallyUninstall {
 			// Use force and yes flags to ensure silent, non-interactive uninstallation.

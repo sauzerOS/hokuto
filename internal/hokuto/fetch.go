@@ -268,10 +268,10 @@ func fetchBinaryPackage(pkgName, version, revision string) error {
 	destPath := filepath.Join(BinDir, filename)
 
 	colArrow.Print("-> ")
-	colSuccess.Printf("Fetching binary from mirror: %s\n", filename)
+	colSuccess.Printf("Checking mirror for binary: %s\n", filename)
 
-	// We use 'true' for showProgress to give feedback during download
-	if err := downloadFile(url, url, destPath); err != nil {
+	// Use downloadFileQuiet so we don't see curl errors (e.g. 404) during update loop
+	if err := downloadFileQuiet(url, url, destPath); err != nil {
 		// Clean up partial file on failure to prevent corrupt cache
 		os.Remove(destPath)
 		return err
