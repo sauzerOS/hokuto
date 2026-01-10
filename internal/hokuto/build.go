@@ -323,6 +323,16 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 			cflags = "-O2 -pipe -fPIC"
 		}
 
+		// --- Multilib Handling in Bootstrap ---
+		// Determine Multilib state (Only allow '1' if config requests it AND we are on x86_64)
+		multilibVal := "0"
+		switch cfg.Values["HOKUTO_MULTILIB"] {
+		case "1":
+			multilibVal = "1"
+		case "0":
+			debugf("Disabling MULTILIB for %s architecture (config requested enabled).\n", targetArch)
+		}
+
 		defaults = map[string]string{
 			"LFS":       lfsRoot,
 			"LC_ALL":    "POSIX",
@@ -339,6 +349,9 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 			"TMPDIR":           currentTmpDir,
 			"HOKUTO_ARCH":      targetArch,
 			"HOKUTO_BUILD_DIR": buildDir,
+			"GNU_MIRROR":       cfg.Values["GNU_MIRROR"],
+			"SET_HOKUTO_LTO":   cfg.Values["SET_HOKUTO_LTO"],
+			"MULTILIB":         multilibVal,
 		}
 
 	} else {
@@ -509,6 +522,7 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 			"HOKUTO_ARCH":                targetArch,
 			"MULTILIB":                   multilibVal,
 			"HOKUTO_BUILD_DIR":           buildDir,
+			"GNU_MIRROR":                 cfg.Values["GNU_MIRROR"],
 		}
 
 		if buildPriority == "idle" || buildPriority == "superidle" {
@@ -1925,6 +1939,39 @@ func handleBuildCommand(args []string, cfg *Config) error {
 			}
 			cfg.Values["HOKUTO_ARCH"] = "x86_64"
 			colSuccess.Println("Target set to x86_64.")
+		}
+
+		// GNU Mirror Selection
+		colArrow.Print("-> ")
+		colInfo.Println("Select GNU Mirror:")
+		colInfo.Println("  1. TH: https://mirror.cyberbits.asia/gnu/ - Default")
+		colInfo.Println("  2. EU: https://mirror.cyberbits.eu/gnu/")
+		colInfo.Println("  3. US: https://mirrors.ocf.berkeley.edu/gnu/")
+		fmt.Print("Enter choice [1-3] (default: 1): ")
+
+		var mirrorChoice string
+		fmt.Scanln(&mirrorChoice)
+		mirrorChoice = strings.TrimSpace(mirrorChoice)
+
+		switch mirrorChoice {
+		case "2":
+			cfg.Values["GNU_MIRROR"] = "https://mirror.cyberbits.eu/gnu/"
+			colSuccess.Println("GNU Mirror set to EU.")
+		case "3":
+			cfg.Values["GNU_MIRROR"] = "https://mirrors.ocf.berkeley.edu/gnu/"
+			colSuccess.Println("GNU Mirror set to US.")
+		default:
+			cfg.Values["GNU_MIRROR"] = "https://mirror.cyberbits.asia/gnu/"
+			colSuccess.Println("GNU Mirror set to TH.")
+		}
+
+		// LTO Consideration (for config)
+		if askForConfirmation(colInfo, "Enable LTO (Link Time Optimization) for the final system?") {
+			cfg.Values["SET_HOKUTO_LTO"] = "1"
+			colSuccess.Println("LTO will be enabled in the final configuration.")
+		} else {
+			cfg.Values["SET_HOKUTO_LTO"] = "0"
+			colWarn.Println("LTO will be disabled in the final configuration.")
 		}
 
 		initConfig(cfg)
