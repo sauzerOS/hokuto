@@ -294,7 +294,15 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 
 	modifiedFiles, err := getModifiedFiles(pkgName, rootDir, modifiedExec)
 	if err != nil {
-		return err
+		if !modifiedExec.ShouldRunAsRoot {
+			debugf("optimized user modified files detection failed, falling back to root executor: %v\n", err)
+			modifiedFiles, err = getModifiedFiles(pkgName, rootDir, execCtx) // execCtx is original (likely root)
+			if err != nil {
+				return err
+			}
+		} else {
+			return err
+		}
 	}
 
 	// 3. Interactive handling of modified files
@@ -601,7 +609,14 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 	}
 
 	if err := generateManifest(stagingDir, stagingManifest2dir, manifestExec); err != nil {
-		return fmt.Errorf("failed to generate manifest: %v", err)
+		if !manifestExec.ShouldRunAsRoot {
+			debugf("optimized user manifest generation failed, falling back to root executor: %v\n", err)
+			if err := generateManifest(stagingDir, stagingManifest2dir, RootExec); err != nil {
+				return fmt.Errorf("failed to generate manifest: %v", err)
+			}
+		} else {
+			return fmt.Errorf("failed to generate manifest: %v", err)
+		}
 	}
 	debugf("Generate update manifest\n")
 	if err := updateManifestWithNewFiles(stagingManifest, stagingManifest2file); err != nil {

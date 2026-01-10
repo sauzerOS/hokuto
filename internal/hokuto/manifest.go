@@ -52,7 +52,8 @@ func generateManifest(outputDir, installedDir string, execCtx *Executor) error {
 	entries, err := listOutputFiles(outputDir, execCtx)
 	if err != nil {
 		// fallback to RootExec
-		entries, err = listOutputFiles(outputDir, RootExec)
+		execCtx = RootExec
+		entries, err = listOutputFiles(outputDir, execCtx)
 		if err != nil {
 			return fmt.Errorf("failed to list output files: %v", err)
 		}

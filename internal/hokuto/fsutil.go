@@ -63,6 +63,9 @@ func listOutputFiles(outputDir string, execCtx *Executor) ([]string, error) {
 	cmd := exec.Command("find", outputDir)
 	var out bytes.Buffer
 	cmd.Stdout = &out
+	if !Debug {
+		cmd.Stderr = io.Discard
+	}
 	if err := execCtx.Run(cmd); err != nil {
 		return nil, fmt.Errorf("failed to list output files via find: %v", err)
 	}

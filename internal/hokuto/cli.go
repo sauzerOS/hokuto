@@ -20,7 +20,8 @@ import (
 // printHelp prints the commands table
 func printHelp() {
 	// General Usage Header
-	color.Bold.Println("Usage: hokuto <command> [arguments...]")
+	colSuccess.Println("Usage: hokuto <command> [arguments]")
+	colSuccess.Println("Run 'hokuto <command>' for advanced options")
 	fmt.Println()
 	color.Info.Println("Available Commands:")
 
@@ -31,24 +32,25 @@ func printHelp() {
 	}
 	// Restore detailed descriptions including command-specific options
 	cmds := []cmdInfo{
-		{"version, --version", "", "Show hokuto version and information"},
-		{"log", "", "View build log in TUI mode"},
-		{"list, ls", "[pkg]", "List installed packages, optionally filter by name"},
-		{"checksum, c", "<pkg>", "Fetch sources and generate checksum file for a package. -f (force redwonload of sources)"},
-		{"build, b", "<pkg...>", "Build package(s). -a (auto-install), -i (half cpu cores), -ii (one cpu core), --alldeps"},
-		{"install, i", "<pkg...>", "Install pre-built packages from the binary cache or a specified .tar.zst file. -nodeps (ignore dependencies)"},
-		{"uninstall, r", "<pkg...>", "Uninstall package(s). -f (force), -y (skip confirmation)"},
-		{"update, u", "[options]", "Update repositories and check for upgrades. Options: -i (half cpu cores), -ii (one cpu core)"},
+		{"version, --version", "", "Version information"},
+		{"log", "", "TUI build log viewer"},
+		{"list, ls", "<pkg>", "List installed packages, optionally filter by name"},
+		{"checksum, c", "<pkg>", "Fetch sources and generate checksum file"},
+		{"build, b", "<pkg>", "Build package(s)"},
+		{"install, i", "<pkg>", "Install pre-built package(s)"},
+		{"uninstall, r", "<pkg>", "Uninstall package(s)"},
+		{"update, u", "[options]", "Update repositories and check for upgrades"},
 		{"manifest, m", "<pkg>", "Show the file list for an installed package"},
 		{"find, f", "<query>", "Find which package matches query string"},
 		{"new, n", "<pkg>", "Create a new package skeleton"},
-		{"edit, e", "<pkg>", "Edit a package's build files. -a (edit all files)"},
+		{"edit, e", "<pkg>", "Edit a package's build files"},
 		{"cd", "<pkg>", "Change directory to package repository directory"},
 		{"bootstrap", "<dir>", "Build a bootstrap rootfs in target directory"},
-		{"chroot", "<dir> [cmd...]", "Enter chroot and run command (default: /bin/bash)"},
-		{"cleanup", "[options]", "Cleanup: -sources, -bins, -orphans, -all"},
+		{"chroot", "<dir> [cmd]", "Enter chroot and run command (default: /bin/bash)"},
+		{"cleanup", "[options]", "Cleanup caches"},
 		{"python-rebuild", "", "Rebuild all python packages"},
-		{"alt", "[pkg]", "Manage file alternatives. List packages with alternatives or show/switch alternatives for a package"},
+		{"alt", "<pkg>", "List packages with alternatives or show/switch alternatives for a package"},
+		{"init-repos", "", "Initialize repositories"},
 	}
 
 	// --- Dynamic Padding Logic ---
@@ -96,7 +98,7 @@ func printHelp() {
 	}
 
 	fmt.Println()
-	color.Info.Println("Run 'hokuto <command> --help' for more details on a specific command.")
+
 }
 
 // Main is the CLI entrypoint for cmd/hokuto.
@@ -258,6 +260,12 @@ func Main() {
 			os.Exit(1)
 		}
 
+	case "init-repos":
+		if err := handleInitReposCommand(cfg); err != nil {
+			fmt.Fprintf(os.Stderr, "Repository initialization failed: %v\n", err)
+			os.Exit(1)
+		}
+
 	case "version", "--version":
 		// Try to pick and show a random embedded PNG from assets/
 		imgs, err := listEmbeddedImages()
@@ -317,7 +325,9 @@ func Main() {
 		unpack := false
 
 		if len(os.Args) < 3 {
-			fmt.Println("Usage: hokuto checksum <pkg1> [<pkg2> ...] [-f] [-unpack]")
+			colNote.Println(" Usage: hokuto checksum [-unpack] <pkg1> [<pkg2> ...] [-f]")
+			colSuccess.Println("  -unpack: Unpack the sources in build directory")
+			colSuccess.Println("  -f: Force sources download")
 			return
 		}
 
@@ -337,7 +347,9 @@ func Main() {
 		}
 
 		if len(args) == 0 {
-			fmt.Println("Usage: hokuto checksum <pkg1> [<pkg2> ...] [-f] [-unpack]")
+			colNote.Println(" Usage: hokuto checksum [-unpack] <pkg1> [<pkg2> ...] [-f]")
+			colSuccess.Println("  -unpack: Unpack the sources in build directory")
+			colSuccess.Println("  -f: Force sources download")
 			return
 		}
 

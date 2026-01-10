@@ -230,7 +230,7 @@ func pkgUninstall(pkgName string, cfg *Config, execCtx *Executor, force, yes boo
 		isEtcFile := strings.HasPrefix(clean, "/etc/") || strings.HasPrefix(clean, filepath.Join(hRoot, "etc/"))
 		isAlternativeFile := alternativeFilePaths[clean]
 
-		if (force || strings.HasPrefix(p, internalFilePrefix) || meta.B3Sum == "" || isAlternativeFile) && !isEtcFile {
+		if (force || strings.HasPrefix(p, internalFilePrefix) || meta.B3Sum == "" || meta.B3Sum == "000000" || isAlternativeFile) && !isEtcFile {
 			filesToRemove = append(filesToRemove, clean)
 		} else {
 			filesToCheck = append(filesToCheck, meta)
@@ -242,8 +242,19 @@ func pkgUninstall(pkgName string, cfg *Config, execCtx *Executor, force, yes boo
 		p := meta.AbsPath
 		clean := filepath.Clean(p)
 
+		// Skip checksum check for symlinks (placeholder "000000")
+		if meta.B3Sum == "000000" {
+			filesToRemove = append(filesToRemove, clean)
+			continue
+		}
+
 		currentSum, err := b3sum(p, execCtx)
 		if err != nil {
+			// If the file is already missing, we don't need to do anything.
+			if os.IsNotExist(err) {
+				debugf("File already missing: %s\n", p)
+				continue
+			}
 			// Treat inability to check as a failure to remove for safety
 			failed = append(failed, fmt.Sprintf("%s: failed to compute b3sum: %v", p, err))
 			continue
