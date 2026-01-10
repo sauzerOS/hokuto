@@ -354,6 +354,10 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 			"MULTILIB":         multilibVal,
 		}
 
+		if cfg.Values["HOKUTO_GENERIC"] == "1" {
+			defaults["HOKUTO_GENERIC"] = "1"
+		}
+
 	} else {
 
 		// 1. Detect Architecture
@@ -1972,6 +1976,25 @@ func handleBuildCommand(args []string, cfg *Config) error {
 		} else {
 			cfg.Values["SET_HOKUTO_LTO"] = "0"
 			colWarn.Println("LTO will be disabled in the final configuration.")
+		}
+
+		// Optimization Level (Local vs Generic)
+		colArrow.Print("-> ")
+		colInfo.Println("Select Optimization Level:")
+		colInfo.Println("  1. Local CPU - Default")
+		colInfo.Println("  2. Generic")
+		fmt.Print("Enter choice [1/2] (default: 1): ")
+
+		var optChoice string
+		fmt.Scanln(&optChoice)
+		optChoice = strings.TrimSpace(optChoice)
+
+		if optChoice == "2" {
+			cfg.Values["HOKUTO_GENERIC"] = "1"
+			colSuccess.Println("Optimization level set to Generic.")
+		} else {
+			cfg.Values["HOKUTO_GENERIC"] = "0"
+			colSuccess.Println("Optimization level set to Local CPU.")
 		}
 
 		initConfig(cfg)

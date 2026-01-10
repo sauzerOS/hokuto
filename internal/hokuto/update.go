@@ -485,10 +485,10 @@ func checkForUpgrades(_ context.Context, cfg *Config) error {
 		colArrow.Print("\n-> ")
 		if userRequestedMap[pkgName] {
 			colSuccess.Printf("Executing update for:")
-			colInfo.Printf(" %s (%d/%d)\n", pkgName, i+1, totalToUpdate)
+			colNote.Printf(" %s (%d/%d)\n", pkgName, i+1, totalToUpdate)
 		} else {
 			colSuccess.Printf("Installing dependency:")
-			colInfo.Printf(" %s (%d/%d)\n", pkgName, i+1, totalToUpdate)
+			colNote.Printf(" %s (%d/%d)\n", pkgName, i+1, totalToUpdate)
 		}
 
 		// 0. Check for binary package first (Local Cache or Mirror)
@@ -525,11 +525,11 @@ func checkForUpgrades(_ context.Context, cfg *Config) error {
 				colArrow.Print("-> ")
 				if userRequestedMap[pkgName] {
 					colSuccess.Printf("Package")
-					colInfo.Printf(" %s ", outputPkgName)
+					colNote.Printf(" %s ", outputPkgName)
 					colSuccess.Printf("updated from binary successfully.\n")
 				} else {
 					colSuccess.Printf("Dependency")
-					colInfo.Printf(" %s ", outputPkgName)
+					colNote.Printf(" %s ", outputPkgName)
 					colSuccess.Printf("installed successfully.\n")
 				}
 				// If it was a requested update, add to world
@@ -563,11 +563,11 @@ func checkForUpgrades(_ context.Context, cfg *Config) error {
 		colArrow.Print("-> ")
 		if userRequestedMap[pkgName] {
 			colSuccess.Printf("Package")
-			colInfo.Printf(" %s ", outputPkgName)
+			colNote.Printf(" %s ", outputPkgName)
 			colSuccess.Printf("updated successfully.\n")
 		} else {
 			colSuccess.Printf("Dependency")
-			colInfo.Printf(" %s ", outputPkgName)
+			colNote.Printf(" %s ", outputPkgName)
 			colSuccess.Printf("installed successfully.\n")
 		}
 
