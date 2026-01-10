@@ -1979,22 +1979,27 @@ func handleBuildCommand(args []string, cfg *Config) error {
 		}
 
 		// Optimization Level (Local vs Generic)
-		colArrow.Print("-> ")
-		colInfo.Println("Select Optimization Level:")
-		colInfo.Println("  1. Local CPU - Default")
-		colInfo.Println("  2. Generic")
-		fmt.Print("Enter choice [1/2] (default: 1): ")
+		if cfg.Values["HOKUTO_ARCH"] != "aarch64" {
+			colArrow.Print("-> ")
+			colInfo.Println("Select Optimization Level:")
+			colInfo.Println("  1. Local CPU - Default")
+			colInfo.Println("  2. Generic")
+			fmt.Print("Enter choice [1/2] (default: 1): ")
 
-		var optChoice string
-		fmt.Scanln(&optChoice)
-		optChoice = strings.TrimSpace(optChoice)
+			var optChoice string
+			fmt.Scanln(&optChoice)
+			optChoice = strings.TrimSpace(optChoice)
 
-		if optChoice == "2" {
-			cfg.Values["HOKUTO_GENERIC"] = "1"
-			colSuccess.Println("Optimization level set to Generic.")
+			if optChoice == "2" {
+				cfg.Values["HOKUTO_GENERIC"] = "1"
+				colSuccess.Println("Optimization level set to Generic.")
+			} else {
+				cfg.Values["HOKUTO_GENERIC"] = "0"
+				colSuccess.Println("Optimization level set to Local CPU.")
+			}
 		} else {
+			// For aarch64, default to Local but don't set HOKUTO_GENERIC=1
 			cfg.Values["HOKUTO_GENERIC"] = "0"
-			colSuccess.Println("Optimization level set to Local CPU.")
 		}
 
 		initConfig(cfg)
