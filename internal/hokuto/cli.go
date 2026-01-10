@@ -44,6 +44,7 @@ func printHelp() {
 		{"find, f", "<query>", "Find which package matches query string"},
 		{"new, n", "<pkg>", "Create a new package skeleton"},
 		{"edit, e", "<pkg>", "Edit a package's build files"},
+		{"bump", "<pkgset> <old> <new>", "Batch update a set of packages"},
 		{"cd", "<pkg>", "Change directory to package repository directory"},
 		{"bootstrap", "<dir>", "Build a bootstrap rootfs in target directory"},
 		{"chroot", "<dir> [cmd]", "Enter chroot and run command (default: /bin/bash)"},
@@ -835,6 +836,16 @@ func Main() {
 
 		if err := editPackage(pkg, openAll); err != nil {
 			fmt.Fprintln(os.Stderr, "Error:", err)
+			os.Exit(1)
+		}
+
+	case "bump":
+		if len(os.Args) < 5 {
+			fmt.Println("Usage: hokuto bump <pkgset> <oldversion> <newversion>")
+			os.Exit(1)
+		}
+		if err := handleBumpCommand(os.Args[2], os.Args[3], os.Args[4]); err != nil {
+			fmt.Fprintf(os.Stderr, "Bump failed: %v\n", err)
 			os.Exit(1)
 		}
 

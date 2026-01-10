@@ -53,6 +53,7 @@ var (
 	WorldFile        = "/var/db/hokuto/world"
 	WorldMakeFile    = "/var/db/hokuto/world_make"
 	LockFile         = "/etc/hokuto.lock"
+	PkgsetFile       = "/etc/hokuto.pkgset"
 	versionedPkgDirs = make(map[string]string) // pkgName@version -> tmpDir
 )
 

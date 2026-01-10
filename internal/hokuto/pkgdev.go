@@ -241,3 +241,111 @@ func editPackage(pkgName string, openAll bool) error {
 
 	return runEditor(editor, filesToOpen...)
 }
+func handleBumpCommand(pkgsetName, oldVersion, newVersion string) error {
+	sets, err := loadPkgsets()
+	if err != nil {
+		return fmt.Errorf("failed to load pkgsets: %v", err)
+	}
+
+	pkgs, ok := sets[pkgsetName]
+	if !ok {
+		return fmt.Errorf("pkgset %s not found in %s", pkgsetName, PkgsetFile)
+	}
+
+	var failed []string
+
+	for _, pkgName := range pkgs {
+		colArrow.Print("-> ")
+		colSuccess.Printf("Bumping %s: %s -> %s\n", pkgName, oldVersion, newVersion)
+
+		pkgDir, err := findPackageDir(pkgName)
+		if err != nil {
+			failed = append(failed, fmt.Sprintf("%s: package not found", pkgName))
+			continue
+		}
+
+		// 1) Verify .sources exists
+		dotSourcesPath := filepath.Join(pkgDir, ".sources")
+		if _, err := os.Stat(dotSourcesPath); os.IsNotExist(err) {
+			failed = append(failed, fmt.Sprintf("%s: .sources file missing", pkgName))
+			continue
+		}
+
+		// 2) Verify version file matches oldVersion
+		versionPath := filepath.Join(pkgDir, "version")
+		versionData, err := os.ReadFile(versionPath)
+		if err != nil {
+			failed = append(failed, fmt.Sprintf("%s: could not read version file", pkgName))
+			continue
+		}
+		fields := strings.Fields(string(versionData))
+		if len(fields) == 0 {
+			failed = append(failed, fmt.Sprintf("%s: version file empty", pkgName))
+			continue
+		}
+		currentVer := fields[0]
+		currentRev := "1"
+		if len(fields) > 1 {
+			currentRev = fields[1]
+		}
+
+		if currentVer != oldVersion {
+			failed = append(failed, fmt.Sprintf("%s: wrong version (found %s, expected %s)", pkgName, currentVer, oldVersion))
+			continue
+		}
+
+		// 3) Amend version to newVersion
+		newVersionContent := fmt.Sprintf("%s %s\n", newVersion, currentRev)
+		if err := os.WriteFile(versionPath, []byte(newVersionContent), 0o644); err != nil {
+			failed = append(failed, fmt.Sprintf("%s: failed to update version file", pkgName))
+			continue
+		}
+
+		// 4) Execute automatic version substitution
+		dotSourcesData, err := os.ReadFile(dotSourcesPath)
+		if err != nil {
+			failed = append(failed, fmt.Sprintf("%s: failed to read .sources", pkgName))
+			continue
+		}
+		updatedSources := applySubstitutions(string(dotSourcesData), newVersion, pkgName)
+		sourcesPath := filepath.Join(pkgDir, "sources")
+		if err := os.WriteFile(sourcesPath, []byte(updatedSources), 0o644); err != nil {
+			failed = append(failed, fmt.Sprintf("%s: failed to update sources file", pkgName))
+			continue
+		}
+
+		// 5) Update checksums (fetchSources + verifyOrCreateChecksums)
+		if err := fetchSources(pkgName, pkgDir, false); err != nil {
+			failed = append(failed, fmt.Sprintf("%s: could not download sources: %v", pkgName, err))
+			continue
+		}
+		if err := verifyOrCreateChecksums(pkgName, pkgDir, false); err != nil {
+			failed = append(failed, fmt.Sprintf("%s: failed to generate checksums: %v", pkgName, err))
+			continue
+		}
+
+		// 5) git add . (within pkgDir)
+		gitAdd := exec.Command("git", "-C", pkgDir, "add", ".")
+		if err := gitAdd.Run(); err != nil {
+			failed = append(failed, fmt.Sprintf("%s: git add failed: %v", pkgName, err))
+			continue
+		}
+
+		// 6) git commit (use hook for message)
+		gitCommit := exec.Command("git", "-C", pkgDir, "commit", "--no-edit", ".")
+		if err := gitCommit.Run(); err != nil {
+			failed = append(failed, fmt.Sprintf("%s: git commit failed: %v", pkgName, err))
+			continue
+		}
+	}
+
+	if len(failed) > 0 {
+		fmt.Fprintln(os.Stderr)
+		for _, f := range failed {
+			colArrow.Print("-> ")
+			colError.Printf("Failed %s\n", f)
+		}
+	}
+
+	return nil
+}
