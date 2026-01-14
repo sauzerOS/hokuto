@@ -965,12 +965,20 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 	}
 
 	// delete /usr/lib/perl5/*/core_perl/perllocal.pod
-	pattern := filepath.Join(outputDir, "lib", "perl5", "*", "core_perl", "perllocal.pod")
-	matches, err := filepath.Glob(pattern)
-	if err != nil {
-		// This is an error in the pattern itself or a fundamental I/O error
-		fmt.Fprintf(os.Stderr, "Warning: failed to glob for perllocal.pod pattern %s: %v\n", pattern, err)
-		// Continue, as this is a non-fatal cleanup
+	// Check both /lib/perl5 and /usr/lib/perl5 locations
+	perllocalPatterns := []string{
+		filepath.Join(outputDir, "lib", "perl5", "*", "core_perl", "perllocal.pod"),
+		filepath.Join(outputDir, "usr", "lib", "perl5", "*", "core_perl", "perllocal.pod"),
+	}
+
+	var matches []string
+	for _, p := range perllocalPatterns {
+		m, err := filepath.Glob(p)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to glob for perllocal.pod pattern %s: %v\n", p, err)
+			continue
+		}
+		matches = append(matches, m...)
 	}
 	if len(matches) > 0 {
 		// Prepare the command arguments: ["rm", "-f"] followed by all file paths
@@ -1657,12 +1665,20 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 	}
 
 	// delete /usr/lib/perl5/*/core_perl/perllocal.pod
-	pattern := filepath.Join(outputDir, "lib", "perl5", "*", "core_perl", "perllocal.pod")
-	matches, err := filepath.Glob(pattern)
-	if err != nil {
-		// This is an error in the pattern itself or a fundamental I/O error
-		fmt.Fprintf(os.Stderr, "Warning: failed to glob for perllocal.pod pattern %s: %v\n", pattern, err)
-		// Continue, as this is a non-fatal cleanup
+	// Check both /lib/perl5 and /usr/lib/perl5 locations
+	perllocalPatterns := []string{
+		filepath.Join(outputDir, "lib", "perl5", "*", "core_perl", "perllocal.pod"),
+		filepath.Join(outputDir, "usr", "lib", "perl5", "*", "core_perl", "perllocal.pod"),
+	}
+
+	var matches []string
+	for _, p := range perllocalPatterns {
+		m, err := filepath.Glob(p)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to glob for perllocal.pod pattern %s: %v\n", p, err)
+			continue
+		}
+		matches = append(matches, m...)
 	}
 	if len(matches) > 0 {
 		// Prepare the command arguments: ["rm", "-f"] followed by all file paths
