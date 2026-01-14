@@ -97,7 +97,7 @@ func resolveBinaryDependencies(pkgName string, visited map[string]bool, plan *[]
 // - creates directory $newPackageDir/<pkg>
 // - creates build, version, sources files with the right modes and contents
 
-func resolveMissingDeps(pkgName string, processed map[string]bool, missing *[]string) error {
+func resolveMissingDeps(pkgName string, processed map[string]bool, missing *[]string, forceBuild map[string]bool) error {
 
 	// 1. Mark this package as processed to prevent infinite recursion
 	if processed[pkgName] {
@@ -143,6 +143,11 @@ func resolveMissingDeps(pkgName string, processed map[string]bool, missing *[]st
 			continue
 		}
 
+		// Skip Make dependencies if the package is installed and not forced to rebuild
+		if dep.Make && isPackageInstalled(pkgName) && !forceBuild[pkgName] {
+			continue
+		}
+
 		// FILTER: Ignore 32-bit dependencies if multilib is disabled
 		if !EnableMultilib && strings.HasSuffix(depName, "-32") {
 			continue
@@ -171,7 +176,7 @@ func resolveMissingDeps(pkgName string, processed map[string]bool, missing *[]st
 			}
 		}
 
-		if err := resolveMissingDeps(depName, processed, missing); err != nil {
+		if err := resolveMissingDeps(depName, processed, missing, forceBuild); err != nil {
 			// Propagate the error up
 			return err
 		}
@@ -511,7 +516,16 @@ func resolveBuildPlan(targetPackages []string, userRequestedPackages map[string]
 				}
 				depName = resolved
 			}
+			if depName == pkgName {
+				continue
+			}
 
+			// Skip Make dependencies if the package is installed and not forced to rebuild
+			// We check both user requested set and plan.RebuildPackages (though RebuildPackages might not be fully populated yet for downstream,
+			// it tracks explicit rebuilds triggered by other things).
+			if dep.Make && isPackageInstalled(pkgName) && !userRequestedPackages[pkgName] && !plan.RebuildPackages[pkgName] {
+				continue
+			}
 			if depName == pkgName {
 				continue
 			}

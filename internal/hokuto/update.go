@@ -520,6 +520,9 @@ func checkForUpgrades(_ context.Context, cfg *Config) error {
 		if foundBinary {
 			isCriticalAtomic.Store(1)
 			handlePreInstallUninstall(outputPkgName, cfg, RootExec)
+			colArrow.Print("-> ")
+			colSuccess.Printf("Installing")
+			colNote.Printf(" %s\n", outputPkgName)
 			if err := pkgInstall(tarballPath, outputPkgName, cfg, RootExec, false); err != nil {
 				isCriticalAtomic.Store(0)
 				color.Danger.Printf("Binary installation failed for %s: %v. Falling back to build.\n", outputPkgName, err)
@@ -555,6 +558,9 @@ func checkForUpgrades(_ context.Context, cfg *Config) error {
 		// B. If build is successful, install the package
 		isCriticalAtomic.Store(1)
 		handlePreInstallUninstall(outputPkgName, cfg, RootExec)
+		colArrow.Print("-> ")
+		colSuccess.Printf("Installing")
+		colNote.Printf(" %s\n", outputPkgName)
 		if err := pkgInstall(tarballPath, outputPkgName, cfg, RootExec, false); err != nil {
 			isCriticalAtomic.Store(0)
 			color.Danger.Printf("Installation failed for %s: %v\n", outputPkgName, err)

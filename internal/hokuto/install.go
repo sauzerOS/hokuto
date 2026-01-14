@@ -58,9 +58,8 @@ func getRebuildTriggers(triggerPkg string, rootDir string) []string {
 }
 
 func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes bool) error {
-	colArrow.Print("-> ")
-	colSuccess.Printf("Installing")
-	colNote.Printf(" %s\n", pkgName)
+	// "Installing" message is now handled by the caller (cli.go, update.go, build.go)
+	// to avoid duplicate output.
 
 	// Special handling for glibc: direct extraction without staging or checks
 	if pkgName == "glibc" {
@@ -318,6 +317,14 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 	for _, file := range modifiedFiles {
 		stagingFile := filepath.Join(stagingDir, file)
 		currentFile := filepath.Join(rootDir, file) // file under the install root
+
+		// Fast path: If user selected "Use new for [A]ll" (or "yes" mode),
+		// we skip expensive checks (owner lookup, conflicts, diffs) and default to "Use New".
+		if skipAllPrompts || yes {
+			// Implicit "Use New": do nothing, let it fall through.
+			// The file remains in staging and will overwrite the target during the final rsync.
+			continue
+		}
 
 		// --- NEW: Find the owner package ---
 		ownerPkg, err := findOwnerPackage(file)

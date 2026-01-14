@@ -2098,7 +2098,7 @@ func handleBuildCommand(args []string, cfg *Config) error {
 		masterProcessed := make(map[string]bool)
 		var missingDeps []string
 		for _, pkgName := range packagesToProcess {
-			if err := resolveMissingDeps(pkgName, masterProcessed, &missingDeps); err != nil {
+			if err := resolveMissingDeps(pkgName, masterProcessed, &missingDeps, userRequestedMap); err != nil {
 				return fmt.Errorf("error resolving dependencies for %s: %v", pkgName, err)
 			}
 		}

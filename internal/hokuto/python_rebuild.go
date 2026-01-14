@@ -43,6 +43,8 @@ func handlePythonRebuildCommand(cfg *Config) error {
 			"arandr":                true,
 			"gobject-introspection": true,
 			"cython":                true,
+			"blueman":               true,
+			"lutris":                true,
 		}
 
 		if strings.Contains(pkgName, "python") || extraPkgs[pkgName] {

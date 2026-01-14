@@ -369,6 +369,9 @@ func Main() {
 		}
 
 	case "build", "b":
+		if err := ensureHokutoOwnership(cfg); err != nil {
+			fmt.Fprintf(os.Stderr, "Ownership check failed: %v\n", err)
+		}
 		if err := handleBuildCommand(os.Args[2:], cfg); err != nil {
 			fmt.Fprintf(os.Stderr, "Build failed: %v\n", err)
 			os.Exit(1)
@@ -402,6 +405,9 @@ func Main() {
 		}
 
 	case "install", "i":
+		if err := ensureHokutoOwnership(cfg); err != nil {
+			fmt.Fprintf(os.Stderr, "Ownership check failed: %v\n", err)
+		}
 		installCmd := flag.NewFlagSet("install", flag.ExitOnError)
 		var yes = installCmd.Bool("y", false, "Assume 'yes' to all prompts and overwrite modified files.")
 		var yesLong = installCmd.Bool("yes", false, "Assume 'yes' to all prompts and overwrite modified files.")
@@ -697,6 +703,9 @@ func Main() {
 		}
 
 	case "update", "u":
+		if err := ensureHokutoOwnership(cfg); err != nil {
+			fmt.Fprintf(os.Stderr, "Ownership check failed: %v\n", err)
+		}
 		// Use a proper FlagSet to parse arguments and set buildPriority
 		updateCmd := flag.NewFlagSet("update", flag.ExitOnError)
 		var idleBuild = updateCmd.Bool("i", false, "Use half CPU cores and lowest niceness for build process.")
@@ -840,13 +849,34 @@ func Main() {
 		}
 
 	case "bump":
-		if len(os.Args) < 5 {
-			fmt.Println("Usage: hokuto bump <pkgset> <oldversion> <newversion>")
+		bumpCmd := flag.NewFlagSet("bump", flag.ExitOnError)
+		var isSet = bumpCmd.Bool("set", false, "Bump a package set")
+		if err := bumpCmd.Parse(os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "Error parsing bump flags: %v\n", err)
 			os.Exit(1)
 		}
-		if err := handleBumpCommand(os.Args[2], os.Args[3], os.Args[4]); err != nil {
-			fmt.Fprintf(os.Stderr, "Bump failed: %v\n", err)
-			os.Exit(1)
+		args := bumpCmd.Args()
+
+		if *isSet {
+			// Mode: Set Bump (hokuto bump -set <pkgset> <old> <new>)
+			if len(args) < 3 {
+				fmt.Println("Usage: hokuto bump -set <pkgset> <oldversion> <newversion>")
+				os.Exit(1)
+			}
+			if err := handleSetBumpCommand(args[0], args[1], args[2]); err != nil {
+				fmt.Fprintf(os.Stderr, "Bump failed: %v\n", err)
+				os.Exit(1)
+			}
+		} else {
+			// Mode: Single Bump (hokuto bump <pkg> <new>)
+			if len(args) < 2 {
+				fmt.Println("Usage: hokuto bump <pkgname> <newversion>")
+				os.Exit(1)
+			}
+			if err := handleSingleBumpCommand(args[0], args[1]); err != nil {
+				fmt.Fprintf(os.Stderr, "Bump failed: %v\n", err)
+				os.Exit(1)
+			}
 		}
 
 	default:
