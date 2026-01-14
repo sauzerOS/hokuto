@@ -846,7 +846,9 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 					fmt.Fprintf(os.Stderr, "failed to cleanup rebuild tmpdirs for %s: %v\n", rebuildPkg, err)
 				}
 				colArrow.Print("-> ")
-				cPrintf(colSuccess, "Rebuild of %s finished and installed.\n", rebuildPkg)
+				cPrintf(colSuccess, "Rebuild of ")
+				colNote.Printf("%s ", rebuildPkg)
+				colSuccess.Printf("finished and installed.\n")
 			}
 		} else {
 			colArrow.Print("-> ")
@@ -938,7 +940,10 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 				if err := execCtx.Run(rmCmd); err != nil {
 					fmt.Fprintf(os.Stderr, "failed to cleanup rebuild tmpdirs for %s: %v\n", pkg, err)
 				}
-				cPrintf(colNote, "Rebuild of %s finished and installed.\n", pkg)
+				colArrow.Print("-> ")
+				colSuccess.Printf("Rebuild of ")
+				colNote.Printf("%s ", pkg)
+				colSuccess.Printf("finished and installed.\n")
 			}
 		}
 	}
