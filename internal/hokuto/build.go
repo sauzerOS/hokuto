@@ -995,6 +995,20 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 		}
 	}
 
+	// delete non-en locales in /usr/share/locale
+	localePattern := filepath.Join(outputDir, "usr", "share", "locale", "*")
+	if localeMatches, err := filepath.Glob(localePattern); err == nil {
+		for _, path := range localeMatches {
+			base := filepath.Base(path)
+			if !strings.HasPrefix(base, "en") {
+				rmCmd := exec.Command("rm", "-rf", path)
+				if err := buildExec.Run(rmCmd); err != nil {
+					fmt.Fprintf(os.Stderr, "Warning: failed to delete locale %s: %v\n", base, err)
+				}
+			}
+		}
+	}
+
 	// Generate manifest
 	if err := generateManifest(outputDir, installedDir, buildExec); err != nil {
 		return 0, fmt.Errorf("failed to generate manifest: %v", err)
@@ -1692,6 +1706,20 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 			// Note: rm -f will not return an error if the files were not found,
 			// but it will if permission is denied, or other fatal errors occur.
 			fmt.Fprintf(os.Stderr, "Warning: failed to delete perllocal.pod files: %v\n", err)
+		}
+	}
+
+	// delete non-en locales in /usr/share/locale
+	localePattern := filepath.Join(outputDir, "usr", "share", "locale", "*")
+	if localeMatches, err := filepath.Glob(localePattern); err == nil {
+		for _, path := range localeMatches {
+			base := filepath.Base(path)
+			if !strings.HasPrefix(base, "en") {
+				rmCmd := exec.Command("rm", "-rf", path)
+				if err := buildExec.Run(rmCmd); err != nil {
+					fmt.Fprintf(os.Stderr, "Warning: failed to delete locale %s: %v\n", base, err)
+				}
+			}
 		}
 	}
 
