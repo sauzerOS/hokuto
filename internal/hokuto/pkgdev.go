@@ -242,9 +242,30 @@ func editPackage(pkgName string, openAll bool) error {
 	return runEditor(editor, filesToOpen...)
 }
 
+// getGitRepoRoot finds the root definition of the git repository containing path.
+func getGitRepoRoot(path string) (string, error) {
+	cmd := exec.Command("git", "-C", path, "rev-parse", "--show-toplevel")
+	output, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("failed to get git repo root for %s: %v", path, err)
+	}
+	return strings.TrimSpace(string(output)), nil
+}
+
+// pushGitRepo pushes changes to the remote repository.
+func pushGitRepo(repoPath string) error {
+	colArrow.Print("-> ")
+	colSuccess.Printf("Pushing changes for repo: %s\n", repoPath)
+	cmd := exec.Command("git", "-C", repoPath, "push")
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
+}
+
 // bumpPackage performs the bump operation on a single package.
 // If expectedOldVersion is empty, the version check is skipped.
-func bumpPackage(pkgName, expectedOldVersion, newVersion string) error {
+// Returns the package directory on success.
+func bumpPackage(pkgName, expectedOldVersion, newVersion string) (string, error) {
 	colArrow.Print("-> ")
 	if expectedOldVersion != "" {
 		colSuccess.Printf("Bumping %s: %s -> %s\n", pkgName, expectedOldVersion, newVersion)
@@ -254,24 +275,24 @@ func bumpPackage(pkgName, expectedOldVersion, newVersion string) error {
 
 	pkgDir, err := findPackageDir(pkgName)
 	if err != nil {
-		return fmt.Errorf("%s: package not found", pkgName)
+		return "", fmt.Errorf("%s: package not found", pkgName)
 	}
 
 	// 1) Verify .sources exists
 	dotSourcesPath := filepath.Join(pkgDir, ".sources")
 	if _, err := os.Stat(dotSourcesPath); os.IsNotExist(err) {
-		return fmt.Errorf("%s: .sources file missing", pkgName)
+		return "", fmt.Errorf("%s: .sources file missing", pkgName)
 	}
 
 	// 2) Verify version file matches oldVersion (if checked)
 	versionPath := filepath.Join(pkgDir, "version")
 	versionData, err := os.ReadFile(versionPath)
 	if err != nil {
-		return fmt.Errorf("%s: could not read version file", pkgName)
+		return "", fmt.Errorf("%s: could not read version file", pkgName)
 	}
 	fields := strings.Fields(string(versionData))
 	if len(fields) == 0 {
-		return fmt.Errorf("%s: version file empty", pkgName)
+		return "", fmt.Errorf("%s: version file empty", pkgName)
 	}
 	currentVer := fields[0]
 	// currentRev := "1"
@@ -280,39 +301,39 @@ func bumpPackage(pkgName, expectedOldVersion, newVersion string) error {
 	// }
 
 	if expectedOldVersion != "" && currentVer != expectedOldVersion {
-		return fmt.Errorf("%s: wrong version (found %s, expected %s)", pkgName, currentVer, expectedOldVersion)
+		return "", fmt.Errorf("%s: wrong version (found %s, expected %s)", pkgName, currentVer, expectedOldVersion)
 	}
 
 	// 3) Amend version to newVersion
 	// Reset revision to 1 on bump
 	newVersionContent := fmt.Sprintf("%s 1\n", newVersion)
 	if err := os.WriteFile(versionPath, []byte(newVersionContent), 0o644); err != nil {
-		return fmt.Errorf("%s: failed to update version file", pkgName)
+		return "", fmt.Errorf("%s: failed to update version file", pkgName)
 	}
 
 	// 4) Execute automatic version substitution
 	dotSourcesData, err := os.ReadFile(dotSourcesPath)
 	if err != nil {
-		return fmt.Errorf("%s: failed to read .sources", pkgName)
+		return "", fmt.Errorf("%s: failed to read .sources", pkgName)
 	}
 	updatedSources := applySubstitutions(string(dotSourcesData), newVersion, pkgName)
 	sourcesPath := filepath.Join(pkgDir, "sources")
 	if err := os.WriteFile(sourcesPath, []byte(updatedSources), 0o644); err != nil {
-		return fmt.Errorf("%s: failed to update sources file", pkgName)
+		return "", fmt.Errorf("%s: failed to update sources file", pkgName)
 	}
 
 	// 5) Update checksums (fetchSources + verifyOrCreateChecksums)
 	if err := fetchSources(pkgName, pkgDir, false); err != nil {
-		return fmt.Errorf("%s: could not download sources: %v", pkgName, err)
+		return "", fmt.Errorf("%s: could not download sources: %v", pkgName, err)
 	}
 	if err := verifyOrCreateChecksums(pkgName, pkgDir, false); err != nil {
-		return fmt.Errorf("%s: failed to generate checksums: %v", pkgName, err)
+		return "", fmt.Errorf("%s: failed to generate checksums: %v", pkgName, err)
 	}
 
 	// 6) git add . (within pkgDir)
 	gitAdd := exec.Command("git", "-C", pkgDir, "add", ".")
 	if err := gitAdd.Run(); err != nil {
-		return fmt.Errorf("%s: git add failed: %v", pkgName, err)
+		return "", fmt.Errorf("%s: git add failed: %v", pkgName, err)
 	}
 
 	// 7) git commit (use hook for message)
@@ -320,16 +341,27 @@ func bumpPackage(pkgName, expectedOldVersion, newVersion string) error {
 	// Depending on git config, --no-edit might fail if no message logic is hooked?
 	// The original code used this, so preserving it.
 	if err := gitCommit.Run(); err != nil {
-		return fmt.Errorf("%s: git commit failed: %v", pkgName, err)
+		return "", fmt.Errorf("%s: git commit failed: %v", pkgName, err)
 	}
 
-	return nil
+	return pkgDir, nil
 }
 
 func handleSingleBumpCommand(pkgName, newVersion string) error {
-	if err := bumpPackage(pkgName, "", newVersion); err != nil {
+	pkgDir, err := bumpPackage(pkgName, "", newVersion)
+	if err != nil {
 		return err
 	}
+
+	// Push changes
+	repoRoot, err := getGitRepoRoot(pkgDir)
+	if err != nil {
+		return fmt.Errorf("failed to determine git repo root: %v", err)
+	}
+	if err := pushGitRepo(repoRoot); err != nil {
+		return fmt.Errorf("git push failed: %v", err)
+	}
+
 	return nil
 }
 
@@ -345,11 +377,19 @@ func handleSetBumpCommand(pkgsetName, oldVersion, newVersion string) error {
 	}
 
 	var failed []string
+	repoRoots := make(map[string]bool)
 
 	for _, pkgName := range pkgs {
-		if err := bumpPackage(pkgName, oldVersion, newVersion); err != nil {
+		pkgDir, err := bumpPackage(pkgName, oldVersion, newVersion)
+		if err != nil {
 			failed = append(failed, err.Error())
 			continue
+		}
+		// Collect repo root for later push
+		if repoRoot, err := getGitRepoRoot(pkgDir); err == nil {
+			repoRoots[repoRoot] = true
+		} else {
+			fmt.Fprintf(os.Stderr, "Warning: failed to determine git repo root for %s: %v\n", pkgName, err)
 		}
 	}
 
@@ -358,6 +398,13 @@ func handleSetBumpCommand(pkgsetName, oldVersion, newVersion string) error {
 		for _, f := range failed {
 			colArrow.Print("-> ")
 			colError.Printf("Failed %s\n", f)
+		}
+	}
+
+	// Push unique repositories
+	for repoRoot := range repoRoots {
+		if err := pushGitRepo(repoRoot); err != nil {
+			colError.Printf("Failed to push repo %s: %v\n", repoRoot, err)
 		}
 	}
 
