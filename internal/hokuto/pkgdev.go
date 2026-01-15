@@ -257,9 +257,15 @@ func pushGitRepo(repoPath string) error {
 	colArrow.Print("-> ")
 	colSuccess.Printf("Pushing changes for repo: %s\n", repoPath)
 	cmd := exec.Command("git", "-C", repoPath, "push")
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	return cmd.Run()
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		fmt.Fprint(os.Stderr, string(out))
+		return err
+	}
+	if Verbose {
+		fmt.Print(string(out))
+	}
+	return nil
 }
 
 // bumpPackage performs the bump operation on a single package.
