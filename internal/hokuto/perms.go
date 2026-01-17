@@ -25,6 +25,10 @@ func ensureHokutoOwnership(cfg *Config) error {
 		targetUser = currentUser.Username
 	}
 
+	if targetUser == "root" {
+		return nil
+	}
+
 	// We assume 'wheel' group as requested.
 	targetGroup := "wheel"
 
