@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -471,6 +472,9 @@ func checkForUpgrades(_ context.Context, cfg *Config) error {
 	// Use the ordered plan instead of the unordered list
 	pkgNames = plan.Order
 
+	// Apply user-specified update order from /etc/hokuto.update
+	pkgNames = applyUpdateOrder(pkgNames)
+
 	// Launch background prefetcher for SUBSEQUENT packages.
 	if len(pkgNames) > 1 {
 		go prefetchSources(pkgNames[1:])
@@ -592,6 +596,66 @@ func checkForUpgrades(_ context.Context, cfg *Config) error {
 	colArrow.Print("-> ")
 	colSuccess.Printf("System update completed successfully (%d/%d) Total Time: %s\n", totalToUpdate, totalToUpdate, totalUpdateDuration.Truncate(time.Second))
 	return nil
+}
+
+// applyUpdateOrder reorders the package list based on /etc/hokuto.update
+func applyUpdateOrder(pkgNames []string) []string {
+	updateOrderFile := filepath.Join(rootDir, "etc", "hokuto.update")
+	data, err := os.ReadFile(updateOrderFile)
+	if err != nil {
+		// If file doesn't exist or can't be read, return original order
+		return pkgNames
+	}
+
+	// Map to store the priority of packages.
+	// We use the order of appearance in the file to determine priority.
+	priority := make(map[string]int)
+	scanner := bufio.NewScanner(strings.NewReader(string(data)))
+	rank := 0
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		// Each line can contain one or more packages separated by spaces
+		pkgs := strings.Fields(line)
+		for _, p := range pkgs {
+			// Only assign priority if not already assigned (first occurrence wins)
+			if _, exists := priority[p]; !exists {
+				priority[p] = rank
+				rank++
+			}
+		}
+	}
+
+	if len(priority) == 0 {
+		return pkgNames
+	}
+
+	// Create a copy to avoid modifying the input slice if that's preferred,
+	// but here we are re-assigning it anyway.
+	result := make([]string, len(pkgNames))
+	copy(result, pkgNames)
+
+	// Sort the packages. We use a stable sort to maintain the relative order
+	// provided by the dependency resolver for packages not mentioned in the update file
+	// or for which no relative order is specified.
+	sort.SliceStable(result, func(i, j int) bool {
+		p1, ok1 := priority[result[i]]
+		p2, ok2 := priority[result[j]]
+
+		// If both packages are in the update order file, use their relative order.
+		if ok1 && ok2 {
+			return p1 < p2
+		}
+
+		// If only one is in the file or neither is, we preserve their original
+		// relative order from the topological sort to avoid breaking dependencies.
+		return false
+	})
+
+	return result
 }
 
 // resolveMissingDeps recursively finds all missing dependencies for a package.
