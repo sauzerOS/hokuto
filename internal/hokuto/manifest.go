@@ -6,6 +6,7 @@ package hokuto
 import (
 	"bufio"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -271,9 +272,8 @@ func updateManifestWithNewFiles(stagingManifest, stagingManifest2 string) error 
 	const zeroChecksum = "000000" // The required replacement checksum
 
 	for path, newEntry := range newEntries {
-		// Ignore any entry that contains the temporary manifest identifier.
-		// This prevents the manifest file itself from being added to the final manifest.
-		if strings.Contains(path, "staging-manifest") {
+		// Ignore manifest and signature files.
+		if strings.Contains(path, "staging-manifest") || strings.HasSuffix(path, "/signature") {
 			continue
 		}
 
@@ -308,6 +308,7 @@ func updateManifestWithNewFiles(stagingManifest, stagingManifest2 string) error 
 
 	// Arguments: tee -a <stagingManifest>
 	cmd := exec.Command("tee", "-a", stagingManifest)
+	cmd.Stdout = io.Discard
 
 	// Pipe the data from the strings.Builder into the command's standard input
 	cmd.Stdin = strings.NewReader(manifestLines.String())

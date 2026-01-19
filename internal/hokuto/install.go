@@ -148,6 +148,11 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 		}
 	}
 
+	// 1.5. Verify package signature
+	if err := VerifyPackageSignature(stagingDir, pkgName, execCtx); err != nil {
+		return err
+	}
+
 	// Helper function to run diff with root executor fallback if permission denied
 	runDiffWithFallback := func(file1, file2 string, outputToStdout bool) error {
 		// Helper to filter binary diff messages

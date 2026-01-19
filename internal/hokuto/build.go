@@ -1009,9 +1009,24 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 		}
 	}
 
-	// Generate manifest
+	// Determine architecture and flags for metadata
+	targetArch := defaults["HOKUTO_ARCH"]
+	cflagsVal := defaults["CFLAGS"]
+	isGeneric := cfg.Values["HOKUTO_GENERIC"] == "1"
+
+	// 1. Generate pkginfo (before manifest) so it's included in the manifest
+	if err := WritePackageInfo(outputDir, outputPkgName, version, revision, targetArch, cflagsVal, isGeneric); err != nil {
+		return 0, fmt.Errorf("failed to write pkginfo: %v", err)
+	}
+
+	// 2. Generate manifest (includes pkginfo and itself)
 	if err := generateManifest(outputDir, installedDir, buildExec); err != nil {
 		return 0, fmt.Errorf("failed to generate manifest: %v", err)
+	}
+
+	// 3. Sign the package metadata and manifest
+	if err := SignPackage(outputDir, outputPkgName, buildExec); err != nil {
+		return 0, fmt.Errorf("failed to sign package: %v", err)
 	}
 
 	// Generate package archive (using output package name if cross-system is enabled)
