@@ -1009,6 +1009,12 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 		}
 	}
 
+	// Compress build log to package metadata
+	logXZPath := filepath.Join(installedDir, "log.xz")
+	if err := compressXZ(logPath, logXZPath); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: failed to compress build log: %v\n", err)
+	}
+
 	// Determine architecture and flags for metadata
 	targetArch := defaults["HOKUTO_ARCH"]
 	cflagsVal := defaults["CFLAGS"]
@@ -1739,6 +1745,12 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 				}
 			}
 		}
+	}
+
+	// Compress build log to package metadata
+	logXZPath := filepath.Join(installedDir, "log.xz")
+	if err := compressXZ(logPath, logXZPath); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: failed to compress build log: %v\n", err)
 	}
 
 	// Generate manifest

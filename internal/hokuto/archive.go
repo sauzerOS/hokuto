@@ -465,3 +465,27 @@ func createPackageTarball(pkgName, pkgVer, pkgRev, arch, variant, outputDir stri
 	colSuccess.Printf("Package tarball created successfully: %s\n", tarballPath)
 	return nil
 }
+
+// compressXZ compresses a file using XZ
+func compressXZ(srcPath, destPath string) error {
+	src, err := os.Open(srcPath)
+	if err != nil {
+		return err
+	}
+	defer src.Close()
+
+	dest, err := os.Create(destPath)
+	if err != nil {
+		return err
+	}
+	defer dest.Close()
+
+	xzWriter, err := xz.NewWriter(dest)
+	if err != nil {
+		return err
+	}
+	defer xzWriter.Close()
+
+	_, err = io.Copy(xzWriter, src)
+	return err
+}

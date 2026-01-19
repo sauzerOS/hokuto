@@ -5,6 +5,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"math/rand"
 	"os"
 	"os/exec"
@@ -15,6 +16,7 @@ import (
 	"time"
 
 	"github.com/gookit/color"
+	"github.com/ulikunitz/xz"
 )
 
 // printHelp prints the commands table
@@ -237,7 +239,54 @@ func Main() {
 
 	switch os.Args[1] {
 	case "log":
-		exitCode = runTUI()
+		if len(os.Args) >= 3 {
+			pkgName := os.Args[2]
+			installedDir := filepath.Join(rootDir, "/var/db/hokuto/installed", pkgName)
+			logXZPath := filepath.Join(installedDir, "log.xz")
+
+			if _, err := os.Stat(logXZPath); err == nil {
+				// Decompress and display
+				f, err := os.Open(logXZPath)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "Error opening log: %v\n", err)
+					os.Exit(1)
+				}
+				defer f.Close()
+
+				xr, err := xz.NewReader(f)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "Error creating xz reader: %v\n", err)
+					os.Exit(1)
+				}
+
+				// Pipe to a pager if possible, otherwise dump to stdout
+				pager := os.Getenv("PAGER")
+				var args []string
+				if pager == "" {
+					pager = "less"
+					args = []string{"-r"}
+				} else if pager == "less" {
+					args = []string{"-r"}
+				}
+
+				cmd := exec.Command(pager, args...)
+				cmd.Stdin = xr
+				cmd.Stdout = os.Stdout
+				cmd.Stderr = os.Stderr
+
+				if err := cmd.Run(); err != nil {
+					// Fallback to plain stdout if pager fails
+					f.Seek(0, 0)
+					xr, _ = xz.NewReader(f)
+					io.Copy(os.Stdout, xr)
+				}
+			} else {
+				fmt.Fprintf(os.Stderr, "No build log found for package %s\n", pkgName)
+				os.Exit(1)
+			}
+		} else {
+			exitCode = runTUI()
+		}
 
 	case "chroot":
 		// Call the new wrapper function that contains the defer logic
