@@ -504,7 +504,9 @@ func checkForUpgrades(_ context.Context, cfg *Config) error {
 		}
 
 		outputPkgName := getOutputPackageName(pkgName, cfg)
-		tarballName := fmt.Sprintf("%s-%s-%s.tar.zst", outputPkgName, version, revision)
+		arch := GetSystemArch(cfg)
+		variant := GetSystemVariant(cfg)
+		tarballName := StandardizeRemoteName(outputPkgName, version, revision, arch, variant)
 		tarballPath := filepath.Join(BinDir, tarballName)
 
 		foundBinary := false
@@ -513,7 +515,7 @@ func checkForUpgrades(_ context.Context, cfg *Config) error {
 			colSuccess.Printf("Using cached binary package: %s\n", tarballName)
 			foundBinary = true
 		} else if BinaryMirror != "" {
-			if err := fetchBinaryPackage(pkgName, version, revision); err == nil {
+			if err := fetchBinaryPackage(pkgName, version, revision, cfg); err == nil {
 				foundBinary = true
 			} else {
 				colArrow.Print("-> ")

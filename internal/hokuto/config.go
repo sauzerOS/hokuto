@@ -150,7 +150,10 @@ func initConfig(cfg *Config) {
 
 	if mirror, exists := cfg.Values["HOKUTO_MIRROR"]; exists && mirror != "" {
 		BinaryMirror = strings.TrimRight(mirror, "/")
-		debugf("=> Using Binary Mirror: %s\n", BinaryMirror)
+		debugf("=> Using Binary Mirror from config: %s\n", BinaryMirror)
+	} else if defaultBinaryMirror != "" {
+		BinaryMirror = strings.TrimRight(defaultBinaryMirror, "/")
+		debugf("=> Using hardcoded default Binary Mirror: %s\n", BinaryMirror)
 	}
 
 	SourcesDir = CacheDir + "/sources"

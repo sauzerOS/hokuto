@@ -39,6 +39,7 @@ var (
 	gnuOriginalURL       = "https://ftp.gnu.org/gnu"
 	gnuMirrorMessageOnce sync.Once
 	BinaryMirror         string
+	defaultBinaryMirror  string  // hardcoded at build time via -X
 	version              = "dev" //default version; overridden at build time
 	arch                 = runtime.GOARCH
 	buildDate            = "unknown" // overridden at build time

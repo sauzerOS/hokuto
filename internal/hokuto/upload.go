@@ -95,20 +95,18 @@ func handleUploadCommand(args []string, cfg *Config) error {
 		}
 
 		if needsUpload {
-			remoteName := StandardizeRemoteName(local.Name, local.Version, local.Revision, local.Arch, local.Variant)
-
 			colArrow.Print("-> ")
 			if !askForConfirmation(colWarn, "Upload %s %s-%s (%s, %s)? ", local.Name, local.Version, local.Revision, local.Arch, local.Variant) {
 				continue
 			}
+
 			colArrow.Print("-> ")
-			colSuccess.Printf("Uploading to R2: %s\n", remoteName)
+			colSuccess.Printf("Uploading to R2: %s\n", local.Filename)
 			localPath := filepath.Join(BinDir, local.Filename)
-			if err := r2.UploadLocalFile(ctx, remoteName, localPath); err != nil {
+			if err := r2.UploadLocalFile(ctx, local.Filename, localPath); err != nil {
 				return fmt.Errorf("failed to upload %s: %w", local.Name, err)
 			}
 
-			local.Filename = remoteName
 			newIndexMap[key] = local
 			uploadedCount++
 		}

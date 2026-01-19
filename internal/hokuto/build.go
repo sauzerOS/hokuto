@@ -407,8 +407,8 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 		// Check if cross-compilation is enabled
 		isCross := cfg.Values["HOKUTO_CROSS_ARCH"] != ""
 
-		// Check if generic build is enabled (BinDir contains "/generic")
-		isGeneric := strings.Contains(BinDir, "/generic")
+		// Check if generic build is enabled
+		isGeneric := cfg.Values["HOKUTO_GENERIC"] == "1"
 
 		if isGeneric {
 			// Generic build: use CFLAGS_GEN and CFLAGS_GEN_LTO
@@ -1012,7 +1012,7 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 	// Determine architecture and flags for metadata
 	targetArch := defaults["HOKUTO_ARCH"]
 	cflagsVal := defaults["CFLAGS"]
-	isGeneric := cfg.Values["HOKUTO_GENERIC"] == "1"
+	isGeneric := cfg.Values["HOKUTO_GENERIC"] == "1" || cfg.Values["HOKUTO_CROSS_ARCH"] != ""
 
 	// 1. Generate pkginfo (before manifest) so it's included in the manifest
 	if err := WritePackageInfo(outputDir, outputPkgName, version, revision, targetArch, cflagsVal, isGeneric); err != nil {
@@ -1029,8 +1029,11 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 		return 0, fmt.Errorf("failed to sign package: %v", err)
 	}
 
+	// Determine variant for naming
+	variant := IdentifyVariant(isGeneric)
+
 	// Generate package archive (using output package name if cross-system is enabled)
-	if err := createPackageTarball(outputPkgName, version, revision, outputDir, buildExec); err != nil {
+	if err := createPackageTarball(outputPkgName, version, revision, targetArch, variant, outputDir, buildExec); err != nil {
 		return 0, fmt.Errorf("failed to package tarball: %v", err)
 	}
 
@@ -1754,9 +1757,13 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 		}
 	}
 
+	// Determine variant for naming
+	isGeneric := cfg.Values["HOKUTO_GENERIC"] == "1" || cfg.Values["HOKUTO_CROSS_ARCH"] != ""
+	variant := IdentifyVariant(isGeneric)
+
 	// Generate package archive (using output package name if cross-system is enabled)
 	// This ensures the binary cache is kept in sync with the rebuild.
-	if err := createPackageTarball(outputPkgName, version, revision, outputDir, buildExec); err != nil {
+	if err := createPackageTarball(outputPkgName, version, revision, targetArch, variant, outputDir, buildExec); err != nil {
 		return fmt.Errorf("failed to package tarball: %v", err)
 	}
 
@@ -1830,12 +1837,8 @@ func handleBuildCommand(args []string, cfg *Config) error {
 
 	// Handle generic build flag
 	if *genericBuild {
-		// Set BinDir to generic subdirectory
-		BinDir = CacheDir + "/bin/generic"
-		// Ensure directory exists
-		if err := os.MkdirAll(BinDir, 0o755); err != nil {
-			return fmt.Errorf("failed to create generic bin directory: %v", err)
-		}
+		cfg.Values["HOKUTO_GENERIC"] = "1"
+		// Set CXXFLAGS_GEN and CXXFLAGS_GEN_LTO to match CFLAGS_GEN and CFLAGS_GEN_LTO
 		// Set CXXFLAGS_GEN and CXXFLAGS_GEN_LTO to match CFLAGS_GEN and CFLAGS_GEN_LTO
 		if cfg.Values["CFLAGS_GEN"] != "" {
 			cfg.Values["CXXFLAGS_GEN"] = cfg.Values["CFLAGS_GEN"]
@@ -1858,13 +1861,6 @@ func handleBuildCommand(args []string, cfg *Config) error {
 		// Validate architecture (currently only arm64 is valid)
 		if crossArchValue != "arm64" {
 			return fmt.Errorf("error: invalid cross-compilation architecture '%s'. only 'arm64' is currently supported", crossArchValue)
-		}
-
-		// Set BinDir to cross subdirectory
-		BinDir = CacheDir + "/bin/cross"
-		// Ensure directory exists
-		if err := os.MkdirAll(BinDir, 0o755); err != nil {
-			return fmt.Errorf("failed to create cross bin directory: %v", err)
 		}
 		// Store cross architecture and system/simple flag in config for use in pkgBuild
 		if cfg.Values == nil {
@@ -2131,7 +2127,9 @@ func handleBuildCommand(args []string, cfg *Config) error {
 			}
 			// Use output package name for tarball and installation (may be renamed for cross-system)
 			outputPkgName := getOutputPackageName(pkgName, cfg)
-			tarballPath := filepath.Join(BinDir, fmt.Sprintf("%s-%s-%s.tar.zst", outputPkgName, version, revision))
+			arch := GetSystemArch(cfg)
+			variant := GetSystemVariant(cfg)
+			tarballPath := filepath.Join(BinDir, StandardizeRemoteName(outputPkgName, version, revision, arch, variant))
 			isCriticalAtomic.Store(1)
 			handlePreInstallUninstall(outputPkgName, cfg, RootExec)
 			colArrow.Print("-> ")
@@ -2176,7 +2174,9 @@ func handleBuildCommand(args []string, cfg *Config) error {
 			}
 			// Use output package name for dependencies too (may be renamed for cross-system)
 			outputDepPkg := getOutputPackageName(depPkg, cfg)
-			tarballPath := filepath.Join(BinDir, fmt.Sprintf("%s-%s-%s.tar.zst", outputDepPkg, version, revision))
+			arch := GetSystemArch(cfg)
+			variant := GetSystemVariant(cfg)
+			tarballPath := filepath.Join(BinDir, StandardizeRemoteName(outputDepPkg, version, revision, arch, variant))
 			if _, err := os.Stat(tarballPath); err == nil {
 				if askForConfirmation(colInfo, "Dependency '%s' is missing. Use available binary package?", depPkg) {
 					isCriticalAtomic.Store(1)
@@ -2318,7 +2318,9 @@ func handleBuildCommand(args []string, cfg *Config) error {
 						}
 						version, revision, _ := getRepoVersion2(finalPkg)
 						outputFinalPkg := getOutputPackageName(finalPkg, cfg)
-						tarballPath := filepath.Join(BinDir, fmt.Sprintf("%s-%s-%s.tar.zst", outputFinalPkg, version, revision))
+						arch := GetSystemArch(cfg)
+						variant := GetSystemVariant(cfg)
+						tarballPath := filepath.Join(BinDir, StandardizeRemoteName(outputFinalPkg, version, revision, arch, variant))
 						isCriticalAtomic.Store(1)
 						handlePreInstallUninstall(outputFinalPkg, cfg, RootExec)
 						colArrow.Print("-> ")
@@ -2510,7 +2512,9 @@ func executeBuildPass(plan *BuildPlan, _ string, installAllTargets bool, cfg *Co
 					// Install the package immediately.
 					version, revision, _ := getRepoVersion2(pkgName)
 					outputPkgName := getOutputPackageName(pkgName, cfg)
-					tarballPath := filepath.Join(BinDir, fmt.Sprintf("%s-%s-%s.tar.zst", outputPkgName, version, revision))
+					arch := GetSystemArch(cfg)
+					variant := GetSystemVariant(cfg)
+					tarballPath := filepath.Join(BinDir, StandardizeRemoteName(outputPkgName, version, revision, arch, variant))
 					isCriticalAtomic.Store(1)
 					handlePreInstallUninstall(outputPkgName, cfg, RootExec)
 					colArrow.Print("-> ")
@@ -2599,7 +2603,9 @@ func executeBuildPass(plan *BuildPlan, _ string, installAllTargets bool, cfg *Co
 						// Install the newly rebuilt parent
 						version, revision, _ := getRepoVersion2(parent)
 						outputParent := getOutputPackageName(parent, cfg)
-						tarballPath := filepath.Join(BinDir, fmt.Sprintf("%s-%s-%s.tar.zst", outputParent, version, revision))
+						arch := GetSystemArch(cfg)
+						variant := GetSystemVariant(cfg)
+						tarballPath := filepath.Join(BinDir, StandardizeRemoteName(outputParent, version, revision, arch, variant))
 						isCriticalAtomic.Store(1)
 						handlePreInstallUninstall(outputParent, cfg, RootExec)
 						if installErr := pkgInstall(tarballPath, outputParent, cfg, RootExec, true); installErr != nil {
@@ -2637,7 +2643,9 @@ func executeBuildPass(plan *BuildPlan, _ string, installAllTargets bool, cfg *Co
 					// B. Install the newly rebuilt package automatically
 					version, revision, _ := getRepoVersion2(rebuildPkg)
 					outputRebuildPkg := getOutputPackageName(rebuildPkg, cfg)
-					tarballPath := filepath.Join(BinDir, fmt.Sprintf("%s-%s-%s.tar.zst", outputRebuildPkg, version, revision))
+					arch := GetSystemArch(cfg)
+					variant := GetSystemVariant(cfg)
+					tarballPath := filepath.Join(BinDir, StandardizeRemoteName(outputRebuildPkg, version, revision, arch, variant))
 					isCriticalAtomic.Store(1)
 					handlePreInstallUninstall(outputRebuildPkg, cfg, RootExec)
 					// Always run this non-interactively

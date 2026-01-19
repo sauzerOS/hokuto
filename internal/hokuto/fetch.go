@@ -258,12 +258,14 @@ func downloadFileWithOptions(originalURL, finalURL, destFile string, opt downloa
 
 // fetchBinaryPackage attempts to download a binary package from the configured mirror.
 
-func fetchBinaryPackage(pkgName, version, revision string) error {
+func fetchBinaryPackage(pkgName, version, revision string, cfg *Config) error {
 	if BinaryMirror == "" {
 		return fmt.Errorf("no HOKUTO_MIRROR configured")
 	}
 
-	filename := fmt.Sprintf("%s-%s-%s.tar.zst", pkgName, version, revision)
+	arch := GetSystemArch(cfg)
+	variant := GetSystemVariant(cfg)
+	filename := StandardizeRemoteName(pkgName, version, revision, arch, variant)
 	url := fmt.Sprintf("%s/%s", BinaryMirror, filename)
 	destPath := filepath.Join(BinDir, filename)
 

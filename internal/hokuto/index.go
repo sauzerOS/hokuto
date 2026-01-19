@@ -10,8 +10,40 @@ import (
 	"path/filepath"
 	"strings"
 
+	"os/exec"
+	"runtime"
+
 	"github.com/klauspost/compress/zstd"
 )
+
+// GetSystemArch returns the current system architecture, normalized (e.g., x86_64, aarch64).
+func GetSystemArch(cfg *Config) string {
+	arch := cfg.Values["HOKUTO_ARCH"]
+	if arch == "" {
+		cmd := exec.Command("uname", "-m")
+		out, err := cmd.Output()
+		if err == nil {
+			arch = strings.TrimSpace(string(out))
+		} else {
+			arch = runtime.GOARCH
+		}
+	}
+	if arch == "amd64" {
+		arch = "x86_64"
+	}
+	if arch == "arm64" {
+		arch = "aarch64"
+	}
+	return arch
+}
+
+// GetSystemVariant returns "generic" if HOKUTO_GENERIC=1 is set in config, otherwise "optimized".
+func GetSystemVariant(cfg *Config) string {
+	if cfg.Values["HOKUTO_GENERIC"] == "1" || cfg.Values["HOKUTO_CROSS_ARCH"] != "" {
+		return "generic"
+	}
+	return "optimized"
+}
 
 // RepoEntry represents a single package in the repository index.
 type RepoEntry struct {
@@ -58,7 +90,7 @@ func ReadPackageMetadata(tarballPath string) (RepoEntry, error) {
 	entry.Arch = metadata["arch"]
 
 	// 4. Identify variant
-	entry.Variant = IdentifyVariant(metadata["cflags"])
+	entry.Variant = IdentifyVariant(metadata["generic"] == "1")
 
 	return entry, nil
 }
@@ -109,9 +141,9 @@ func parsePkgInfo(data []byte) map[string]string {
 	return meta
 }
 
-// IdentifyVariant returns "generic" if -march=generic is found in cflags, else "optimized".
-func IdentifyVariant(cflags string) string {
-	if strings.Contains(cflags, "-march=generic") {
+// IdentifyVariant returns "generic" if HOKUTO_GENERIC=1 or equivalent flag is set.
+func IdentifyVariant(isGeneric bool) string {
+	if isGeneric {
 		return "generic"
 	}
 	return "optimized"

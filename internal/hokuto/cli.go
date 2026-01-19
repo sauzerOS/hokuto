@@ -37,7 +37,7 @@ func printHelp() {
 		{"list, ls", "<pkg>", "List installed packages, optionally filter by name"},
 		{"checksum, c", "<pkg>", "Fetch sources and generate checksum file"},
 		{"build, b", "<pkg>", "Build package(s)"},
-		{"install, i", "<pkg>", "Install pre-built package(s)"},
+		{"install, i", "[-g] <pkg>", "Install pre-built package(s)"},
 		{"uninstall, r", "<pkg>", "Uninstall package(s)"},
 		{"update, u", "[options]", "Update repositories and check for upgrades"},
 		{"manifest, m", "<pkg>", "Show the file list for an installed package"},
@@ -420,11 +420,27 @@ func Main() {
 		var yesLong = installCmd.Bool("yes", false, "Assume 'yes' to all prompts and overwrite modified files.")
 		var force = installCmd.Bool("force", false, "Install even if package is already installed.")
 		var nodeps = installCmd.Bool("nodeps", false, "Ignore dependencies.")
+		var genericFlag = installCmd.Bool("generic", false, "Install the generic variant of the package.")
+		var genericShortFlag = installCmd.Bool("g", false, "Install the generic variant of the package.")
+		var arm64Flag = installCmd.Bool("arm64", false, "Install arm64 version of the package.")
+		var x86_64Flag = installCmd.Bool("x86_64", false, "Install x86_64 version of the package.")
 
 		if err := installCmd.Parse(os.Args[2:]); err != nil {
 			fmt.Fprintf(os.Stderr, "Error parsing install flags: %v\n", err)
 			os.Exit(1)
 		}
+
+		if *genericFlag || *genericShortFlag {
+			cfg.Values["HOKUTO_GENERIC"] = "1"
+		}
+
+		if *arm64Flag {
+			cfg.Values["HOKUTO_ARCH"] = "aarch64"
+		}
+		if *x86_64Flag {
+			cfg.Values["HOKUTO_ARCH"] = "x86_64"
+		}
+
 		packagesToInstall := installCmd.Args()
 		if len(packagesToInstall) == 0 {
 			fmt.Println("Usage: hokuto install [options] <tarball|pkgname>...")
@@ -582,7 +598,7 @@ func Main() {
 					// If source not found (e.g., renamed cross-system packages), try to find tarball
 					if strings.Contains(err.Error(), "not found") {
 						// Try to find the newest tarball matching this package name
-						foundTarball, foundVersion, foundRevision := findNewestTarball(pkgName)
+						foundTarball, foundVersion, foundRevision := findNewestTarball(pkgName, GetSystemVariant(cfg))
 						if foundTarball != "" {
 							tarballPath = foundTarball
 							version = foundVersion
@@ -599,7 +615,9 @@ func Main() {
 						continue
 					}
 				} else {
-					tarballPath = filepath.Join(BinDir, fmt.Sprintf("%s-%s-%s.tar.zst", pkgName, version, revision))
+					arch := GetSystemArch(cfg)
+					variant := GetSystemVariant(cfg)
+					tarballPath = filepath.Join(BinDir, StandardizeRemoteName(pkgName, version, revision, arch, variant))
 				}
 
 				// 1. Check Local Cache (skip if we already found the tarball directly)
@@ -609,7 +627,7 @@ func Main() {
 
 						// 2. Not in local cache? Try Mirror.
 						if BinaryMirror != "" {
-							if err := fetchBinaryPackage(pkgName, version, revision); err == nil {
+							if err := fetchBinaryPackage(pkgName, version, revision, cfg); err == nil {
 								foundOnMirror = true
 							} else {
 								debugf("Mirror fetch failed for %s: %v\n", pkgName, err)
@@ -893,23 +911,19 @@ func Main() {
 	os.Exit(exitCode)
 }
 
-// findNewestTarball finds the newest tarball matching the package name pattern
+// findNewestTarball finds the newest tarball matching the package name and variant pattern
 // Returns (tarballPath, version, revision) or ("", "", "") if not found
-func findNewestTarball(pkgName string) (string, string, string) {
-	// Search in all possible bin directories
-	binDirs := []string{
-		BinDir,                    // Default bin directory
-		CacheDir + "/bin/generic", // Generic builds
-		CacheDir + "/bin/cross",   // Cross builds
-	}
+func findNewestTarball(pkgName, variant string) (string, string, string) {
+	// All packages are now stored directly in BinDir
+	binDirs := []string{BinDir}
 
 	var newestTarball string
 	var newestModTime time.Time
 	var foundVersion, foundRevision string
 
 	for _, binDir := range binDirs {
-		// Pattern: pkgname-*-*.tar.zst (new format) or pkgname-*.tar.zst (old format)
-		pattern := filepath.Join(binDir, pkgName+"-*.tar.zst")
+		// Pattern: pkgname-ver-rev-arch-variant.tar.zst
+		pattern := filepath.Join(binDir, fmt.Sprintf("%s-*-*-*-%s.tar.zst", pkgName, variant))
 		matches, err := filepath.Glob(pattern)
 		if err != nil {
 			continue
@@ -923,21 +937,32 @@ func findNewestTarball(pkgName string) (string, string, string) {
 
 			// Check if this is newer than what we've found so far
 			if newestTarball == "" || info.ModTime().After(newestModTime) {
-				newestTarball = match
-				newestModTime = info.ModTime()
-
 				// Parse version and revision from filename
+				// Standardized format: name-version-revision-arch-variant.tar.zst
 				base := filepath.Base(match)
 				nameWithoutExt := strings.TrimSuffix(base, ".tar.zst")
 				parts := strings.Split(nameWithoutExt, "-")
-				if len(parts) >= 3 {
-					// New format: pkgname-version-revision
-					foundVersion = parts[len(parts)-2]
-					foundRevision = parts[len(parts)-1]
-				} else if len(parts) >= 2 {
-					// Old format: pkgname-version (revision defaults to "1")
-					foundVersion = parts[len(parts)-1]
-					foundRevision = "1"
+
+				// We expect at least 5 parts for the new format: name, version, revision, arch, variant
+				if len(parts) >= 5 {
+					// Search for version and revision. They are at index len-4 and len-3.
+					// But name can contain dashes. So we count from the end.
+					v := parts[len(parts)-4]
+					r := parts[len(parts)-3]
+
+					newestTarball = match
+					newestModTime = info.ModTime()
+					foundVersion = v
+					foundRevision = r
+				} else if len(parts) >= 3 {
+					// Fallback for transitional format: name-version-revision
+					v := parts[len(parts)-2]
+					r := parts[len(parts)-1]
+
+					newestTarball = match
+					newestModTime = info.ModTime()
+					foundVersion = v
+					foundRevision = r
 				}
 			}
 		}
