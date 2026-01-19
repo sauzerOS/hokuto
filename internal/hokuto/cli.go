@@ -705,7 +705,12 @@ func Main() {
 			colNote.Printf(" %s (%d/%d)\n", pkgName, i+1, len(installPlan))
 
 			if err := pkgInstall(tarballPath, pkgName, cfg, RootExec, effectiveYes); err != nil {
-				fmt.Fprintf(os.Stderr, "Error installing package %s: %v\n", pkgName, err)
+				fmt.Fprintln(os.Stderr,
+					colArrow.Sprint("->"),
+					colSuccess.Sprintf("Error installing package"),
+					colNote.Sprintf(" %s", pkgName),
+					fmt.Sprintf("%v", err),
+				)
 				allSucceeded = false
 				continue
 			}

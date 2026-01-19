@@ -3,6 +3,7 @@ package hokuto
 import (
 	"crypto/ed25519"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -154,7 +155,9 @@ func VerifyPackageSignature(stagingDir, pkgName string, execCtx *Executor) error
 
 	if ed25519.Verify(publicKey, dataToVerify, signature) {
 		colArrow.Print("-> ")
-		colSuccess.Printf("Package %s: signature verified (OFFICIAL)\n", pkgName)
+		colSuccess.Printf("Package ")
+		colNote.Printf("%s", pkgName)
+		colSuccess.Printf(" signature OK\n")
 
 		// 4. Verify integrity of all files against the signed manifest
 		if err := VerifyPackageIntegrity(stagingDir, pkgName, manifestPath, execCtx); err != nil {
@@ -228,8 +231,10 @@ func VerifyPackageIntegrity(stagingDir, pkgName, manifestPath string, execCtx *E
 	}
 
 	if len(mismatches) > 0 {
-		return fmt.Errorf("INTEGRITY CHECK FAILED: the following files in package %s have been tampered with: %s",
-			pkgName, strings.Join(mismatches, ", "))
+		return errors.New(colError.Sprintf(
+			"INTEGRITY CHECK FAILED: the following files in package %s have been tampered with: %s",
+			pkgName, strings.Join(mismatches, ", "),
+		))
 	}
 
 	debugf("Integrity check passed for %s\n", pkgName)
