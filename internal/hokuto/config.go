@@ -161,4 +161,10 @@ func initConfig(cfg *Config) {
 	WorldMakeFile = filepath.Join(rootDir, "/var/db/hokuto/world_make")
 	LockFile = filepath.Join(rootDir, "/etc/hokuto.lock")
 	newPackageDir = "/repo/sauzeros/extra" // default for 'hokuto new'
+
+	// R2 Configuration
+	cfg.Values["R2_ACCOUNT_ID"] = cfg.Values["R2_ACCOUNT_ID"]
+	cfg.Values["R2_ACCESS_KEY_ID"] = cfg.Values["R2_ACCESS_KEY_ID"]
+	cfg.Values["R2_SECRET_ACCESS_KEY"] = cfg.Values["R2_SECRET_ACCESS_KEY"]
+	cfg.Values["R2_BUCKET_NAME"] = cfg.Values["R2_BUCKET_NAME"]
 }

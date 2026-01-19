@@ -52,6 +52,7 @@ func printHelp() {
 		{"python-rebuild", "", "Rebuild all python packages"},
 		{"alt", "<pkg>", "List packages with alternatives or show/switch alternatives for a package"},
 		{"init-repos", "", "Initialize repositories"},
+		{"upload", "[--cleanup]", "Upload local binaries to R2 and update index"},
 	}
 
 	// --- Dynamic Padding Logic ---
@@ -264,6 +265,12 @@ func Main() {
 	case "init-repos":
 		if err := handleInitReposCommand(cfg); err != nil {
 			fmt.Fprintf(os.Stderr, "Repository initialization failed: %v\n", err)
+			os.Exit(1)
+		}
+
+	case "upload":
+		if err := handleUploadCommand(os.Args[2:], cfg); err != nil {
+			fmt.Fprintf(os.Stderr, "Upload failed: %v\n", err)
 			os.Exit(1)
 		}
 

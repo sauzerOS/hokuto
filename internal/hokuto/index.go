@@ -1,0 +1,142 @@
+package hokuto
+
+import (
+	"archive/tar"
+	"bufio"
+	"encoding/json"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
+
+	"github.com/klauspost/compress/zstd"
+)
+
+// RepoEntry represents a single package in the repository index.
+type RepoEntry struct {
+	Name     string `json:"name"`
+	Version  string `json:"version"`
+	Revision string `json:"revision"`
+	Arch     string `json:"arch"`
+	Variant  string `json:"variant"` // generic or optimized
+	Filename string `json:"filename"`
+	Size     int64  `json:"size"`
+	B3Sum    string `json:"b3sum"`
+}
+
+// ReadPackageMetadata extracts pkginfo and computes checksum for a local tarball.
+func ReadPackageMetadata(tarballPath string) (RepoEntry, error) {
+	entry := RepoEntry{
+		Filename: filepath.Base(tarballPath),
+	}
+
+	// 1. Compute checksum and size
+	info, err := os.Stat(tarballPath)
+	if err != nil {
+		return entry, err
+	}
+	entry.Size = info.Size()
+
+	sum, err := blake3SumFile(tarballPath)
+	if err != nil {
+		return entry, fmt.Errorf("failed to compute checksum: %w", err)
+	}
+	entry.B3Sum = sum
+
+	// 2. Extract pkginfo from tar.zst
+	pkgInfoData, err := extractPkgInfoFromTar(tarballPath)
+	if err != nil {
+		return entry, fmt.Errorf("failed to extract pkginfo: %w", err)
+	}
+
+	// 3. Parse pkginfo
+	metadata := parsePkgInfo(pkgInfoData)
+	entry.Name = metadata["name"]
+	entry.Version = metadata["version"]
+	entry.Revision = metadata["revision"]
+	entry.Arch = metadata["arch"]
+
+	// 4. Identify variant
+	entry.Variant = IdentifyVariant(metadata["cflags"])
+
+	return entry, nil
+}
+
+// extractPkgInfoFromTar reads the pkginfo file from a .tar.zst archive without unpacking everything.
+func extractPkgInfoFromTar(tarballPath string) ([]byte, error) {
+	f, err := os.Open(tarballPath)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	zsr, err := zstd.NewReader(f)
+	if err != nil {
+		return nil, err
+	}
+	defer zsr.Close()
+
+	tr := tar.NewReader(zsr)
+	for {
+		header, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+
+		// Look for pkginfo in var/db/hokuto/installed/<pkg>/pkginfo
+		if strings.HasSuffix(header.Name, "/pkginfo") {
+			return io.ReadAll(tr)
+		}
+	}
+
+	return nil, fmt.Errorf("pkginfo not found in archive")
+}
+
+func parsePkgInfo(data []byte) map[string]string {
+	meta := make(map[string]string)
+	scanner := bufio.NewScanner(strings.NewReader(string(data)))
+	for scanner.Scan() {
+		line := scanner.Text()
+		parts := strings.SplitN(line, "=", 2)
+		if len(parts) == 2 {
+			meta[parts[0]] = parts[1]
+		}
+	}
+	return meta
+}
+
+// IdentifyVariant returns "generic" if -march=generic is found in cflags, else "optimized".
+func IdentifyVariant(cflags string) string {
+	if strings.Contains(cflags, "-march=generic") {
+		return "generic"
+	}
+	return "optimized"
+}
+
+// StandardizeRemoteName generates a consistent filename for the remote repository.
+func StandardizeRemoteName(name, ver, rev, arch, variant string) string {
+	return fmt.Sprintf("%s-%s-%s-%s-%s.tar.zst", name, ver, rev, arch, variant)
+}
+
+// SaveRepoIndex writes the index to a JSON file.
+func SaveRepoIndex(path string, index []RepoEntry) error {
+	data, err := json.MarshalIndent(index, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0644)
+}
+
+// ParseRepoIndex reads the index from JSON data.
+func ParseRepoIndex(data []byte) ([]RepoEntry, error) {
+	var index []RepoEntry
+	if len(data) == 0 {
+		return index, nil
+	}
+	err := json.Unmarshal(data, &index)
+	return index, err
+}
