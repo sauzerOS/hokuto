@@ -7,7 +7,6 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
 )
 
@@ -310,21 +309,6 @@ func handleUploadCommand(args []string, cfg *Config) error {
 	}
 
 	return nil
-}
-
-// isNewer returns true if a is newer than b.
-func isNewer(a, b RepoEntry) bool {
-	cmp := compareVersions(a.Version, b.Version)
-	if cmp > 0 {
-		return true
-	}
-	if cmp < 0 {
-		return false
-	}
-	// Revisions
-	ar, _ := strconv.Atoi(a.Revision)
-	br, _ := strconv.Atoi(b.Revision)
-	return ar > br
 }
 
 func humanReadableSize(b int64) string {

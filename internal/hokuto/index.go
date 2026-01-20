@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"os/exec"
@@ -172,6 +173,21 @@ func IdentifyVariant(pkgName string, isGeneric bool, isMultilib bool) string {
 // StandardizeRemoteName generates a consistent filename for the remote repository.
 func StandardizeRemoteName(name, ver, rev, arch, variant string) string {
 	return fmt.Sprintf("%s-%s-%s-%s-%s.tar.zst", name, ver, rev, arch, variant)
+}
+
+// isNewer returns true if a is newer than b.
+func isNewer(a, b RepoEntry) bool {
+	cmp := compareVersions(a.Version, b.Version)
+	if cmp > 0 {
+		return true
+	}
+	if cmp < 0 {
+		return false
+	}
+	// Revisions
+	ar, _ := strconv.Atoi(a.Revision)
+	br, _ := strconv.Atoi(b.Revision)
+	return ar > br
 }
 
 // SaveRepoIndex writes the index to a JSON file.

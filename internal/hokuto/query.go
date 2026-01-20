@@ -120,23 +120,49 @@ func listPackages(searchTerm string) error {
 	return nil
 }
 
-func listRemotePackages(searchTerm string, cfg *Config) error {
+func FetchRemoteIndex(cfg *Config) ([]RepoEntry, error) {
 	ctx := context.Background()
-	r2, err := NewR2Client(cfg)
+	var data []byte
+	var err error
+
+	r2, r2Err := NewR2Client(cfg)
+	if r2Err == nil {
+		colArrow.Print("-> ")
+		colSuccess.Println("Fetching remote index from R2")
+		data, err = r2.DownloadFile(ctx, "repo-index.json")
+	} else {
+		debugf("R2 client initialization skipped: %v\n", r2Err)
+		err = r2Err
+	}
+
+	if err != nil {
+		if r2Err == nil {
+			debugf("failed to fetch remote index from R2: %v", err)
+		}
+		// Fallback: try download via BinaryMirror URL
+		if BinaryMirror != "" {
+			colArrow.Print("-> ")
+			colSuccess.Println("Fetching remote index via Binary Mirror")
+			url := fmt.Sprintf("%s/repo-index.json", BinaryMirror)
+			dest := filepath.Join(os.TempDir(), "hokuto-index.json")
+			if dlErr := downloadFileQuiet(url, url, dest); dlErr == nil {
+				data, err = os.ReadFile(dest)
+				os.Remove(dest)
+			}
+		}
+	}
+
+	if err != nil || len(data) == 0 {
+		return nil, fmt.Errorf("failed to fetch remote index: %w", err)
+	}
+
+	return ParseRepoIndex(data)
+}
+
+func listRemotePackages(searchTerm string, cfg *Config) error {
+	remoteIndex, err := FetchRemoteIndex(cfg)
 	if err != nil {
 		return err
-	}
-
-	colArrow.Print("-> ")
-	colSuccess.Println("Fetching remote index from R2")
-	data, err := r2.DownloadFile(ctx, "repo-index.json")
-	if err != nil {
-		return fmt.Errorf("failed to fetch remote index: %w", err)
-	}
-
-	remoteIndex, err := ParseRepoIndex(data)
-	if err != nil {
-		return fmt.Errorf("failed to parse remote index: %w", err)
 	}
 
 	foundAny := false
@@ -169,6 +195,28 @@ func listRemotePackages(searchTerm string, cfg *Config) error {
 	}
 
 	return nil
+}
+
+// GetRemotePackageVersion searches the remote index for a package matching system criteria.
+func GetRemotePackageVersion(pkgName string, cfg *Config, remoteIndex []RepoEntry) (version, revision string, err error) {
+	arch := GetSystemArch(cfg)
+	variant := GetSystemVariantForPackage(cfg, pkgName)
+
+	var bestMatch *RepoEntry
+	for i := range remoteIndex {
+		entry := &remoteIndex[i]
+		if entry.Name == pkgName && entry.Arch == arch && entry.Variant == variant {
+			if bestMatch == nil || isNewer(*entry, *bestMatch) {
+				bestMatch = entry
+			}
+		}
+	}
+
+	if bestMatch != nil {
+		return bestMatch.Version, bestMatch.Revision, nil
+	}
+
+	return "", "", fmt.Errorf("package %s not found in remote index for %s (%s)", pkgName, arch, variant)
 }
 
 // showManifest prints the file list for a package manifest, skipping directories,

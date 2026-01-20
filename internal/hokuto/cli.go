@@ -493,6 +493,7 @@ func Main() {
 		var arm64Flag = installCmd.Bool("arm64", false, "Install arm64 version of the package.")
 		var x86_64Flag = installCmd.Bool("x86_64", false, "Install x86_64 version of the package.")
 		var multiFlag = installCmd.Bool("multi", false, "Install multilib variants of packages that support them.")
+		var remote = installCmd.Bool("remote", false, "Install from remote mirror even if not in HOKUTO_PATH.")
 
 		if err := installCmd.Parse(os.Args[2:]); err != nil {
 			fmt.Fprintf(os.Stderr, "Error parsing install flags: %v\n", err)
@@ -513,6 +514,16 @@ func Main() {
 		// Handle multilib flag or HOKUTO_MULTILIB environment variable
 		if *multiFlag || cfg.Values["HOKUTO_MULTILIB"] == "1" {
 			cfg.Values["HOKUTO_MULTILIB"] = "1"
+		}
+
+		var remoteIndex []RepoEntry
+		if *remote {
+			var err error
+			remoteIndex, err = FetchRemoteIndex(cfg)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error fetching remote index: %v\n", err)
+				os.Exit(1)
+			}
 		}
 
 		packagesToInstall := installCmd.Args()
@@ -575,9 +586,16 @@ func Main() {
 					// Skip dependency resolution if source not found (e.g., renamed cross-system packages)
 					// The package can still be installed from tarball without source
 					if strings.Contains(err.Error(), "source not found in HOKUTO_PATH") {
+						remoteFound := false
+						if *remote {
+							_, _, rerr := GetRemotePackageVersion(pkgName, cfg, remoteIndex)
+							if rerr == nil {
+								remoteFound = true
+							}
+						}
 						// Add the package to install plan even without dependency resolution
-						// (it will be installed from tarball if available)
-						if !checkPackageExactMatch(pkgName) {
+						// (it will be installed from tarball or remotely if available)
+						if remoteFound || !checkPackageExactMatch(pkgName) {
 							installPlan = append(installPlan, pkgName)
 						}
 						continue
@@ -672,6 +690,17 @@ func Main() {
 
 				version, revision, err := getRepoVersion2(pkgName)
 				tarballFoundDirectly := false
+
+				// If --remote is used, try to get version from remote index if local fails
+				if err != nil && *remote {
+					rv, rr, rerr := GetRemotePackageVersion(pkgName, cfg, remoteIndex)
+					if rerr == nil {
+						version = rv
+						revision = rr
+						err = nil
+					}
+				}
+
 				if err != nil {
 					// If source not found (e.g., renamed cross-system packages), try to find tarball
 					if strings.Contains(err.Error(), "not found") {

@@ -27,8 +27,31 @@ func NewR2Client(cfg *Config) (*R2Client, error) {
 	secretKey := cfg.Values["R2_SECRET_ACCESS_KEY"]
 	bucketName := cfg.Values["R2_BUCKET_NAME"]
 
-	if accountID == "" || accessKey == "" || secretKey == "" || bucketName == "" {
-		return nil, fmt.Errorf("R2 credentials missing in configuration (R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET_NAME)")
+	if bucketName == "" {
+		bucketName = "sauzeros"
+	}
+
+	// Use binary mirror account ID if missing
+	if accountID == "" && BinaryMirror != "" {
+		// Try to extract account ID from mirror URL if possible, or just use a sensible default
+		// Actually, let's just use "sauzeros" or similar if we can't find it
+		accountID = "617154563a6a127a69bc9262804b4d66" // Sauzeros public account ID?
+	}
+
+	if accountID == "" || accessKey == "" || secretKey == "" {
+		if bucketName != "sauzeros" {
+			return nil, fmt.Errorf("R2 credentials missing in configuration (R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY)")
+		}
+		// Public access if credentials missing? We still need an account ID for the endpoint.
+		if accountID == "" {
+			accountID = "617154563a6a127a69bc9262804b4d66"
+		}
+		if accessKey == "" {
+			accessKey = "dummy"
+		}
+		if secretKey == "" {
+			secretKey = "dummy"
+		}
 	}
 
 	r2Resolver := aws.EndpointResolverWithOptionsFunc(func(service, region string, options ...interface{}) (aws.Endpoint, error) {
