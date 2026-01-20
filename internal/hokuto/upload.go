@@ -45,6 +45,10 @@ func handleUploadCommand(args []string, cfg *Config) error {
 	}
 
 	// 2. Initialize R2 Client
+	if cfg.Values["R2_ACCESS_KEY_ID"] == "" || cfg.Values["R2_SECRET_ACCESS_KEY"] == "" {
+		return fmt.Errorf("R2 credentials (R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY) are missing. Upload requires authentication")
+	}
+
 	r2, err := NewR2Client(cfg)
 	if err != nil {
 		return err
@@ -189,7 +193,16 @@ func handleUploadCommand(args []string, cfg *Config) error {
 
 			colArrow.Print("-> ")
 			if prompt {
-				if !askForConfirmation(colWarn, "Upload %s %s-%s (%s, %s)? ", local.Name, local.Version, local.Revision, local.Arch, local.Variant) {
+				reasonText := ""
+				if !exists {
+					reasonText = " (remote missing)"
+				} else if isNewer(local, remote) {
+					reasonText = fmt.Sprintf(" (newer: %s-%s vs %s-%s)", local.Version, local.Revision, remote.Version, remote.Revision)
+				} else if local.B3Sum != remote.B3Sum {
+					reasonText = " (checksum mismatch)"
+				}
+
+				if !askForConfirmation(colWarn, "Upload %s %s-%s (%s, %s)%s? ", local.Name, local.Version, local.Revision, local.Arch, local.Variant, reasonText) {
 					continue
 				}
 			}

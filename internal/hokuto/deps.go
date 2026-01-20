@@ -4,13 +4,17 @@ package hokuto
 // No behavior changes intended.
 
 import (
+	"archive/tar"
 	"bufio"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
+
+	"github.com/klauspost/compress/zstd"
 )
 
 // Cache for resolved alternative dependencies to avoid prompting multiple times
@@ -41,7 +45,7 @@ func MovePackageToFront(list []string, pkgName string) []string {
 // 'visited' tracks packages processed in this specific resolution pass to prevent cycles.
 // cfg is used to check if multilib is enabled and resolve package names accordingly.
 
-func resolveBinaryDependencies(pkgName string, visited map[string]bool, plan *[]string, force bool, yes bool) error {
+func resolveBinaryDependencies(pkgName string, visited map[string]bool, plan *[]string, force bool, yes bool, cfg *Config, remoteIndex []RepoEntry) error {
 	// 1. Cycle detection
 	if visited[pkgName] {
 		return nil
@@ -56,13 +60,34 @@ func resolveBinaryDependencies(pkgName string, visited map[string]bool, plan *[]
 		return nil
 	}
 
-	// 3. Find source directory to read 'depends' file
+	// 3. Remote Resolution (Priority if remoteIndex is provided)
+	// If the user requested --remote (implied by non-empty remoteIndex), we prioritize
+	// the remote package's dependencies over the local source definition.
+	if len(remoteIndex) > 0 {
+		// Check if package exists in remote index
+		found := false
+		for _, entry := range remoteIndex {
+			if entry.Name == pkgName {
+				found = true
+				break
+			}
+		}
+
+		if found {
+			// Unmark visited to allow resolveRemoteDependencies to handle it
+			delete(visited, pkgName)
+			if err := resolveRemoteDependencies(pkgName, visited, plan, force, yes, cfg, remoteIndex); err != nil {
+				return fmt.Errorf("remote resolution failed for %s: %w", pkgName, err)
+			}
+			return nil
+		}
+		// If not found in remote, fall through to local source check
+	}
+
+	// 4. Find source directory to read 'depends' file
 	// We rely on the source repo metadata to know what the binary dependencies are.
 	pkgDir, err := findPackageDir(pkgName)
 	if err != nil {
-		// If we can't find the source, we can't resolve dependencies.
-		// However, for 'install', maybe the user just has a binary and no source.
-		// In that case, we can't auto-resolve. We return an error.
 		return fmt.Errorf("cannot resolve dependencies for %s: source not found in HOKUTO_PATH", pkgName)
 	}
 
@@ -103,7 +128,7 @@ func resolveBinaryDependencies(pkgName string, visited map[string]bool, plan *[]
 			}
 		}
 
-		if err := resolveBinaryDependencies(depName, visited, plan, force, yes); err != nil {
+		if err := resolveBinaryDependencies(depName, visited, plan, force, yes, cfg, remoteIndex); err != nil {
 			return err
 		}
 	}
@@ -229,7 +254,131 @@ func parseDependsFile(pkgDir string) ([]DepSpec, error) {
 		}
 		return nil, fmt.Errorf("failed to read depends file: %w", err)
 	}
+	return parseDependsData(content)
+}
 
+func extractDependsFromTarball(tarballPath string) ([]byte, error) {
+	f, err := os.Open(tarballPath)
+	if err != nil {
+		return nil, fmt.Errorf("open tarball: %w", err)
+	}
+	defer f.Close()
+
+	// Use zstd reader
+	zr, err := zstd.NewReader(f)
+	if err != nil {
+		return nil, fmt.Errorf("zstd reader: %w", err)
+	}
+	defer zr.Close()
+
+	tr := tar.NewReader(zr)
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, fmt.Errorf("tar read: %w", err)
+		}
+
+		// Look for 'depends' file
+		// The archive stores metadata in var/db/hokuto/installed/<pkg>/depends
+		// We look for any file ending in "/depends" to be safe and robust
+		if strings.HasSuffix(hdr.Name, "/depends") {
+			return io.ReadAll(tr)
+		}
+	}
+	// Return empty if depends not found (valid constraint, means no deps)
+	return []byte{}, nil
+}
+
+func resolveRemoteDependencies(pkgName string, visited map[string]bool, plan *[]string, force bool, yes bool, cfg *Config, remoteIndex []RepoEntry) error {
+	// 1. Cycle detection
+	if visited[pkgName] {
+		return nil
+	}
+	visited[pkgName] = true
+
+	// 2. Check installed (skip if force)
+	if !force && checkPackageExactMatch(pkgName) {
+		return nil
+	}
+
+	// 3. Find in remote index
+	var ver, rev string
+	found := false
+	for _, entry := range remoteIndex {
+		if entry.Name == pkgName {
+			ver = entry.Version
+			rev = entry.Revision
+			found = true
+			break
+		}
+	}
+	if !found {
+		// If not in remote index, we can't do anything
+		return fmt.Errorf("package %s not found in remote index", pkgName)
+	}
+
+	// 4. Fetch binary package to ensure we have it (to read depends)
+	if err := fetchBinaryPackage(pkgName, ver, rev, cfg); err != nil {
+		return fmt.Errorf("failed to fetch remote package for dependency resolution: %w", err)
+	}
+
+	arch := GetSystemArch(cfg)
+	variant := GetSystemVariantForPackage(cfg, pkgName)
+	tarballName := StandardizeRemoteName(pkgName, ver, rev, arch, variant)
+	tarballPath := filepath.Join(BinDir, tarballName)
+
+	// 5. Extract depends file
+	dependsContent, err := extractDependsFromTarball(tarballPath)
+	if err != nil {
+		return fmt.Errorf("failed to extract depends from %s: %w", tarballName, err)
+	}
+
+	// 6. Parse dependencies
+	deps, err := parseDependsData(dependsContent)
+	if err != nil {
+		return fmt.Errorf("failed to parse depends for %s: %w", pkgName, err)
+	}
+
+	// 7. Recurse
+	for _, dep := range deps {
+		// Skip build-time only dependencies (Make=true)
+		if dep.Make {
+			continue
+		}
+		if !EnableMultilib && strings.HasSuffix(dep.Name, "-32") {
+			continue
+		}
+
+		depName := dep.Name
+		if len(dep.Alternatives) > 0 {
+			resolved, err := resolveAlternativeDep(dep, yes)
+			if err != nil {
+				return fmt.Errorf("failed to resolve alternative dependency for %s: %w", pkgName, err)
+			}
+			depName = resolved
+		}
+
+		if !force {
+			if findInstalledSatisfying(depName, dep.Op, dep.Version) != "" {
+				continue
+			}
+		}
+
+		// Try to resolve using normal logic (local source preferred), fallback to remote is built-in
+		if err := resolveBinaryDependencies(depName, visited, plan, force, yes, cfg, remoteIndex); err != nil {
+			return err
+		}
+	}
+
+	// 8. Add to plan
+	*plan = append(*plan, pkgName)
+	return nil
+}
+
+func parseDependsData(content []byte) ([]DepSpec, error) {
 	var dependencies []DepSpec
 	lines := strings.Split(string(content), "\n")
 

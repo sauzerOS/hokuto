@@ -582,24 +582,7 @@ func Main() {
 				}
 			} else {
 				// Recursively find missing dependencies (always check if deps are installed, force doesn't apply to deps)
-				if err := resolveBinaryDependencies(pkgName, visited, &installPlan, false, effectiveYes); err != nil {
-					// Skip dependency resolution if source not found (e.g., renamed cross-system packages)
-					// The package can still be installed from tarball without source
-					if strings.Contains(err.Error(), "source not found in HOKUTO_PATH") {
-						remoteFound := false
-						if *remote {
-							_, _, rerr := GetRemotePackageVersion(pkgName, cfg, remoteIndex)
-							if rerr == nil {
-								remoteFound = true
-							}
-						}
-						// Add the package to install plan even without dependency resolution
-						// (it will be installed from tarball or remotely if available)
-						if remoteFound || !checkPackageExactMatch(pkgName) {
-							installPlan = append(installPlan, pkgName)
-						}
-						continue
-					}
+				if err := resolveBinaryDependencies(pkgName, visited, &installPlan, false, effectiveYes, cfg, remoteIndex); err != nil {
 					fmt.Fprintf(os.Stderr, "Error resolving dependencies for %s: %v\n", pkgName, err)
 					os.Exit(1)
 				}

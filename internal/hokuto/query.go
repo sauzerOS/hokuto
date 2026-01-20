@@ -125,18 +125,30 @@ func FetchRemoteIndex(cfg *Config) ([]RepoEntry, error) {
 	var data []byte
 	var err error
 
-	r2, r2Err := NewR2Client(cfg)
-	if r2Err == nil {
-		colArrow.Print("-> ")
-		colSuccess.Println("Fetching remote index from R2")
-		data, err = r2.DownloadFile(ctx, "repo-index.json")
+	// Check for R2 credentials before attempting to initialize client
+	hasCreds := cfg.Values["R2_ACCESS_KEY_ID"] != "" && cfg.Values["R2_SECRET_ACCESS_KEY"] != ""
+	// Also allow if we are using the default "sauzeros" bucket which might be public (though in this codebase writes seem to use creds, reads might be public?
+	// The user request implies R2 is slowing things down when creds are missing, so we should be strict).
+	// Actually, looking at NewR2Client, it sets "dummy" creds if missing. We want to avoid that if the intention is to use the mirror.
+
+	if hasCreds {
+		r2, r2Err := NewR2Client(cfg)
+		if r2Err == nil {
+			colArrow.Print("-> ")
+			colSuccess.Println("Fetching remote index from R2")
+			data, err = r2.DownloadFile(ctx, "repo-index.json")
+		} else {
+			debugf("R2 client initialization skipped: %v\n", r2Err)
+			err = r2Err
+		}
 	} else {
-		debugf("R2 client initialization skipped: %v\n", r2Err)
-		err = r2Err
+		// Explicitly set err to trigger fallback
+		err = fmt.Errorf("R2 credentials not configured, skipping R2")
+		debugf("R2 credentials missing, skipping R2 fetch\n")
 	}
 
 	if err != nil {
-		if r2Err == nil {
+		if hasCreds {
 			debugf("failed to fetch remote index from R2: %v", err)
 		}
 		// Fallback: try download via BinaryMirror URL

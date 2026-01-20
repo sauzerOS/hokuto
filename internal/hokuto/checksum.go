@@ -357,7 +357,14 @@ func ComputeChecksums(paths []string, execCtx *Executor) (map[string]string, err
 			cmd.Stdout = &out
 			cmd.Stderr = io.Discard
 
-			if err := execCtx.Run(cmd); err == nil {
+			var err error
+			if execCtx != nil {
+				err = execCtx.Run(cmd)
+			} else {
+				err = cmd.Run()
+			}
+
+			if err == nil {
 				scanner := bufio.NewScanner(&out)
 				for scanner.Scan() {
 					fields := strings.Fields(scanner.Text())
