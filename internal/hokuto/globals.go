@@ -34,7 +34,7 @@ var (
 	setIdlePriority      bool
 	buildPriority        string
 	EnableMultilib       bool
-	ConfigFile           = "/etc/hokuto.conf"
+	ConfigFile           = "/etc/hokuto/hokuto.conf"
 	gnuMirrorURL         string
 	gnuOriginalURL       = "https://ftp.gnu.org/gnu"
 	gnuMirrorMessageOnce sync.Once
@@ -53,8 +53,8 @@ var (
 	embeddedAssets   embed.FS
 	WorldFile        = "/var/db/hokuto/world"
 	WorldMakeFile    = "/var/db/hokuto/world_make"
-	LockFile         = "/etc/hokuto.lock"
-	PkgsetFile       = "/etc/hokuto.pkgset"
+	LockFile         = "/etc/hokuto/hokuto.lock"
+	PkgsetFile       = "/etc/hokuto/hokuto.pkgset"
 	versionedPkgDirs = make(map[string]string) // pkgName@version -> tmpDir
 )
 
@@ -62,6 +62,9 @@ var (
 // When HOKUTO_MULTILIB=1 or -multi flag is used, these packages
 // will have their "-multi" variant installed instead of the regular version.
 var MultilibPackages = []string{
+	"05-libstdc++",
+	"07-ncurses",
+	"20-gcc-2",
 	"acl",
 	"alsa-lib",
 	"attr",

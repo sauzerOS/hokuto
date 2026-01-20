@@ -157,7 +157,7 @@ func handleInitReposCommand(cfg *Config) error {
 }
 
 func updateHokutoConfig(rootDir string, enableKDE, enableCosmic bool) error {
-	configPath := filepath.Join(rootDir, "etc", "hokuto.conf")
+	configPath := filepath.Join(rootDir, "etc", "hokuto", "hokuto.conf")
 
 	// Base paths
 	basePath := "/repo/sauzeros/core:/repo/sauzeros/extra"

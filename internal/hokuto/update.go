@@ -407,7 +407,7 @@ func checkForUpgrades(_ context.Context, cfg *Config) error {
 			blockReason = fmt.Sprintf("%s update blocked by %s", pkg.Name, blockingPkg)
 		}
 
-		// Check if locked in /etc/hokuto.lock
+		// Check if locked in /etc/hokuto/hokuto.lock
 		if lockedVersion, isLocked := lockedPackages[pkg.Name]; isLocked {
 			// If locked version is lower than the new version, block the update
 			if compareVersions(lockedVersion, pkg.RepoVersion) < 0 {
@@ -472,7 +472,7 @@ func checkForUpgrades(_ context.Context, cfg *Config) error {
 	// Use the ordered plan instead of the unordered list
 	pkgNames = plan.Order
 
-	// Apply user-specified update order from /etc/hokuto.update
+	// Apply user-specified update order from /etc/hokuto/hokuto.update
 	pkgNames = applyUpdateOrder(pkgNames)
 
 	// Launch background prefetcher for SUBSEQUENT packages.
@@ -600,9 +600,9 @@ func checkForUpgrades(_ context.Context, cfg *Config) error {
 	return nil
 }
 
-// applyUpdateOrder reorders the package list based on /etc/hokuto.update
+// applyUpdateOrder reorders the package list based on /etc/hokuto/hokuto.update
 func applyUpdateOrder(pkgNames []string) []string {
-	updateOrderFile := filepath.Join(rootDir, "etc", "hokuto.update")
+	updateOrderFile := filepath.Join(rootDir, "etc", "hokuto", "hokuto.update")
 	data, err := os.ReadFile(updateOrderFile)
 	if err != nil {
 		// If file doesn't exist or can't be read, return original order

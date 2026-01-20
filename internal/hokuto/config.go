@@ -16,7 +16,7 @@ type Config struct {
 	DefaultLTO   bool
 }
 
-// Load /etc/hokuto.conf and apply defaults
+// Load /etc/hokuto/hokuto.conf and apply defaults
 func loadConfig(path string) (*Config, error) {
 	cfg := &Config{Values: make(map[string]string)}
 
@@ -162,7 +162,7 @@ func initConfig(cfg *Config) {
 	Installed = rootDir + "/var/db/hokuto/installed"
 	WorldFile = filepath.Join(rootDir, "/var/db/hokuto/world")
 	WorldMakeFile = filepath.Join(rootDir, "/var/db/hokuto/world_make")
-	LockFile = filepath.Join(rootDir, "/etc/hokuto.lock")
+	LockFile = filepath.Join(rootDir, "/etc/hokuto/hokuto.lock")
 	newPackageDir = "/repo/sauzeros/extra" // default for 'hokuto new'
 
 	// R2 Configuration

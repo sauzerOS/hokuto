@@ -16,20 +16,23 @@ import (
 	"github.com/gookit/color"
 )
 
-// getRebuildTriggers parses /etc/hokuto.rebuild and returns packages that should
+// getRebuildTriggers parses /etc/hokuto/hokuto.rebuild and returns packages that should
 // be rebuilt when the given trigger package is installed.
 // Format: triggerpkg pkg1 pkg2 pkg3...
 // Returns empty slice if no triggers found or file doesn't exist.
 func getRebuildTriggers(triggerPkg string, rootDir string) []string {
-	rebuildFilePath := filepath.Join(rootDir, "etc/hokuto.rebuild")
+	rebuildFilePath := filepath.Join(rootDir, "etc", "hokuto", "hokuto.rebuild")
 	if rootDir == "/" {
-		rebuildFilePath = "/etc/hokuto.rebuild"
+		rebuildFilePath = "/etc/hokuto/hokuto.rebuild"
 	}
 
-	data, err := readFileAsRoot(rebuildFilePath)
+	data, err := os.ReadFile(rebuildFilePath)
 	if err != nil {
-		// File doesn't exist or can't be read - that's fine, just return empty
-		return nil
+		data, err = readFileAsRoot(rebuildFilePath)
+		if err != nil {
+			// File doesn't exist or can't be read - that's fine, just return empty
+			return nil
+		}
 	}
 
 	var packagesToRebuild []string
@@ -48,8 +51,14 @@ func getRebuildTriggers(triggerPkg string, rootDir string) []string {
 
 		// First field is the trigger package
 		if fields[0] == triggerPkg {
-			// Return all packages after the trigger
-			packagesToRebuild = append(packagesToRebuild, fields[1:]...)
+			// Check if each package is installed before adding to rebuild list
+			for _, pkg := range fields[1:] {
+				if isPackageInstalled(pkg) {
+					packagesToRebuild = append(packagesToRebuild, pkg)
+				} else {
+					debugf("Skipping rebuild trigger for %s (not installed)\n", pkg)
+				}
+			}
 			break // Found matching trigger, no need to continue
 		}
 	}
@@ -806,7 +815,7 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 		fmt.Printf("warning: post-install for %s returned error: %v\n", pkgName, err)
 	}
 
-	// 7.5. Check for rebuild triggers from /etc/hokuto.rebuild
+	// 7.5. Check for rebuild triggers from /etc/hokuto/hokuto.rebuild
 	rebuildTriggerPkgs := getRebuildTriggers(pkgName, rootDir)
 	if len(rebuildTriggerPkgs) > 0 {
 		colArrow.Print("-> ")

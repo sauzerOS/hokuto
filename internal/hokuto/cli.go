@@ -181,7 +181,11 @@ func Main() {
 		return
 	}
 
-	cfg, err := loadConfig(ConfigFile)
+	configPath := ConfigFile
+	if root := os.Getenv("HOKUTO_ROOT"); root != "" {
+		configPath = filepath.Join(root, "etc", "hokuto", "hokuto.conf")
+	}
+	cfg, err := loadConfig(configPath)
 	if err != nil {
 		// handle error
 	}

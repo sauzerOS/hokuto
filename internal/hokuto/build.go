@@ -957,7 +957,7 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 		fmt.Fprintf(os.Stderr, "Warning: failed to save build time to %s: %v\n", buildTimeFile, err)
 	}
 	// delete /usr/share/info/dir and /tools/info/dir
-	for _, infoPath := range []string{"/usr/share/info/dir", "/tools/info/dir"} {
+	for _, infoPath := range []string{"/usr/share/info/dir", "/tools/share/info/dir"} {
 		infodirPath := filepath.Join(outputDir, infoPath)
 		infoRmCmd := exec.Command("rm", "-rf", infodirPath)
 		if err := buildExec.Run(infoRmCmd); err != nil {
@@ -1714,7 +1714,7 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 		fmt.Fprintf(os.Stderr, "Warning: failed to save build time to %s: %v\n", buildTimeFile, err)
 	}
 	// delete /usr/share/info/dir and /tools/info/dir
-	for _, infoPath := range []string{"/usr/share/info/dir", "/tools/info/dir"} {
+	for _, infoPath := range []string{"/usr/share/info/dir", "/tools/share/info/dir"} {
 		infodirPath := filepath.Join(outputDir, infoPath)
 		infoRmCmd := exec.Command("rm", "-rf", infodirPath)
 		if err := buildExec.Run(infoRmCmd); err != nil {

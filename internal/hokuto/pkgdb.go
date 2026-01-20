@@ -345,7 +345,7 @@ func getInstalledVersion(pkgName string) (string, bool) {
 	return "", false
 }
 
-// readLockFile reads /etc/hokuto.lock and returns a map of package name -> locked version.
+// readLockFile reads /etc/hokuto/hokuto.lock and returns a map of package name -> locked version.
 // Returns an empty map if the file doesn't exist or on error (errors are silently ignored).
 func readLockFile() map[string]string {
 	locked := make(map[string]string)

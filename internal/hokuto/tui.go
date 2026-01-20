@@ -324,7 +324,7 @@ func readAllBuildLogs() []logInfo {
 	// Determine config file path based on HOKUTO_ROOT env variable
 	configPath := ConfigFile
 	if hokutoRoot := os.Getenv("HOKUTO_ROOT"); hokutoRoot != "" {
-		configPath = filepath.Join(hokutoRoot, "etc", "hokuto.conf")
+		configPath = filepath.Join(hokutoRoot, "etc", "hokuto", "hokuto.conf")
 	}
 
 	// Parse config to get TMPDIR and TMPDIR2

@@ -125,7 +125,7 @@ func SignPackage(stagingDir, pkgName string, execCtx *Executor) error {
 	dataToSign := append(manifestData, pkgInfoData...)
 
 	// 3. Load private key
-	keyPath := "/etc/hokuto.key"
+	keyPath := "/etc/hokuto/hokuto.key"
 	if val, ok := os.LookupEnv("HOKUTO_SIGNING_KEY"); ok {
 		keyPath = val
 	}
