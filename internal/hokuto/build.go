@@ -956,12 +956,13 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 	if err := buildExec.Run(echoCmd); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: failed to save build time to %s: %v\n", buildTimeFile, err)
 	}
-
-	// delete /usr/share/info/dir
-	infodirPath := filepath.Join(outputDir, "/usr/share/info/dir")
-	infoRmCmd := exec.Command("rm", "-rf", infodirPath)
-	if err := buildExec.Run(infoRmCmd); err != nil {
-		fmt.Fprintf(os.Stderr, "Warning: failed to delete /usr/share/info/dir: %v\n", err)
+	// delete /usr/share/info/dir and /tools/info/dir
+	for _, infoPath := range []string{"/usr/share/info/dir", "/tools/info/dir"} {
+		infodirPath := filepath.Join(outputDir, infoPath)
+		infoRmCmd := exec.Command("rm", "-rf", infodirPath)
+		if err := buildExec.Run(infoRmCmd); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to delete %s: %v\n", infoPath, err)
+		}
 	}
 
 	// delete /usr/lib/perl5/*/core_perl/perllocal.pod
@@ -1712,12 +1713,13 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 	if err := buildExec.Run(echoCmd); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: failed to save build time to %s: %v\n", buildTimeFile, err)
 	}
-
-	// delete /usr/share/info/dir
-	infodirPath := filepath.Join(outputDir, "/usr/share/info/dir")
-	infoRmCmd := exec.Command("rm", "-rf", infodirPath)
-	if err := buildExec.Run(infoRmCmd); err != nil {
-		fmt.Fprintf(os.Stderr, "Warning: failed to delete /usr/share/info/dir: %v\n", err)
+	// delete /usr/share/info/dir and /tools/info/dir
+	for _, infoPath := range []string{"/usr/share/info/dir", "/tools/info/dir"} {
+		infodirPath := filepath.Join(outputDir, infoPath)
+		infoRmCmd := exec.Command("rm", "-rf", infodirPath)
+		if err := buildExec.Run(infoRmCmd); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to delete %s: %v\n", infoPath, err)
+		}
 	}
 
 	// delete /usr/lib/perl5/*/core_perl/perllocal.pod
