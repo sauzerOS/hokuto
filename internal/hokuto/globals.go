@@ -148,7 +148,7 @@ var MultilibPackages = []string{
 	"libxcvt",
 	"libxkbcommon",
 	"libxkbfile",
-	"ibxml2",
+	"libxml2",
 	"libxpm",
 	"libxpresent",
 	"libxshmfence",

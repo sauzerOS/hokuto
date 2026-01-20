@@ -17,9 +17,31 @@ func handleUploadCommand(args []string, cfg *Config) error {
 
 	// 1. Parse Flags
 	cleanup := false
+	reindex := false
+	sync := false
+	prompt := false
+
+	if len(args) == 0 {
+		fmt.Println("Usage: hk upload [options]")
+		fmt.Println("")
+		fmt.Println("Options:")
+		fmt.Println("  --sync     Upload all local files missing on remote without prompt")
+		fmt.Println("  --prompt   Prompt for confirmation for each local file missing on remote")
+		fmt.Println("  --cleanup  Prompt to remove older versions on remote")
+		fmt.Println("  --reindex  Regenerate the remote index by scanning the bucket")
+		return nil
+	}
+
 	for _, arg := range args {
-		if arg == "--cleanup" || arg == "-c" {
+		switch arg {
+		case "--cleanup", "-c":
 			cleanup = true
+		case "--reindex":
+			reindex = true
+		case "--sync":
+			sync = true
+		case "--prompt":
+			prompt = true
 		}
 	}
 
@@ -75,6 +97,69 @@ func handleUploadCommand(args []string, cfg *Config) error {
 		newIndexMap[key] = entry
 	}
 
+	var reindexedCount int
+	if reindex {
+		colArrow.Print("-> ")
+		colSuccess.Println("Re-indexing: Scanning all objects on R2")
+		remoteObjects, err := r2.ListObjects(ctx, "")
+		if err != nil {
+			return fmt.Errorf("failed to list remote objects for re-indexing: %w", err)
+		}
+
+		localByFilename := make(map[string]RepoEntry)
+		for _, entry := range latestLocals {
+			localByFilename[entry.Filename] = entry
+		}
+
+		for _, obj := range remoteObjects {
+			if !strings.HasSuffix(obj.Key, ".tar.zst") {
+				continue
+			}
+
+			// Check if we already have this in the index map and it matches the size
+			if existing, ok := newIndexMap[obj.Key]; ok && existing.Size == obj.Size {
+				continue
+			}
+
+			// Check if we have it locally
+			if local, ok := localByFilename[obj.Key]; ok && local.Size == obj.Size {
+				key := fmt.Sprintf("%s-%s-%s", local.Name, local.Arch, local.Variant)
+				newIndexMap[key] = local
+				reindexedCount++
+				continue
+			}
+
+			// Last resort: download and parse (expensive)
+			colArrow.Print("-> ")
+			colWarn.Printf("Remote file %s not in index or local cache. Fetching metadata...\n", obj.Key)
+			data, err := r2.DownloadFile(ctx, obj.Key)
+			if err != nil {
+				debugf("Warning: failed to download %s for re-indexing: %v\n", obj.Key, err)
+				continue
+			}
+
+			// We need a temporary file to use ReadPackageMetadata logic or just use bytes
+			tmpFile := filepath.Join(os.TempDir(), obj.Key)
+			if err := os.WriteFile(tmpFile, data, 0644); err != nil {
+				debugf("Warning: failed to write tmp file for %s: %v\n", obj.Key, err)
+				continue
+			}
+			entry, err := ReadPackageMetadata(tmpFile)
+			os.Remove(tmpFile)
+			if err != nil {
+				debugf("Warning: failed to parse metadata for %s: %v\n", obj.Key, err)
+				continue
+			}
+
+			key := fmt.Sprintf("%s-%s-%s", entry.Name, entry.Arch, entry.Variant)
+			newIndexMap[key] = entry
+			reindexedCount++
+		}
+		if reindexedCount > 0 {
+			colSuccess.Printf("Re-indexing complete. Added %d files to the index.\n", reindexedCount)
+		}
+	}
+
 	var uploadedCount int
 	// Sort local keys for deterministic processing
 	var sortedKeys []string
@@ -95,9 +180,19 @@ func handleUploadCommand(args []string, cfg *Config) error {
 		}
 
 		if needsUpload {
-			colArrow.Print("-> ")
-			if !askForConfirmation(colWarn, "Upload %s %s-%s (%s, %s)? ", local.Name, local.Version, local.Revision, local.Arch, local.Variant) {
+			if !sync && !prompt {
+				// If neither --sync nor --prompt is used, we only upload if we have an explicit reason
+				// but based on user request, hk upload without args shows help.
+				// So if we are here, some other flag like --cleanup or --reindex was used.
+				// In that case, we should probably SKIP uploads unless asked.
 				continue
+			}
+
+			colArrow.Print("-> ")
+			if prompt {
+				if !askForConfirmation(colWarn, "Upload %s %s-%s (%s, %s)? ", local.Name, local.Version, local.Revision, local.Arch, local.Variant) {
+					continue
+				}
 			}
 
 			colArrow.Print("-> ")
@@ -168,7 +263,7 @@ func handleUploadCommand(args []string, cfg *Config) error {
 	}
 
 	// 8. Finalize Index
-	if uploadedCount > 0 || cleanup {
+	if uploadedCount > 0 || cleanup || (reindex && reindexedCount > 0) {
 		colArrow.Print("-> ")
 		colSuccess.Println("Updating remote index")
 

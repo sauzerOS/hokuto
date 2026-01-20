@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
@@ -36,16 +37,24 @@ func NewR2Client(cfg *Config) (*R2Client, error) {
 		}, nil
 	})
 
-	awsCfg, err := config.LoadDefaultConfig(context.TODO(),
+	options := []func(*config.LoadOptions) error{
 		config.WithEndpointResolverWithOptions(r2Resolver),
 		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(accessKey, secretKey, "")),
 		config.WithRegion("auto"),
-	)
+	}
+
+	if Debug {
+		options = append(options, config.WithClientLogMode(aws.LogSigning|aws.LogRetries|aws.LogRequest|aws.LogResponse|aws.LogRequestWithBody|aws.LogResponseWithBody))
+	}
+
+	awsCfg, err := config.LoadDefaultConfig(context.TODO(), options...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load R2 config: %w", err)
 	}
 
-	client := s3.NewFromConfig(awsCfg)
+	client := s3.NewFromConfig(awsCfg, func(o *s3.Options) {
+		o.UsePathStyle = true
+	})
 
 	return &R2Client{
 		Client:     client,
@@ -69,10 +78,19 @@ func (r *R2Client) DownloadFile(ctx context.Context, key string) ([]byte, error)
 
 // UploadFile uploads a file to R2.
 func (r *R2Client) UploadFile(ctx context.Context, key string, body []byte) error {
+	contentType := "application/octet-stream"
+	if strings.HasSuffix(key, ".json") {
+		contentType = "application/json"
+	} else if strings.HasSuffix(key, ".zst") {
+		contentType = "application/zstd"
+	}
+
 	_, err := r.Client.PutObject(ctx, &s3.PutObjectInput{
-		Bucket: aws.String(r.BucketName),
-		Key:    aws.String(key),
-		Body:   bytes.NewReader(body),
+		Bucket:        aws.String(r.BucketName),
+		Key:           aws.String(key),
+		Body:          bytes.NewReader(body),
+		ContentLength: aws.Int64(int64(len(body))),
+		ContentType:   aws.String(contentType),
 	})
 	return err
 }
@@ -85,10 +103,22 @@ func (r *R2Client) UploadLocalFile(ctx context.Context, key, filePath string) er
 	}
 	defer file.Close()
 
+	stat, err := file.Stat()
+	if err != nil {
+		return err
+	}
+
+	contentType := "application/octet-stream"
+	if strings.HasSuffix(key, ".zst") {
+		contentType = "application/zstd"
+	}
+
 	_, err = r.Client.PutObject(ctx, &s3.PutObjectInput{
-		Bucket: aws.String(r.BucketName),
-		Key:    aws.String(key),
-		Body:   file,
+		Bucket:        aws.String(r.BucketName),
+		Key:           aws.String(key),
+		Body:          file,
+		ContentLength: aws.Int64(stat.Size()),
+		ContentType:   aws.String(contentType),
 	})
 	return err
 }
