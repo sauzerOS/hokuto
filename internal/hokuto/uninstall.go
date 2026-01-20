@@ -237,7 +237,18 @@ func pkgUninstall(pkgName string, cfg *Config, execCtx *Executor, force, yes boo
 		}
 	}
 
-	// Check files that need verification
+	// Check files that need verification in a single batch
+	var filesToBatch []string
+	for _, meta := range filesToCheck {
+		filesToBatch = append(filesToBatch, meta.AbsPath)
+	}
+
+	computedSums, err := ComputeChecksums(filesToBatch, execCtx)
+	if err != nil {
+		// If batch fails, we'll fall back to individual checks below or handle missing files
+		debugf("Batch checksum failed in uninstall, falling back: %v\n", err)
+	}
+
 	for _, meta := range filesToCheck {
 		p := meta.AbsPath
 		clean := filepath.Clean(p)
@@ -248,16 +259,20 @@ func pkgUninstall(pkgName string, cfg *Config, execCtx *Executor, force, yes boo
 			continue
 		}
 
-		currentSum, err := b3sum(p, execCtx)
-		if err != nil {
-			// If the file is already missing, we don't need to do anything.
-			if os.IsNotExist(err) {
-				debugf("File already missing: %s\n", p)
+		currentSum, exists := computedSums[p]
+		if !exists {
+			// Try individual check as fallback
+			currentSum, err = ComputeChecksum(p, execCtx)
+			if err != nil {
+				// If the file is already missing, we don't need to do anything.
+				if os.IsNotExist(err) {
+					debugf("File already missing: %s\n", p)
+					continue
+				}
+				// Treat inability to check as a failure to remove for safety
+				failed = append(failed, fmt.Sprintf("%s: failed to compute checksum: %v", p, err))
 				continue
 			}
-			// Treat inability to check as a failure to remove for safety
-			failed = append(failed, fmt.Sprintf("%s: failed to compute b3sum: %v", p, err))
-			continue
 		}
 
 		// Skip modification warning for files with 000000 checksum
@@ -307,8 +322,37 @@ func pkgUninstall(pkgName string, cfg *Config, execCtx *Executor, force, yes boo
 		}
 	}
 
-	// 8. Try to rmdir directories recorded in manifest, deepest first (unchanged)
+	// 8. Try to rmdir directories recorded in manifest, deepest first
 	sort.Slice(dirs, func(i, j int) bool { return len(dirs[i]) > len(dirs[j]) })
+
+	var batch []string
+	const directoryBatchSize = 100
+
+	processBatch := func() {
+		if len(batch) == 0 {
+			return
+		}
+		rmdirCmd := exec.Command("rmdir", batch...)
+		rmdirCmd.Stderr = io.Discard // Silence stderr to avoid "Directory not empty" warnings
+		if err := execCtx.Run(rmdirCmd); err == nil {
+			debugf("Batch removed %d empty directories\n", len(batch))
+		} else {
+			// If batch fails, some directories might still have been removed.
+			// Checking exactly which ones is slow, so we only do it in debug mode.
+			if Debug {
+				removedCount := 0
+				for _, d := range batch {
+					if _, statErr := os.Stat(d); os.IsNotExist(statErr) {
+						debugf("Removed empty directory %s\n", d)
+						removedCount++
+					}
+				}
+				debugf("Batch result: removed %d/%d directories (others likely not empty)\n", removedCount, len(batch))
+			}
+		}
+		batch = nil
+	}
+
 	for _, d := range dirs {
 		clean := filepath.Clean(d)
 
@@ -331,16 +375,8 @@ func pkgUninstall(pkgName string, cfg *Config, execCtx *Executor, force, yes boo
 
 		// A. Check 1: Forbidden Recursive Directories (Prefix Check)
 		for forbiddenPath := range forbiddenSystemDirsRecursive {
-			// Trim the trailing slash for comparison, unless the path itself is "/"
 			recursiveRoot := forbiddenPath
-
-			// The path is forbidden if it's an exact match OR starts with the forbidden path + '/'
-			if relToHRoot == recursiveRoot {
-				isForbidden = true
-				break
-			}
-
-			if strings.HasPrefix(relToHRoot, recursiveRoot+"/") {
+			if relToHRoot == recursiveRoot || strings.HasPrefix(relToHRoot, recursiveRoot+"/") {
 				isForbidden = true
 				break
 			}
@@ -355,15 +391,17 @@ func pkgUninstall(pkgName string, cfg *Config, execCtx *Executor, force, yes boo
 
 		if isForbidden {
 			debugf("Skipping removal of protected system directory: %s\n", clean)
+			// Process any pending batch before skipping a large branch
+			processBatch()
 			continue
 		}
 
-		rmdirCmd := exec.Command("rmdir", clean)
-		rmdirCmd.Stderr = io.Discard // Silence stderr to avoid "Directory not empty" warnings
-		if err := execCtx.Run(rmdirCmd); err == nil {
-			debugf("Removed empty directory %s\n", clean)
+		batch = append(batch, clean)
+		if len(batch) >= directoryBatchSize {
+			processBatch()
 		}
 	}
+	processBatch()
 
 	// 9. Remove package metadata directory (unchanged)
 	rmMetaCmd := exec.Command("rm", "-rf", installedDir)
