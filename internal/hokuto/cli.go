@@ -657,9 +657,31 @@ func Main() {
 					}
 					pkgName = nameWithoutExt[:lastDashIndex]
 				} else {
-					// New format: pkgname-version-revision
-					// Rejoin all but the last two parts as package name
-					pkgName = strings.Join(parts[:len(parts)-2], "-")
+					// New format: pkgname-version-revision[-arch-variant]
+					// Check if it ends with known variant/arch pattern
+					// Common variants: generic, optimized, multilib
+					// Common archs: x86_64, aarch64
+
+					isExtendedFormat := false
+					if len(parts) >= 5 {
+						last := parts[len(parts)-1]
+						secondLast := parts[len(parts)-2]
+
+						knownVariants := map[string]bool{"generic": true, "optimized": true, "multilib": true}
+						knownArchs := map[string]bool{"x86_64": true, "aarch64": true}
+
+						if knownVariants[last] && knownArchs[secondLast] {
+							isExtendedFormat = true
+						}
+					}
+
+					if isExtendedFormat {
+						// Format: pkgname-version-revision-arch-variant
+						pkgName = strings.Join(parts[:len(parts)-4], "-")
+					} else {
+						// Format: pkgname-version-revision
+						pkgName = strings.Join(parts[:len(parts)-2], "-")
+					}
 				}
 				if _, err := os.Stat(tarballPath); err != nil {
 					fmt.Fprintf(os.Stderr, "Error: Tarball not found or inaccessible: %s\n", tarballPath)
@@ -835,7 +857,9 @@ func Main() {
 		// Add long flags for consistency
 		var idleBuildLong = updateCmd.Bool("idle", false, "Use half CPU cores and lowest niceness for build process.")
 		var superidleBuildLong = updateCmd.Bool("superidle", false, "Use one CPU core and lowest niceness for build process.")
+
 		var verboseLong = updateCmd.Bool("verbose", false, "Enable verbose output.")
+		var remote = updateCmd.Bool("remote", false, "Check for updates from remote binary mirror only.")
 
 		if err := updateCmd.Parse(os.Args[2:]); err != nil {
 			fmt.Fprintf(os.Stderr, "Error parsing update flags: %v\n", err)
@@ -851,6 +875,14 @@ func Main() {
 			buildPriority = "normal"
 		}
 		Verbose = *verbose || *verboseLong
+
+		if *remote {
+			if err := checkForRemoteUpgrades(ctx, cfg); err != nil {
+				fmt.Fprintf(os.Stderr, "Remote upgrade process failed: %v\n", err)
+				os.Exit(1)
+			}
+			os.Exit(0) // Exit after remote update
+		}
 
 		updateRepos()
 
