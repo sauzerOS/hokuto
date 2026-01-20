@@ -1054,7 +1054,7 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 	}
 
 	// Determine variant for naming - include multilib prefix if detected
-	variant := IdentifyVariant(isGeneric, isMultilib)
+	variant := IdentifyVariant(pkgName, isGeneric, isMultilib)
 
 	// Generate package archive (using output package name if cross-system is enabled)
 	if err := createPackageTarball(outputPkgName, version, revision, targetArch, variant, outputDir, buildExec); err != nil {
@@ -1797,7 +1797,7 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 
 	// Determine variant for naming - include multilib prefix if detected
 	isGeneric := cfg.Values["HOKUTO_GENERIC"] == "1" || cfg.Values["HOKUTO_CROSS_ARCH"] != ""
-	variant := IdentifyVariant(isGeneric, isMultilib)
+	variant := IdentifyVariant(pkgName, isGeneric, isMultilib)
 
 	// Generate package archive (using output package name if cross-system is enabled)
 	// This ensures the binary cache is kept in sync with the rebuild.

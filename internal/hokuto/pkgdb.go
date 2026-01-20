@@ -387,6 +387,9 @@ func checkLock(pkgName, version string) error {
 
 // isMultilibPackage checks if a package name (without -multi suffix) is in the MultilibPackages list
 func isMultilibPackage(pkgName string) bool {
+	if pkgName == "sauzeros-base" {
+		return false
+	}
 	// Remove -multi suffix if present for lookup
 	baseName := strings.TrimSuffix(pkgName, "-multi")
 	for _, multilibPkg := range MultilibPackages {
@@ -411,7 +414,7 @@ func resolveMultilibPackageName(pkgName string, cfg *Config) string {
 	}
 
 	// Check if this package has a multilib variant
-	if isMultilibPackage(pkgName) {
+	if pkgName != "sauzeros-base" && isMultilibPackage(pkgName) {
 		return pkgName + "-multi"
 	}
 

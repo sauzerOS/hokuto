@@ -52,7 +52,7 @@ func GetSystemVariantForPackage(cfg *Config, pkgName string) string {
 	}
 
 	// Check if multilib is enabled and package supports it
-	if cfg.Values["HOKUTO_MULTILIB"] == "1" && pkgName != "" {
+	if cfg.Values["HOKUTO_MULTILIB"] == "1" && pkgName != "" && pkgName != "sauzeros-base" {
 		if isMultilibPackage(pkgName) {
 			return "multi-" + baseVariant
 		}
@@ -106,7 +106,7 @@ func ReadPackageMetadata(tarballPath string) (RepoEntry, error) {
 	entry.Arch = metadata["arch"]
 
 	// 4. Identify variant
-	entry.Variant = IdentifyVariant(metadata["generic"] == "1", metadata["multilib"] == "1")
+	entry.Variant = IdentifyVariant(entry.Name, metadata["generic"] == "1", metadata["multilib"] == "1")
 
 	return entry, nil
 }
@@ -158,12 +158,12 @@ func parsePkgInfo(data []byte) map[string]string {
 }
 
 // IdentifyVariant returns the variant string (e.g., "optimized", "generic", "multi-optimized").
-func IdentifyVariant(isGeneric bool, isMultilib bool) string {
+func IdentifyVariant(pkgName string, isGeneric bool, isMultilib bool) string {
 	variant := "optimized"
 	if isGeneric {
 		variant = "generic"
 	}
-	if isMultilib {
+	if isMultilib && pkgName != "sauzeros-base" {
 		variant = "multi-" + variant
 	}
 	return variant
