@@ -10,7 +10,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"sort"
 	"strings"
 )
@@ -119,28 +118,9 @@ func generateManifest(outputDir, installedDir string, execCtx *Executor) error {
 	}
 
 	var checksums map[string]string
-	if !execCtx.ShouldRunAsRoot {
-		checksums, err = b3sumBatch(regularFiles, runtime.NumCPU()*2)
-		if err != nil {
-			debugf("parallel b3sum failed (%v), falling back to sequential\n", err)
-			checksums = make(map[string]string)
-			for _, absPath := range regularFiles {
-				checksum, serr := b3sum(absPath, RootExec)
-				if serr != nil {
-					return fmt.Errorf("b3sum failed for %s: %v", absPath, serr)
-				}
-				checksums[absPath] = checksum
-			}
-		}
-	} else {
-		checksums = make(map[string]string)
-		for _, absPath := range regularFiles {
-			checksum, err := b3sum(absPath, execCtx)
-			if err != nil {
-				return fmt.Errorf("b3sum failed for %s: %v", absPath, err)
-			}
-			checksums[absPath] = checksum
-		}
+	checksums, err = ComputeChecksums(regularFiles, execCtx)
+	if err != nil {
+		return fmt.Errorf("failed to compute checksums: %v", err)
 	}
 
 	for _, entry := range filtered {
@@ -159,9 +139,9 @@ func generateManifest(outputDir, installedDir string, execCtx *Executor) error {
 
 	f.Close()
 
-	tempChecksum, err := b3sum(tmpManifest, execCtx)
+	tempChecksum, err := ComputeChecksum(tmpManifest, execCtx)
 	if err != nil {
-		return fmt.Errorf("b3sum failed for temporary manifest %s: %v", tmpManifest, err)
+		return fmt.Errorf("failed to compute checksum for temporary manifest %s: %v", tmpManifest, err)
 	}
 
 	f, err = os.OpenFile(tmpManifest, os.O_APPEND|os.O_WRONLY, 0o644)

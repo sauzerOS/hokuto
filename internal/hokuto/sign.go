@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 )
@@ -14,13 +15,40 @@ import (
 // This is used to verify official repositories.
 const officialPublicKeyHex = "b30f07098a4f98ec90bb169bdd49324d5e22fc09eab79e368e6fafc63453f5f2"
 
+// detectMultilib checks if the staging directory contains multilib libraries
+// (checks for /usr/lib32 or /lib32 directories)
+func detectMultilib(stagingDir string) bool {
+	lib32Paths := []string{
+		filepath.Join(stagingDir, "usr/lib32"),
+		filepath.Join(stagingDir, "lib32"),
+	}
+	for _, path := range lib32Paths {
+		if info, err := os.Stat(path); err == nil && info.IsDir() {
+			return true
+		}
+	}
+	return false
+}
+
 // WritePackageInfo generates the pkginfo metadata file.
-func WritePackageInfo(stagingDir, pkgName, pkgVer, pkgRev, arch, cflags string, generic bool) error {
+func WritePackageInfo(stagingDir, pkgName, pkgVer, pkgRev, arch, cflags string, generic bool, multilib bool, execCtx *Executor) error {
 	metadataDir := filepath.Join(stagingDir, "var", "db", "hokuto", "installed", pkgName)
 	pkgInfoPath := filepath.Join(metadataDir, "pkginfo")
 
-	if err := os.MkdirAll(metadataDir, 0755); err != nil {
-		return fmt.Errorf("failed to create metadata directory: %w", err)
+	// Create directory using executor if running as root is needed
+	if execCtx != nil && execCtx.ShouldRunAsRoot {
+		mkdirCmd := exec.Command("mkdir", "-p", metadataDir)
+		if err := execCtx.Run(mkdirCmd); err != nil {
+			return fmt.Errorf("failed to create metadata directory: %w", err)
+		}
+		chmodCmd := exec.Command("chmod", "755", metadataDir)
+		if err := execCtx.Run(chmodCmd); err != nil {
+			return fmt.Errorf("failed to set metadata directory permissions: %w", err)
+		}
+	} else {
+		if err := os.MkdirAll(metadataDir, 0755); err != nil {
+			return fmt.Errorf("failed to create metadata directory: %w", err)
+		}
 	}
 
 	var pkgInfo strings.Builder
@@ -34,9 +62,43 @@ func WritePackageInfo(stagingDir, pkgName, pkgVer, pkgRev, arch, cflags string, 
 	} else {
 		pkgInfo.WriteString("generic=0\n")
 	}
+	if multilib {
+		pkgInfo.WriteString("multilib=1\n")
+	} else {
+		pkgInfo.WriteString("multilib=0\n")
+	}
 
-	if err := os.WriteFile(pkgInfoPath, []byte(pkgInfo.String()), 0644); err != nil {
-		return fmt.Errorf("failed to write pkginfo: %w", err)
+	// Write file using executor if running as root is needed
+	if execCtx != nil && execCtx.ShouldRunAsRoot {
+		// Write to a temp file first, then move it using executor
+		tmpFile, err := os.CreateTemp("", "hokuto-pkginfo-")
+		if err != nil {
+			return fmt.Errorf("failed to create temp file: %w", err)
+		}
+		tmpPath := tmpFile.Name()
+		if _, err := tmpFile.WriteString(pkgInfo.String()); err != nil {
+			tmpFile.Close()
+			os.Remove(tmpPath)
+			return fmt.Errorf("failed to write pkginfo to temp file: %w", err)
+		}
+		tmpFile.Close()
+
+		// Copy using executor
+		cpCmd := exec.Command("cp", tmpPath, pkgInfoPath)
+		if err := execCtx.Run(cpCmd); err != nil {
+			os.Remove(tmpPath)
+			return fmt.Errorf("failed to write pkginfo: %w", err)
+		}
+		chmodCmd := exec.Command("chmod", "644", pkgInfoPath)
+		if err := execCtx.Run(chmodCmd); err != nil {
+			os.Remove(tmpPath)
+			return fmt.Errorf("failed to set pkginfo permissions: %w", err)
+		}
+		os.Remove(tmpPath)
+	} else {
+		if err := os.WriteFile(pkgInfoPath, []byte(pkgInfo.String()), 0644); err != nil {
+			return fmt.Errorf("failed to write pkginfo: %w", err)
+		}
 	}
 	return nil
 }
@@ -100,8 +162,37 @@ func SignPackage(stagingDir, pkgName string, execCtx *Executor) error {
 	signature := ed25519.Sign(privateKey, dataToSign)
 
 	// 5. Write signature
-	if err := os.WriteFile(signaturePath, []byte(hex.EncodeToString(signature)), 0644); err != nil {
-		return fmt.Errorf("failed to write signature: %w", err)
+	signatureData := []byte(hex.EncodeToString(signature))
+	if execCtx != nil && execCtx.ShouldRunAsRoot {
+		// Write to a temp file first, then copy it using executor
+		tmpFile, err := os.CreateTemp("", "hokuto-signature-")
+		if err != nil {
+			return fmt.Errorf("failed to create temp file: %w", err)
+		}
+		tmpPath := tmpFile.Name()
+		if _, err := tmpFile.Write(signatureData); err != nil {
+			tmpFile.Close()
+			os.Remove(tmpPath)
+			return fmt.Errorf("failed to write signature to temp file: %w", err)
+		}
+		tmpFile.Close()
+
+		// Copy using executor
+		cpCmd := exec.Command("cp", tmpPath, signaturePath)
+		if err := execCtx.Run(cpCmd); err != nil {
+			os.Remove(tmpPath)
+			return fmt.Errorf("failed to write signature: %w", err)
+		}
+		chmodCmd := exec.Command("chmod", "644", signaturePath)
+		if err := execCtx.Run(chmodCmd); err != nil {
+			os.Remove(tmpPath)
+			return fmt.Errorf("failed to set signature permissions: %w", err)
+		}
+		os.Remove(tmpPath)
+	} else {
+		if err := os.WriteFile(signaturePath, signatureData, 0644); err != nil {
+			return fmt.Errorf("failed to write signature: %w", err)
+		}
 	}
 
 	colArrow.Print("-> ")
@@ -215,8 +306,7 @@ func VerifyPackageIntegrity(stagingDir, pkgName, manifestPath string, execCtx *E
 	debugf("Verifying integrity of %d files for %s\n", len(filesToVerify), pkgName)
 
 	// Use parallel checksum computation
-	numWorkers := 10 // b3sumBatch default, or we could use runtime.NumCPU() * 2
-	computedChecksums, err := b3sumBatch(filesToVerify, numWorkers)
+	computedChecksums, err := ComputeChecksums(filesToVerify, execCtx)
 	if err != nil {
 		return fmt.Errorf("integrity check failed: %w", err)
 	}

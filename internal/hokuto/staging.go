@@ -16,7 +16,7 @@ import (
 // with the manifest present in the staging tree. It returns a slice of absolute
 // paths (under rootDir) that should be deleted after the staging has been rsynced.
 func removeObsoleteFiles(pkgName, stagingDir, rootDir string) ([]string, error) {
-	installedManifestPath := filepath.Join(rootDir, Installed, pkgName, "manifest")
+	installedManifestPath := filepath.Join(Installed, pkgName, "manifest")
 	stagingManifestPath := filepath.Join(stagingDir, "var", "db", "hokuto", "installed", pkgName, "manifest")
 
 	installedData, err := readFileAsRoot(installedManifestPath)

@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 
@@ -39,25 +40,7 @@ func hashString(s string) string {
 	return fmt.Sprintf("%x", h.Sum(nil))
 }
 
-// compute b3sum with go implementation lukechampime.com/blake3
-
-func blake3SumFile(path string) (string, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return "", err
-	}
-	defer f.Close()
-
-	// Create a BLAKE3 hasher with a 32-byte output and no key.
-	h := blake3.New(32, nil)
-	if _, err := io.Copy(h, f); err != nil {
-		return "", err
-	}
-	return fmt.Sprintf("%x", h.Sum(nil)), nil
-}
-
 // check if b3sum is installed on system
-
 func hasB3sum() bool {
 	_, err := exec.LookPath("b3sum")
 	return err == nil
@@ -144,6 +127,25 @@ func verifyOrCreateChecksums(pkgName, pkgDir string, force bool) error {
 		}
 	}
 
+	// 1. COLLECT: Gather all existing files that need verification
+	var filesToVerify []string
+	if !force {
+		for _, fname := range expectedFiles {
+			if _, exists := existing[fname]; exists {
+				filesToVerify = append(filesToVerify, filepath.Join(pkgSrcDir, fname))
+			}
+		}
+	}
+
+	computedSums := make(map[string]string)
+	if len(filesToVerify) > 0 {
+		var err error
+		computedSums, err = ComputeChecksums(filesToVerify, UserExec)
+		if err != nil {
+			return fmt.Errorf("failed to verify existing files: %v", err)
+		}
+	}
+
 	var summary []string
 	var finalChecksums []string
 
@@ -153,36 +155,13 @@ func verifyOrCreateChecksums(pkgName, pkgDir string, force bool) error {
 		substitutedURL := applyGnuMirror(originalURL)
 
 		currentSum, sumExists := existing[fname]
-		isHashValid := false
+		computedSum, hasComputed := computedSums[filePath]
+		isHashValid := hasComputed && computedSum == currentSum
 		fileMissing := false
-
-		// 1. VERIFY: Check the hash if it exists and we aren't forcing a refresh.
-		if sumExists && !force {
-			lockBase := resolveLockBaseForVerification(filePath)
-			_ = withSharedDownloadLock(lockBase, func() error {
-				if _, err := os.Stat(filePath); err != nil {
-					fileMissing = true
-					return nil
-				}
-
-				// Prefer the external `b3sum` command if available.
-				if hasB3sum() {
-					out, err := exec.Command("b3sum", filePath).Output()
-					if err == nil {
-						fields := strings.Fields(string(out))
-						if len(fields) > 0 && fields[0] == currentSum {
-							isHashValid = true
-						}
-					}
-				} else {
-					// Fallback to internal blake3 calculation.
-					sum, err := blake3SumFile(filePath)
-					if err == nil && sum == currentSum {
-						isHashValid = true
-					}
-				}
-				return nil
-			})
+		if sumExists && !hasComputed {
+			if _, err := os.Stat(filePath); os.IsNotExist(err) {
+				fileMissing = true
+			}
 		}
 
 		// 2. DECIDE & ACT: Determine what to do based on checksum validity.
@@ -272,19 +251,9 @@ func verifyOrCreateChecksums(pkgName, pkgDir string, force bool) error {
 
 		// 4. RECALCULATE: Generate the new checksum for the file now on disk.
 		debugf("-> Updating checksum for %s\n", fname)
-		var newSum string
-		var calcErr error
-		if hasB3sum() {
-			out, err := exec.Command("b3sum", filePath).Output()
-			if err != nil {
-				return fmt.Errorf("b3sum failed for %s: %v", fname, err)
-			}
-			newSum = strings.Fields(string(out))[0]
-		} else {
-			newSum, calcErr = blake3SumFile(filePath)
-			if calcErr != nil {
-				return fmt.Errorf("failed to compute checksum for %s: %v", fname, calcErr)
-			}
+		newSum, err := ComputeChecksum(filePath, UserExec)
+		if err != nil {
+			return fmt.Errorf("failed to compute checksum for %s: %v", fname, err)
 		}
 
 		finalChecksums = append(finalChecksums, fmt.Sprintf("%s  %s", newSum, fname))
@@ -361,27 +330,140 @@ func hokutoChecksum(pkgName string, force bool, unpack bool) error {
 	return nil
 }
 
-// unzipGo extracts a zip archive using a native Go library.
-// It includes a security check to prevent path traversal attacks (Zip Slip).
+// ComputeChecksums computes checksums for multiple files, using system b3sum if available.
+// It handles privilege escalation via execCtx and batches files for efficiency.
+func ComputeChecksums(paths []string, execCtx *Executor) (map[string]string, error) {
+	if len(paths) == 0 {
+		return make(map[string]string), nil
+	}
 
-func b3sum(path string, execCtx *Executor) (string, error) {
-	// 1. Try to read directly (Native Go).
-	// This covers:
-	// - User running as themselves reading their own files.
-	// - User running as themselves reading world-readable system files (install checks).
-	// - Root running as root reading anything.
+	results := make(map[string]string)
+	var mu sync.Mutex
+
+	// 1. Try system b3sum if available
+	if hasB3sum() {
+		// Batch files to avoid ARG_MAX issues. On Linux, ARG_MAX is typically 2MB.
+		// 5000 files with ~200 byte paths is ~1MB, which is safe.
+		const batchSize = 5000
+		for i := 0; i < len(paths); i += batchSize {
+			end := i + batchSize
+			if end > len(paths) {
+				end = len(paths)
+			}
+			batch := paths[i:end]
+
+			cmd := exec.Command("b3sum", batch...)
+			var out bytes.Buffer
+			cmd.Stdout = &out
+			cmd.Stderr = io.Discard
+
+			if err := execCtx.Run(cmd); err == nil {
+				scanner := bufio.NewScanner(&out)
+				for scanner.Scan() {
+					fields := strings.Fields(scanner.Text())
+					if len(fields) >= 2 {
+						// b3sum output: <hash>  <path>
+						hash := fields[0]
+						// We need to match the path back. Since b3sum might return relative or different absolute style,
+						// but usually it's the exact path we passed.
+						// The second field might have spaces if the path has spaces.
+						// Reconstruct path from fields[1:]
+						pathInOutput := strings.Join(fields[1:], " ")
+						results[pathInOutput] = hash
+					}
+				}
+			} else {
+				// If a batch fails (e.g. one file missing or permission denied even with execCtx),
+				// we'll let the fallback handle it or report error later.
+				debugf("b3sum batch %d-%d failed: %v\n", i, end, err)
+			}
+		}
+
+		// If we got results for all files, we're done.
+		if len(results) == len(paths) {
+			return results, nil
+		}
+	}
+
+	// 2. Fallback: Internal Go BLAKE3 (Parallel)
+	// Compute remaining or all if b3sum failed/missing
+	var remaining []string
+	for _, p := range paths {
+		if _, ok := results[p]; !ok {
+			remaining = append(remaining, p)
+		}
+	}
+
+	if len(remaining) == 0 {
+		return results, nil
+	}
+
+	numWorkers := runtime.NumCPU() * 2
+	if len(remaining) < numWorkers {
+		numWorkers = len(remaining)
+	}
+
+	jobs := make(chan string, len(remaining))
+	var wg sync.WaitGroup
+	var errOnce sync.Once
+	var firstErr error
+
+	for w := 0; w < numWorkers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			buf := make([]byte, 64*1024)
+			for path := range jobs {
+				hash, err := computeSingleGoHash(path, execCtx, buf)
+				mu.Lock()
+				if err != nil {
+					errOnce.Do(func() { firstErr = err })
+				} else {
+					results[path] = hash
+				}
+				mu.Unlock()
+			}
+		}()
+	}
+
+	for _, p := range remaining {
+		jobs <- p
+	}
+	close(jobs)
+	wg.Wait()
+
+	if firstErr != nil {
+		return results, firstErr
+	}
+
+	return results, nil
+}
+
+// ComputeChecksum computes a single checksum, using system b3sum if available.
+func ComputeChecksum(path string, execCtx *Executor) (string, error) {
+	results, err := ComputeChecksums([]string{path}, execCtx)
+	if err != nil {
+		return "", err
+	}
+	if hash, ok := results[path]; ok {
+		return hash, nil
+	}
+	return "", fmt.Errorf("failed to compute checksum for %s", path)
+}
+
+func computeSingleGoHash(path string, execCtx *Executor, buf []byte) (string, error) {
+	// 1. Try to read directly
 	f, err := os.Open(path)
 	if err == nil {
 		defer f.Close()
 		h := blake3.New(32, nil)
-		if _, err := io.Copy(h, f); err == nil {
+		if _, err := io.CopyBuffer(h, f, buf); err == nil {
 			return fmt.Sprintf("%x", h.Sum(nil)), nil
 		}
 	}
 
 	// 2. Fallback: Privileged Read via Executor
-	// Only if native read failed due to permissions AND we can escalate.
-	if err != nil && os.IsPermission(err) && execCtx.ShouldRunAsRoot {
+	if err != nil && os.IsPermission(err) && execCtx != nil && execCtx.ShouldRunAsRoot {
 		catCmd := exec.Command("cat", path)
 		var out bytes.Buffer
 		catCmd.Stdout = &out
@@ -389,98 +471,13 @@ func b3sum(path string, execCtx *Executor) (string, error) {
 
 		if runErr := execCtx.Run(catCmd); runErr == nil {
 			h := blake3.New(32, nil)
-			if _, hashErr := h.Write(out.Bytes()); hashErr == nil {
-				return fmt.Sprintf("%x", h.Sum(nil)), nil
-			}
-			return "", fmt.Errorf("failed to hash privileged data: %v", runErr)
+			h.Write(out.Bytes())
+			return fmt.Sprintf("%x", h.Sum(nil)), nil
 		}
 	}
 
 	if err != nil {
-		return "", fmt.Errorf("failed to open file for blake3: %w", err)
+		return "", err
 	}
-	return "", fmt.Errorf("failed to hash file with blake3")
-}
-
-// b3sumFast computes BLAKE3 for a file, using the system `b3sum` if available,
-// and falling back to the internal pure-Go implementation otherwise.
-
-func b3sumFast(path string) (string, error) {
-	// Try the system b3sum first (only if it's present in PATH).
-	if _, err := exec.LookPath("b3sum"); err == nil {
-		cmd := exec.Command("b3sum", path)
-		var out bytes.Buffer
-		cmd.Stdout = &out
-		// ** FIX: Discard stderr to silence "No such file or directory" messages. **
-		// The error will still be propagated by cmd.Run if b3sum fails.
-		cmd.Stderr = io.Discard
-
-		if err := cmd.Run(); err == nil {
-			fields := strings.Fields(out.String())
-			if len(fields) > 0 {
-				return fields[0], nil
-			}
-			// fall through to internal if b3sum produced no output
-		}
-		// If b3sum failed to run, we’ll fall back to internal below.
-	}
-
-	// Fallback: internal Go BLAKE3 (32-byte output, no key).
-	f, err := os.Open(path)
-	if err != nil {
-		return "", fmt.Errorf("failed to open file for blake3: %w", err)
-	}
-	defer f.Close()
-
-	h := blake3.New(32, nil)
-	if _, err := io.Copy(h, f); err != nil {
-		return "", fmt.Errorf("failed to hash file with blake3: %w", err)
-	}
-	return fmt.Sprintf("%x", h.Sum(nil)), nil
-}
-
-// b3sumBatch computes checksums for multiple files in parallel for user-built packages
-
-func b3sumBatch(paths []string, maxWorkers int) (map[string]string, error) {
-	if maxWorkers <= 0 {
-		maxWorkers = 10 // reasonable default
-	}
-
-	results := make(map[string]string)
-	errors := make(map[string]error)
-	var mu sync.Mutex
-
-	semaphore := make(chan struct{}, maxWorkers)
-	var wg sync.WaitGroup
-
-	for _, path := range paths {
-		wg.Add(1)
-		go func(p string) {
-			defer wg.Done()
-			semaphore <- struct{}{}        // acquire
-			defer func() { <-semaphore }() // release
-
-			checksum, err := blake3SumFile(p)
-
-			mu.Lock()
-			if err != nil {
-				errors[p] = err
-			} else {
-				results[p] = checksum
-			}
-			mu.Unlock()
-		}(path)
-	}
-
-	wg.Wait()
-
-	if len(errors) > 0 {
-		var errMsgs []string
-		for path, err := range errors {
-			errMsgs = append(errMsgs, fmt.Sprintf("%s: %v", path, err))
-		}
-		return results, fmt.Errorf("b3sum errors: %s", strings.Join(errMsgs, "; "))
-	}
-
-	return results, nil
+	return "", fmt.Errorf("hashing failed")
 }

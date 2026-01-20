@@ -16,9 +16,30 @@ import (
 // Cache for resolved alternative dependencies to avoid prompting multiple times
 var alternativeDepCache = make(map[string]string)
 
+// MovePackageToFront moves a specific package to the beginning of the list if it exists.
+func MovePackageToFront(list []string, pkgName string) []string {
+	foundIdx := -1
+	for i, name := range list {
+		if name == pkgName {
+			foundIdx = i
+			break
+		}
+	}
+	if foundIdx == -1 {
+		return list
+	}
+	// Move it to the front
+	newList := make([]string, 0, len(list))
+	newList = append(newList, list[foundIdx])
+	newList = append(newList, list[:foundIdx]...)
+	newList = append(newList, list[foundIdx+1:]...)
+	return newList
+}
+
 // resolveBinaryDependencies recursively finds missing dependencies for a package.
 // It populates 'plan' with the names of packages that need to be installed, in topological order.
 // 'visited' tracks packages processed in this specific resolution pass to prevent cycles.
+// cfg is used to check if multilib is enabled and resolve package names accordingly.
 
 func resolveBinaryDependencies(pkgName string, visited map[string]bool, plan *[]string, force bool, yes bool) error {
 	// 1. Cycle detection
@@ -613,6 +634,9 @@ func resolveBuildPlan(targetPackages []string, userRequestedPackages map[string]
 		}
 	}
 
+	// CRITICAL: Always prioritize sauzeros-base if it's in the build plan
+	plan.Order = MovePackageToFront(plan.Order, "sauzeros-base")
+
 	return plan, nil
 }
 
@@ -805,6 +829,9 @@ func getPackageDependenciesForward(pkgName string) ([]string, error) {
 	if err := collectDeps(pkgName); err != nil {
 		return nil, err
 	}
+
+	// CRITICAL: Always prioritize sauzeros-base if it's in the dependency list
+	result = MovePackageToFront(result, "sauzeros-base")
 
 	return result, nil
 }

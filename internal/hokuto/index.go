@@ -38,11 +38,27 @@ func GetSystemArch(cfg *Config) string {
 }
 
 // GetSystemVariant returns "generic" if HOKUTO_GENERIC=1 is set in config, otherwise "optimized".
+// If multilib is enabled and the package supports it, returns "multi-generic" or "multi-optimized".
 func GetSystemVariant(cfg *Config) string {
+	return GetSystemVariantForPackage(cfg, "")
+}
+
+// GetSystemVariantForPackage returns the variant string for a specific package.
+// If multilib is enabled and the package supports it, returns "multi-generic" or "multi-optimized".
+func GetSystemVariantForPackage(cfg *Config, pkgName string) string {
+	baseVariant := "optimized"
 	if cfg.Values["HOKUTO_GENERIC"] == "1" || cfg.Values["HOKUTO_CROSS_ARCH"] != "" {
-		return "generic"
+		baseVariant = "generic"
 	}
-	return "optimized"
+
+	// Check if multilib is enabled and package supports it
+	if cfg.Values["HOKUTO_MULTILIB"] == "1" && pkgName != "" {
+		if isMultilibPackage(pkgName) {
+			return "multi-" + baseVariant
+		}
+	}
+
+	return baseVariant
 }
 
 // RepoEntry represents a single package in the repository index.
@@ -70,7 +86,7 @@ func ReadPackageMetadata(tarballPath string) (RepoEntry, error) {
 	}
 	entry.Size = info.Size()
 
-	sum, err := blake3SumFile(tarballPath)
+	sum, err := ComputeChecksum(tarballPath, nil)
 	if err != nil {
 		return entry, fmt.Errorf("failed to compute checksum: %w", err)
 	}
@@ -90,7 +106,7 @@ func ReadPackageMetadata(tarballPath string) (RepoEntry, error) {
 	entry.Arch = metadata["arch"]
 
 	// 4. Identify variant
-	entry.Variant = IdentifyVariant(metadata["generic"] == "1")
+	entry.Variant = IdentifyVariant(metadata["generic"] == "1", metadata["multilib"] == "1")
 
 	return entry, nil
 }
@@ -141,12 +157,16 @@ func parsePkgInfo(data []byte) map[string]string {
 	return meta
 }
 
-// IdentifyVariant returns "generic" if HOKUTO_GENERIC=1 or equivalent flag is set.
-func IdentifyVariant(isGeneric bool) string {
+// IdentifyVariant returns the variant string (e.g., "optimized", "generic", "multi-optimized").
+func IdentifyVariant(isGeneric bool, isMultilib bool) string {
+	variant := "optimized"
 	if isGeneric {
-		return "generic"
+		variant = "generic"
 	}
-	return "optimized"
+	if isMultilib {
+		variant = "multi-" + variant
+	}
+	return variant
 }
 
 // StandardizeRemoteName generates a consistent filename for the remote repository.

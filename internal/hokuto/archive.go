@@ -467,13 +467,62 @@ func createPackageTarball(pkgName, pkgVer, pkgRev, arch, variant, outputDir stri
 }
 
 // compressXZ compresses a file using XZ
-func compressXZ(srcPath, destPath string) error {
+func compressXZ(srcPath, destPath string, execCtx *Executor) error {
+	// Ensure destination directory exists using executor if needed
+	destDir := filepath.Dir(destPath)
+	if execCtx != nil && execCtx.ShouldRunAsRoot {
+		mkdirCmd := exec.Command("mkdir", "-p", destDir)
+		if err := execCtx.Run(mkdirCmd); err != nil {
+			return fmt.Errorf("failed to create destination directory: %w", err)
+		}
+	} else {
+		if err := os.MkdirAll(destDir, 0755); err != nil {
+			return fmt.Errorf("failed to create destination directory: %w", err)
+		}
+	}
+
 	src, err := os.Open(srcPath)
 	if err != nil {
 		return err
 	}
 	defer src.Close()
 
+	// Use executor to write file if running as root is needed
+	if execCtx != nil && execCtx.ShouldRunAsRoot {
+		// Write to a temp file first, then copy it using executor
+		tmpFile, err := os.CreateTemp("", "hokuto-log-*.xz")
+		if err != nil {
+			return fmt.Errorf("failed to create temp file: %w", err)
+		}
+		tmpPath := tmpFile.Name()
+		defer os.Remove(tmpPath)
+
+		xzWriter, err := xz.NewWriter(tmpFile)
+		if err != nil {
+			tmpFile.Close()
+			return err
+		}
+
+		_, err = io.Copy(xzWriter, src)
+		xzWriter.Close()
+		tmpFile.Close()
+		if err != nil {
+			return fmt.Errorf("failed to compress to temp file: %w", err)
+		}
+
+		// Copy temp file to destination using executor
+		cpCmd := exec.Command("cp", tmpPath, destPath)
+		if err := execCtx.Run(cpCmd); err != nil {
+			return fmt.Errorf("failed to copy compressed file: %w", err)
+		}
+		chmodCmd := exec.Command("chmod", "644", destPath)
+		if err := execCtx.Run(chmodCmd); err != nil {
+			return fmt.Errorf("failed to set file permissions: %w", err)
+		}
+		return nil
+	}
+
+	// Normal path: create and write directly
 	dest, err := os.Create(destPath)
 	if err != nil {
 		return err

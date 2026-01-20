@@ -213,7 +213,7 @@ func checkFileConflict(filePath, currentFileAbsPath, currentPackage, rootDir str
 				if resolvedTargetRelPath != "" && cleanManifestPath == resolvedTargetRelPath {
 					// Found the target file in manifest - check if checksum matches
 					// Compute checksum of the resolved target file
-					targetChecksum, err := b3sum(resolvedTargetPath, execCtx)
+					targetChecksum, err := ComputeChecksum(resolvedTargetPath, execCtx)
 					if err == nil && strings.EqualFold(targetChecksum, manifestChecksum) {
 						// Target file matches - this is a conflict
 						return pkgName, true, true, symlinkTarget
@@ -227,7 +227,7 @@ func checkFileConflict(filePath, currentFileAbsPath, currentPackage, rootDir str
 			if cleanManifestPath == searchPath {
 				// Found the file in another package's manifest
 				// Regular file - check if the checksum matches
-				currentChecksum, err := b3sum(currentFileAbsPath, execCtx)
+				currentChecksum, err := ComputeChecksum(currentFileAbsPath, execCtx)
 				if err != nil {
 					// Can't compute checksum, assume no match
 					return pkgName, false, false, ""
@@ -383,4 +383,38 @@ func checkLock(pkgName, version string) error {
 		}
 	}
 	return nil
+}
+
+// isMultilibPackage checks if a package name (without -multi suffix) is in the MultilibPackages list
+func isMultilibPackage(pkgName string) bool {
+	// Remove -multi suffix if present for lookup
+	baseName := strings.TrimSuffix(pkgName, "-multi")
+	for _, multilibPkg := range MultilibPackages {
+		if multilibPkg == baseName {
+			return true
+		}
+	}
+	return false
+}
+
+// resolveMultilibPackageName resolves a package name to its multilib variant if enabled
+// Returns the package name to use (either original or -multi variant)
+func resolveMultilibPackageName(pkgName string, cfg *Config) string {
+	// If multilib is not enabled, return original name
+	if cfg.Values["HOKUTO_MULTILIB"] != "1" {
+		return pkgName
+	}
+
+	// If package already has -multi suffix, return as-is
+	if strings.HasSuffix(pkgName, "-multi") {
+		return pkgName
+	}
+
+	// Check if this package has a multilib variant
+	if isMultilibPackage(pkgName) {
+		return pkgName + "-multi"
+	}
+
+	// No multilib variant, return original
+	return pkgName
 }

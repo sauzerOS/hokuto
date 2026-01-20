@@ -12,7 +12,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"sort"
 	"strings"
 )
@@ -452,28 +451,14 @@ func getModifiedFiles(pkgName, rootDir string, execCtx *Executor) ([]string, err
 		return nil, fmt.Errorf("error scanning manifest: %v", err)
 	}
 
-	// Compute checksums - use optimized path for user-built packages
-	var checksums map[string]string
-	if !execCtx.ShouldRunAsRoot {
-		// Fast path: parallel processing for user-built packages
-		var err error
-		checksums, err = b3sumBatch(filesToCheck, runtime.NumCPU()*2)
-		if err != nil {
-			// Fall back to sequential processing if batch fails
-			checksums = make(map[string]string)
-			for _, absPath := range filesToCheck {
-				sum, err := b3sum(absPath, execCtx)
-				if err != nil {
-					continue // skip missing files or checksum failures
-				}
-				checksums[absPath] = sum
-			}
-		}
-	} else {
-		// Slow path: sequential processing for root-built packages
+	// Compute checksums using the unified optimized path
+	checksums, err := ComputeChecksums(filesToCheck, execCtx)
+	if err != nil {
+		// Fall back to manual loop if batch fails (though ComputeChecksums already has fallbacks)
+		debugf("ComputeChecksums failed in getModifiedFiles: %v\n", err)
 		checksums = make(map[string]string)
 		for _, absPath := range filesToCheck {
-			sum, err := b3sum(absPath, execCtx)
+			sum, err := ComputeChecksum(absPath, execCtx)
 			if err != nil {
 				continue // skip missing files or checksum failures
 			}

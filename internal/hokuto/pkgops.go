@@ -474,10 +474,11 @@ func generateDepends(pkgName, pkgDir, outputDir, rootDir string, execCtx *Execut
 
 func executePostInstall(pkgName, rootDir string, execCtx *Executor, cfg *Config) error {
 
-	// absolute path inside the system (and inside the chroot)
+	// absolute path inside the chroot
 	const relScript = "/var/db/hokuto/installed"
 	scriptPath := filepath.Join(relScript, pkgName, "post-install")
-	hostScript := filepath.Join(rootDir, scriptPath)
+	// Construct host path by joining rootDir with the relative portion (without leading slash)
+	hostScript := filepath.Join(rootDir, strings.TrimPrefix(scriptPath, "/"))
 
 	// nothing to do if the file doesn't exist on host
 	if fi, err := os.Stat(hostScript); err != nil {

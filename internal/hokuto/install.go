@@ -996,7 +996,7 @@ func checkStagingConflicts(pkgName, stagingDir, rootDir, stagingManifest string,
 	currentPkgFiles := make(map[string]bool)
 
 	// First, check if current package is installed and build its file set
-	installedManifestPath := filepath.Join(rootDir, Installed, pkgName, "manifest")
+	installedManifestPath := filepath.Join(Installed, pkgName, "manifest")
 	if data, err := os.ReadFile(installedManifestPath); err == nil {
 		scanner := bufio.NewScanner(bytes.NewReader(data))
 		for scanner.Scan() {

@@ -39,7 +39,7 @@ func printHelp() {
 		{"list, ls", "<pkg>", "List installed packages, optionally filter by name"},
 		{"checksum, c", "<pkg>", "Fetch sources and generate checksum file"},
 		{"build, b", "<pkg>", "Build package(s)"},
-		{"install, i", "[-g] <pkg>", "Install pre-built package(s)"},
+		{"install, i", "[-g] [-multi] <pkg>", "Install pre-built package(s)"},
 		{"uninstall, r", "<pkg>", "Uninstall package(s)"},
 		{"update, u", "[options]", "Update repositories and check for upgrades"},
 		{"manifest, m", "<pkg>", "Show the file list for an installed package"},
@@ -473,6 +473,7 @@ func Main() {
 		var genericShortFlag = installCmd.Bool("g", false, "Install the generic variant of the package.")
 		var arm64Flag = installCmd.Bool("arm64", false, "Install arm64 version of the package.")
 		var x86_64Flag = installCmd.Bool("x86_64", false, "Install x86_64 version of the package.")
+		var multiFlag = installCmd.Bool("multi", false, "Install multilib variants of packages that support them.")
 
 		if err := installCmd.Parse(os.Args[2:]); err != nil {
 			fmt.Fprintf(os.Stderr, "Error parsing install flags: %v\n", err)
@@ -488,6 +489,11 @@ func Main() {
 		}
 		if *x86_64Flag {
 			cfg.Values["HOKUTO_ARCH"] = "x86_64"
+		}
+
+		// Handle multilib flag or HOKUTO_MULTILIB environment variable
+		if *multiFlag || cfg.Values["HOKUTO_MULTILIB"] == "1" {
+			cfg.Values["HOKUTO_MULTILIB"] = "1"
 		}
 
 		packagesToInstall := installCmd.Args()
@@ -532,6 +538,7 @@ func Main() {
 
 			// If argument is a package name
 			pkgName := arg
+			// Keep package name as-is, but will use multi variant in filename if multilib is enabled
 			userRequestedMap[pkgName] = true
 
 			if *nodeps {
@@ -578,6 +585,7 @@ func Main() {
 				}
 			}
 		}
+		installPlan = MovePackageToFront(installPlan, "sauzeros-base")
 
 		if len(installPlan) == 0 && !*force {
 			colArrow.Print("-> ")
@@ -641,13 +649,16 @@ func Main() {
 			} else {
 				// Case B: Package Name (Auto-resolved or requested)
 				pkgName = arg
+				// Keep package name as-is, but use multi variant in filename if multilib is enabled
+
 				version, revision, err := getRepoVersion2(pkgName)
 				tarballFoundDirectly := false
 				if err != nil {
 					// If source not found (e.g., renamed cross-system packages), try to find tarball
 					if strings.Contains(err.Error(), "not found") {
-						// Try to find the newest tarball matching this package name
-						foundTarball, foundVersion, foundRevision := findNewestTarball(pkgName, GetSystemVariant(cfg))
+						// Try to find the newest tarball matching this package name with appropriate variant
+						variant := GetSystemVariantForPackage(cfg, pkgName)
+						foundTarball, foundVersion, foundRevision := findNewestTarball(pkgName, variant)
 						if foundTarball != "" {
 							tarballPath = foundTarball
 							version = foundVersion
@@ -665,7 +676,7 @@ func Main() {
 					}
 				} else {
 					arch := GetSystemArch(cfg)
-					variant := GetSystemVariant(cfg)
+					variant := GetSystemVariantForPackage(cfg, pkgName)
 					tarballPath = filepath.Join(BinDir, StandardizeRemoteName(pkgName, version, revision, arch, variant))
 				}
 

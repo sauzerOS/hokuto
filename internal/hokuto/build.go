@@ -1011,7 +1011,12 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 
 	// Compress build log to package metadata
 	logXZPath := filepath.Join(installedDir, "log.xz")
-	if err := compressXZ(logPath, logXZPath); err != nil {
+	// Use RootExec when package was built as root to handle root-owned files
+	logExec := buildExec
+	if buildExec.ShouldRunAsRoot {
+		logExec = RootExec
+	}
+	if err := compressXZ(logPath, logXZPath, logExec); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: failed to compress build log: %v\n", err)
 	}
 
@@ -1020,8 +1025,16 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 	cflagsVal := defaults["CFLAGS"]
 	isGeneric := cfg.Values["HOKUTO_GENERIC"] == "1" || cfg.Values["HOKUTO_CROSS_ARCH"] != ""
 
+	// Detect multilib in output directory
+	isMultilib := detectMultilib(outputDir)
+
 	// 1. Generate pkginfo (before manifest) so it's included in the manifest
-	if err := WritePackageInfo(outputDir, outputPkgName, version, revision, targetArch, cflagsVal, isGeneric); err != nil {
+	// Use RootExec when package was built as root to handle root-owned files
+	pkginfoExec := buildExec
+	if buildExec.ShouldRunAsRoot {
+		pkginfoExec = RootExec
+	}
+	if err := WritePackageInfo(outputDir, outputPkgName, version, revision, targetArch, cflagsVal, isGeneric, isMultilib, pkginfoExec); err != nil {
 		return 0, fmt.Errorf("failed to write pkginfo: %v", err)
 	}
 
@@ -1031,12 +1044,17 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 	}
 
 	// 3. Sign the package metadata and manifest
-	if err := SignPackage(outputDir, outputPkgName, buildExec); err != nil {
+	// Use RootExec when package was built as root to handle root-owned files
+	signExec := buildExec
+	if buildExec.ShouldRunAsRoot {
+		signExec = RootExec
+	}
+	if err := SignPackage(outputDir, outputPkgName, signExec); err != nil {
 		return 0, fmt.Errorf("failed to sign package: %v", err)
 	}
 
-	// Determine variant for naming
-	variant := IdentifyVariant(isGeneric)
+	// Determine variant for naming - include multilib prefix if detected
+	variant := IdentifyVariant(isGeneric, isMultilib)
 
 	// Generate package archive (using output package name if cross-system is enabled)
 	if err := createPackageTarball(outputPkgName, version, revision, targetArch, variant, outputDir, buildExec); err != nil {
@@ -1749,7 +1767,12 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 
 	// Compress build log to package metadata
 	logXZPath := filepath.Join(installedDir, "log.xz")
-	if err := compressXZ(logPath, logXZPath); err != nil {
+	// Use RootExec when package was built as root to handle root-owned files
+	logExec := buildExec
+	if buildExec.ShouldRunAsRoot {
+		logExec = RootExec
+	}
+	if err := compressXZ(logPath, logXZPath, logExec); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: failed to compress build log: %v\n", err)
 	}
 
@@ -1769,9 +1792,12 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 		}
 	}
 
-	// Determine variant for naming
+	// Detect multilib in output directory
+	isMultilib := detectMultilib(outputDir)
+
+	// Determine variant for naming - include multilib prefix if detected
 	isGeneric := cfg.Values["HOKUTO_GENERIC"] == "1" || cfg.Values["HOKUTO_CROSS_ARCH"] != ""
-	variant := IdentifyVariant(isGeneric)
+	variant := IdentifyVariant(isGeneric, isMultilib)
 
 	// Generate package archive (using output package name if cross-system is enabled)
 	// This ensures the binary cache is kept in sync with the rebuild.
@@ -2101,6 +2127,8 @@ func handleBuildCommand(args []string, cfg *Config) error {
 			fullBuildList = append(fullBuildList, pkgName) // Add the target itself
 		}
 
+		fullBuildList = MovePackageToFront(fullBuildList, "sauzeros-base")
+
 		colArrow.Print("-> ")
 		colSuccess.Printf("Build order: %s\n", strings.Join(fullBuildList, " -> "))
 
@@ -2140,7 +2168,7 @@ func handleBuildCommand(args []string, cfg *Config) error {
 			// Use output package name for tarball and installation (may be renamed for cross-system)
 			outputPkgName := getOutputPackageName(pkgName, cfg)
 			arch := GetSystemArch(cfg)
-			variant := GetSystemVariant(cfg)
+			variant := GetSystemVariantForPackage(cfg, pkgName)
 			tarballPath := filepath.Join(BinDir, StandardizeRemoteName(outputPkgName, version, revision, arch, variant))
 			isCriticalAtomic.Store(1)
 			handlePreInstallUninstall(outputPkgName, cfg, RootExec)
@@ -2171,6 +2199,8 @@ func handleBuildCommand(args []string, cfg *Config) error {
 				return fmt.Errorf("error resolving dependencies for %s: %v", pkgName, err)
 			}
 		}
+		missingDeps = MovePackageToFront(missingDeps, "sauzeros-base")
+
 		packagesThatMustBeBuilt := make(map[string]bool)
 		for pkg := range userRequestedMap {
 			packagesThatMustBeBuilt[pkg] = true
@@ -2187,7 +2217,7 @@ func handleBuildCommand(args []string, cfg *Config) error {
 			// Use output package name for dependencies too (may be renamed for cross-system)
 			outputDepPkg := getOutputPackageName(depPkg, cfg)
 			arch := GetSystemArch(cfg)
-			variant := GetSystemVariant(cfg)
+			variant := GetSystemVariantForPackage(cfg, depPkg)
 			tarballPath := filepath.Join(BinDir, StandardizeRemoteName(outputDepPkg, version, revision, arch, variant))
 			if _, err := os.Stat(tarballPath); err == nil {
 				if askForConfirmation(colInfo, "Dependency '%s' is missing. Use available binary package?", depPkg) {
@@ -2331,7 +2361,7 @@ func handleBuildCommand(args []string, cfg *Config) error {
 						version, revision, _ := getRepoVersion2(finalPkg)
 						outputFinalPkg := getOutputPackageName(finalPkg, cfg)
 						arch := GetSystemArch(cfg)
-						variant := GetSystemVariant(cfg)
+						variant := GetSystemVariantForPackage(cfg, finalPkg)
 						tarballPath := filepath.Join(BinDir, StandardizeRemoteName(outputFinalPkg, version, revision, arch, variant))
 						isCriticalAtomic.Store(1)
 						handlePreInstallUninstall(outputFinalPkg, cfg, RootExec)
@@ -2525,7 +2555,7 @@ func executeBuildPass(plan *BuildPlan, _ string, installAllTargets bool, cfg *Co
 					version, revision, _ := getRepoVersion2(pkgName)
 					outputPkgName := getOutputPackageName(pkgName, cfg)
 					arch := GetSystemArch(cfg)
-					variant := GetSystemVariant(cfg)
+					variant := GetSystemVariantForPackage(cfg, pkgName)
 					tarballPath := filepath.Join(BinDir, StandardizeRemoteName(outputPkgName, version, revision, arch, variant))
 					isCriticalAtomic.Store(1)
 					handlePreInstallUninstall(outputPkgName, cfg, RootExec)
@@ -2616,7 +2646,7 @@ func executeBuildPass(plan *BuildPlan, _ string, installAllTargets bool, cfg *Co
 						version, revision, _ := getRepoVersion2(parent)
 						outputParent := getOutputPackageName(parent, cfg)
 						arch := GetSystemArch(cfg)
-						variant := GetSystemVariant(cfg)
+						variant := GetSystemVariantForPackage(cfg, parent)
 						tarballPath := filepath.Join(BinDir, StandardizeRemoteName(outputParent, version, revision, arch, variant))
 						isCriticalAtomic.Store(1)
 						handlePreInstallUninstall(outputParent, cfg, RootExec)
@@ -2656,7 +2686,7 @@ func executeBuildPass(plan *BuildPlan, _ string, installAllTargets bool, cfg *Co
 					version, revision, _ := getRepoVersion2(rebuildPkg)
 					outputRebuildPkg := getOutputPackageName(rebuildPkg, cfg)
 					arch := GetSystemArch(cfg)
-					variant := GetSystemVariant(cfg)
+					variant := GetSystemVariantForPackage(cfg, rebuildPkg)
 					tarballPath := filepath.Join(BinDir, StandardizeRemoteName(outputRebuildPkg, version, revision, arch, variant))
 					isCriticalAtomic.Store(1)
 					handlePreInstallUninstall(outputRebuildPkg, cfg, RootExec)
