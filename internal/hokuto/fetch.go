@@ -36,12 +36,20 @@ func newHttpClient() (*http.Client, error) {
 
 	// Configure the TLS client to use the selected pool of trusted CAs.
 	tlsConfig := &tls.Config{
-		RootCAs: rootCAs,
+		RootCAs:    rootCAs,
+		MinVersion: tls.VersionTLS12,
 	}
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.TLSClientConfig = tlsConfig
 
-	return &http.Client{Transport: transport}, nil
+	// Increase TLS handshake timeout to handle slow/problematic sites like busybox.net
+	// Default is 10s, we increase it to 30s.
+	transport.TLSHandshakeTimeout = 30 * time.Second
+
+	return &http.Client{
+		Transport: transport,
+		Timeout:   300 * time.Second, // 5 min total timeout for large downloads
+	}, nil
 }
 
 // downloadFile downloads a URL into the hokuto cache.
