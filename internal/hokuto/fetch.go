@@ -272,7 +272,7 @@ func fetchBinaryPackage(pkgName, version, revision string, cfg *Config) error {
 	}
 
 	arch := GetSystemArch(cfg)
-	variant := GetSystemVariant(cfg)
+	variant := GetSystemVariantForPackage(cfg, pkgName)
 	filename := StandardizeRemoteName(pkgName, version, revision, arch, variant)
 	url := fmt.Sprintf("%s/%s", BinaryMirror, filename)
 	destPath := filepath.Join(BinDir, filename)

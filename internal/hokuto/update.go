@@ -505,7 +505,7 @@ func checkForUpgrades(_ context.Context, cfg *Config) error {
 
 		outputPkgName := getOutputPackageName(pkgName, cfg)
 		arch := GetSystemArch(cfg)
-		variant := GetSystemVariant(cfg)
+		variant := GetSystemVariantForPackage(cfg, pkgName)
 		tarballName := StandardizeRemoteName(outputPkgName, version, revision, arch, variant)
 		tarballPath := filepath.Join(BinDir, tarballName)
 
