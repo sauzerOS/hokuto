@@ -6,6 +6,7 @@ package hokuto
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -114,6 +115,57 @@ func listPackages(searchTerm string) error {
 		} else {
 			cPrintf(color.Cyan, "%s %s\n", p, versionInfo)
 		}
+	}
+
+	return nil
+}
+
+func listRemotePackages(searchTerm string, cfg *Config) error {
+	ctx := context.Background()
+	r2, err := NewR2Client(cfg)
+	if err != nil {
+		return err
+	}
+
+	colArrow.Print("-> ")
+	colSuccess.Println("Fetching remote index from R2")
+	data, err := r2.DownloadFile(ctx, "repo-index.json")
+	if err != nil {
+		return fmt.Errorf("failed to fetch remote index: %w", err)
+	}
+
+	remoteIndex, err := ParseRepoIndex(data)
+	if err != nil {
+		return fmt.Errorf("failed to parse remote index: %w", err)
+	}
+
+	foundAny := false
+	for _, entry := range remoteIndex {
+		if searchTerm != "" && !strings.Contains(entry.Name, searchTerm) {
+			continue
+		}
+
+		variantDisplay := entry.Variant
+		multiSuffix := ""
+
+		// Identify variant and multi-bitness
+		// Possible variants: optimized, generic, multi-optimized, multi-generic
+		if strings.HasPrefix(variantDisplay, "multi-") {
+			variantDisplay = strings.TrimPrefix(variantDisplay, "multi-")
+			multiSuffix = " (multi)"
+		}
+
+		if variantDisplay == "optimized" {
+			variantDisplay = "native"
+		}
+
+		cPrintf(color.Cyan, "%-25s %-15s %-10s %s%s\n", entry.Name, fmt.Sprintf("%s-%s", entry.Version, entry.Revision), entry.Arch, variantDisplay, multiSuffix)
+		foundAny = true
+	}
+
+	if !foundAny && searchTerm != "" {
+		colArrow.Print("-> ")
+		colSuccess.Printf("No remote packages found matching: %s\n", searchTerm)
 	}
 
 	return nil

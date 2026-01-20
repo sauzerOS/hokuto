@@ -351,17 +351,32 @@ func Main() {
 		colNote.Printf("hokuto %s (%s) built %s\n", version, arch, buildDate)
 
 	case "list", "ls":
-		pkg := ""
-		if len(os.Args) >= 3 {
-			pkg = os.Args[2]
+		lsCmd := flag.NewFlagSet("list", flag.ExitOnError)
+		var remote = lsCmd.Bool("remote", false, "List packages from the remote repository.")
+		if err := lsCmd.Parse(os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "Error parsing ls flags: %v\n", err)
+			os.Exit(1)
 		}
-		if err := listPackages(pkg); err != nil {
-			// If it's the "not found" error, the friendly message was already printed.
-			if errors.Is(err, errPackageNotFound) {
+
+		pkg := ""
+		if lsCmd.NArg() > 0 {
+			pkg = lsCmd.Arg(0)
+		}
+
+		if *remote {
+			if err := listRemotePackages(pkg, cfg); err != nil {
+				fmt.Fprintln(os.Stderr, "Error listing remote packages:", err)
 				exitCode = 1
-			} else {
-				fmt.Fprintln(os.Stderr, "Error:", err)
-				exitCode = 1
+			}
+		} else {
+			if err := listPackages(pkg); err != nil {
+				// If it's the "not found" error, the friendly message was already printed.
+				if errors.Is(err, errPackageNotFound) {
+					exitCode = 1
+				} else {
+					fmt.Fprintln(os.Stderr, "Error:", err)
+					exitCode = 1
+				}
 			}
 		}
 
