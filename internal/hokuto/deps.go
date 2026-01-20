@@ -4,17 +4,13 @@ package hokuto
 // No behavior changes intended.
 
 import (
-	"archive/tar"
 	"bufio"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
-
-	"github.com/klauspost/compress/zstd"
 )
 
 // Cache for resolved alternative dependencies to avoid prompting multiple times
@@ -257,41 +253,6 @@ func parseDependsFile(pkgDir string) ([]DepSpec, error) {
 	return parseDependsData(content)
 }
 
-func extractDependsFromTarball(tarballPath string) ([]byte, error) {
-	f, err := os.Open(tarballPath)
-	if err != nil {
-		return nil, fmt.Errorf("open tarball: %w", err)
-	}
-	defer f.Close()
-
-	// Use zstd reader
-	zr, err := zstd.NewReader(f)
-	if err != nil {
-		return nil, fmt.Errorf("zstd reader: %w", err)
-	}
-	defer zr.Close()
-
-	tr := tar.NewReader(zr)
-	for {
-		hdr, err := tr.Next()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return nil, fmt.Errorf("tar read: %w", err)
-		}
-
-		// Look for 'depends' file
-		// The archive stores metadata in var/db/hokuto/installed/<pkg>/depends
-		// We look for any file ending in "/depends" to be safe and robust
-		if strings.HasSuffix(hdr.Name, "/depends") {
-			return io.ReadAll(tr)
-		}
-	}
-	// Return empty if depends not found (valid constraint, means no deps)
-	return []byte{}, nil
-}
-
 func resolveRemoteDependencies(pkgName string, visited map[string]bool, plan *[]string, force bool, yes bool, cfg *Config, remoteIndex []RepoEntry) error {
 	// 1. Cycle detection
 	if visited[pkgName] {
@@ -305,12 +266,11 @@ func resolveRemoteDependencies(pkgName string, visited map[string]bool, plan *[]
 	}
 
 	// 3. Find in remote index
-	var ver, rev string
+	var entry RepoEntry
 	found := false
-	for _, entry := range remoteIndex {
-		if entry.Name == pkgName {
-			ver = entry.Version
-			rev = entry.Revision
+	for _, e := range remoteIndex {
+		if e.Name == pkgName {
+			entry = e
 			found = true
 			break
 		}
@@ -320,26 +280,32 @@ func resolveRemoteDependencies(pkgName string, visited map[string]bool, plan *[]
 		return fmt.Errorf("package %s not found in remote index", pkgName)
 	}
 
-	// 4. Fetch binary package to ensure we have it (to read depends)
-	if err := fetchBinaryPackage(pkgName, ver, rev, cfg); err != nil {
-		return fmt.Errorf("failed to fetch remote package for dependency resolution: %w", err)
-	}
+	var deps []DepSpec
+	if len(entry.Depends) > 0 {
+		// Optimization: Use pre-resolved dependencies from index
+		for _, d := range entry.Depends {
+			deps = append(deps, DepSpec{Name: d})
+		}
+	} else {
+		// Fallback: Fetch binary package to read depends (older index or missing info)
+		if err := fetchBinaryPackage(pkgName, entry.Version, entry.Revision, cfg); err != nil {
+			return fmt.Errorf("failed to fetch remote package for dependency resolution (%s): %v", pkgName, err)
+		}
 
-	arch := GetSystemArch(cfg)
-	variant := GetSystemVariantForPackage(cfg, pkgName)
-	tarballName := StandardizeRemoteName(pkgName, ver, rev, arch, variant)
-	tarballPath := filepath.Join(BinDir, tarballName)
+		arch := GetSystemArch(cfg)
+		variant := GetSystemVariantForPackage(cfg, pkgName)
+		tarballName := StandardizeRemoteName(pkgName, entry.Version, entry.Revision, arch, variant)
+		tarballPath := filepath.Join(BinDir, tarballName)
 
-	// 5. Extract depends file
-	dependsContent, err := extractDependsFromTarball(tarballPath)
-	if err != nil {
-		return fmt.Errorf("failed to extract depends from %s: %w", tarballName, err)
-	}
+		// 5. Scan metadata (pkginfo and depends)
+		_, entryDeps, err := scanTarballMetadata(tarballPath)
+		if err != nil {
+			return fmt.Errorf("failed to scan metadata from %s: %w", tarballName, err)
+		}
 
-	// 6. Parse dependencies
-	deps, err := parseDependsData(dependsContent)
-	if err != nil {
-		return fmt.Errorf("failed to parse depends for %s: %w", pkgName, err)
+		for _, d := range entryDeps {
+			deps = append(deps, DepSpec{Name: d})
+		}
 	}
 
 	// 7. Recurse
@@ -376,100 +342,6 @@ func resolveRemoteDependencies(pkgName string, visited map[string]bool, plan *[]
 	// 8. Add to plan
 	*plan = append(*plan, pkgName)
 	return nil
-}
-
-func parseDependsData(content []byte) ([]DepSpec, error) {
-	var dependencies []DepSpec
-	lines := strings.Split(string(content), "\n")
-
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-
-		// Check if this line contains alternative dependencies (using |)
-		if strings.Contains(line, "|") {
-			// Parse alternative dependencies
-			altDeps, err := parseAlternativeDeps(line)
-			if err != nil {
-				return nil, fmt.Errorf("failed to parse alternative dependencies: %w", err)
-			}
-			dependencies = append(dependencies, altDeps...)
-		} else {
-			// Regular dependency parsing
-			name, op, ver, optional, rebuild, makeDep := parseDepToken(line)
-			if name != "" {
-				dependencies = append(dependencies, DepSpec{
-					Name:         name,
-					Op:           op,
-					Version:      ver,
-					Optional:     optional,
-					Rebuild:      rebuild,
-					Make:         makeDep,
-					Alternatives: nil,
-				})
-			}
-		}
-	}
-
-	return dependencies, nil
-}
-
-// parseAlternativeDeps parses a line with alternative dependencies like "rust | rustup make"
-// Returns a single DepSpec with Alternatives populated
-func parseAlternativeDeps(line string) ([]DepSpec, error) {
-	// Split by | to get alternatives
-	parts := strings.Split(line, "|")
-	if len(parts) < 2 {
-		return nil, fmt.Errorf("invalid alternative dependency syntax: expected 'pkg1 | pkg2'")
-	}
-
-	// Extract flags from the entire line (they apply to all alternatives)
-	fields := strings.Fields(line)
-	var optional, rebuild, makeDep bool
-	var alternatives []string
-
-	// Parse each part separated by |
-	for _, part := range parts {
-		part = strings.TrimSpace(part)
-		if part == "" {
-			continue
-		}
-		// Extract package name (first field of this part)
-		partFields := strings.Fields(part)
-		if len(partFields) > 0 {
-			pkgName := partFields[0]
-			alternatives = append(alternatives, pkgName)
-		}
-	}
-
-	// Check for flags in the entire line
-	for _, field := range fields {
-		switch field {
-		case "optional":
-			optional = true
-		case "rebuild":
-			rebuild = true
-		case "make":
-			makeDep = true
-		}
-	}
-
-	if len(alternatives) < 2 {
-		return nil, fmt.Errorf("alternative dependency must have at least 2 options")
-	}
-
-	// Create DepSpec with first alternative as Name and all in Alternatives
-	return []DepSpec{{
-		Name:         alternatives[0],
-		Op:           "",
-		Version:      "",
-		Optional:     optional,
-		Rebuild:      rebuild,
-		Make:         makeDep,
-		Alternatives: alternatives,
-	}}, nil
 }
 
 // resolveAlternativeDep resolves an alternative dependency by checking which alternatives are available

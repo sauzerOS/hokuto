@@ -3,6 +3,7 @@ package hokuto
 import (
 	"context"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -15,33 +16,37 @@ func handleUploadCommand(args []string, cfg *Config) error {
 	ctx := context.Background()
 
 	// 1. Parse Flags
-	cleanup := false
-	reindex := false
-	sync := false
-	prompt := false
+	uploadCmd := flag.NewFlagSet("upload", flag.ContinueOnError)
+	var cleanup = uploadCmd.Bool("cleanup", false, "Prompt to remove older versions on remote")
+	var reindex = uploadCmd.Bool("reindex", false, "Regenerate the remote index by scanning the bucket")
+	var sync = uploadCmd.Bool("sync", false, "Upload all local files missing on remote without prompt")
+	var prompt = uploadCmd.Bool("prompt", false, "Prompt for confirmation for each local file missing on remote")
+	var deletePkg = uploadCmd.String("delete", "", "Delete all variants of a package from remote")
+
+	// Set output to stderr to avoid polluting stdout if captured
+	uploadCmd.SetOutput(os.Stderr)
 
 	if len(args) == 0 {
 		fmt.Println("Usage: hk upload [options]")
 		fmt.Println("")
 		fmt.Println("Options:")
-		fmt.Println("  --sync     Upload all local files missing on remote without prompt")
-		fmt.Println("  --prompt   Prompt for confirmation for each local file missing on remote")
-		fmt.Println("  --cleanup  Prompt to remove older versions on remote")
-		fmt.Println("  --reindex  Regenerate the remote index by scanning the bucket")
+		uploadCmd.PrintDefaults()
 		return nil
 	}
 
-	for _, arg := range args {
-		switch arg {
-		case "--cleanup", "-c":
-			cleanup = true
-		case "--reindex":
-			reindex = true
-		case "--sync":
-			sync = true
-		case "--prompt":
-			prompt = true
-		}
+	if err := uploadCmd.Parse(args); err != nil {
+		// flag.ContinueOnError means parsing failed (e.g. unknown flag).
+		// usage is accepted printed by Parse().
+		return nil // Return nil to just "do nothing" as requested
+	}
+
+	// Usage check if not deleting
+	if *deletePkg == "" && !*sync && !*prompt && !*cleanup && !*reindex {
+		fmt.Println("Usage: hk upload [options]")
+		fmt.Println("")
+		fmt.Println("Options:")
+		uploadCmd.PrintDefaults()
+		return nil
 	}
 
 	// 2. Initialize R2 Client
@@ -69,6 +74,8 @@ func handleUploadCommand(args []string, cfg *Config) error {
 	}
 
 	// 4. Scan Local BinDir and filter for LATEST only
+	// (Skip if we are just cleaning up or reindexing and no sync/prompt requested, but reindexing needs scans?
+	// The original logic scanned first. Let's keep it to support syncing.)
 	colArrow.Print("-> ")
 	colSuccess.Printf("Scanning local binaries in %s\n", BinDir)
 	localFiles, err := filepath.Glob(filepath.Join(BinDir, "*.tar.zst"))
@@ -100,13 +107,71 @@ func handleUploadCommand(args []string, cfg *Config) error {
 		newIndexMap[key] = entry
 	}
 
+	// Handle --delete logic explicitly
+	var deletionsOccurred bool
+	if *deletePkg != "" {
+		colArrow.Print("-> ")
+		colSuccess.Printf("Scanning remote for package: %s\n", *deletePkg)
+
+		remoteObjects, err := r2.ListObjects(ctx, "")
+		if err != nil {
+			return fmt.Errorf("failed to list remote objects: %w", err)
+		}
+
+		// Pattern to match: pkgname-version-revision-arch-variant.tar.zst
+		// We want to verify that the filename starts with "pkgname-" to avoid partial matches (e.g. "foobar" matching "foo")
+		// But verify it carefully.
+		// StandardizedRemoteName uses dashes.
+		// A stricter check: matches "{pkgName}-*.tar.zst"
+		prefix := *deletePkg + "-"
+
+		var foundCount int
+		for _, obj := range remoteObjects {
+			if strings.HasPrefix(obj.Key, prefix) && strings.HasSuffix(obj.Key, ".tar.zst") {
+				colArrow.Print("-> ")
+				if askForConfirmation(colWarn, "Delete remote file %s? ", obj.Key) {
+					if err := r2.DeleteFile(ctx, obj.Key); err != nil {
+						fmt.Fprintf(os.Stderr, "Error deleting %s: %v\n", obj.Key, err)
+					} else {
+						foundCount++
+						colSuccess.Printf("Deleted %s\n", obj.Key)
+						// Update in-memory index
+						deletionsOccurred = true
+						for k, v := range newIndexMap {
+							if v.Filename == obj.Key {
+								delete(newIndexMap, k)
+								// Do NOT break, in case of duplicate entries or just to be safe (though keys are unique)
+							}
+						}
+					}
+				}
+			}
+		}
+
+		if foundCount == 0 {
+			colWarn.Printf("No remote files found for package '%s'.\n", *deletePkg)
+		} else {
+			colArrow.Print("-> ")
+			colSuccess.Println("Deletions complete.")
+		}
+	}
+
 	var reindexedCount int
-	if reindex {
+	if *reindex {
 		colArrow.Print("-> ")
 		colSuccess.Println("Re-indexing: Scanning all objects on R2")
 		remoteObjects, err := r2.ListObjects(ctx, "")
 		if err != nil {
 			return fmt.Errorf("failed to list remote objects for re-indexing: %w", err)
+		}
+
+		// Reconciliation Map: only items actually present on R2 will be in the final index
+		reconciledMap := make(map[string]RepoEntry)
+
+		// Index current remoteIndex by filename for fast reconciliation
+		oldByFilename := make(map[string]RepoEntry)
+		for _, e := range remoteIndex {
+			oldByFilename[e.Filename] = e
 		}
 
 		localByFilename := make(map[string]RepoEntry)
@@ -119,20 +184,24 @@ func handleUploadCommand(args []string, cfg *Config) error {
 				continue
 			}
 
-			// Check if we already have this in the index map and it matches the size
-			if existing, ok := newIndexMap[obj.Key]; ok && existing.Size == obj.Size {
+			// 1. Check if we already have this in the OLD index and it matches the size
+			// AND it has dependency info (Depends field is not empty if it should have some)
+			// Actually, just check if it's missing Depends and force re-scan if so.
+			if existing, ok := oldByFilename[obj.Key]; ok && existing.Size == obj.Size && len(existing.Depends) > 0 {
+				key := fmt.Sprintf("%s-%s-%s", existing.Name, existing.Arch, existing.Variant)
+				reconciledMap[key] = existing
 				continue
 			}
 
-			// Check if we have it locally
+			// 2. Check if we have it locally
 			if local, ok := localByFilename[obj.Key]; ok && local.Size == obj.Size {
 				key := fmt.Sprintf("%s-%s-%s", local.Name, local.Arch, local.Variant)
-				newIndexMap[key] = local
+				reconciledMap[key] = local
 				reindexedCount++
 				continue
 			}
 
-			// Last resort: download and parse (expensive)
+			// 3. Last resort: download and parse (expensive but necessary for new/changed files)
 			colArrow.Print("-> ")
 			colWarn.Printf("Remote file %s not in index or local cache. Fetching metadata...\n", obj.Key)
 			data, err := r2.DownloadFile(ctx, obj.Key)
@@ -155,11 +224,14 @@ func handleUploadCommand(args []string, cfg *Config) error {
 			}
 
 			key := fmt.Sprintf("%s-%s-%s", entry.Name, entry.Arch, entry.Variant)
-			newIndexMap[key] = entry
+			reconciledMap[key] = entry
 			reindexedCount++
 		}
+
+		newIndexMap = reconciledMap
+
 		if reindexedCount > 0 {
-			colSuccess.Printf("Re-indexing complete. Added %d files to the index.\n", reindexedCount)
+			colSuccess.Printf("Re-indexing complete. Added/Updated %d files in the index.\n", reindexedCount)
 		}
 	}
 
@@ -183,7 +255,7 @@ func handleUploadCommand(args []string, cfg *Config) error {
 		}
 
 		if needsUpload {
-			if !sync && !prompt {
+			if !*sync && !*prompt {
 				// If neither --sync nor --prompt is used, we only upload if we have an explicit reason
 				// but based on user request, hk upload without args shows help.
 				// So if we are here, some other flag like --cleanup or --reindex was used.
@@ -192,7 +264,7 @@ func handleUploadCommand(args []string, cfg *Config) error {
 			}
 
 			colArrow.Print("-> ")
-			if prompt {
+			if *prompt {
 				reasonText := ""
 				if !exists {
 					reasonText = " (remote missing)"
@@ -220,7 +292,7 @@ func handleUploadCommand(args []string, cfg *Config) error {
 	}
 
 	// 6. Cleanup old versions on R2
-	if cleanup {
+	if *cleanup {
 		colArrow.Print("-> ")
 		colSuccess.Println("Checking for old versions on R2 to cleanup")
 		remoteObjects, err := r2.ListObjects(ctx, "")
@@ -275,7 +347,7 @@ func handleUploadCommand(args []string, cfg *Config) error {
 	}
 
 	// 8. Finalize Index
-	if uploadedCount > 0 || cleanup || (reindex && reindexedCount > 0) {
+	if uploadedCount > 0 || *cleanup || (*reindex && reindexedCount > 0) || deletionsOccurred {
 		colArrow.Print("-> ")
 		colSuccess.Println("Updating remote index")
 

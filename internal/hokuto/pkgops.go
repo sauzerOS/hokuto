@@ -349,7 +349,7 @@ func generateLibDeps(outputDir, libdepsFile string, execCtx *Executor) error {
 	return nil
 }
 
-func generateDepends(pkgName, pkgDir, outputDir, rootDir string, execCtx *Executor) error {
+func generateDepends(pkgName, pkgDir, outputDir, rootDir string, execCtx *Executor, bootstrap bool) error {
 	installedDir := filepath.Join(outputDir, "var", "db", "hokuto", "installed", pkgName)
 	dependsFile := filepath.Join(installedDir, "depends")
 
@@ -418,12 +418,45 @@ func generateDepends(pkgName, pkgDir, outputDir, rootDir string, execCtx *Execut
 			line = strings.TrimSpace(line)
 			if line != "" && !strings.HasPrefix(line, "#") {
 				// Extract package name to use as key in the map
-				name, _, _, _, _, makeDep := parseDepToken(line)
+				name, op, ver, optional, rebuild, makeDep := parseDepToken(line)
 				if name != "" {
 					// Skip build-time only dependencies
 					if makeDep {
 						continue
 					}
+
+					if !bootstrap {
+						// Cleanup bootstrap names in normal mode
+						if name == "19-binutils-2" {
+							continue
+						}
+
+						newName := ""
+						switch name {
+						case "08-bash":
+							newName = "bash"
+						case "11-file":
+							newName = "file"
+						case "07-ncurses":
+							newName = "ncurses"
+						}
+
+						if newName != "" {
+							// Rebuild the line with the new name but preserve everything else
+							line = newName
+							if op != "" {
+								line += op + ver
+							}
+							if optional {
+								line += " optional"
+							}
+							if rebuild {
+								line += " rebuild"
+							}
+							name = newName // update key for the map
+						}
+					}
+
 					// Store the full line to preserve version constraints
 					repoDepLines[name] = line
 				}
@@ -443,6 +476,20 @@ func generateDepends(pkgName, pkgDir, outputDir, rootDir string, execCtx *Execut
 
 	// Then, add library-only dependencies (just package names)
 	for dep := range libDepSet {
+		// Also apply cleanup to auto-detected library dependencies if in normal mode
+		if !bootstrap {
+			if dep == "19-binutils-2" {
+				continue
+			}
+			switch dep {
+			case "08-bash":
+				dep = "bash"
+			case "11-file":
+				dep = "file"
+			case "07-ncurses":
+				dep = "ncurses"
+			}
+		}
 		deps = append(deps, dep)
 	}
 

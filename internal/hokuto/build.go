@@ -876,7 +876,7 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 	}
 
 	// Generate depends (use outputPkgName for cross-system builds)
-	if err := generateDepends(outputPkgName, pkgDir, outputDir, rootDir, buildExec); err != nil {
+	if err := generateDepends(outputPkgName, pkgDir, outputDir, rootDir, buildExec, bootstrap); err != nil {
 		return 0, fmt.Errorf("failed to generate depends: %v", err)
 	}
 	debugf("Depends written to %s\n", filepath.Join(installedDir, "depends"))
@@ -1633,7 +1633,7 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 	}
 
 	// Generate depends (use outputPkgName for cross-system builds)
-	if err := generateDepends(outputPkgName, pkgDir, outputDir, rootDir, buildExec); err != nil {
+	if err := generateDepends(outputPkgName, pkgDir, outputDir, rootDir, buildExec, false); err != nil {
 		return fmt.Errorf("failed to generate depends: %v", err)
 	}
 	debugf("Depends written to %s\n", filepath.Join(installedDir, "depends"))

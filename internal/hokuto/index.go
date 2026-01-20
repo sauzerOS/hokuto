@@ -64,14 +64,15 @@ func GetSystemVariantForPackage(cfg *Config, pkgName string) string {
 
 // RepoEntry represents a single package in the repository index.
 type RepoEntry struct {
-	Name     string `json:"name"`
-	Version  string `json:"version"`
-	Revision string `json:"revision"`
-	Arch     string `json:"arch"`
-	Variant  string `json:"variant"` // generic or optimized
-	Filename string `json:"filename"`
-	Size     int64  `json:"size"`
-	B3Sum    string `json:"b3sum"`
+	Name     string   `json:"name"`
+	Version  string   `json:"version"`
+	Revision string   `json:"revision"`
+	Arch     string   `json:"arch"`
+	Variant  string   `json:"variant"` // generic or optimized
+	Filename string   `json:"filename"`
+	Size     int64    `json:"size"`
+	B3Sum    string   `json:"b3sum"`
+	Depends  []string `json:"depends,omitempty"`
 }
 
 // ReadPackageMetadata extracts pkginfo and computes checksum for a local tarball.
@@ -93,14 +94,13 @@ func ReadPackageMetadata(tarballPath string) (RepoEntry, error) {
 	}
 	entry.B3Sum = sum
 
-	// 2. Extract pkginfo from tar.zst
-	pkgInfoData, err := extractPkgInfoFromTar(tarballPath)
+	// 2. Scan tarball once for all metadata (pkginfo and depends)
+	metadata, deps, err := scanTarballMetadata(tarballPath)
 	if err != nil {
-		return entry, fmt.Errorf("failed to extract pkginfo: %w", err)
+		return entry, fmt.Errorf("failed to scan tarball metadata: %w", err)
 	}
 
-	// 3. Parse pkginfo
-	metadata := parsePkgInfo(pkgInfoData)
+	// 3. Populate RepoEntry
 	entry.Name = metadata["name"]
 	entry.Version = metadata["version"]
 	entry.Revision = metadata["revision"]
@@ -109,22 +109,28 @@ func ReadPackageMetadata(tarballPath string) (RepoEntry, error) {
 	// 4. Identify variant
 	entry.Variant = IdentifyVariant(entry.Name, metadata["generic"] == "1", metadata["multilib"] == "1")
 
+	// 5. Populate Dependencies
+	entry.Depends = deps
+
 	return entry, nil
 }
 
-// extractPkgInfoFromTar reads the pkginfo file from a .tar.zst archive without unpacking everything.
-func extractPkgInfoFromTar(tarballPath string) ([]byte, error) {
+// scanTarballMetadata reads pkginfo and depends files from a .tar.zst archive in one pass.
+func scanTarballMetadata(tarballPath string) (map[string]string, []string, error) {
 	f, err := os.Open(tarballPath)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer f.Close()
 
 	zsr, err := zstd.NewReader(f)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer zsr.Close()
+
+	var metadata map[string]string
+	var dependencies []string
 
 	tr := tar.NewReader(zsr)
 	for {
@@ -133,16 +139,44 @@ func extractPkgInfoFromTar(tarballPath string) ([]byte, error) {
 			break
 		}
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 
-		// Look for pkginfo in var/db/hokuto/installed/<pkg>/pkginfo
+		// 1. Look for pkginfo
 		if strings.HasSuffix(header.Name, "/pkginfo") {
-			return io.ReadAll(tr)
+			data, err := io.ReadAll(tr)
+			if err != nil {
+				return nil, nil, fmt.Errorf("failed to read pkginfo from %s: %w", tarballPath, err)
+			}
+			metadata = parsePkgInfo(data)
+			continue
+		}
+
+		// 2. Look for depends
+		if strings.HasSuffix(header.Name, "/depends") {
+			data, err := io.ReadAll(tr)
+			if err != nil {
+				return nil, nil, fmt.Errorf("failed to read depends from %s: %w", tarballPath, err)
+			}
+			depSpecs, err := parseDependsData(data)
+			if err != nil {
+				debugf("Warning: failed to parse depends data for %s: %v\n", tarballPath, err)
+				continue
+			}
+			for _, d := range depSpecs {
+				if !d.Make { // Only store runtime dependencies
+					dependencies = append(dependencies, d.Name)
+				}
+			}
+			continue
 		}
 	}
 
-	return nil, fmt.Errorf("pkginfo not found in archive")
+	if metadata == nil {
+		return nil, nil, fmt.Errorf("pkginfo not found in %s", tarballPath)
+	}
+
+	return metadata, dependencies, nil
 }
 
 func parsePkgInfo(data []byte) map[string]string {
@@ -207,4 +241,83 @@ func ParseRepoIndex(data []byte) ([]RepoEntry, error) {
 	}
 	err := json.Unmarshal(data, &index)
 	return index, err
+}
+
+func parseDependsData(content []byte) ([]DepSpec, error) {
+	var dependencies []DepSpec
+	lines := strings.Split(string(content), "\n")
+
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		// Check if this line contains alternative dependencies (using |)
+		if strings.Contains(line, "|") {
+			// Parse alternative dependencies
+			altDeps, err := parseAlternativeDeps(line)
+			if err != nil {
+				return nil, fmt.Errorf("failed to parse alternative dependencies: %w", err)
+			}
+			dependencies = append(dependencies, altDeps...)
+		} else {
+			// Regular dependency parsing
+			name, op, ver, optional, rebuild, makeDep := parseDepToken(line)
+			if name != "" {
+				dependencies = append(dependencies, DepSpec{
+					Name:         name,
+					Op:           op,
+					Version:      ver,
+					Optional:     optional,
+					Rebuild:      rebuild,
+					Make:         makeDep,
+					Alternatives: nil,
+				})
+			}
+		}
+	}
+
+	return dependencies, nil
+}
+
+// parseAlternativeDeps parses a line with alternative dependencies like "rust | rustup make"
+// Returns a single DepSpec with Alternatives populated
+func parseAlternativeDeps(line string) ([]DepSpec, error) {
+	// Split by | to get alternatives
+	parts := strings.Split(line, "|")
+	var alternatives []string
+	var commonOp, commonVer string
+	var commonOptional, commonRebuild, commonMake bool
+
+	for i, part := range parts {
+		part = strings.TrimSpace(part)
+		name, op, ver, optional, rebuild, makeDep := parseDepToken(part)
+		if name != "" {
+			alternatives = append(alternatives, name)
+			// Assuming common flags for all alternatives in a single line
+			if i == 0 {
+				commonOp = op
+				commonVer = ver
+				commonOptional = optional
+				commonRebuild = rebuild
+				commonMake = makeDep
+			}
+		}
+	}
+
+	if len(alternatives) == 0 {
+		return nil, fmt.Errorf("no alternatives found in line: %s", line)
+	}
+
+	// For binary index, we mostly care about runtime names.
+	return []DepSpec{{
+		Name:         alternatives[0],
+		Op:           commonOp,
+		Version:      commonVer,
+		Optional:     commonOptional,
+		Rebuild:      commonRebuild,
+		Make:         commonMake,
+		Alternatives: alternatives,
+	}}, nil
 }
