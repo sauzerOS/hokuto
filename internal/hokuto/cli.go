@@ -54,7 +54,7 @@ func printHelp() {
 		{"python-rebuild", "", "Rebuild all python packages"},
 		{"alt", "<pkg>", "List packages with alternatives or show/switch alternatives for a package"},
 		{"init-repos", "", "Initialize repositories"},
-		{"upload", "[--cleanup]", "Upload local binaries to R2 and update index"},
+		{"upload", "", "Upload local binaries to R2 and update index"},
 	}
 
 	// --- Dynamic Padding Logic ---

@@ -36,8 +36,8 @@ func loadPkgsets() (map[string][]string, error) {
 			continue
 		}
 
-		if strings.HasSuffix(line, ":") {
-			currentSetName = strings.TrimSuffix(line, ":")
+		if before, ok := strings.CutSuffix(line, ":"); ok {
+			currentSetName = before
 			continue
 		}
 

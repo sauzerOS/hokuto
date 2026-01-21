@@ -12,7 +12,7 @@ import (
 
 // ensureHokutoOwnership checks if critical Hokuto directories are owned by the correct user
 // (SUDO_USER or current user) and group (wheel). If not, it attempts to fix them via chown.
-func ensureHokutoOwnership(cfg *Config) error {
+func ensureHokutoOwnership(_ *Config) error {
 	// 1. Determine target user and group
 	// If running as root (likely via sudo), we want to own files as the SUDO_USER.
 	targetUser := os.Getenv("SUDO_USER")

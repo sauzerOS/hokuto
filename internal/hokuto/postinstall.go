@@ -77,13 +77,7 @@ func PostInstallTasks(e *Executor) error {
 
 	// Use a number of workers based on CPU count, but cap it to prevent thrashing.
 	// 4 is a sensible maximum for this kind of I/O-bound work.
-	numWorkers := runtime.NumCPU()
-	if numWorkers > 4 {
-		numWorkers = 4
-	}
-	if numWorkers < 1 {
-		numWorkers = 1
-	}
+	numWorkers := max(min(runtime.NumCPU(), 4), 1)
 
 	// Filter out the sequential tasks from the parallel pool
 	parallelTasks := make([]struct {
@@ -110,10 +104,8 @@ func PostInstallTasks(e *Executor) error {
 	var wg sync.WaitGroup
 
 	// Start the worker goroutines.
-	for w := 0; w < numWorkers; w++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+	for range numWorkers {
+		wg.Go(func() {
 			// Each worker pulls jobs from the channel until it's closed and empty.
 			for job := range jobs {
 				if _, err := exec.LookPath(job.name); err != nil {
@@ -142,7 +134,7 @@ func PostInstallTasks(e *Executor) error {
 				// This will print a message every time a task finishes.
 				debugf("Completed post-install task: %s\n", job.name)
 			}
-		}()
+		})
 	}
 
 	// Feed all the jobs into the channel.

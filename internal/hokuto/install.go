@@ -983,13 +983,6 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 	return nil
 }
 
-// uninstallPackage removes an installed package safely.
-// - pkgName: package to remove
-// - cfg: configuration (used for HOKUTO_ROOT)
-// - execCtx: Executor that must have ShouldRunAsRoot=true (RootExec)
-// - force: ignore reverse-dep checks
-// - yes: assume confirmation
-
 // checkStagingConflicts checks for conflicts between files in staging and existing files in the target.
 // This handles fresh installs where the package is not installed but files may already exist.
 // filesHandledInConflict is optional and only used for tracking (can be nil for fresh installs).
@@ -1202,11 +1195,12 @@ func checkStagingConflicts(pkgName, stagingDir, rootDir, stagingManifest string,
 				input = "n" // Default to new
 			}
 			// Set batch flag for remaining conflicts
-			if input == "k" || input == "o" {
+			switch input {
+			case "k", "o":
 				keepAllConflicts = true
-			} else if input == "n" {
+			case "n":
 				useNewAllConflicts = true
-			} else {
+			default:
 				// Invalid input, default to new
 				useNewAllConflicts = true
 				input = "n"

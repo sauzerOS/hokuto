@@ -54,14 +54,7 @@ func NewR2Client(cfg *Config) (*R2Client, error) {
 		}
 	}
 
-	r2Resolver := aws.EndpointResolverWithOptionsFunc(func(service, region string, options ...interface{}) (aws.Endpoint, error) {
-		return aws.Endpoint{
-			URL: fmt.Sprintf("https://%s.r2.cloudflarestorage.com", accountID),
-		}, nil
-	})
-
 	options := []func(*config.LoadOptions) error{
-		config.WithEndpointResolverWithOptions(r2Resolver),
 		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(accessKey, secretKey, "")),
 		config.WithRegion("auto"),
 	}
@@ -76,6 +69,7 @@ func NewR2Client(cfg *Config) (*R2Client, error) {
 	}
 
 	client := s3.NewFromConfig(awsCfg, func(o *s3.Options) {
+		o.BaseEndpoint = aws.String(fmt.Sprintf("https://%s.r2.cloudflarestorage.com", accountID))
 		o.UsePathStyle = true
 	})
 
