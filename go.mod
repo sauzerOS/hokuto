@@ -13,7 +13,7 @@ require (
 	github.com/klauspost/pgzip v1.2.6
 	github.com/rivo/tview v0.42.0
 	github.com/ulikunitz/xz v0.5.15
-	golang.org/x/sys v0.39.0
+	golang.org/x/sys v0.40.0
 	lukechampine.com/blake3 v1.4.1
 )
 
@@ -39,6 +39,6 @@ require (
 	github.com/mattn/go-runewidth v0.0.16 // indirect
 	github.com/rivo/uniseg v0.4.7 // indirect
 	github.com/xo/terminfo v0.0.0-20220910002029-abceb7e1c41e // indirect
-	golang.org/x/term v0.28.0 // indirect
-	golang.org/x/text v0.21.0 // indirect
+	golang.org/x/term v0.39.0 // indirect
+	golang.org/x/text v0.33.0 // indirect
 )
