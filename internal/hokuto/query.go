@@ -147,10 +147,13 @@ func FetchRemoteIndex(cfg *Config) ([]RepoEntry, error) {
 		debugf("R2 credentials missing, skipping R2 fetch\n")
 	}
 
-	if err != nil {
-		if hasCreds {
-			debugf("failed to fetch remote index from R2: %v", err)
+	var sigData []byte
+	if err == nil {
+		// If index was from R2, try to get sig from R2
+		if r2, r2Err := NewR2Client(cfg); r2Err == nil {
+			sigData, _ = r2.DownloadFile(ctx, "repo-index.json.sig")
 		}
+	} else {
 		// Fallback: try download via BinaryMirror URL
 		if BinaryMirror != "" {
 			colArrow.Print("-> ")
@@ -160,12 +163,37 @@ func FetchRemoteIndex(cfg *Config) ([]RepoEntry, error) {
 			if dlErr := downloadFileQuiet(url, url, dest); dlErr == nil {
 				data, err = os.ReadFile(dest)
 				os.Remove(dest)
+
+				// Also try to fetch sig from mirror
+				sigUrl := url + ".sig"
+				sigDest := dest + ".sig"
+				if dlErr := downloadFileQuiet(sigUrl, sigUrl, sigDest); dlErr == nil {
+					sigData, _ = os.ReadFile(sigDest)
+					os.Remove(sigDest)
+				}
 			}
 		}
 	}
 
 	if err != nil || len(data) == 0 {
 		return nil, fmt.Errorf("failed to fetch remote index: %w", err)
+	}
+
+	// Signature Verification
+	if os.Getenv("HOKUTO_VERIFY_SIGNATURE") != "0" {
+		if len(sigData) == 0 {
+			return nil, fmt.Errorf("MISSING REPO INDEX SIGNATURE: the remote index is not signed and signature verification is enforced")
+		}
+		if vErr := VerifyRepoIndexSignature(data, sigData); vErr != nil {
+			return nil, vErr
+		}
+		colArrow.Print("-> ")
+		colSuccess.Println("Remote index signature OK")
+	} else if len(sigData) > 0 {
+		// Even if not enforced, if it's there, verify it for safety
+		if vErr := VerifyRepoIndexSignature(data, sigData); vErr != nil {
+			colWarn.Printf("Warning: remote index signature verification failed: %v\n", vErr)
+		}
 	}
 
 	return ParseRepoIndex(data)
