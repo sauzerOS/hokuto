@@ -22,13 +22,13 @@ func askForConfirmation(p colorPrinter, format string, a ...any) bool {
 	reader := bufio.NewReader(os.Stdin)
 	// First, create the main part of the prompt using the provided arguments.
 	mainPrompt := fmt.Sprintf(format, a...)
-	// Then, create the final, full prompt string.
-	fullPrompt := fmt.Sprintf("%s [Y/n]: ", mainPrompt)
-
 	for {
 		// Use our existing cPrintf helper to print the prompt with the desired color.
-		// cPrintf will handle the case where 'p' is nil and print without color.
-		cPrintf(p, "%s", fullPrompt)
+		// We print mainPrompt and the suffix separately to ensure the suffix keeps
+		// the color 'p' even if mainPrompt contains internal color resets (like colNote).
+		cPrintf(p, "%s", mainPrompt)
+		cPrintf(p, " [Y/n]: ")
+
 		response, err := reader.ReadString('\n')
 
 		if err != nil {

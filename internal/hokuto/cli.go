@@ -806,7 +806,9 @@ func Main() {
 			}
 
 			colArrow.Print("-> ")
-			colSuccess.Printf("Package %s installed successfully.\n", pkgName)
+			colSuccess.Printf("Package ")
+			colNote.Printf("%s", pkgName)
+			colSuccess.Printf(" installed successfully.\n")
 		}
 
 		if !allSucceeded {

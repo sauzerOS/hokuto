@@ -2355,7 +2355,11 @@ func handleBuildCommand(args []string, cfg *Config) error {
 					for i, pkg := range targetsPass1 {
 						outputPkgNames[i] = getOutputPackageName(pkg, cfg)
 					}
-					shouldInstall = askForConfirmation(colWarn, "-> Do you want to install the following built package(s): %s?", strings.Join(outputPkgNames, ", "))
+					pkgNoun := "package"
+					if len(outputPkgNames) > 1 {
+						pkgNoun = "packages"
+					}
+					shouldInstall = askForConfirmation(colWarn, "-> Install built %s: %s", pkgNoun, colNote.Sprint(strings.Join(outputPkgNames, ", ")))
 				}
 				if shouldInstall && !isCrossWithoutSystem {
 					for i, finalPkg := range targetsPass1 {
