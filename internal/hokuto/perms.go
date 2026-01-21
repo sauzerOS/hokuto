@@ -12,7 +12,7 @@ import (
 
 // ensureHokutoOwnership checks if critical Hokuto directories are owned by the correct user
 // (SUDO_USER or current user) and group (wheel). If not, it attempts to fix them via chown.
-func ensureHokutoOwnership(_ *Config) error {
+func ensureHokutoOwnership(cfg *Config) error {
 	// 0. Skip if already root
 	if os.Geteuid() == 0 {
 		return nil
@@ -50,27 +50,37 @@ func ensureHokutoOwnership(_ *Config) error {
 	// HOKUTO_ROOT/var/cache/hokuto, HOKUTO_ROOT/var/db/hokuto
 	var pathsToCheck []string
 
+	addPath := func(p string) {
+		if p == "" {
+			return
+		}
+		full := filepath.Clean(filepath.Join(rootDir, strings.TrimPrefix(p, "/")))
+		// NEVER try to chown root or standard system temp dirs
+		if full == "/" || full == "/tmp" || full == "/var/tmp" || full == "/home" || full == "/usr" {
+			return
+		}
+		pathsToCheck = append(pathsToCheck, full)
+	}
+
 	// TMPDIRs
-	if tmpDir != "" {
-		pathsToCheck = append(pathsToCheck, filepath.Join(rootDir, strings.TrimPrefix(tmpDir, "/")))
-	}
+	addPath(tmpDir)
 	if HokutoTmpDir != "" && HokutoTmpDir != tmpDir {
-		pathsToCheck = append(pathsToCheck, filepath.Join(rootDir, strings.TrimPrefix(HokutoTmpDir, "/")))
+		addPath(HokutoTmpDir)
+	}
+	if tmp2 := cfg.Values["TMPDIR2"]; tmp2 != "" {
+		addPath(tmp2)
 	}
 
-	// Repo
-	pathsToCheck = append(pathsToCheck, filepath.Join(rootDir, "repo"))
-
-	// Cache
-	pathsToCheck = append(pathsToCheck, filepath.Join(rootDir, "var/cache/hokuto"))
-
-	// DB
-	pathsToCheck = append(pathsToCheck, filepath.Join(rootDir, "var/db/hokuto"))
+	// Repo, Cache, DB
+	addPath("repo")
+	addPath("var/cache/hokuto")
+	addPath("var/db/hokuto")
 
 	// 3. Check for mismatches
 	var pathsToFix []string
 	for _, path := range pathsToCheck {
-		info, err := os.Stat(path)
+		// Use Lstat to check the link itself if it's a symlink
+		info, err := os.Lstat(path)
 		if err != nil {
 			// If it doesn't exist, we don't need to fix it.
 			continue
@@ -81,20 +91,44 @@ func ensureHokutoOwnership(_ *Config) error {
 			continue
 		}
 
-		if fmt.Sprint(stat.Uid) != targetUID || fmt.Sprint(stat.Gid) != targetGID {
+		uidMatch := fmt.Sprint(stat.Uid) == targetUID
+		gidMatch := fmt.Sprint(stat.Gid) == targetGID
+
+		// Mismatch detection
+		mismatch := false
+		if !uidMatch {
+			mismatch = true
+		} else if !gidMatch {
+			// Special case: ignore group mismatch for cache directory
+			// (often a symlink to external drive with different group permissions)
+			isCache := strings.Contains(path, "var/cache/hokuto")
+			if !isCache {
+				mismatch = true
+			}
+		}
+
+		if mismatch {
 			pathsToFix = append(pathsToFix, path)
 		}
 	}
 
 	// 4. Fix if needed
 	if len(pathsToFix) > 0 {
+		// Inform the user what we are doing (only in debug mode)
+		if Debug {
+			colArrow.Print("-> ")
+			fmt.Printf("Ensuring ownership for Hokuto directories (current user:wheel)...\n")
+			for _, p := range pathsToFix {
+				fmt.Printf("   Fixing: %s\n", p)
+			}
+		}
+
 		// We need root to fix ownership. Prompt for sudo.
 		if err := authenticateOnce(); err != nil {
 			return fmt.Errorf("failed to authenticate for ownership fix: %w", err)
 		}
 
 		for _, path := range pathsToFix {
-			debugf("Enforcing ownership of %s to %s:%s\n", path, targetUser, targetGroup)
 			cmd := exec.Command("sudo", "chown", "-R", fmt.Sprintf("%s:%s", targetUser, targetGroup), path)
 			if err := cmd.Run(); err != nil {
 				return fmt.Errorf("failed to fix ownership of %s: %w", path, err)

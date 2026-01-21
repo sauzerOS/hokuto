@@ -166,6 +166,7 @@ var MultilibPackages = []string{
 	"nettle",
 	"nspr",
 	"nss",
+	"nv-codec-headers",
 	"nvidia",
 	"openssl",
 	"opus",
