@@ -211,13 +211,29 @@ func listRemotePackages(searchTerm string, cfg *Config) error {
 
 // GetRemotePackageVersion searches the remote index for a package matching system criteria.
 func GetRemotePackageVersion(pkgName string, cfg *Config, remoteIndex []RepoEntry) (version, revision string, err error) {
+	targetVersion := ""
+	lookupName := pkgName
+	if idx := strings.Index(pkgName, "@"); idx != -1 {
+		lookupName = pkgName[:idx]
+		targetVersion = pkgName[idx+1:]
+	}
+
 	arch := GetSystemArch(cfg)
-	variant := GetSystemVariantForPackage(cfg, pkgName)
+	variant := GetSystemVariantForPackage(cfg, lookupName)
 
 	var bestMatch *RepoEntry
 	for i := range remoteIndex {
 		entry := &remoteIndex[i]
-		if entry.Name == pkgName && entry.Arch == arch && entry.Variant == variant {
+		if entry.Name == lookupName && entry.Arch == arch && entry.Variant == variant {
+			// If targetVersion is specified, only match that exact version
+			if targetVersion != "" {
+				if entry.Version == targetVersion {
+					// Found the exact version
+					return entry.Version, entry.Revision, nil
+				}
+				continue
+			}
+
 			if bestMatch == nil || isNewer(*entry, *bestMatch) {
 				bestMatch = entry
 			}
@@ -226,6 +242,10 @@ func GetRemotePackageVersion(pkgName string, cfg *Config, remoteIndex []RepoEntr
 
 	if bestMatch != nil {
 		return bestMatch.Version, bestMatch.Revision, nil
+	}
+
+	if targetVersion != "" {
+		return "", "", fmt.Errorf("package %s@%s not found in remote index for %s (%s)", lookupName, targetVersion, arch, variant)
 	}
 
 	return "", "", fmt.Errorf("package %s not found in remote index for %s (%s)", pkgName, arch, variant)

@@ -46,9 +46,19 @@ func getRepoVersion(pkgName string) (string, error) {
 // used for the update check
 
 func getRepoVersion2(pkgName string) (version string, revision string, err error) {
-	pkgDir, err := findPackageDir(pkgName)
+	// If pkgName contains @version, strip it for the directory lookup
+	// but we might want to return that version if it's what was requested.
+	// Actually, getRepoVersion2 is usually for getting the CURRENT repo version.
+	// If we have @version, we should probably just return that?
+	// No, the caller wants to know what the current version in the repo is.
+	lookupName := pkgName
+	if idx := strings.Index(pkgName, "@"); idx != -1 {
+		lookupName = pkgName[:idx]
+	}
+
+	pkgDir, err := findPackageDir(lookupName)
 	if err != nil {
-		return "", "", fmt.Errorf("package %s not found in HOKUTO_PATH: %v", pkgName, err)
+		return "", "", fmt.Errorf("package %s not found in HOKUTO_PATH: %v", lookupName, err)
 	}
 
 	versionFile := filepath.Join(pkgDir, "version")

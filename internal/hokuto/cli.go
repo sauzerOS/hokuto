@@ -207,6 +207,22 @@ func Main() {
 				arg := os.Args[i]
 				// Basic check to see if it's a versioned package request and not a flag or file path
 				if strings.Contains(arg, "@") && !strings.HasPrefix(arg, "-") && !strings.HasSuffix(arg, ".tar.zst") && !strings.Contains(arg, "/") {
+					// If it's an 'install --remote' command, we skip prepareVersionedPackage
+					// because we want to resolve the version from the remote index, not Git.
+					isRemoteInstall := false
+					if cmd == "install" || cmd == "i" {
+						for _, a := range os.Args {
+							if a == "--remote" || a == "-remote" {
+								isRemoteInstall = true
+								break
+							}
+						}
+					}
+
+					if isRemoteInstall {
+						continue
+					}
+
 					pkgName, err := prepareVersionedPackage(arg)
 					if err == nil {
 						os.Args[i] = pkgName // Replace gcc@1.2.3 with gcc in Args
@@ -691,14 +707,17 @@ func Main() {
 			} else {
 				// Case B: Package Name (Auto-resolved or requested)
 				pkgName = arg
+				if idx := strings.Index(arg, "@"); idx != -1 {
+					pkgName = arg[:idx]
+				}
 				// Keep package name as-is, but use multi variant in filename if multilib is enabled
 
-				version, revision, err := getRepoVersion2(pkgName)
+				version, revision, err := getRepoVersion2(arg)
 				tarballFoundDirectly := false
 
 				// If --remote is used, try to get version from remote index if local fails
 				if err != nil && *remote {
-					rv, rr, rerr := GetRemotePackageVersion(pkgName, cfg, remoteIndex)
+					rv, rr, rerr := GetRemotePackageVersion(arg, cfg, remoteIndex)
 					if rerr == nil {
 						version = rv
 						revision = rr

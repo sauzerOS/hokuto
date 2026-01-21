@@ -62,8 +62,13 @@ func resolveBinaryDependencies(pkgName string, visited map[string]bool, plan *[]
 	if len(remoteIndex) > 0 {
 		// Check if package exists in remote index
 		found := false
+		lookupName := pkgName
+		if idx := strings.Index(pkgName, "@"); idx != -1 {
+			lookupName = pkgName[:idx]
+		}
+
 		for _, entry := range remoteIndex {
-			if entry.Name == pkgName {
+			if entry.Name == lookupName {
 				found = true
 				break
 			}
@@ -82,7 +87,11 @@ func resolveBinaryDependencies(pkgName string, visited map[string]bool, plan *[]
 
 	// 4. Find source directory to read 'depends' file
 	// We rely on the source repo metadata to know what the binary dependencies are.
-	pkgDir, err := findPackageDir(pkgName)
+	lookupName := pkgName
+	if idx := strings.Index(pkgName, "@"); idx != -1 {
+		lookupName = pkgName[:idx]
+	}
+	pkgDir, err := findPackageDir(lookupName)
 	if err != nil {
 		return fmt.Errorf("cannot resolve dependencies for %s: source not found in HOKUTO_PATH", pkgName)
 	}
@@ -266,17 +275,47 @@ func resolveRemoteDependencies(pkgName string, visited map[string]bool, plan *[]
 	}
 
 	// 3. Find in remote index
+	targetVersion := ""
+	lookupName := pkgName
+	if idx := strings.Index(pkgName, "@"); idx != -1 {
+		lookupName = pkgName[:idx]
+		targetVersion = pkgName[idx+1:]
+	}
+
 	var entry RepoEntry
 	found := false
-	for _, e := range remoteIndex {
-		if e.Name == pkgName {
-			entry = e
-			found = true
-			break
+	arch := GetSystemArch(cfg)
+	variant := GetSystemVariantForPackage(cfg, lookupName)
+
+	var bestMatch *RepoEntry
+	for i := range remoteIndex {
+		e := &remoteIndex[i]
+		if e.Name == lookupName && e.Arch == arch && e.Variant == variant {
+			if targetVersion != "" {
+				if e.Version == targetVersion {
+					entry = *e
+					found = true
+					break
+				}
+				continue
+			}
+
+			if bestMatch == nil || isNewer(*e, *bestMatch) {
+				bestMatch = e
+			}
 		}
 	}
+
+	if !found && bestMatch != nil {
+		entry = *bestMatch
+		found = true
+	}
+
 	if !found {
 		// If not in remote index, we can't do anything
+		if targetVersion != "" {
+			return fmt.Errorf("package %s@%s not found in remote index", lookupName, targetVersion)
+		}
 		return fmt.Errorf("package %s not found in remote index", pkgName)
 	}
 
