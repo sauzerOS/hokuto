@@ -152,6 +152,9 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 		}
 	} else {
 		// fallback if tar not found
+		if os.Geteuid() != 0 {
+			return fmt.Errorf("system tar not found and root privileges are required for internal extraction to preserve ownership. Please install 'tar' or run hokuto as root.")
+		}
 		if err := unpackTarballFallback(tarballPath, stagingDir); err != nil {
 			return fmt.Errorf("failed to unpack tarball (fallback): %v", err)
 		}

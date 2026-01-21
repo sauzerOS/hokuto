@@ -250,6 +250,10 @@ func extractTar(realPath, dest string) error {
 			if err := os.Chtimes(targetPath, hdr.AccessTime, hdr.ModTime); err != nil {
 				return fmt.Errorf("failed to set times for dir %s: %w", targetPath, err)
 			}
+			// Restore ownership if running as root
+			if os.Geteuid() == 0 {
+				_ = os.Chown(targetPath, hdr.Uid, hdr.Gid)
+			}
 		case tar.TypeReg:
 			outFile, err := os.OpenFile(targetPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, os.FileMode(hdr.Mode))
 			if err != nil {
@@ -264,9 +268,17 @@ func extractTar(realPath, dest string) error {
 			if err := os.Chtimes(targetPath, hdr.AccessTime, hdr.ModTime); err != nil {
 				return fmt.Errorf("failed to set times for file %s: %w", targetPath, err)
 			}
+			// Restore ownership if running as root
+			if os.Geteuid() == 0 {
+				_ = os.Chown(targetPath, hdr.Uid, hdr.Gid)
+			}
 		case tar.TypeSymlink:
 			if err := os.Symlink(hdr.Linkname, targetPath); err != nil && !os.IsExist(err) {
 				return fmt.Errorf("failed to create symlink %s -> %s: %w", targetPath, hdr.Linkname, err)
+			}
+			// Restore ownership (don't chase link) if running as root
+			if os.Geteuid() == 0 {
+				_ = unix.Lchown(targetPath, hdr.Uid, hdr.Gid)
 			}
 			// Set timestamp for symlink using unix.Lutimes with Timeval
 			atime := unix.Timeval{
@@ -324,6 +336,9 @@ func unpackTarballFallback(tarballPath, dest string) error {
 			if err := os.MkdirAll(target, os.FileMode(hdr.Mode)); err != nil {
 				return err
 			}
+			if os.Geteuid() == 0 {
+				_ = os.Chown(target, hdr.Uid, hdr.Gid)
+			}
 		case tar.TypeReg:
 			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 				return err
@@ -337,6 +352,9 @@ func unpackTarballFallback(tarballPath, dest string) error {
 				return err
 			}
 			out.Close()
+			if os.Geteuid() == 0 {
+				_ = os.Chown(target, hdr.Uid, hdr.Gid)
+			}
 		case tar.TypeSymlink:
 			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 				return err
@@ -344,6 +362,9 @@ func unpackTarballFallback(tarballPath, dest string) error {
 			_ = os.Remove(target)
 			if err := os.Symlink(hdr.Linkname, target); err != nil && !os.IsExist(err) {
 				return err
+			}
+			if os.Geteuid() == 0 {
+				_ = unix.Lchown(target, hdr.Uid, hdr.Gid)
 			}
 		}
 	}
@@ -415,9 +436,6 @@ func createPackageTarball(pkgName, pkgVer, pkgRev, arch, variant, outputDir stri
 		if err != nil {
 			return err
 		}
-		if rel == "." {
-			return nil
-		}
 
 		var linkTarget string
 		if info.Mode()&os.ModeSymlink != 0 {
@@ -432,16 +450,24 @@ func createPackageTarball(pkgName, pkgVer, pkgRev, arch, variant, outputDir stri
 		if err != nil {
 			return err
 		}
-		hdr.Name = rel
 
-		// Force numeric root ownership if not run as root
-		if !execCtx.ShouldRunAsRoot {
-			hdr.Uid, hdr.Gid = 0, 0
-			hdr.Uname, hdr.Gname = "root", "root"
+		if rel == "." {
+			hdr.Name = "./"
+		} else {
+			hdr.Name = rel
 		}
+
+		// Binary packages must be PORTABLY root-owned.
+		// Always force numeric root ownership for all entries.
+		hdr.Uid, hdr.Gid = 0, 0
+		hdr.Uname, hdr.Gname = "root", "root"
 
 		if err := tw.WriteHeader(hdr); err != nil {
 			return err
+		}
+
+		if rel == "." {
+			return nil
 		}
 
 		// Only copy file contents for regular files
