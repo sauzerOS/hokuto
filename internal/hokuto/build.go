@@ -2285,7 +2285,8 @@ func handleBuildCommand(args []string, cfg *Config) error {
 
 				colInfo.Printf("Build order for this group: %s\n\n", strings.Join(plan.Order, " -> "))
 
-				failedThisGroup, _, elapsedThisGroup := executeBuildPass(plan, pkgName, true, cfg, bootstrap, userRequestedMap)
+				progressCount := 0
+				failedThisGroup, _, elapsedThisGroup := executeBuildPass(plan, pkgName, true, cfg, bootstrap, userRequestedMap, &progressCount)
 				totalElapsedTime += elapsedThisGroup
 				for k, v := range failedThisGroup {
 					failedBuilds[k] = v
@@ -2336,7 +2337,8 @@ func handleBuildCommand(args []string, cfg *Config) error {
 				colWarn.Printf("Packages scheduled for inline rebuild with optional features: %s\n", strings.Join(rebuilds, ", "))
 			}
 
-			failedPass1, targetsPass1, elapsedPass1 := executeBuildPass(initialPlan, "Initial Pass", false, cfg, bootstrap, userRequestedMap)
+			progressCount := 0
+			failedPass1, targetsPass1, elapsedPass1 := executeBuildPass(initialPlan, "Initial Pass", false, cfg, bootstrap, userRequestedMap, &progressCount)
 			totalElapsedTime = elapsedPass1
 			failedBuilds = failedPass1
 
@@ -2410,7 +2412,7 @@ BuildSummary:
 
 // Helper for HandleBuildCommand to execute a single build pass based on the provided BuildPlan.
 
-func executeBuildPass(plan *BuildPlan, _ string, installAllTargets bool, cfg *Config, bootstrap *bool, userRequestedMap map[string]bool) (map[string]error, []string, time.Duration) {
+func executeBuildPass(plan *BuildPlan, _ string, installAllTargets bool, cfg *Config, bootstrap *bool, userRequestedMap map[string]bool, progressCount *int) (map[string]error, []string, time.Duration) {
 
 	toBuild := plan.Order
 	failed := make(map[string]error)
@@ -2500,11 +2502,13 @@ func executeBuildPass(plan *BuildPlan, _ string, installAllTargets bool, cfg *Co
 				continue
 			}
 			totalInPlan := len(plan.Order) // Get the original total count
+			*progressCount++
+			currentIndex := *progressCount
 			colArrow.Print("-> ")
 			colSuccess.Print("Building: ")
-			colNote.Printf("%s (%d/%d)\n", pkgName, i+1, totalInPlan)
+			colNote.Printf("%s (%d/%d)\n", pkgName, currentIndex, totalInPlan)
 
-			duration, err := pkgBuild(pkgName, cfg, UserExec, *bootstrap, i+1, totalInPlan)
+			duration, err := pkgBuild(pkgName, cfg, UserExec, *bootstrap, currentIndex, totalInPlan)
 			if err != nil {
 				failed[pkgName] = err
 				color.Danger.Printf("Build failed for %s: %v\n\n", pkgName, err)
@@ -2563,7 +2567,7 @@ func executeBuildPass(plan *BuildPlan, _ string, installAllTargets bool, cfg *Co
 					handlePreInstallUninstall(outputPkgName, cfg, RootExec)
 					colArrow.Print("-> ")
 					colSuccess.Printf("Installing:")
-					colNote.Printf(" %s (%d/%d) Time: %s\n", outputPkgName, i+1, totalInPlan, duration.Truncate(time.Second))
+					colNote.Printf(" %s (%d/%d) Time: %s\n", outputPkgName, currentIndex, totalInPlan, duration.Truncate(time.Second))
 					if installErr := pkgInstall(tarballPath, outputPkgName, cfg, RootExec, true); installErr != nil {
 						isCriticalAtomic.Store(0)
 						failed[pkgName] = fmt.Errorf("post-build installation failed: %w", installErr)
@@ -2637,7 +2641,9 @@ func executeBuildPass(plan *BuildPlan, _ string, installAllTargets bool, cfg *Co
 						colWarn.Printf("Optional dependency '%s' now available for '%s'. Triggering immediate rebuild.\n", strings.Join(missingDeps, ", "), parent)
 
 						// Rebuild the parent package
-						duration, err := pkgBuild(parent, cfg, UserExec, *bootstrap, i+1, totalInPlan)
+						*progressCount++
+						rebuildIdx := *progressCount
+						duration, err := pkgBuild(parent, cfg, UserExec, *bootstrap, rebuildIdx, totalInPlan)
 						if err != nil {
 							color.Danger.Printf("Inline rebuild of '%s' failed: %v\n", parent, err)
 							failed[parent] = fmt.Errorf("inline rebuild failed: %w", err)
@@ -2675,7 +2681,9 @@ func executeBuildPass(plan *BuildPlan, _ string, installAllTargets bool, cfg *Co
 
 				for _, rebuildPkg := range rebuilds {
 					// A. Build the package again
-					duration, err := pkgBuild(rebuildPkg, cfg, UserExec, *bootstrap, i+1, totalInPlan)
+					*progressCount++
+					rebuildIdx := *progressCount
+					duration, err := pkgBuild(rebuildPkg, cfg, UserExec, *bootstrap, rebuildIdx, totalInPlan)
 					if err != nil {
 						color.Danger.Printf("Post-build of '%s' failed: %v\n", rebuildPkg, err)
 						// Mark the PARENT package as failed, because its post-build action failed.
