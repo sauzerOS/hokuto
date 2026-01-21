@@ -192,6 +192,11 @@ func Main() {
 	mergeEnvOverrides(cfg)
 	initConfig(cfg)
 
+	// Ensure critical directories have correct ownership
+	if err := ensureHokutoOwnership(cfg); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: Ownership check failed: %v\n", err)
+	}
+
 	// 4.5 Handle versioned package requests (pkg@version)
 	// This allows commands like 'build gcc@1.2.3' to work by extracting the old version from Git history.
 	if len(os.Args) >= 2 {
@@ -460,9 +465,6 @@ func Main() {
 		}
 
 	case "build", "b":
-		if err := ensureHokutoOwnership(cfg); err != nil {
-			fmt.Fprintf(os.Stderr, "Ownership check failed: %v\n", err)
-		}
 		if err := handleBuildCommand(os.Args[2:], cfg); err != nil {
 			fmt.Fprintf(os.Stderr, "Build failed: %v\n", err)
 			os.Exit(1)
@@ -496,9 +498,6 @@ func Main() {
 		}
 
 	case "install", "i":
-		if err := ensureHokutoOwnership(cfg); err != nil {
-			fmt.Fprintf(os.Stderr, "Ownership check failed: %v\n", err)
-		}
 		installCmd := flag.NewFlagSet("install", flag.ExitOnError)
 		var yes = installCmd.Bool("y", false, "Assume 'yes' to all prompts and overwrite modified files.")
 		var yesLong = installCmd.Bool("yes", false, "Assume 'yes' to all prompts and overwrite modified files.")
