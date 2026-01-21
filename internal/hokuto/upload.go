@@ -203,7 +203,7 @@ func handleUploadCommand(args []string, cfg *Config) error {
 
 			// 3. Last resort: download and parse (expensive but necessary for new/changed files)
 			colArrow.Print("-> ")
-			colWarn.Printf("Remote file %s not in index or local cache. Fetching metadata...\n", obj.Key)
+			colWarn.Printf("Remote file %s not in index or local cache. Fetching metadata\n", obj.Key)
 			data, err := r2.DownloadFile(ctx, obj.Key)
 			if err != nil {
 				debugf("Warning: failed to download %s for re-indexing: %v\n", obj.Key, err)
@@ -387,6 +387,19 @@ func handleUploadCommand(args []string, cfg *Config) error {
 		if err := r2.UploadFile(ctx, "repo-index.json", indexBytes); err != nil {
 			return fmt.Errorf("failed to upload index: %w", err)
 		}
+
+		// 9. Sign and upload index signature
+		sigBytes, err := SignRepoIndex(indexBytes)
+		if err != nil {
+			colWarn.Printf("Warning: failed to sign repo index: %v. Continuing without signature.\n", err)
+		} else {
+			if err := r2.UploadFile(ctx, "repo-index.json.sig", sigBytes); err != nil {
+				colWarn.Printf("Warning: failed to upload index signature: %v\n", err)
+			} else {
+				colSuccess.Println("Remote index signature updated.")
+			}
+		}
+
 		colSuccess.Printf("Sync complete. Updated index with %d new uploads.\n", uploadedCount)
 	} else {
 		colArrow.Print("-> ")

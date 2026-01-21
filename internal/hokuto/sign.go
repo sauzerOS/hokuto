@@ -104,6 +104,67 @@ func WritePackageInfo(stagingDir, pkgName, pkgVer, pkgRev, arch, cflags string, 
 	return nil
 }
 
+// getPrivateKey loads the Ed25519 private key from standard locations.
+func getPrivateKey() (ed25519.PrivateKey, error) {
+	keyPath := "/etc/hokuto/hokuto.key"
+	if val, ok := os.LookupEnv("HOKUTO_SIGNING_KEY"); ok {
+		keyPath = val
+	}
+
+	keyData, err := os.ReadFile(keyPath)
+	if err != nil {
+		return nil, fmt.Errorf("private key not found at %s", keyPath)
+	}
+
+	var privateKey ed25519.PrivateKey
+	trimmedKey := strings.TrimSpace(string(keyData))
+
+	if len(trimmedKey) == 128 {
+		// Likely hex encoded
+		decoded, err := hex.DecodeString(trimmedKey)
+		if err == nil && len(decoded) == 64 {
+			privateKey = ed25519.PrivateKey(decoded)
+		}
+	}
+
+	if privateKey == nil {
+		if len(keyData) == 64 {
+			privateKey = ed25519.PrivateKey(keyData)
+		} else {
+			return nil, fmt.Errorf("invalid private key format at %s (expected 64 bytes raw or 128 hex chars, got %d)", keyPath, len(trimmedKey))
+		}
+	}
+	return privateKey, nil
+}
+
+// SignRepoIndex signs the repo-index.json data.
+func SignRepoIndex(indexData []byte) ([]byte, error) {
+	privateKey, err := getPrivateKey()
+	if err != nil {
+		return nil, fmt.Errorf("failed to sign repo index: %w", err)
+	}
+
+	signature := ed25519.Sign(privateKey, indexData)
+	return []byte(hex.EncodeToString(signature)), nil
+}
+
+// VerifyRepoIndexSignature verifies the repo-index.json signature.
+func VerifyRepoIndexSignature(indexData, sigHex []byte) error {
+	signature, err := hex.DecodeString(strings.TrimSpace(string(sigHex)))
+	if err != nil {
+		return fmt.Errorf("invalid repo index signature format: %w", err)
+	}
+
+	pubKeyBytes, _ := hex.DecodeString(officialPublicKeyHex)
+	publicKey := ed25519.PublicKey(pubKeyBytes)
+
+	if !ed25519.Verify(publicKey, indexData, signature) {
+		return errors.New("REPO INDEX SIGNATURE VERIFICATION FAILED: the remote index has been tampered with or is from an untrusted source")
+	}
+
+	return nil
+}
+
 // SignPackage signs a package manifest and metadata.
 func SignPackage(stagingDir, pkgName string, execCtx *Executor) error {
 	metadataDir := filepath.Join(stagingDir, "var", "db", "hokuto", "installed", pkgName)
@@ -126,37 +187,11 @@ func SignPackage(stagingDir, pkgName string, execCtx *Executor) error {
 	dataToSign := append(manifestData, pkgInfoData...)
 
 	// 3. Load private key
-	keyPath := "/etc/hokuto/hokuto.key"
-	if val, ok := os.LookupEnv("HOKUTO_SIGNING_KEY"); ok {
-		keyPath = val
-	}
-
-	keyData, err := os.ReadFile(keyPath)
+	privateKey, err := getPrivateKey()
 	if err != nil {
-		// If key doesn't exist, we just skip signing (logging a debug message)
-		debugf("Signing skipped: private key not found at %s\n", keyPath)
+		// If key doesn't exist, we just skip signing
+		debugf("Signing skipped: %v\n", err)
 		return nil
-	}
-
-	// The key file can be hex encoded string or raw bytes.
-	// Standard ed25519 private key is 64 bytes (seed + pub).
-	var privateKey ed25519.PrivateKey
-	trimmedKey := strings.TrimSpace(string(keyData))
-
-	if len(trimmedKey) == 128 {
-		// Likely hex encoded
-		decoded, err := hex.DecodeString(trimmedKey)
-		if err == nil && len(decoded) == 64 {
-			privateKey = ed25519.PrivateKey(decoded)
-		}
-	}
-
-	if privateKey == nil {
-		if len(keyData) == 64 {
-			privateKey = ed25519.PrivateKey(keyData)
-		} else {
-			return fmt.Errorf("invalid private key format at %s (expected 64 bytes raw or 128 hex chars, got %d)", keyPath, len(trimmedKey))
-		}
 	}
 
 	// 4. Sign
