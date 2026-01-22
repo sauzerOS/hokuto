@@ -9,7 +9,32 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 )
+
+type uploadCacheEntry struct {
+	Size  int64     `json:"size"`
+	Mtime time.Time `json:"mtime"`
+	Entry RepoEntry `json:"entry"`
+}
+
+func loadUploadCache(path string) map[string]uploadCacheEntry {
+	cache := make(map[string]uploadCacheEntry)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return cache
+	}
+	json.Unmarshal(data, &cache)
+	return cache
+}
+
+func saveUploadCache(path string, cache map[string]uploadCacheEntry) error {
+	data, err := json.MarshalIndent(cache, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0644)
+}
 
 // handleUploadCommand implements the 'hokuto upload' command.
 func handleUploadCommand(args []string, cfg *Config) error {
@@ -83,13 +108,37 @@ func handleUploadCommand(args []string, cfg *Config) error {
 		return err
 	}
 
+	cachePath := filepath.Join(CacheDir, "upload-scanning-cache.json")
+	cache := loadUploadCache(cachePath)
+	cacheUpdated := false
+
 	latestLocals := make(map[string]RepoEntry) // key: Name-Arch-Variant
 	for _, file := range localFiles {
-		entry, err := ReadPackageMetadata(file)
+		filename := filepath.Base(file)
+
+		info, err := os.Stat(file)
 		if err != nil {
 			debugf("Warning: skipping %s: %v\n", file, err)
 			continue
 		}
+
+		var entry RepoEntry
+		if cached, ok := cache[filename]; ok && cached.Size == info.Size() && cached.Mtime.Equal(info.ModTime()) {
+			entry = cached.Entry
+		} else {
+			entry, err = ReadPackageMetadata(file)
+			if err != nil {
+				debugf("Warning: skipping %s: %v\n", file, err)
+				continue
+			}
+			cache[filename] = uploadCacheEntry{
+				Size:  info.Size(),
+				Mtime: info.ModTime(),
+				Entry: entry,
+			}
+			cacheUpdated = true
+		}
+
 		key := fmt.Sprintf("%s-%s-%s", entry.Name, entry.Arch, entry.Variant)
 		if existing, ok := latestLocals[key]; ok {
 			if isNewer(entry, existing) {
@@ -97,6 +146,12 @@ func handleUploadCommand(args []string, cfg *Config) error {
 			}
 		} else {
 			latestLocals[key] = entry
+		}
+	}
+
+	if cacheUpdated {
+		if err := saveUploadCache(cachePath, cache); err != nil {
+			debugf("Warning: failed to save upload scanning cache: %v\n", err)
 		}
 	}
 
