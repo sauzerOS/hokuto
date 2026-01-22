@@ -279,7 +279,6 @@ func handleUploadCommand(args []string, cfg *Config) error {
 				}
 			}
 
-			colArrow.Print("-> ")
 			colSuccess.Printf("Uploading to R2: %s\n", local.Filename)
 			localPath := filepath.Join(BinDir, local.Filename)
 			if err := r2.UploadLocalFile(ctx, local.Filename, localPath); err != nil {

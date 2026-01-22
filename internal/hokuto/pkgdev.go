@@ -29,8 +29,10 @@ func applySubstitutions(content, version, pkgName string) string {
 
 	// Logic for ${version-glued-last}: 1.0.0.a -> 1.0.0a
 	versionGluedLast := version
+	versionLastOnly := version
 	if lastDot := strings.LastIndex(version, "."); lastDot != -1 {
 		versionGluedLast = version[:lastDot] + version[lastDot+1:]
+		versionLastOnly = version[lastDot+1:]
 	}
 
 	// SQLite version format: Mmmppee (Major, Minor, Patch, Extra)
@@ -54,6 +56,7 @@ func applySubstitutions(content, version, pkgName string) string {
 		"${version-sqlite}", sqliteVer,
 		"${version-glued}", strings.ReplaceAll(version, ".", ""),
 		"${version-glued-last}", versionGluedLast,
+		"${version-last-only}", versionLastOnly,
 		"${pkgname}", pkgName,
 	)
 	return r.Replace(content)
