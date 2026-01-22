@@ -585,6 +585,10 @@ func getPackageDependenciesToUninstall(name string) []string {
 		return []string{"01-binutils-1", "19-binutils-2"}
 	case "linux-headers":
 		return []string{"03-linux-headers"}
+	case "mingw":
+		return []string{"mingw-headers"}
+	case "mingw-gcc":
+		return []string{"mingw-gcc-static"}
 	case "m4":
 		return []string{"06-m4"}
 	case "ncurses":

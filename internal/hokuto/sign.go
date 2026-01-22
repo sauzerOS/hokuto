@@ -22,6 +22,8 @@ func detectMultilib(stagingDir string) bool {
 		filepath.Join(stagingDir, "usr/lib32"),
 		filepath.Join(stagingDir, "lib32"),
 		filepath.Join(stagingDir, "usr/lib/rustlib/i686-unknown-linux-gnu"),
+		filepath.Join(stagingDir, "usr/i686-w64-mingw32"),
+		filepath.Join(stagingDir, "usr/lib/gcc/i686-w64-mingw32"),
 	}
 	for _, path := range lib32Paths {
 		if info, err := os.Stat(path); err == nil && info.IsDir() {
