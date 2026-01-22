@@ -59,8 +59,40 @@ func lstatViaExecutor(path string, execCtx *Executor) (string, error) {
 }
 
 func listOutputFiles(outputDir string, execCtx *Executor) ([]string, error) {
-	var entries []string
+	if os.Geteuid() == 0 || !execCtx.ShouldRunAsRoot {
+		var entries []string
+		err := filepath.Walk(outputDir, func(path string, info os.FileInfo, err error) error {
+			if err != nil {
+				return err
+			}
+			rel, err := filepath.Rel(outputDir, path)
+			if err != nil {
+				return nil
+			}
+			if rel == "." {
+				return nil
+			}
 
+			// Filter out libtool .la files and charset.alias
+			if strings.HasSuffix(rel, ".la") || strings.HasSuffix(rel, "charset.alias") {
+				return nil
+			}
+
+			if info.IsDir() {
+				entries = append(entries, "/"+rel+"/")
+			} else {
+				entries = append(entries, "/"+rel)
+			}
+			return nil
+		})
+		if err != nil {
+			return nil, fmt.Errorf("failed to list output files natively: %v", err)
+		}
+		sort.Strings(entries)
+		return entries, nil
+	}
+
+	var entries []string
 	cmd := exec.Command("find", outputDir)
 	var out bytes.Buffer
 	cmd.Stdout = &out

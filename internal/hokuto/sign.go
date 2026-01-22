@@ -38,8 +38,12 @@ func WritePackageInfo(stagingDir, pkgName, pkgVer, pkgRev, arch, cflags string, 
 	metadataDir := filepath.Join(stagingDir, "var", "db", "hokuto", "installed", pkgName)
 	pkgInfoPath := filepath.Join(metadataDir, "pkginfo")
 
-	// Create directory using executor if running as root is needed
-	if execCtx != nil && execCtx.ShouldRunAsRoot {
+	// Create directory using native or executor
+	if os.Geteuid() == 0 {
+		if err := os.MkdirAll(metadataDir, 0755); err != nil {
+			return fmt.Errorf("failed to create metadata directory natively: %w", err)
+		}
+	} else if execCtx != nil && execCtx.ShouldRunAsRoot {
 		mkdirCmd := exec.Command("mkdir", "-p", metadataDir)
 		if err := execCtx.Run(mkdirCmd); err != nil {
 			return fmt.Errorf("failed to create metadata directory: %w", err)
@@ -86,16 +90,28 @@ func WritePackageInfo(stagingDir, pkgName, pkgVer, pkgRev, arch, cflags string, 
 		}
 		tmpFile.Close()
 
-		// Copy using executor
-		cpCmd := exec.Command("cp", tmpPath, pkgInfoPath)
-		if err := execCtx.Run(cpCmd); err != nil {
-			os.Remove(tmpPath)
-			return fmt.Errorf("failed to write pkginfo: %w", err)
-		}
-		chmodCmd := exec.Command("chmod", "644", pkgInfoPath)
-		if err := execCtx.Run(chmodCmd); err != nil {
-			os.Remove(tmpPath)
-			return fmt.Errorf("failed to set pkginfo permissions: %w", err)
+		// Copy using native if root, else executor
+		if os.Geteuid() == 0 {
+			if err := copyFile(tmpPath, pkgInfoPath); err != nil {
+				os.Remove(tmpPath)
+				return fmt.Errorf("failed to write pkginfo natively: %w", err)
+			}
+			if err := os.Chmod(pkgInfoPath, 0644); err != nil {
+				os.Remove(tmpPath)
+				return fmt.Errorf("failed to set pkginfo permissions natively: %w", err)
+			}
+		} else {
+			// Copy using executor
+			cpCmd := exec.Command("cp", tmpPath, pkgInfoPath)
+			if err := execCtx.Run(cpCmd); err != nil {
+				os.Remove(tmpPath)
+				return fmt.Errorf("failed to write pkginfo: %w", err)
+			}
+			chmodCmd := exec.Command("chmod", "644", pkgInfoPath)
+			if err := execCtx.Run(chmodCmd); err != nil {
+				os.Remove(tmpPath)
+				return fmt.Errorf("failed to set pkginfo permissions: %w", err)
+			}
 		}
 		os.Remove(tmpPath)
 	} else {
@@ -215,16 +231,28 @@ func SignPackage(stagingDir, pkgName string, execCtx *Executor) error {
 		}
 		tmpFile.Close()
 
-		// Copy using executor
-		cpCmd := exec.Command("cp", tmpPath, signaturePath)
-		if err := execCtx.Run(cpCmd); err != nil {
-			os.Remove(tmpPath)
-			return fmt.Errorf("failed to write signature: %w", err)
-		}
-		chmodCmd := exec.Command("chmod", "644", signaturePath)
-		if err := execCtx.Run(chmodCmd); err != nil {
-			os.Remove(tmpPath)
-			return fmt.Errorf("failed to set signature permissions: %w", err)
+		// Copy using native if root, else executor
+		if os.Geteuid() == 0 {
+			if err := copyFile(tmpPath, signaturePath); err != nil {
+				os.Remove(tmpPath)
+				return fmt.Errorf("failed to write signature natively: %w", err)
+			}
+			if err := os.Chmod(signaturePath, 0644); err != nil {
+				os.Remove(tmpPath)
+				return fmt.Errorf("failed to set signature permissions natively: %w", err)
+			}
+		} else {
+			// Copy using executor
+			cpCmd := exec.Command("cp", tmpPath, signaturePath)
+			if err := execCtx.Run(cpCmd); err != nil {
+				os.Remove(tmpPath)
+				return fmt.Errorf("failed to write signature: %w", err)
+			}
+			chmodCmd := exec.Command("chmod", "644", signaturePath)
+			if err := execCtx.Run(chmodCmd); err != nil {
+				os.Remove(tmpPath)
+				return fmt.Errorf("failed to set signature permissions: %w", err)
+			}
 		}
 		os.Remove(tmpPath)
 	} else {

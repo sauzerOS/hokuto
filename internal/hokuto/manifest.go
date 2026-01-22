@@ -44,9 +44,15 @@ func generateManifest(outputDir, installedDir string, execCtx *Executor) error {
 	// Ensure cleanup happens even if we error out early
 	defer os.Remove(tmpManifest)
 
-	mkdirCmd := exec.Command("mkdir", "-p", installedDir)
-	if err := execCtx.Run(mkdirCmd); err != nil {
-		return fmt.Errorf("failed to create installedDir: %v", err)
+	if os.Geteuid() == 0 {
+		if err := os.MkdirAll(installedDir, 0755); err != nil {
+			return fmt.Errorf("failed to create installedDir natively: %v", err)
+		}
+	} else {
+		mkdirCmd := exec.Command("mkdir", "-p", installedDir)
+		if err := execCtx.Run(mkdirCmd); err != nil {
+			return fmt.Errorf("failed to create installedDir: %v", err)
+		}
 	}
 
 	entries, err := listOutputFiles(outputDir, execCtx)
@@ -154,9 +160,15 @@ func generateManifest(outputDir, installedDir string, execCtx *Executor) error {
 	}
 	f.Close()
 
-	cpCmd := exec.Command("cp", "--remove-destination", tmpManifest, manifestFile)
-	if err := execCtx.Run(cpCmd); err != nil {
-		return fmt.Errorf("failed to copy temporary manifest into place: %v", err)
+	if os.Geteuid() == 0 {
+		if err := copyFile(tmpManifest, manifestFile); err != nil {
+			return fmt.Errorf("failed to copy temporary manifest into place natively: %v", err)
+		}
+	} else {
+		cpCmd := exec.Command("cp", "--remove-destination", tmpManifest, manifestFile)
+		if err := execCtx.Run(cpCmd); err != nil {
+			return fmt.Errorf("failed to copy temporary manifest into place: %v", err)
+		}
 	}
 
 	debugf("Manifest written to %s (%d entries)\n", manifestFile, len(filtered))
@@ -282,20 +294,31 @@ func updateManifestWithNewFiles(stagingManifest, stagingManifest2 string) error 
 		manifestLines.WriteString(fmt.Sprintf("%s  %s\n", entry.Path, entry.Checksum))
 	}
 
-	// Second, use the RootExec to run the privileged 'tee -a' command.
-	// 'tee -a' reads from stdin and appends to the specified file, running as root
-	// via the Executor's mechanism (e.g., sudo).
+	if os.Geteuid() == 0 {
+		f, err := os.OpenFile(stagingManifest, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0644)
+		if err != nil {
+			return fmt.Errorf("failed to open manifest for appending natively: %w", err)
+		}
+		defer f.Close()
+		if _, err := f.WriteString(manifestLines.String()); err != nil {
+			return fmt.Errorf("failed to append to manifest natively: %w", err)
+		}
+	} else {
+		// Second, use the RootExec to run the privileged 'tee -a' command.
+		// 'tee -a' reads from stdin and appends to the specified file, running as root
+		// via the Executor's mechanism (e.g., sudo).
 
-	// Arguments: tee -a <stagingManifest>
-	cmd := exec.Command("tee", "-a", stagingManifest)
-	cmd.Stdout = io.Discard
+		// Arguments: tee -a <stagingManifest>
+		cmd := exec.Command("tee", "-a", stagingManifest)
+		cmd.Stdout = io.Discard
 
-	// Pipe the data from the strings.Builder into the command's standard input
-	cmd.Stdin = strings.NewReader(manifestLines.String())
+		// Pipe the data from the strings.Builder into the command's standard input
+		cmd.Stdin = strings.NewReader(manifestLines.String())
 
-	// Run the command using the global RootExec
-	if err := RootExec.Run(cmd); err != nil {
-		return fmt.Errorf("failed to append to manifest file %s via RootExec: %w", stagingManifest, err)
+		// Run the command using the global RootExec
+		if err := RootExec.Run(cmd); err != nil {
+			return fmt.Errorf("failed to append to manifest file %s via RootExec: %w", stagingManifest, err)
+		}
 	}
 
 	return nil
@@ -389,10 +412,16 @@ func removeManifestEntries(manifestPath string, filesToRemove map[string]bool, e
 		return fmt.Errorf("failed to close temp file: %w", err)
 	}
 
-	// Copy temp file to manifest location using executor for proper permissions
-	cpCmd := exec.Command("cp", tmpPath, manifestPath)
-	if err := execCtx.Run(cpCmd); err != nil {
-		return fmt.Errorf("failed to update manifest: %w", err)
+	if os.Geteuid() == 0 {
+		if err := copyFile(tmpPath, manifestPath); err != nil {
+			return fmt.Errorf("failed to update manifest natively: %w", err)
+		}
+	} else {
+		// Copy temp file to manifest location using executor for proper permissions
+		cpCmd := exec.Command("cp", tmpPath, manifestPath)
+		if err := execCtx.Run(cpCmd); err != nil {
+			return fmt.Errorf("failed to update manifest: %w", err)
+		}
 	}
 
 	return nil

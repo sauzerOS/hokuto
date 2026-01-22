@@ -169,11 +169,17 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 	outputDir := filepath.Join(pkgTmpDir, "output")
 
 	// First try to cleanup pkgTmpDir with Go's os.RemoveAll
-	if err := os.RemoveAll(pkgTmpDir); err != nil {
-		// If that fails, fall back to system rm -rf with rootExec
-		rmCmd := exec.Command("rm", "-rf", pkgTmpDir)
-		if err2 := RootExec.Run(rmCmd); err2 != nil {
-			return 0, fmt.Errorf("failed to clean pkgTmpDir %s: %v (fallback also failed: %v)", pkgTmpDir, err, err2)
+	if os.Geteuid() == 0 {
+		if err := os.RemoveAll(pkgTmpDir); err != nil {
+			return 0, fmt.Errorf("failed to clean pkgTmpDir %s natively: %v", pkgTmpDir, err)
+		}
+	} else {
+		if err := os.RemoveAll(pkgTmpDir); err != nil {
+			// If that fails, fall back to system rm -rf with rootExec
+			rmCmd := exec.Command("rm", "-rf", pkgTmpDir)
+			if err2 := RootExec.Run(rmCmd); err2 != nil {
+				return 0, fmt.Errorf("failed to clean pkgTmpDir %s: %v (fallback also failed: %v)", pkgTmpDir, err, err2)
+			}
 		}
 	}
 

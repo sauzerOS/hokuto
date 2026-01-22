@@ -387,7 +387,11 @@ func createPackageTarball(pkgName, pkgVer, pkgRev, arch, variant, outputDir stri
 		// FIX: Correct ownership of the root directory '.' in the archive.
 		// If we are building as root, the outputDir itself might still be owned by the user who started the build.
 		// We must ensure the root of the package is owned by root:root.
-		if execCtx.ShouldRunAsRoot {
+		if os.Geteuid() == 0 {
+			if err := os.Chown(outputDir, 0, 0); err != nil {
+				return fmt.Errorf("failed to chown outputDir to root natively: %v", err)
+			}
+		} else if execCtx.ShouldRunAsRoot {
 			chownCmd := exec.Command("chown", "0:0", outputDir)
 			if err := execCtx.Run(chownCmd); err != nil {
 				return fmt.Errorf("failed to chown outputDir to root: %v", err)
@@ -496,7 +500,11 @@ func createPackageTarball(pkgName, pkgVer, pkgRev, arch, variant, outputDir stri
 func compressXZ(srcPath, destPath string, execCtx *Executor) error {
 	// Ensure destination directory exists using executor if needed
 	destDir := filepath.Dir(destPath)
-	if execCtx != nil && execCtx.ShouldRunAsRoot {
+	if os.Geteuid() == 0 {
+		if err := os.MkdirAll(destDir, 0755); err != nil {
+			return fmt.Errorf("failed to create destination directory natively: %w", err)
+		}
+	} else if execCtx != nil && execCtx.ShouldRunAsRoot {
 		mkdirCmd := exec.Command("mkdir", "-p", destDir)
 		if err := execCtx.Run(mkdirCmd); err != nil {
 			return fmt.Errorf("failed to create destination directory: %w", err)
@@ -536,14 +544,24 @@ func compressXZ(srcPath, destPath string, execCtx *Executor) error {
 			return fmt.Errorf("failed to compress to temp file: %w", err)
 		}
 
-		// Copy temp file to destination using executor
-		cpCmd := exec.Command("cp", tmpPath, destPath)
-		if err := execCtx.Run(cpCmd); err != nil {
-			return fmt.Errorf("failed to copy compressed file: %w", err)
-		}
-		chmodCmd := exec.Command("chmod", "644", destPath)
-		if err := execCtx.Run(chmodCmd); err != nil {
-			return fmt.Errorf("failed to set file permissions: %w", err)
+		// Copy temp file to destination using executor or native if root
+		if os.Geteuid() == 0 {
+			if err := copyFile(tmpPath, destPath); err != nil {
+				return fmt.Errorf("failed to copy compressed file natively: %w", err)
+			}
+			if err := os.Chmod(destPath, 0644); err != nil {
+				return fmt.Errorf("failed to set file permissions natively: %w", err)
+			}
+		} else {
+			// Copy temp file to destination using executor
+			cpCmd := exec.Command("cp", tmpPath, destPath)
+			if err := execCtx.Run(cpCmd); err != nil {
+				return fmt.Errorf("failed to copy compressed file: %w", err)
+			}
+			chmodCmd := exec.Command("chmod", "644", destPath)
+			if err := execCtx.Run(chmodCmd); err != nil {
+				return fmt.Errorf("failed to set file permissions: %w", err)
+			}
 		}
 		return nil
 	}

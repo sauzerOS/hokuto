@@ -33,6 +33,10 @@ func addToWorld(pkgName string) error {
 	if err != nil {
 		// Try with root if permission denied
 		if os.IsPermission(err) {
+			if os.Geteuid() == 0 {
+				// This shouldn't happen if we're root, but for robust logic:
+				return fmt.Errorf("permission denied writing to world file even as root")
+			}
 			cmd := exec.Command("sh", "-c", fmt.Sprintf("echo '%s' >> %s", pkgName, WorldFile))
 			return RootExec.Run(cmd)
 		}
@@ -83,6 +87,9 @@ func removeFromWorld(pkgName string) error {
 	if err := os.WriteFile(WorldFile, []byte(newContent), 0644); err != nil {
 		// Fallback to root write
 		if os.IsPermission(err) {
+			if os.Geteuid() == 0 {
+				return fmt.Errorf("permission denied writing to world file even as root")
+			}
 			tmpFile, _ := os.CreateTemp("", "world-tmp")
 			tmpFile.WriteString(newContent)
 			tmpFile.Close()
@@ -114,6 +121,9 @@ func addToWorldMake(pkgName string) error {
 	f, err := os.OpenFile(WorldMakeFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		if os.IsPermission(err) {
+			if os.Geteuid() == 0 {
+				return fmt.Errorf("permission denied writing to world_make file even as root")
+			}
 			cmd := exec.Command("sh", "-c", fmt.Sprintf("echo '%s' >> %s", pkgName, WorldMakeFile))
 			return RootExec.Run(cmd)
 		}
@@ -158,6 +168,9 @@ func removeFromWorldMake(pkgName string) error {
 
 	if err := os.WriteFile(WorldMakeFile, []byte(newContent), 0644); err != nil {
 		if os.IsPermission(err) {
+			if os.Geteuid() == 0 {
+				return fmt.Errorf("permission denied writing to world_make file even as root")
+			}
 			tmpFile, _ := os.CreateTemp("", "worldmake-tmp")
 			tmpFile.WriteString(newContent)
 			tmpFile.Close()
