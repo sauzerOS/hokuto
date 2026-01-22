@@ -324,24 +324,32 @@ func generateLibDeps(outputDir, libdepsFile string, execCtx *Executor) error {
 	}
 	sort.Strings(sortedLibs)
 
-	// --- FIX: Use a privileged 'tee' command to write the file ---
-	// This ensures the write succeeds even if the staging directory is root-owned (from an asroot build).
+	// --- FIX: Use native os.WriteFile if running as root, otherwise fallback to tee ---
 	if len(sortedLibs) > 0 {
 		content := strings.Join(sortedLibs, "\n") + "\n"
-		cmd := exec.Command("tee", libdepsFile)
-		cmd.Stdin = strings.NewReader(content)
-		// Discard tee's stdout to prevent it from printing the content to the console.
-		cmd.Stdout = io.Discard
-
-		// Use the privileged RootExec to ensure the write is successful.
-		if err := execCtx.Run(cmd); err != nil {
-			return fmt.Errorf("failed to write libdeps file via tee: %w", err)
+		if os.Geteuid() == 0 {
+			if err := os.WriteFile(libdepsFile, []byte(content), 0644); err != nil {
+				return fmt.Errorf("failed to write libdeps file natively: %w", err)
+			}
+		} else {
+			cmd := exec.Command("tee", libdepsFile)
+			cmd.Stdin = strings.NewReader(content)
+			cmd.Stdout = io.Discard
+			if err := execCtx.Run(cmd); err != nil {
+				return fmt.Errorf("failed to write libdeps file via tee: %w", err)
+			}
 		}
 	} else {
 		// If there are no dependencies, create an empty file.
-		touchCmd := exec.Command("touch", libdepsFile)
-		if err := execCtx.Run(touchCmd); err != nil {
-			return fmt.Errorf("failed to create empty libdeps file: %w", err)
+		if os.Geteuid() == 0 {
+			if err := os.WriteFile(libdepsFile, []byte{}, 0644); err != nil {
+				return fmt.Errorf("failed to create empty libdeps file natively: %w", err)
+			}
+		} else {
+			touchCmd := exec.Command("touch", libdepsFile)
+			if err := execCtx.Run(touchCmd); err != nil {
+				return fmt.Errorf("failed to create empty libdeps file: %w", err)
+			}
 		}
 	}
 
@@ -502,15 +510,18 @@ func generateDepends(pkgName, pkgDir, outputDir, rootDir string, execCtx *Execut
 	sort.Strings(deps)
 	content := strings.Join(deps, "\n")
 
-	// --- FIX: Use a privileged 'tee' command to write the depends file ---
-	// This ensures the write succeeds even in a root-owned staging directory.
-	cmd := exec.Command("tee", dependsFile)
-	cmd.Stdin = strings.NewReader(content + "\n")
-	cmd.Stdout = io.Discard // Don't print the file content to the console
-
-	// Use RootExec, which is guaranteed to have the necessary permissions.
-	if err := execCtx.Run(cmd); err != nil {
-		return fmt.Errorf("failed to write depends file via tee: %w", err)
+	// --- FIX: Use native os.WriteFile if running as root, otherwise fallback to tee ---
+	if os.Geteuid() == 0 {
+		if err := os.WriteFile(dependsFile, []byte(content+"\n"), 0644); err != nil {
+			return fmt.Errorf("failed to write depends file natively: %w", err)
+		}
+	} else {
+		cmd := exec.Command("tee", dependsFile)
+		cmd.Stdin = strings.NewReader(content + "\n")
+		cmd.Stdout = io.Discard
+		if err := execCtx.Run(cmd); err != nil {
+			return fmt.Errorf("failed to write depends file via tee: %w", err)
+		}
 	}
 
 	return nil

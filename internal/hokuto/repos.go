@@ -38,11 +38,17 @@ func handleInitReposCommand(cfg *Config) error {
 			// If it exists but is not a git repo, remove it
 			colArrow.Print("-> ")
 			colWarn.Printf("Removing non-git directory: %s\n", path)
-			if err := os.RemoveAll(path); err != nil {
-				// Fallback to RootExec (rm -rf) if Go's os.RemoveAll fails (likely permission issue)
-				rmCmd := exec.Command("rm", "-rf", path)
-				if err := RootExec.Run(rmCmd); err != nil {
-					return fmt.Errorf("failed to remove existing directory %s: %v", path, err)
+			if os.Geteuid() == 0 {
+				if err := os.RemoveAll(path); err != nil {
+					return fmt.Errorf("failed to remove existing directory %s natively: %v", path, err)
+				}
+			} else {
+				if err := os.RemoveAll(path); err != nil {
+					// Fallback to RootExec (rm -rf) if Go's os.RemoveAll fails (likely permission issue)
+					rmCmd := exec.Command("rm", "-rf", path)
+					if err := RootExec.Run(rmCmd); err != nil {
+						return fmt.Errorf("failed to remove existing directory %s: %v", path, err)
+					}
 				}
 			}
 		}
@@ -58,10 +64,16 @@ func handleInitReposCommand(cfg *Config) error {
 	if _, err := os.Stat(repoDir); os.IsNotExist(err) {
 		colArrow.Print("-> ")
 		colInfo.Printf("Creating repository directory: %s\n", repoDir)
-		if err := os.MkdirAll(repoDir, 0o755); err != nil {
-			mkdirCmd := exec.Command("mkdir", "-p", repoDir)
-			if err := RootExec.Run(mkdirCmd); err != nil {
-				return fmt.Errorf("failed to create directory %s: %v", repoDir, err)
+		if os.Geteuid() == 0 {
+			if err := os.MkdirAll(repoDir, 0755); err != nil {
+				return fmt.Errorf("failed to create directory %s natively: %v", repoDir, err)
+			}
+		} else {
+			if err := os.MkdirAll(repoDir, 0o755); err != nil {
+				mkdirCmd := exec.Command("mkdir", "-p", repoDir)
+				if err := RootExec.Run(mkdirCmd); err != nil {
+					return fmt.Errorf("failed to create directory %s: %v", repoDir, err)
+				}
 			}
 		}
 	}
@@ -69,10 +81,17 @@ func handleInitReposCommand(cfg *Config) error {
 	// Ensure the repo directory is owned by the current user
 	uid := os.Getuid()
 	gid := os.Getgid()
-	chownCmd := exec.Command("chown", "-R", fmt.Sprintf("%d:%d", uid, gid), repoDir)
-	if err := RootExec.Run(chownCmd); err != nil {
-		colArrow.Print("-> ")
-		colWarn.Printf("Warning: failed to set ownership of %s: %v\n", repoDir, err)
+	if os.Geteuid() == 0 {
+		if err := os.Chown(repoDir, uid, gid); err != nil {
+			colArrow.Print("-> ")
+			colWarn.Printf("Warning: failed to set ownership of %s natively: %v\n", repoDir, err)
+		}
+	} else {
+		chownCmd := exec.Command("chown", "-R", fmt.Sprintf("%d:%d", uid, gid), repoDir)
+		if err := RootExec.Run(chownCmd); err != nil {
+			colArrow.Print("-> ")
+			colWarn.Printf("Warning: failed to set ownership of %s: %v\n", repoDir, err)
+		}
 	}
 
 	// 5. Clone the repositories
@@ -213,10 +232,17 @@ func updateHokutoConfig(rootDir string, enableKDE, enableCosmic bool) error {
 		}
 	}
 
-	mvCmd := exec.Command("mv", tmpFile, configPath)
-	if err := RootExec.Run(mvCmd); err != nil {
-		os.Remove(tmpFile)
-		return fmt.Errorf("failed to update config file: %v", err)
+	if os.Geteuid() == 0 {
+		if err := os.Rename(tmpFile, configPath); err != nil {
+			os.Remove(tmpFile)
+			return fmt.Errorf("failed to update config file natively: %v", err)
+		}
+	} else {
+		mvCmd := exec.Command("mv", tmpFile, configPath)
+		if err := RootExec.Run(mvCmd); err != nil {
+			os.Remove(tmpFile)
+			return fmt.Errorf("failed to update config file: %v", err)
+		}
 	}
 
 	return nil

@@ -300,25 +300,41 @@ func pkgUninstall(pkgName string, cfg *Config, execCtx *Executor, force, yes boo
 
 	// Batch remove all files at once
 	if len(filesToRemove) > 0 {
-		// Use rm with multiple files for better performance
-		rmCmd := exec.Command("rm", "-f")
-		rmCmd.Args = append(rmCmd.Args, filesToRemove...)
-
-		if err := execCtx.Run(rmCmd); err != nil {
-			// If batch removal fails, try individual removals
-			colArrow.Print("-> ")
-			colSuccess.Println("Batch removal failed, trying individual removals")
+		if os.Geteuid() == 0 {
+			removedCount := 0
 			for _, file := range filesToRemove {
-				rmCmd := exec.Command("rm", "-f", file)
-				if err := execCtx.Run(rmCmd); err != nil {
-					failed = append(failed, fmt.Sprintf("%s: %v", file, err))
+				if err := os.Remove(file); err != nil && !os.IsNotExist(err) {
+					failed = append(failed, fmt.Sprintf("%s natively: %v", file, err))
 				} else {
-					debugf("Removed %s\n", file)
+					if !os.IsNotExist(err) {
+						removedCount++
+						debugf("Removed %s natively\n", file)
+					}
 				}
 			}
-		} else {
 			colArrow.Print("-> ")
-			colSuccess.Printf("Removed %d files\n", len(filesToRemove))
+			colSuccess.Printf("Removed %d files natively\n", removedCount)
+		} else {
+			// Use rm with multiple files for better performance
+			rmCmd := exec.Command("rm", "-f")
+			rmCmd.Args = append(rmCmd.Args, filesToRemove...)
+
+			if err := execCtx.Run(rmCmd); err != nil {
+				// If batch removal fails, try individual removals
+				colArrow.Print("-> ")
+				colSuccess.Println("Batch removal failed, trying individual removals")
+				for _, file := range filesToRemove {
+					rmCmd := exec.Command("rm", "-f", file)
+					if err := execCtx.Run(rmCmd); err != nil {
+						failed = append(failed, fmt.Sprintf("%s: %v", file, err))
+					} else {
+						debugf("Removed %s\n", file)
+					}
+				}
+			} else {
+				colArrow.Print("-> ")
+				colSuccess.Printf("Removed %d files\n", len(filesToRemove))
+			}
 		}
 	}
 
@@ -332,22 +348,33 @@ func pkgUninstall(pkgName string, cfg *Config, execCtx *Executor, force, yes boo
 		if len(batch) == 0 {
 			return
 		}
-		rmdirCmd := exec.Command("rmdir", batch...)
-		rmdirCmd.Stderr = io.Discard // Silence stderr to avoid "Directory not empty" warnings
-		if err := execCtx.Run(rmdirCmd); err == nil {
-			debugf("Batch removed %d empty directories\n", len(batch))
-		} else {
-			// If batch fails, some directories might still have been removed.
-			// Checking exactly which ones is slow, so we only do it in debug mode.
-			if Debug {
-				removedCount := 0
-				for _, d := range batch {
-					if _, statErr := os.Stat(d); os.IsNotExist(statErr) {
-						debugf("Removed empty directory %s\n", d)
-						removedCount++
-					}
+		if os.Geteuid() == 0 {
+			removedInBatch := 0
+			for _, d := range batch {
+				if err := os.Remove(d); err == nil {
+					debugf("Removed empty directory %s natively\n", d)
+					removedInBatch++
 				}
-				debugf("Batch result: removed %d/%d directories (others likely not empty)\n", removedCount, len(batch))
+			}
+			debugf("Batch removed %d empty directories natively\n", removedInBatch)
+		} else {
+			rmdirCmd := exec.Command("rmdir", batch...)
+			rmdirCmd.Stderr = io.Discard // Silence stderr to avoid "Directory not empty" warnings
+			if err := execCtx.Run(rmdirCmd); err == nil {
+				debugf("Batch removed %d empty directories\n", len(batch))
+			} else {
+				// If batch fails, some directories might still have been removed.
+				// Checking exactly which ones is slow, so we only do it in debug mode.
+				if Debug {
+					removedCount := 0
+					for _, d := range batch {
+						if _, statErr := os.Stat(d); os.IsNotExist(statErr) {
+							debugf("Removed empty directory %s\n", d)
+							removedCount++
+						}
+					}
+					debugf("Batch result: removed %d/%d directories (others likely not empty)\n", removedCount, len(batch))
+				}
 			}
 		}
 		batch = nil
@@ -404,11 +431,19 @@ func pkgUninstall(pkgName string, cfg *Config, execCtx *Executor, force, yes boo
 	processBatch()
 
 	// 9. Remove package metadata directory (unchanged)
-	rmMetaCmd := exec.Command("rm", "-rf", installedDir)
-	if err := execCtx.Run(rmMetaCmd); err != nil {
-		failed = append(failed, fmt.Sprintf("failed to remove metadata %s: %v", installedDir, err))
+	if os.Geteuid() == 0 {
+		if err := os.RemoveAll(installedDir); err != nil {
+			failed = append(failed, fmt.Sprintf("failed to remove metadata %s natively: %v", installedDir, err))
+		} else {
+			debugf("Removed package metadata natively: %s\n", installedDir)
+		}
 	} else {
-		debugf("Removed package metadata: %s\n", installedDir)
+		rmMetaCmd := exec.Command("rm", "-rf", installedDir)
+		if err := execCtx.Run(rmMetaCmd); err != nil {
+			failed = append(failed, fmt.Sprintf("failed to remove metadata %s: %v", installedDir, err))
+		} else {
+			debugf("Removed package metadata: %s\n", installedDir)
+		}
 	}
 
 	// 10. Run post-uninstall hook if present (unchanged)
@@ -426,11 +461,19 @@ func pkgUninstall(pkgName string, cfg *Config, execCtx *Executor, force, yes boo
 	// 11. Remove alternatives directory (alternatives were already restored in step 6.5)
 	if hasAlternatives {
 		altDir := filepath.Join(hRoot, "var", "db", "hokuto", "alternatives", pkgName)
-		rmAltCmd := exec.Command("rm", "-rf", altDir)
-		if err := execCtx.Run(rmAltCmd); err != nil {
-			debugf("Warning: failed to remove alternatives directory %s: %v\n", altDir, err)
+		if os.Geteuid() == 0 {
+			if err := os.RemoveAll(altDir); err != nil {
+				debugf("Warning: failed to remove alternatives directory %s natively: %v\n", altDir, err)
+			} else {
+				debugf("Removed alternatives directory natively: %s\n", altDir)
+			}
 		} else {
-			debugf("Removed alternatives directory: %s\n", altDir)
+			rmAltCmd := exec.Command("rm", "-rf", altDir)
+			if err := execCtx.Run(rmAltCmd); err != nil {
+				debugf("Warning: failed to remove alternatives directory %s: %v\n", altDir, err)
+			} else {
+				debugf("Removed alternatives directory: %s\n", altDir)
+			}
 		}
 	}
 

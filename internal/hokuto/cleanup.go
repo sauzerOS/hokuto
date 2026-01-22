@@ -6,6 +6,7 @@ package hokuto
 import (
 	"flag"
 	"fmt"
+	"os"
 	"os/exec"
 )
 
@@ -40,9 +41,15 @@ func handleCleanupCommand(args []string, cfg *Config) error {
 		cPrintf(colWarn, "Deleting sources cache at %s.\n", SourcesDir)
 		if askForConfirmation(colArrow, "Are you sure you want to proceed?") {
 			debugf("Removing source cache directory: %s\n", SourcesDir)
-			rmCmd := exec.Command("rm", "-rf", SourcesDir)
-			if err := RootExec.Run(rmCmd); err != nil {
-				return fmt.Errorf("failed to remove source cache: %w", err)
+			if os.Geteuid() == 0 {
+				if err := os.RemoveAll(SourcesDir); err != nil {
+					return fmt.Errorf("failed to remove source cache natively: %w", err)
+				}
+			} else {
+				rmCmd := exec.Command("rm", "-rf", SourcesDir)
+				if err := RootExec.Run(rmCmd); err != nil {
+					return fmt.Errorf("failed to remove source cache: %w", err)
+				}
 			}
 			colArrow.Print("-> ")
 			colSuccess.Println("Source cache removed successfully.")
@@ -56,9 +63,15 @@ func handleCleanupCommand(args []string, cfg *Config) error {
 		cPrintf(colWarn, "This will permanently delete all built binary packages at %s.\n", BinDir)
 		if askForConfirmation(colArrow, "Are you sure you want to proceed?") {
 			debugf("Removing binary cache directory: %s\n", BinDir)
-			rmCmd := exec.Command("rm", "-rf", BinDir)
-			if err := RootExec.Run(rmCmd); err != nil {
-				return fmt.Errorf("failed to remove binary cache: %w", err)
+			if os.Geteuid() == 0 {
+				if err := os.RemoveAll(BinDir); err != nil {
+					return fmt.Errorf("failed to remove binary cache natively: %w", err)
+				}
+			} else {
+				rmCmd := exec.Command("rm", "-rf", BinDir)
+				if err := RootExec.Run(rmCmd); err != nil {
+					return fmt.Errorf("failed to remove binary cache: %w", err)
+				}
 			}
 			colArrow.Print("-> ")
 			colSuccess.Println("Binary cache removed successfully.")

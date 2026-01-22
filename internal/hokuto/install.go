@@ -90,24 +90,30 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 
 		var extractErr error
 
-		// Use system tar if available
+		tarSuccess := false
 		if _, err := exec.LookPath("tar"); err == nil {
 			args := []string{"xf", tarballPath, "-C", rootDir}
 			tarCmd := exec.Command("tar", args...)
 			tarCmd.Stdout = os.Stdout
 			tarCmd.Stderr = os.Stderr
 
-			extractErr = execCtx.Run(tarCmd)
-			if extractErr == nil {
+			if err := execCtx.Run(tarCmd); err == nil {
+				tarSuccess = true
 				colArrow.Print("-> ")
-				colSuccess.Println("glibc installed successfully via direct extraction.")
+				colSuccess.Println("glibc installed successfully via direct extraction")
 			}
-		} else {
-			// Fallback to Go implementation if tar not available
-			extractErr = unpackTarballFallback(tarballPath, rootDir)
-			if extractErr == nil {
-				colArrow.Print("-> ")
-				colSuccess.Println("glibc installed successfully via direct extraction (fallback).")
+		}
+
+		if !tarSuccess {
+			if os.Geteuid() == 0 {
+				if err := unpackTarballFallback(tarballPath, rootDir); err != nil {
+					extractErr = fmt.Errorf("native fallback failed: %v", err)
+				} else {
+					colArrow.Print("-> ")
+					colSuccess.Println("glibc installed successfully via direct extraction")
+				}
+			} else {
+				extractErr = fmt.Errorf("System tar missing or broken, run hokuto as root!")
 			}
 		}
 
@@ -139,24 +145,21 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 	// 1. Unpack tarball into staging
 	debugf("Unpacking %s into %s\n", tarballPath, stagingDir)
 
-	// Try system tar first
+	tarSuccess := false
 	if _, err := exec.LookPath("tar"); err == nil {
 		untarCmd := exec.Command("tar", "--zstd", "-xf", tarballPath, "-C", stagingDir)
 		if err := execCtx.Run(untarCmd); err == nil {
-			// success with system tar
-		} else {
-			// fallback if tar failed
+			tarSuccess = true
+		}
+	}
+
+	if !tarSuccess {
+		if os.Geteuid() == 0 || execCtx.ShouldRunAsRoot {
 			if err := unpackTarballFallback(tarballPath, stagingDir); err != nil {
-				return fmt.Errorf("failed to unpack tarball (fallback): %v", err)
+				return fmt.Errorf("failed to unpack tarball (native): %v", err)
 			}
-		}
-	} else {
-		// fallback if tar not found
-		if os.Geteuid() != 0 {
-			return fmt.Errorf("system tar not found and root privileges are required for internal extraction to preserve ownership. Please install 'tar' or run hokuto as root.")
-		}
-		if err := unpackTarballFallback(tarballPath, stagingDir); err != nil {
-			return fmt.Errorf("failed to unpack tarball (fallback): %v", err)
+		} else {
+			return fmt.Errorf("System tar missing or broken, run hokuto as root!")
 		}
 	}
 
@@ -407,9 +410,15 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 				switch strings.ToLower(input) {
 				case "k":
 					// Keep the file from the other package - delete from staging
-					rmCmd := exec.Command("rm", "-f", stagingFile)
-					if err := execCtx.Run(rmCmd); err != nil {
-						return fmt.Errorf("failed to remove file from staging %s: %v", stagingFile, err)
+					if os.Geteuid() == 0 {
+						if err := os.Remove(stagingFile); err != nil {
+							return fmt.Errorf("failed to remove file from staging %s natively: %v", stagingFile, err)
+						}
+					} else {
+						rmCmd := exec.Command("rm", "-f", stagingFile)
+						if err := execCtx.Run(rmCmd); err != nil {
+							return fmt.Errorf("failed to remove file from staging %s: %v", stagingFile, err)
+						}
 					}
 					// Track this file for manifest removal
 					filesRemovedFromStaging[file] = true
@@ -426,9 +435,15 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 					continue
 				default:
 					// Invalid input, default to keep
-					rmCmd := exec.Command("rm", "-f", stagingFile)
-					if err := execCtx.Run(rmCmd); err != nil {
-						return fmt.Errorf("failed to remove file from staging %s: %v", stagingFile, err)
+					if os.Geteuid() == 0 {
+						if err := os.Remove(stagingFile); err != nil {
+							return fmt.Errorf("failed to remove file from staging %s natively: %v", stagingFile, err)
+						}
+					} else {
+						rmCmd := exec.Command("rm", "-f", stagingFile)
+						if err := execCtx.Run(rmCmd); err != nil {
+							return fmt.Errorf("failed to remove file from staging %s: %v", stagingFile, err)
+						}
 					}
 					// Track this file for manifest removal
 					filesRemovedFromStaging[file] = true
@@ -477,21 +492,34 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 					if err != nil {
 						return fmt.Errorf("failed to read symlink %s: %v", currentFile, err)
 					}
-					// Remove existing file/symlink in staging if it exists (use executor for proper permissions)
-					rmCmd := exec.Command("rm", "-f", stagingFile)
-					if err := execCtx.Run(rmCmd); err != nil {
-						return fmt.Errorf("failed to remove existing file %s: %v", stagingFile, err)
-					}
-					// Recreate the symlink in staging using executor for proper permissions
-					lnCmd := exec.Command("ln", "-s", linkTarget, stagingFile)
-					if err := execCtx.Run(lnCmd); err != nil {
-						return fmt.Errorf("failed to recreate symlink %s -> %s: %v", stagingFile, linkTarget, err)
+					// Remove existing file/symlink in staging if it exists (use executor or native if root)
+					if os.Geteuid() == 0 {
+						os.Remove(stagingFile)
+						if err := os.Symlink(linkTarget, stagingFile); err != nil {
+							return fmt.Errorf("failed to recreate symlink %s -> %s natively: %v", stagingFile, linkTarget, err)
+						}
+					} else {
+						rmCmd := exec.Command("rm", "-f", stagingFile)
+						if err := execCtx.Run(rmCmd); err != nil {
+							return fmt.Errorf("failed to remove existing file %s: %v", stagingFile, err)
+						}
+						// Recreate the symlink in staging using executor for proper permissions
+						lnCmd := exec.Command("ln", "-s", linkTarget, stagingFile)
+						if err := execCtx.Run(lnCmd); err != nil {
+							return fmt.Errorf("failed to recreate symlink %s -> %s: %v", stagingFile, linkTarget, err)
+						}
 					}
 				} else {
 					// It's a regular file - copy it normally
-					cpCmd := exec.Command("cp", "--remove-destination", currentFile, stagingFile)
-					if err := execCtx.Run(cpCmd); err != nil {
-						return fmt.Errorf("failed to overwrite %s: %v", stagingFile, err)
+					if os.Geteuid() == 0 {
+						if err := copyFile(currentFile, stagingFile); err != nil {
+							return fmt.Errorf("failed to overwrite %s natively: %v", stagingFile, err)
+						}
+					} else {
+						cpCmd := exec.Command("cp", "--remove-destination", currentFile, stagingFile)
+						if err := execCtx.Run(cpCmd); err != nil {
+							return fmt.Errorf("failed to overwrite %s: %v", stagingFile, err)
+						}
 					}
 				}
 			case "u":
@@ -560,19 +588,29 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 				}
 
 				// After editing, copy temp back to staging
-				cpCmd := exec.Command("cp", "--preserve=mode,ownership,timestamps", tmpPath, stagingFile)
-				if err := execCtx.Run(cpCmd); err != nil {
-					return fmt.Errorf("failed to copy edited file back to staging %s: %v", stagingFile, err)
-				}
-				// --- NEW: Explicitly restore permissions ---
-				// The `cp --preserve=mode` relies on the temp file's mode, which is wrong.
-				// Use chmod to ensure the correct original mode is set.
-				// We format the mode to an octal string (e.g., "0644").
-				modeStr := fmt.Sprintf("%#o", originalMode.Perm())
+				if os.Geteuid() == 0 {
+					if err := copyFile(tmpPath, stagingFile); err != nil {
+						return fmt.Errorf("failed to copy edited file back to staging %s natively: %v", stagingFile, err)
+					}
+					// restore mode
+					if err := os.Chmod(stagingFile, originalMode.Perm()); err != nil {
+						return fmt.Errorf("failed to restore permissions on %s natively: %v", stagingFile, err)
+					}
+				} else {
+					cpCmd := exec.Command("cp", "--preserve=mode,ownership,timestamps", tmpPath, stagingFile)
+					if err := execCtx.Run(cpCmd); err != nil {
+						return fmt.Errorf("failed to copy edited file back to staging %s: %v", stagingFile, err)
+					}
+					// --- NEW: Explicitly restore permissions ---
+					// The `cp --preserve=mode` relies on the temp file's mode, which is wrong.
+					// Use chmod to ensure the correct original mode is set.
+					// We format the mode to an octal string (e.g., "0644").
+					modeStr := fmt.Sprintf("%#o", originalMode.Perm())
 
-				chmodCmd := exec.Command("chmod", modeStr, stagingFile)
-				if err := execCtx.Run(chmodCmd); err != nil {
-					return fmt.Errorf("failed to restore permissions on %s to %s: %v", stagingFile, modeStr, err)
+					chmodCmd := exec.Command("chmod", modeStr, stagingFile)
+					if err := execCtx.Run(chmodCmd); err != nil {
+						return fmt.Errorf("failed to restore permissions on %s to %s: %v", stagingFile, modeStr, err)
+					}
 				}
 			}
 		} else {
@@ -587,26 +625,41 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 				}
 			}
 			if ans == "y" {
-				// ensure staging directory exists (run as root)
 				stagingFileDir := filepath.Dir(stagingFile)
-				mkdirCmd := exec.Command("mkdir", "-p", stagingFileDir)
-				if err := execCtx.Run(mkdirCmd); err != nil {
-					return fmt.Errorf("failed to create directory %s: %v", stagingFileDir, err)
-				}
-				// copy current file into staging preserving attributes
-				cpCmd := exec.Command("cp", "--preserve=mode,ownership,timestamps", currentFile, stagingFile)
-				if err := execCtx.Run(cpCmd); err != nil {
-					return fmt.Errorf("failed to copy %s to staging: %v", file, err)
+				if os.Geteuid() == 0 {
+					if err := os.MkdirAll(stagingFileDir, 0755); err != nil {
+						return fmt.Errorf("failed to create directory %s natively: %v", stagingFileDir, err)
+					}
+					if err := copyFile(currentFile, stagingFile); err != nil {
+						return fmt.Errorf("failed to copy %s to staging natively: %v", file, err)
+					}
+				} else {
+					// ensure staging directory exists (run as root)
+					mkdirCmd := exec.Command("mkdir", "-p", stagingFileDir)
+					if err := execCtx.Run(mkdirCmd); err != nil {
+						return fmt.Errorf("failed to create directory %s: %v", stagingFileDir, err)
+					}
+					// copy current file into staging preserving attributes
+					cpCmd := exec.Command("cp", "--preserve=mode,ownership,timestamps", currentFile, stagingFile)
+					if err := execCtx.Run(cpCmd); err != nil {
+						return fmt.Errorf("failed to copy %s to staging: %v", file, err)
+					}
 				}
 				debugf("Kept modified file by copying %s into staging\n", file)
 			} else {
-				// user chose not to keep it -> remove the installed file (run as root)
-				rmCmd := exec.Command("rm", "-f", currentFile)
-				if err := execCtx.Run(rmCmd); err != nil {
-					// warn but continue install; do not abort the whole install for a removal failure
-					cPrintf(colWarn, "Warning: failed to remove %s: %v\n", currentFile, err)
+				if os.Geteuid() == 0 {
+					if err := os.Remove(currentFile); err != nil {
+						cPrintf(colWarn, "Warning: failed to remove %s natively: %v\n", currentFile, err)
+					}
 				} else {
-					debugf("Removed user-modified file: %s\n", file)
+					// user chose not to keep it -> remove the installed file (run as root)
+					rmCmd := exec.Command("rm", "-f", currentFile)
+					if err := execCtx.Run(rmCmd); err != nil {
+						// warn but continue install; do not abort the whole install for a removal failure
+						cPrintf(colWarn, "Warning: failed to remove %s: %v\n", currentFile, err)
+					} else {
+						debugf("Removed user-modified file: %s\n", file)
+					}
 				}
 			}
 		}
@@ -651,9 +704,13 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 	}
 
 	// Delete stagingManifest2dir
-	rmCmd := exec.Command("rm", "-rf", stagingManifest2dir)
-	if err := execCtx.Run(rmCmd); err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to remove StagingManifest: %v", err)
+	if os.Geteuid() == 0 {
+		os.RemoveAll(stagingManifest2dir)
+	} else {
+		rmCmd := exec.Command("rm", "-rf", stagingManifest2dir)
+		if err := execCtx.Run(rmCmd); err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to remove StagingManifest: %v", err)
+		}
 	}
 
 	// 3.5. Check for conflicts with existing files (for both fresh installs and upgrades)
@@ -781,17 +838,28 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 		backupDir := filepath.Dir(backupPath)
 
 		// Create the directory structure in the backup location
-		mkdirCmd := exec.Command("mkdir", "-p", backupDir)
-		if err := execCtx.Run(mkdirCmd); err != nil {
-			return fmt.Errorf("failed to create backup dir %s: %v", backupDir, err)
-		}
-
-		// Copy the library file to the backup location
-		cpCmd := exec.Command("cp", "--remove-destination", "--preserve=mode,ownership,timestamps", libPath, backupPath)
-		if err := execCtx.Run(cpCmd); err != nil {
-			fmt.Fprintf(os.Stderr, "warning: failed to backup library %s: %v\n", libPath, err)
+		if os.Geteuid() == 0 {
+			if err := os.MkdirAll(backupDir, 0755); err != nil {
+				return fmt.Errorf("failed to create backup dir %s natively: %v", backupDir, err)
+			}
+			if err := copyFile(libPath, backupPath); err != nil {
+				fmt.Fprintf(os.Stderr, "warning: failed to backup library %s natively: %v\n", libPath, err)
+			} else {
+				cPrintf(colInfo, "Backed up affected library %s to %s\n", libPath, backupPath)
+			}
 		} else {
-			cPrintf(colInfo, "Backed up affected library %s to %s\n", libPath, backupPath)
+			mkdirCmd := exec.Command("mkdir", "-p", backupDir)
+			if err := execCtx.Run(mkdirCmd); err != nil {
+				return fmt.Errorf("failed to create backup dir %s: %v", backupDir, err)
+			}
+
+			// Copy the library file to the backup location
+			cpCmd := exec.Command("cp", "--remove-destination", "--preserve=mode,ownership,timestamps", libPath, backupPath)
+			if err := execCtx.Run(cpCmd); err != nil {
+				fmt.Fprintf(os.Stderr, "warning: failed to backup library %s: %v\n", libPath, err)
+			} else {
+				cPrintf(colInfo, "Backed up affected library %s to %s\n", libPath, backupPath)
+			}
 		}
 	}
 

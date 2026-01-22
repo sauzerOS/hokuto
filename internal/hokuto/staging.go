@@ -183,9 +183,15 @@ func rsyncStaging(stagingDir, rootDir string, execCtx *Executor) error {
 	stagingPath := filepath.Clean(stagingDir)
 
 	// Ensure rootDir exists
-	mkdirCmd := exec.Command("mkdir", "-p", rootDir)
-	if err := execCtx.Run(mkdirCmd); err != nil {
-		return fmt.Errorf("failed to create rootDir %s: %v", rootDir, err)
+	if os.Geteuid() == 0 {
+		if err := os.MkdirAll(rootDir, 0755); err != nil {
+			return fmt.Errorf("failed to create rootDir %s natively: %v", rootDir, err)
+		}
+	} else {
+		mkdirCmd := exec.Command("mkdir", "-p", rootDir)
+		if err := execCtx.Run(mkdirCmd); err != nil {
+			return fmt.Errorf("failed to create rootDir %s: %v", rootDir, err)
+		}
 	}
 
 	// --- Try system rsync first ---
@@ -205,9 +211,15 @@ func rsyncStaging(stagingDir, rootDir string, execCtx *Executor) error {
 		cmd.Stderr = os.Stderr
 
 		if err := execCtx.Run(cmd); err == nil {
-			rmCmd := exec.Command("rm", "-rf", stagingDir)
-			if err := execCtx.Run(rmCmd); err != nil {
-				return fmt.Errorf("failed to remove staging dir %s: %v", stagingDir, err)
+			if os.Geteuid() == 0 {
+				if err := os.RemoveAll(stagingDir); err != nil {
+					return fmt.Errorf("failed to remove staging dir %s natively: %v", stagingDir, err)
+				}
+			} else {
+				rmCmd := exec.Command("rm", "-rf", stagingDir)
+				if err := execCtx.Run(rmCmd); err != nil {
+					return fmt.Errorf("failed to remove staging dir %s: %v", stagingDir, err)
+				}
 			}
 			return nil
 		}
@@ -223,9 +235,15 @@ func rsyncStaging(stagingDir, rootDir string, execCtx *Executor) error {
 		debugf("Attempting to sync with 'cp -aT %s %s'\n", stagingPath, rootDir)
 		if err := execCtx.Run(cmd); err == nil {
 			// Success! Clean up and return.
-			rmCmd := exec.Command("rm", "-rf", stagingDir)
-			if err := execCtx.Run(rmCmd); err != nil {
-				fmt.Fprintf(os.Stderr, "warning: failed to remove staging dir %s: %v\n", stagingDir, err)
+			if os.Geteuid() == 0 {
+				if err := os.RemoveAll(stagingDir); err != nil {
+					fmt.Fprintf(os.Stderr, "warning: failed to remove staging dir %s natively: %v\n", stagingDir, err)
+				}
+			} else {
+				rmCmd := exec.Command("rm", "-rf", stagingDir)
+				if err := execCtx.Run(rmCmd); err != nil {
+					fmt.Fprintf(os.Stderr, "warning: failed to remove staging dir %s: %v\n", stagingDir, err)
+				}
 			}
 			return nil
 		}
@@ -242,9 +260,15 @@ func rsyncStaging(stagingDir, rootDir string, execCtx *Executor) error {
 		return fmt.Errorf("internal tar fallback failed: %v", err)
 	}
 
-	rmCmd := exec.Command("rm", "-rf", stagingDir)
-	if err := execCtx.Run(rmCmd); err != nil {
-		return fmt.Errorf("failed to remove staging dir %s: %v", stagingDir, err)
+	if os.Geteuid() == 0 {
+		if err := os.RemoveAll(stagingDir); err != nil {
+			return fmt.Errorf("failed to remove staging dir %s natively: %v", stagingDir, err)
+		}
+	} else {
+		rmCmd := exec.Command("rm", "-rf", stagingDir)
+		if err := execCtx.Run(rmCmd); err != nil {
+			return fmt.Errorf("failed to remove staging dir %s: %v", stagingDir, err)
+		}
 	}
 
 	return nil

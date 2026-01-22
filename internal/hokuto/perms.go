@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"os/user"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 )
@@ -129,9 +130,29 @@ func ensureHokutoOwnership(cfg *Config) error {
 		}
 
 		for _, path := range pathsToFix {
-			cmd := exec.Command("sudo", "chown", "-R", fmt.Sprintf("%s:%s", targetUser, targetGroup), path)
-			if err := cmd.Run(); err != nil {
-				return fmt.Errorf("failed to fix ownership of %s: %w", path, err)
+			uid, _ := strconv.Atoi(targetUID)
+			gid, _ := strconv.Atoi(targetGID)
+
+			if os.Geteuid() == 0 {
+				if err := os.Chown(path, uid, gid); err != nil {
+					return fmt.Errorf("failed to fix ownership of %s natively: %w", path, err)
+				}
+				// Also handle recursive if it was -R, but pathsToFix are individual identified paths?
+				// Actually pathsToCheck are only the top level dirs. chown -R was used.
+				// If we want to replace chown -R we need a recursive walk.
+				if err := filepath.Walk(path, func(p string, info os.FileInfo, err error) error {
+					if err != nil {
+						return err
+					}
+					return os.Chown(p, uid, gid)
+				}); err != nil {
+					return fmt.Errorf("failed to fix recursive ownership of %s natively: %w", path, err)
+				}
+			} else {
+				cmd := exec.Command("sudo", "chown", "-R", fmt.Sprintf("%s:%s", targetUser, targetGroup), path)
+				if err := cmd.Run(); err != nil {
+					return fmt.Errorf("failed to fix ownership of %s: %w", path, err)
+				}
 			}
 		}
 	}

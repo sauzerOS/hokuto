@@ -14,6 +14,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+
+	"golang.org/x/sys/unix"
 )
 
 type fileMetadata struct {
@@ -25,7 +27,7 @@ type fileMetadata struct {
 // It can print the prompt with a specific color style if p is not nil.
 
 func lstatViaExecutor(path string, execCtx *Executor) (string, error) {
-	if !execCtx.ShouldRunAsRoot {
+	if os.Geteuid() == 0 || !execCtx.ShouldRunAsRoot {
 		info, err := os.Lstat(path)
 		if err != nil {
 			return "", fmt.Errorf("failed to lstat %s: %v", path, err)
@@ -188,19 +190,26 @@ func copyTreeWithTar(src, dst string, execCtx *Executor) error {
 		// For symlinks, we need to use Lstat to get the link info, not the target
 		var linkTarget string
 		if info.Mode()&os.ModeSymlink != 0 {
-			linkTarget, err = os.Readlink(path)
-			if err != nil {
-				// If we can't read the symlink as the current user and need root
-				if execCtx.ShouldRunAsRoot {
-					cmd := exec.Command("readlink", path)
-					var out bytes.Buffer
-					cmd.Stdout = &out
-					if err := execCtx.Run(cmd); err != nil {
+			if os.Geteuid() == 0 {
+				linkTarget, err = os.Readlink(path)
+				if err != nil {
+					return fmt.Errorf("failed to read symlink %s natively: %w", path, err)
+				}
+			} else {
+				linkTarget, err = os.Readlink(path)
+				if err != nil {
+					// If we can't read the symlink as the current user and need root
+					if execCtx.ShouldRunAsRoot {
+						cmd := exec.Command("readlink", path)
+						var out bytes.Buffer
+						cmd.Stdout = &out
+						if err := execCtx.Run(cmd); err != nil {
+							return fmt.Errorf("failed to read symlink %s: %w", path, err)
+						}
+						linkTarget = strings.TrimSpace(out.String())
+					} else {
 						return fmt.Errorf("failed to read symlink %s: %w", path, err)
 					}
-					linkTarget = strings.TrimSpace(out.String())
-				} else {
-					return fmt.Errorf("failed to read symlink %s: %w", path, err)
 				}
 			}
 		}
@@ -221,8 +230,17 @@ func copyTreeWithTar(src, dst string, execCtx *Executor) error {
 
 		// For regular files, write the content
 		if info.Mode().IsRegular() {
-			// If we need root privileges to read the file, use cat
-			if execCtx.ShouldRunAsRoot {
+			if os.Geteuid() == 0 {
+				f, err := os.Open(path)
+				if err != nil {
+					return fmt.Errorf("failed to open file %s natively: %w", path, err)
+				}
+				if _, err := io.Copy(tw, f); err != nil {
+					f.Close()
+					return err
+				}
+				f.Close()
+			} else if execCtx.ShouldRunAsRoot {
 				cmd := exec.Command("cat", path)
 				var out bytes.Buffer
 				cmd.Stdout = &out
@@ -288,6 +306,9 @@ func copyTreeWithTar(src, dst string, execCtx *Executor) error {
 		switch hdr.Typeflag {
 		case tar.TypeDir:
 			if err := os.MkdirAll(target, os.FileMode(hdr.Mode)); err != nil {
+				if os.Geteuid() == 0 {
+					return fmt.Errorf("failed to create dir %s natively: %w", target, err)
+				}
 				if execCtx.ShouldRunAsRoot {
 					mkdirCmd := exec.Command("mkdir", "-p", target)
 					if err := execCtx.Run(mkdirCmd); err != nil {
@@ -300,7 +321,9 @@ func copyTreeWithTar(src, dst string, execCtx *Executor) error {
 				}
 			}
 			// Set ownership and times
-			if execCtx.ShouldRunAsRoot {
+			if os.Geteuid() == 0 {
+				_ = os.Chown(target, hdr.Uid, hdr.Gid)
+			} else if execCtx.ShouldRunAsRoot {
 				chownCmd := exec.Command("chown", fmt.Sprintf("%d:%d", hdr.Uid, hdr.Gid), target)
 				execCtx.Run(chownCmd) // best effort
 			}
@@ -308,37 +331,52 @@ func copyTreeWithTar(src, dst string, execCtx *Executor) error {
 
 		case tar.TypeReg:
 			// Write file content
-			outFile, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, os.FileMode(hdr.Mode))
-			if err != nil {
-				if execCtx.ShouldRunAsRoot {
-					// Create file via shell redirection
-					var content bytes.Buffer
-					if _, err := io.Copy(&content, tr); err != nil {
-						return fmt.Errorf("failed to read file content: %w", err)
-					}
-
-					// Write via dd for privilege escalation
-					ddCmd := exec.Command("dd", "of="+target, "status=none")
-					ddCmd.Stdin = &content
-					if err := execCtx.Run(ddCmd); err != nil {
-						return fmt.Errorf("failed to write file %s with privileges: %w", target, err)
-					}
-
-					chmodCmd := exec.Command("chmod", fmt.Sprintf("%o", hdr.Mode), target)
-					execCtx.Run(chmodCmd) // best effort
-				} else {
-					return fmt.Errorf("failed to create file %s: %w", target, err)
+			if os.Geteuid() == 0 {
+				outFile, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, os.FileMode(hdr.Mode))
+				if err != nil {
+					return fmt.Errorf("failed to create file %s natively: %w", target, err)
 				}
-			} else {
 				if _, err := io.Copy(outFile, tr); err != nil {
 					outFile.Close()
-					return fmt.Errorf("failed to write file %s: %w", target, err)
+					return fmt.Errorf("failed to write file %s natively: %w", target, err)
 				}
 				outFile.Close()
+				_ = os.Chown(target, hdr.Uid, hdr.Gid)
+			} else {
+				outFile, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, os.FileMode(hdr.Mode))
+				if err != nil {
+					if execCtx.ShouldRunAsRoot {
+						// Create file via shell redirection
+						var content bytes.Buffer
+						if _, err := io.Copy(&content, tr); err != nil {
+							return fmt.Errorf("failed to read file content: %w", err)
+						}
+
+						// Write via dd for privilege escalation
+						ddCmd := exec.Command("dd", "of="+target, "status=none")
+						ddCmd.Stdin = &content
+						if err := execCtx.Run(ddCmd); err != nil {
+							return fmt.Errorf("failed to write file %s with privileges: %w", target, err)
+						}
+
+						chmodCmd := exec.Command("chmod", fmt.Sprintf("%o", hdr.Mode), target)
+						execCtx.Run(chmodCmd) // best effort
+					} else {
+						return fmt.Errorf("failed to create file %s: %w", target, err)
+					}
+				} else {
+					if _, err := io.Copy(outFile, tr); err != nil {
+						outFile.Close()
+						return fmt.Errorf("failed to write file %s: %w", target, err)
+					}
+					outFile.Close()
+				}
 			}
 
 			// Set ownership and times
-			if execCtx.ShouldRunAsRoot {
+			if os.Geteuid() == 0 {
+				_ = os.Chown(target, hdr.Uid, hdr.Gid)
+			} else if execCtx.ShouldRunAsRoot {
 				chownCmd := exec.Command("chown", fmt.Sprintf("%d:%d", hdr.Uid, hdr.Gid), target)
 				execCtx.Run(chownCmd) // best effort
 			}
@@ -349,6 +387,9 @@ func copyTreeWithTar(src, dst string, execCtx *Executor) error {
 			os.Remove(target)
 
 			if err := os.Symlink(hdr.Linkname, target); err != nil {
+				if os.Geteuid() == 0 {
+					return fmt.Errorf("failed to create symlink %s natively: %w", target, err)
+				}
 				if execCtx.ShouldRunAsRoot {
 					lnCmd := exec.Command("ln", "-sf", hdr.Linkname, target)
 					if err := execCtx.Run(lnCmd); err != nil {
@@ -360,7 +401,9 @@ func copyTreeWithTar(src, dst string, execCtx *Executor) error {
 			}
 
 			// Set ownership on the symlink itself
-			if execCtx.ShouldRunAsRoot {
+			if os.Geteuid() == 0 {
+				_ = unix.Lchown(target, hdr.Uid, hdr.Gid)
+			} else if execCtx.ShouldRunAsRoot {
 				chownCmd := exec.Command("chown", "-h", fmt.Sprintf("%d:%d", hdr.Uid, hdr.Gid), target)
 				execCtx.Run(chownCmd) // best effort
 			}
@@ -371,6 +414,9 @@ func copyTreeWithTar(src, dst string, execCtx *Executor) error {
 			os.Remove(target)
 
 			if err := os.Link(linkTarget, target); err != nil {
+				if os.Geteuid() == 0 {
+					return fmt.Errorf("failed to create hard link %s natively: %w", target, err)
+				}
 				if execCtx.ShouldRunAsRoot {
 					lnCmd := exec.Command("ln", linkTarget, target)
 					if err := execCtx.Run(lnCmd); err != nil {
@@ -517,6 +563,17 @@ func getModifiedFiles(pkgName, rootDir string, execCtx *Executor) ([]string, err
 }
 
 func isDirectoryPrivileged(path string, execCtx *Executor) (bool, error) {
+	if os.Geteuid() == 0 || !execCtx.ShouldRunAsRoot {
+		info, err := os.Stat(path)
+		if err != nil {
+			if os.IsNotExist(err) {
+				return false, nil
+			}
+			return false, err
+		}
+		return info.IsDir(), nil
+	}
+
 	// We use the shell 'test -d <path>' command.
 	// It returns exit code 0 if the path is a directory, 1 otherwise.
 	// Since this command is simple, we run it directly through the Executor.
