@@ -65,10 +65,16 @@ func saveAlternative(pkgName, filePath, sourcePkg, originalPkg, sourceFile strin
 		debugf("Source file is a symlink: %s -> %s\n", sourceFile, symlinkTarget)
 	}
 
-	// Create directory using executor (may need root permissions)
-	mkdirCmd := exec.Command("mkdir", "-p", altDir)
-	if err := execCtx.Run(mkdirCmd); err != nil {
-		return fmt.Errorf("failed to create alternatives directory %s: %w", altDir, err)
+	// Create directory using native or executor
+	if os.Geteuid() == 0 {
+		if err := os.MkdirAll(altDir, 0755); err != nil {
+			return fmt.Errorf("failed to create alternatives directory %s natively: %w", altDir, err)
+		}
+	} else {
+		mkdirCmd := exec.Command("mkdir", "-p", altDir)
+		if err := execCtx.Run(mkdirCmd); err != nil {
+			return fmt.Errorf("failed to create alternatives directory %s: %w", altDir, err)
+		}
 	}
 	debugf("Created alternatives directory: %s\n", altDir)
 
@@ -78,10 +84,17 @@ func saveAlternative(pkgName, filePath, sourcePkg, originalPkg, sourceFile strin
 	altFilePath := filepath.Join(altDir, altFileName)
 	debugf("Copying %s to %s\n", sourceFile, altFilePath)
 
-	// Use cp -a to preserve symlinks (--no-dereference) and all attributes
-	cpCmd := exec.Command("cp", "-a", sourceFile, altFilePath)
-	if err := execCtx.Run(cpCmd); err != nil {
-		return fmt.Errorf("failed to copy alternative file from %s to %s: %w", sourceFile, altFilePath, err)
+	// Copy using native if root, else executor
+	if os.Geteuid() == 0 {
+		if err := copyFile(sourceFile, altFilePath); err != nil {
+			return fmt.Errorf("failed to copy alternative file natively from %s to %s: %w", sourceFile, altFilePath, err)
+		}
+	} else {
+		// Use cp -a to preserve symlinks (--no-dereference) and all attributes
+		cpCmd := exec.Command("cp", "-a", sourceFile, altFilePath)
+		if err := execCtx.Run(cpCmd); err != nil {
+			return fmt.Errorf("failed to copy alternative file from %s to %s: %w", sourceFile, altFilePath, err)
+		}
 	}
 	debugf("Successfully copied alternative file\n")
 
@@ -157,15 +170,22 @@ func saveAlternative(pkgName, filePath, sourcePkg, originalPkg, sourceFile strin
 		return fmt.Errorf("failed to close temp file: %w", err)
 	}
 
-	// Copy temp file to final location using executor (may need root permissions)
-	cpCmd = exec.Command("cp", tmpFilePath, metadataFile)
-	if err = execCtx.Run(cpCmd); err != nil {
-		return fmt.Errorf("failed to write metadata file: %w", err)
-	}
-	// Set permissions so the file is readable by all (needed for listing)
-	chmodCmd := exec.Command("chmod", "644", metadataFile)
-	if err = execCtx.Run(chmodCmd); err != nil {
-		debugf("Warning: failed to set permissions on metadata file: %v\n", err)
+	// Copy using native if root, else executor
+	if os.Geteuid() == 0 {
+		if err = os.WriteFile(metadataFile, data, 0644); err != nil {
+			return fmt.Errorf("failed to write metadata file natively: %w", err)
+		}
+	} else {
+		// Copy temp file to final location using executor (may need root permissions)
+		cpCmd := exec.Command("cp", tmpFilePath, metadataFile)
+		if err = execCtx.Run(cpCmd); err != nil {
+			return fmt.Errorf("failed to write metadata file: %w", err)
+		}
+		// Set permissions so the file is readable by all (needed for listing)
+		chmodCmd := exec.Command("chmod", "644", metadataFile)
+		if err = execCtx.Run(chmodCmd); err != nil {
+			debugf("Warning: failed to set permissions on metadata file: %v\n", err)
+		}
 	}
 
 	debugf("Saved alternative for %s: source=%s, sourcePkg=%s, originalPkg=%s\n", filePath, sourceFile, sourcePkg, originalPkg)
@@ -224,10 +244,16 @@ func switchToAlternative(pkgName, filePath string, execCtx *Executor) error {
 
 	// Backup the original file if it exists
 	backupDir := filepath.Join(getAlternativesDir(pkgName), "backup")
-	// Use root executor for directory creation (may need root permissions)
-	mkdirCmd := exec.Command("mkdir", "-p", backupDir)
-	if err := RootExec.Run(mkdirCmd); err != nil {
-		return fmt.Errorf("failed to create backup directory: %w", err)
+	if os.Geteuid() == 0 {
+		if err := os.MkdirAll(backupDir, 0755); err != nil {
+			return fmt.Errorf("failed to create backup directory natively: %w", err)
+		}
+	} else {
+		// Use root executor for directory creation (may need root permissions)
+		mkdirCmd := exec.Command("mkdir", "-p", backupDir)
+		if err := RootExec.Run(mkdirCmd); err != nil {
+			return fmt.Errorf("failed to create backup directory: %w", err)
+		}
 	}
 
 	backupFileName := strings.ReplaceAll(strings.TrimPrefix(filePath, "/"), "/", "_")
@@ -263,11 +289,17 @@ func switchToAlternative(pkgName, filePath string, execCtx *Executor) error {
 			}
 		}
 
-		// Backup current file - use root executor (may need root permissions)
-		// Use cp -a to preserve symlinks
-		cpCmd := exec.Command("cp", "-a", targetFile, backupFilePath)
-		if err := RootExec.Run(cpCmd); err != nil {
-			return fmt.Errorf("failed to backup current file: %w", err)
+		// Backup current file - use native if root, else executor
+		if os.Geteuid() == 0 {
+			if err := copyFile(targetFile, backupFilePath); err != nil {
+				return fmt.Errorf("failed to backup current file natively: %w", err)
+			}
+		} else {
+			// Use cp -a to preserve symlinks
+			cpCmd := exec.Command("cp", "-a", targetFile, backupFilePath)
+			if err := RootExec.Run(cpCmd); err != nil {
+				return fmt.Errorf("failed to backup current file: %w", err)
+			}
 		}
 
 		// Also capture the backup file's stat and store it in metadata
@@ -298,10 +330,15 @@ func switchToAlternative(pkgName, filePath string, execCtx *Executor) error {
 							defer os.Remove(tmpFilePath)
 							if _, err = tmpFile.Write(data); err == nil {
 								if err = tmpFile.Close(); err == nil {
-									cpCmd := exec.Command("cp", tmpFilePath, metadataFile)
-									RootExec.Run(cpCmd)
-									chmodCmd := exec.Command("chmod", "644", metadataFile)
-									RootExec.Run(chmodCmd)
+									if os.Geteuid() == 0 {
+										os.Rename(tmpFilePath, metadataFile)
+										os.Chmod(metadataFile, 0644)
+									} else {
+										cpCmd := exec.Command("cp", tmpFilePath, metadataFile)
+										RootExec.Run(cpCmd)
+										chmodCmd := exec.Command("chmod", "644", metadataFile)
+										RootExec.Run(chmodCmd)
+									}
 								}
 							}
 						}
@@ -311,11 +348,17 @@ func switchToAlternative(pkgName, filePath string, execCtx *Executor) error {
 		}
 	}
 
-	// Copy alternative file to target location - use root executor (may need root permissions)
-	// Use cp -a to preserve symlinks
-	cpCmd := exec.Command("cp", "-a", altFilePath, targetFile)
-	if err := RootExec.Run(cpCmd); err != nil {
-		return fmt.Errorf("failed to install alternative file: %w", err)
+	// Copy alternative file to target location - use native if root, else executor
+	if os.Geteuid() == 0 {
+		if err := copyFile(altFilePath, targetFile); err != nil {
+			return fmt.Errorf("failed to install alternative file natively: %w", err)
+		}
+	} else {
+		// Use cp -a to preserve symlinks
+		cpCmd := exec.Command("cp", "-a", altFilePath, targetFile)
+		if err := RootExec.Run(cpCmd); err != nil {
+			return fmt.Errorf("failed to install alternative file: %w", err)
+		}
 	}
 
 	// Load metadata to get the original file's permissions and apply them to the alternative file
@@ -352,11 +395,17 @@ func switchToAlternative(pkgName, filePath string, execCtx *Executor) error {
 
 		// Apply ownership to the alternative file (so it matches the original file's ownership)
 		if restoreUID != 0 || restoreGID != 0 {
-			chownCmd := exec.Command("chown", fmt.Sprintf("%d:%d", restoreUID, restoreGID), targetFile)
-			if err := RootExec.Run(chownCmd); err != nil {
-				debugf("Warning: failed to set ownership on alternative file: %v\n", err)
+			if os.Geteuid() == 0 {
+				if err := os.Chown(targetFile, restoreUID, restoreGID); err != nil {
+					debugf("Warning: failed to set ownership on alternative file natively: %v\n", err)
+				}
 			} else {
-				debugf("Applied ownership %d:%d to alternative file %s\n", restoreUID, restoreGID, targetFile)
+				chownCmd := exec.Command("chown", fmt.Sprintf("%d:%d", restoreUID, restoreGID), targetFile)
+				if err := RootExec.Run(chownCmd); err != nil {
+					debugf("Warning: failed to set ownership on alternative file: %v\n", err)
+				} else {
+					debugf("Applied ownership %d:%d to alternative file %s\n", restoreUID, restoreGID, targetFile)
+				}
 			}
 		}
 
@@ -410,11 +459,17 @@ func switchToOriginal(pkgName, filePath string, execCtx *Executor) error {
 		return fmt.Errorf("original file backup not found: %s", backupFilePath)
 	}
 
-	// Restore original file from backup - use root executor (may need root permissions)
-	// Use cp -a to preserve symlinks
-	cpCmd := exec.Command("cp", "-a", backupFilePath, targetFile)
-	if err := RootExec.Run(cpCmd); err != nil {
-		return fmt.Errorf("failed to restore original file: %w", err)
+	// Restore original file from backup - use native if root, else executor
+	if os.Geteuid() == 0 {
+		if err := copyFile(backupFilePath, targetFile); err != nil {
+			return fmt.Errorf("failed to restore original file natively: %w", err)
+		}
+	} else {
+		// Use cp -a to preserve symlinks
+		cpCmd := exec.Command("cp", "-a", backupFilePath, targetFile)
+		if err := RootExec.Run(cpCmd); err != nil {
+			return fmt.Errorf("failed to restore original file: %w", err)
+		}
 	}
 
 	// Restore permissions and ownership from metadata
@@ -626,11 +681,19 @@ func restoreAlternativesOnUninstall(pkgName string, execCtx *Executor, hRoot str
 					continue
 				}
 
-				// Use cp -a to preserve symlinks
-				cpCmd := exec.Command("cp", "-a", altFilePath, targetFile)
-				if err := RootExec.Run(cpCmd); err != nil {
-					debugf("Warning: failed to restore alternative file for %s: %v\n", filePath, err)
-					continue
+				// Use native if root, else executor
+				if os.Geteuid() == 0 {
+					if err := copyFile(altFilePath, targetFile); err != nil {
+						debugf("Warning: failed to restore alternative file natively for %s: %v\n", filePath, err)
+						continue
+					}
+				} else {
+					// Use cp -a to preserve symlinks
+					cpCmd := exec.Command("cp", "-a", altFilePath, targetFile)
+					if err := RootExec.Run(cpCmd); err != nil {
+						debugf("Warning: failed to restore alternative file for %s: %v\n", filePath, err)
+						continue
+					}
 				}
 
 				// Restore permissions and ownership
