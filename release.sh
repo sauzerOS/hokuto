@@ -12,9 +12,10 @@ export CGO_ENABLED=0            # set 0 to avoid cgo and produce static bin when
 go build -trimpath -o hokuto-amd64 \
   -ldflags="-s -w -X 'hokuto/internal/hokuto.version=${VERSION}' \
   -X 'hokuto/internal/hokuto.buildDate=${BUILD_DATE}' \
--X 'hokuto/internal/hokuto.defaultBinaryMirror=${MIRROR}'" \
+  -X 'hokuto/internal/hokuto.defaultBinaryMirror=${MIRROR}'" \
   ./cmd/hokuto
 tar cvfJ hokuto-$VERSION-amd64.tar.xz hokuto-amd64
+./hokuto-amd64 sign-file hokuto-$VERSION-amd64.tar.xz
 
 # build arm64
 export GOOS=linux
@@ -23,9 +24,10 @@ export CGO_ENABLED=0            # set 0 to avoid cgo and produce static bin when
 go build -trimpath -o hokuto-arm64 \
   -ldflags="-s -w -X 'hokuto/internal/hokuto.version=${VERSION}' \
   -X 'hokuto/internal/hokuto.buildDate=${BUILD_DATE}' \
--X 'hokuto/internal/hokuto.defaultBinaryMirror=${MIRROR}'" \
+  -X 'hokuto/internal/hokuto.defaultBinaryMirror=${MIRROR}'" \
   ./cmd/hokuto
 tar cvfJ hokuto-$VERSION-arm64.tar.xz hokuto-arm64
+./hokuto-amd64 sign-file hokuto-$VERSION-arm64.tar.xz
 
 # Check if tag exists locally
 if git rev-parse "$TAG" >/dev/null 2>&1; then
@@ -49,6 +51,8 @@ if gh release view "v$VERSION" >/dev/null 2>&1; then
     gh release upload "v$VERSION" \
         hokuto-$VERSION-amd64.tar.xz \
         hokuto-$VERSION-arm64.tar.xz \
+        hokuto-$VERSION-amd64.tar.xz.sig \
+        hokuto-$VERSION-arm64.tar.xz.sig \
         --clobber
 else
     tmpfile=$(mktemp)
@@ -56,11 +60,13 @@ else
     gh release create "v$VERSION" \
         hokuto-$VERSION-amd64.tar.xz \
         hokuto-$VERSION-arm64.tar.xz \
+        hokuto-$VERSION-amd64.tar.xz.sig \
+        hokuto-$VERSION-arm64.tar.xz.sig \
         --title "hokuto v$VERSION" \
         --notes-file "$tmpfile"
      rm "$tmpfile"
 fi
 
 # cleanup
-rm -f hokuto-$VERSION-arm64.tar.xz hokuto-arm64
-rm -f hokuto-$VERSION-amd64.tar.xz hokuto-amd64
+rm -f hokuto-$VERSION-arm64.tar.xz hokuto-arm64 hokuto-$VERSION-arm64.tar.xz.sig
+rm -f hokuto-$VERSION-amd64.tar.xz hokuto-amd64 hokuto-$VERSION-amd64.tar.xz.sig

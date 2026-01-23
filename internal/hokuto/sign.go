@@ -128,16 +128,16 @@ func WritePackageInfo(stagingDir, pkgName, pkgVer, pkgRev, arch, cflags string, 
 
 // getPrivateKey loads the Ed25519 private key based on activeKeyID.
 func getPrivateKey() (ed25519.PrivateKey, error) {
-	keyPath := filepath.Join("/etc/hokuto", activeKeyID+".key")
+	keyPath := filepath.Join("/etc/hokuto/keys", activeKeyID+".key")
 	if root := os.Getenv("HOKUTO_ROOT"); root != "" {
-		keyPath = filepath.Join(root, "etc", "hokuto", activeKeyID+".key")
+		keyPath = filepath.Join(root, "etc", "hokuto", "keys", activeKeyID+".key")
 	}
 
 	// Handle the default case where officialKeyID refers to hokuto.key
 	if activeKeyID == officialKeyID {
-		keyPath = filepath.Join("/etc/hokuto", "hokuto.key")
+		keyPath = filepath.Join("/etc/hokuto/keys", "hokuto.key")
 		if root := os.Getenv("HOKUTO_ROOT"); root != "" {
-			keyPath = filepath.Join(root, "etc", "hokuto", "hokuto.key")
+			keyPath = filepath.Join(root, "etc", "hokuto", "keys", "hokuto.key")
 		}
 	}
 
@@ -174,13 +174,13 @@ func GenerateKeyPair(id string, execCtx *Executor) error {
 		return fmt.Errorf("failed to generate key pair: %w", err)
 	}
 
-	keyDir := "/etc/hokuto"
+	keyDir := "/etc/hokuto/keys"
 	if root := os.Getenv("HOKUTO_ROOT"); root != "" {
-		keyDir = filepath.Join(root, "etc", "hokuto")
+		keyDir = filepath.Join(root, "etc", "hokuto", "keys")
 	}
 
 	privPath := filepath.Join(keyDir, id+".key")
-	pubPath := filepath.Join(keyDir, "keys", id+".pub")
+	pubPath := filepath.Join(keyDir, id+".pub")
 
 	// Ensure directories exist
 	if os.Geteuid() == 0 {
@@ -325,8 +325,30 @@ func VerifySignatureRaw(data, sigHex, pubKeyBytes []byte) error {
 	return nil
 }
 
-// PromptForMasterPrivateKey securely prompts the user for the master private key.
+// PromptForMasterPrivateKey securely prompts the user for the master private key,
+// but first checks if hokuto.key exists in the local keyring.
 func PromptForMasterPrivateKey() (ed25519.PrivateKey, error) {
+	keyPath := filepath.Join("/etc/hokuto/keys", "hokuto.key")
+	if root := os.Getenv("HOKUTO_ROOT"); root != "" {
+		keyPath = filepath.Join(root, "etc", "hokuto", "keys", "hokuto.key")
+	}
+
+	if data, err := os.ReadFile(keyPath); err == nil {
+		debugf("Using master private key from %s\n", keyPath)
+		trimmedKey := strings.TrimSpace(string(data))
+		if len(trimmedKey) == 128 {
+			decoded, err := hex.DecodeString(trimmedKey)
+			if err == nil && len(decoded) == 64 {
+				priv := ed25519.PrivateKey(decoded)
+				pub := priv.Public().(ed25519.PublicKey)
+				masterPubKeyBytes, _ := hex.DecodeString(officialPublicKeyHex)
+				if hex.EncodeToString(pub) == hex.EncodeToString(masterPubKeyBytes) {
+					return priv, nil
+				}
+			}
+		}
+	}
+
 	fmt.Print("Enter Master Private Key (hex): ")
 	bytePassword, err := term.ReadPassword(int(syscall.Stdin))
 	fmt.Println() // New line after password entry

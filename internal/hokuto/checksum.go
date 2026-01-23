@@ -6,6 +6,7 @@ package hokuto
 import (
 	"bufio"
 	"bytes"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"os"
@@ -269,6 +270,35 @@ func verifyOrCreateChecksums(pkgName, pkgDir string, force bool) error {
 	for _, s := range summary {
 		colArrow.Print("-> ")
 		colSuccess.Println("Checksum", s)
+	}
+
+	// 6. SIGNATURE VERIFICATION PASS: Check all files for accompanying signatures
+	for _, fname := range expectedFiles {
+		if strings.HasSuffix(fname, ".sig") {
+			continue
+		}
+		filePath := filepath.Join(pkgSrcDir, fname)
+		sigPath := filePath + ".sig"
+
+		if _, err := os.Stat(sigPath); err == nil {
+			sigData, err := os.ReadFile(sigPath)
+			if err != nil {
+				return fmt.Errorf("failed to read signature file %s: %v", sigPath, err)
+			}
+			fileData, err := os.ReadFile(filePath)
+			if err != nil {
+				return fmt.Errorf("failed to read file for verification %s: %v", filePath, err)
+			}
+
+			masterPubKeyBytes, _ := hex.DecodeString(officialPublicKeyHex)
+			if err := VerifySignatureRaw(fileData, sigData, masterPubKeyBytes); err != nil {
+				colArrow.Print("-> ")
+				colError.Printf("SIGNATURE VERIFICATION FAILED for %s: %v\n", fname, err)
+				return fmt.Errorf("signature verification failed for %s", fname)
+			}
+			colArrow.Print("-> ")
+			colSuccess.Printf("Signature verified for %s\n", fname)
+		}
 	}
 
 	return nil

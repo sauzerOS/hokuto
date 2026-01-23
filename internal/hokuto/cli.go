@@ -2,6 +2,7 @@ package hokuto
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
@@ -359,6 +360,16 @@ func Main() {
 	case "keys":
 		if err := handleKeysCommand(os.Args[2:], cfg); err != nil {
 			fmt.Fprintf(os.Stderr, "Keys command failed: %v\n", err)
+			os.Exit(1)
+		}
+
+	case "sign-file":
+		if len(os.Args) < 3 {
+			fmt.Println("Usage: hokuto sign-file <path>")
+			os.Exit(1)
+		}
+		if err := handleSignFileCommand(os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "Sign-file failed: %v\n", err)
 			os.Exit(1)
 		}
 
@@ -1152,5 +1163,33 @@ func handleKeysCommand(args []string, cfg *Config) error {
 		colNote.Printf("  %-15s ", e.ID)
 		fmt.Printf("%s\n", e.Pub)
 	}
+	return nil
+}
+
+func handleSignFileCommand(args []string) error {
+	if len(args) < 1 {
+		return fmt.Errorf("missing file path")
+	}
+	path := args[0]
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("failed to read file: %w", err)
+	}
+
+	priv, err := PromptForMasterPrivateKey()
+	if err != nil {
+		return err
+	}
+
+	sig := SignData(data, priv)
+	sigHex := hex.EncodeToString(sig)
+
+	sigPath := path + ".sig"
+	if err := os.WriteFile(sigPath, []byte(sigHex), 0644); err != nil {
+		return fmt.Errorf("failed to write signature: %w", err)
+	}
+	colArrow.Printf("-> ")
+	colSuccess.Printf("Signature written to %s\n", sigPath)
 	return nil
 }
