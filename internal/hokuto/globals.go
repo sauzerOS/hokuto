@@ -30,6 +30,8 @@ var (
 	Debug                bool
 	Verbose              bool
 	WantLTO              string
+	VerifySignature      bool
+	HokutoGeneric        bool
 	newPackageDir        string
 	setIdlePriority      bool
 	buildPriority        string

@@ -29,6 +29,8 @@ func needsRootPrivileges(args []string) bool {
 		"u":         true,
 		"chroot":    true,
 		"cleanup":   true,
+		"settings":  true,
+		"alt":       true,
 	}
 
 	if rootCommands[cmd] {

@@ -277,7 +277,7 @@ func VerifyPackageSignature(stagingDir, pkgName string, execCtx *Executor) error
 	// Check if signature exists
 	if _, err := os.Stat(signaturePath); os.IsNotExist(err) {
 		// If verification is enforced, this is an error
-		if os.Getenv("HOKUTO_VERIFY_SIGNATURE") != "0" {
+		if VerifySignature {
 			return fmt.Errorf("MISSING SIGNATURE: package %s is not signed and signature verification is enforced", pkgName)
 		}
 		debugf("Warning: package %s is not signed, skipping verification\n", pkgName)

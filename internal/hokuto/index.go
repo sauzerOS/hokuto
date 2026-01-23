@@ -48,7 +48,7 @@ func GetSystemVariant(cfg *Config) string {
 // If multilib is enabled and the package supports it, returns "multi-generic" or "multi-optimized".
 func GetSystemVariantForPackage(cfg *Config, pkgName string) string {
 	baseVariant := "optimized"
-	if cfg.Values["HOKUTO_GENERIC"] == "1" || cfg.Values["HOKUTO_CROSS_ARCH"] != "" {
+	if HokutoGeneric || cfg.Values["HOKUTO_GENERIC"] == "1" || cfg.Values["HOKUTO_CROSS_ARCH"] != "" {
 		baseVariant = "generic"
 	}
 

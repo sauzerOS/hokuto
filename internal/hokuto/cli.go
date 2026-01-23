@@ -53,6 +53,7 @@ func printHelp() {
 		{"cleanup", "[options]", "Cleanup caches"},
 		{"python-rebuild", "", "Rebuild all python packages"},
 		{"alt", "<pkg>", "List packages with alternatives or show/switch alternatives for a package"},
+		{"settings", "", "Manage hokuto configuration interactively"},
 		{"init-repos", "", "Initialize repositories"},
 		{"upload", "", "Upload local binaries to R2 and update index"},
 	}
@@ -333,6 +334,12 @@ func Main() {
 	case "alt":
 		if err := handleAlternativesCommand(os.Args[2:]); err != nil {
 			fmt.Fprintf(os.Stderr, "Alternatives command failed: %v\n", err)
+			os.Exit(1)
+		}
+
+	case "settings":
+		if err := handleSettingsCommand(cfg); err != nil {
+			fmt.Fprintf(os.Stderr, "Settings command failed: %v\n", err)
 			os.Exit(1)
 		}
 

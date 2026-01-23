@@ -2,10 +2,13 @@ package hokuto
 
 import (
 	"bufio"
+	"fmt"
 	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 )
 
@@ -122,6 +125,16 @@ func initConfig(cfg *Config) {
 		cfg.DefaultLTO = true
 	}
 
+	VerifySignature = true
+	if cfg.Values["HOKUTO_VERIFY_SIGNATURE"] == "0" {
+		VerifySignature = false
+	}
+
+	HokutoGeneric = false
+	if cfg.Values["HOKUTO_GENERIC"] == "1" {
+		HokutoGeneric = true
+	}
+
 	// Multilib is only supported on x86_64 architecture
 	// Automatically disable for aarch64 and other architectures
 	EnableMultilib = false
@@ -164,4 +177,77 @@ func initConfig(cfg *Config) {
 	WorldMakeFile = filepath.Join(rootDir, "/var/db/hokuto/world_make")
 	LockFile = filepath.Join(rootDir, "/etc/hokuto/hokuto.lock")
 	newPackageDir = "/repo/sauzeros/extra" // default for 'hokuto new'
+}
+
+// saveConfig writes the current configuration map to /etc/hokuto/hokuto.conf
+func saveConfig(path string, cfg *Config) error {
+	// 1. Prepare data
+	var data strings.Builder
+	keys := make([]string, 0, len(cfg.Values))
+	for k := range cfg.Values {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		data.WriteString(fmt.Sprintf("%s=%s\n", k, cfg.Values[k]))
+	}
+	content := []byte(data.String())
+
+	// 2. Write if root or destination is writable
+	if os.Geteuid() == 0 {
+		if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+			return err
+		}
+		return os.WriteFile(path, content, 0644)
+	}
+
+	// 3. Fallback: Write to temp file and move with RootExec
+	tmp, err := os.CreateTemp("", "hokuto-conf-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+
+	if _, err := tmp.Write(content); err != nil {
+		tmp.Close()
+		return err
+	}
+	tmp.Close()
+
+	// Ensure destination directory exists
+	mkdirCmd := exec.Command("mkdir", "-p", filepath.Dir(path))
+	if err := RootExec.Run(mkdirCmd); err != nil {
+		return fmt.Errorf("failed to create config directory: %w", err)
+	}
+
+	// Move temp file to path
+	mvCmd := exec.Command("mv", tmpPath, path)
+	if err := RootExec.Run(mvCmd); err != nil {
+		return fmt.Errorf("failed to save config file: %w", err)
+	}
+
+	// Set permissions
+	chmodCmd := exec.Command("chmod", "644", path)
+	_ = RootExec.Run(chmodCmd)
+
+	return nil
+}
+
+// setConfigValue updates a value in the config map and saves it to disk
+func setConfigValue(cfg *Config, key, value string) error {
+	cfg.Values[key] = value
+
+	configPath := ConfigFile
+	if root := os.Getenv("HOKUTO_ROOT"); root != "" {
+		configPath = filepath.Join(root, "etc", "hokuto", "hokuto.conf")
+	}
+
+	if err := saveConfig(configPath, cfg); err != nil {
+		return err
+	}
+
+	// Re-initialize globals
+	initConfig(cfg)
+	return nil
 }
