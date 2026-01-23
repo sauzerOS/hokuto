@@ -1015,6 +1015,14 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 			}
 		}
 	}
+	// delete /usr/share/doc directory
+	docPath := filepath.Join(outputDir, "usr", "share", "doc")
+	if os.Geteuid() == 0 {
+		_ = os.RemoveAll(docPath)
+	} else {
+		docRmCmd := exec.Command("rm", "-rf", docPath)
+		_ = buildExec.Run(docRmCmd)
+	}
 
 	// Compress build log to package metadata
 	logXZPath := filepath.Join(installedDir, "log.xz")
@@ -1771,6 +1779,15 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 				}
 			}
 		}
+	}
+
+	// delete /usr/share/doc directory
+	docPath := filepath.Join(outputDir, "usr", "share", "doc")
+	if os.Geteuid() == 0 {
+		_ = os.RemoveAll(docPath)
+	} else {
+		docRmCmd := exec.Command("rm", "-rf", docPath)
+		_ = buildExec.Run(docRmCmd)
 	}
 
 	// Compress build log to package metadata
