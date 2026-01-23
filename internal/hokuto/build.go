@@ -2197,14 +2197,16 @@ func handleBuildCommand(args []string, cfg *Config) error {
 			tarballPath := filepath.Join(BinDir, StandardizeRemoteName(outputPkgName, version, revision, arch, variant))
 			isCriticalAtomic.Store(1)
 			handlePreInstallUninstall(outputPkgName, cfg, RootExec)
+			if installErr := pkgInstall(tarballPath, outputPkgName, cfg, RootExec, true); installErr != nil {
+				isCriticalAtomic.Store(0)
+				colArrow.Print("-> ")
+				color.Danger.Printf("Installation failed for %s: %v\n", outputPkgName, installErr)
+				failedBuilds[pkgName] = fmt.Errorf("post-build installation failed: %w", installErr)
+				goto BuildSummary // Fatal error, abort
+			}
 			colArrow.Print("-> ")
 			colSuccess.Printf("Installing:")
 			colNote.Printf(" %s (%d/%d)\n", outputPkgName, i+1, totalBuildCount)
-			if installErr := pkgInstall(tarballPath, outputPkgName, cfg, RootExec, true); installErr != nil {
-				isCriticalAtomic.Store(0)
-				failedBuilds[pkgName] = fmt.Errorf("post-build installation failed: %w", installErr)
-				break // Fatal error
-			}
 			// Add to world file
 			// Only add if user specifically asked for this package
 			if userRequestedMap[pkgName] {
@@ -2396,17 +2398,20 @@ func handleBuildCommand(args []string, cfg *Config) error {
 						tarballPath := filepath.Join(BinDir, StandardizeRemoteName(outputFinalPkg, version, revision, arch, variant))
 						isCriticalAtomic.Store(1)
 						handlePreInstallUninstall(outputFinalPkg, cfg, RootExec)
-						colArrow.Print("-> ")
-						colSuccess.Printf("Installing:")
-						colNote.Printf(" %s (%d/%d)\n", outputFinalPkg, i+1, len(targetsPass1))
 						if err := pkgInstall(tarballPath, outputFinalPkg, cfg, RootExec, false); err != nil {
 							isCriticalAtomic.Store(0)
+							colArrow.Print("-> ")
+							color.Danger.Printf("Installation failed for %s: %v\n", outputFinalPkg, err)
 							failedBuilds[finalPkg] = fmt.Errorf("final installation failed: %w", err)
+							goto BuildSummary // Abort the whole process
 						} else {
 							// Add package to world file
 							if userRequestedMap[finalPkg] {
 								addToWorld(finalPkg)
 							}
+							colArrow.Print("-> ")
+							colSuccess.Printf("Installing:")
+							colNote.Printf(" %s (%d/%d)\n", outputFinalPkg, i+1, len(targetsPass1))
 						}
 						isCriticalAtomic.Store(0)
 					}
@@ -2592,15 +2597,16 @@ func executeBuildPass(plan *BuildPlan, _ string, installAllTargets bool, cfg *Co
 					tarballPath := filepath.Join(BinDir, StandardizeRemoteName(outputPkgName, version, revision, arch, variant))
 					isCriticalAtomic.Store(1)
 					handlePreInstallUninstall(outputPkgName, cfg, RootExec)
+					if installErr := pkgInstall(tarballPath, outputPkgName, cfg, RootExec, true); installErr != nil {
+						isCriticalAtomic.Store(0)
+						colArrow.Print("-> ")
+						color.Danger.Printf("Installation failed for %s: %v\n", outputPkgName, installErr)
+						failed[pkgName] = fmt.Errorf("post-build installation failed: %w", installErr)
+						return failed, successfullyBuiltTargets, totalElapsedTime // Abort this pass
+					}
 					colArrow.Print("-> ")
 					colSuccess.Printf("Installing:")
 					colNote.Printf(" %s (%d/%d) Time: %s\n", outputPkgName, currentIndex, totalInPlan, duration.Truncate(time.Second))
-					if installErr := pkgInstall(tarballPath, outputPkgName, cfg, RootExec, true); installErr != nil {
-						isCriticalAtomic.Store(0)
-						failed[pkgName] = fmt.Errorf("post-build installation failed: %w", installErr)
-						// We must 'continue' here to stop processing this package's post-build actions.
-						continue
-					}
 					// Add to World file
 					// Only add if this was an explicit user target,
 					// NOT if it was just installed because it's a dependency (shouldInstallNow check logic)
@@ -2687,8 +2693,10 @@ func executeBuildPass(plan *BuildPlan, _ string, installAllTargets bool, cfg *Co
 						handlePreInstallUninstall(outputParent, cfg, RootExec)
 						if installErr := pkgInstall(tarballPath, outputParent, cfg, RootExec, true); installErr != nil {
 							isCriticalAtomic.Store(0)
-							color.Danger.Printf("Installation of rebuilt '%s' failed: %v\n", parent, installErr)
+							colArrow.Print("-> ")
+							color.Danger.Printf("Installation failed for rebuilt %s: %v\n", outputParent, installErr)
 							failed[parent] = fmt.Errorf("install of rebuilt '%s' failed: %w", parent, installErr)
+							return failed, successfullyBuiltTargets, totalElapsedTime // Abort
 						} else {
 							isCriticalAtomic.Store(0)
 							colArrow.Print("-> ")
@@ -2730,9 +2738,10 @@ func executeBuildPass(plan *BuildPlan, _ string, installAllTargets bool, cfg *Co
 					// Always run this non-interactively
 					if installErr := pkgInstall(tarballPath, outputRebuildPkg, cfg, RootExec, true); installErr != nil {
 						isCriticalAtomic.Store(0)
-						color.Danger.Printf("Installation of rebuilt '%s' failed: %v\n", rebuildPkg, installErr)
+						colArrow.Print("-> ")
+						color.Danger.Printf("Installation failed for post-build %s: %v\n", outputRebuildPkg, installErr)
 						failed[pkgName] = fmt.Errorf("install of post-built '%s' failed: %w", rebuildPkg, installErr)
-						break
+						return failed, successfullyBuiltTargets, totalElapsedTime // Abort
 					}
 					isCriticalAtomic.Store(0)
 				}
