@@ -482,7 +482,7 @@ func checkForUpgrades(_ context.Context, cfg *Config) error {
 	// If hokuto is in the list, we prioritize it and stop afterwards
 	if hokutoInUpdates {
 		colArrow.Printf("-> ")
-		colSuccess.Println("Updating Hokuto")
+		colSuccess.Printf("Updating Hokuto")
 		pkgNames = []string{"hokuto"}
 		// Re-initialize userRequestedMap for just hokuto
 		userRequestedMap = map[string]bool{"hokuto": true}
@@ -620,7 +620,7 @@ func checkForUpgrades(_ context.Context, cfg *Config) error {
 	}
 
 	if hokutoInUpdates && len(filteredUpgradeList) > 1 {
-		colArrow.Print("\n-> ")
+		colArrow.Print("-> ")
 		colSuccess.Println("Hokuto has been updated. Run 'hokuto update' again to complete the remaining updates.")
 		return nil
 	}

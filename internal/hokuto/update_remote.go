@@ -195,7 +195,7 @@ func checkForRemoteUpgrades(ctx context.Context, cfg *Config) error {
 	}
 
 	if hokutoInUpdates && len(upgradeList) > 1 {
-		colArrow.Print("\n-> ")
+		colArrow.Print("-> ")
 		colSuccess.Println("Hokuto has been updated. Run 'hokuto update' again to complete the remaining updates.")
 		return nil
 	}
