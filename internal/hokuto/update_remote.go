@@ -122,13 +122,20 @@ func checkForRemoteUpgrades(ctx context.Context, cfg *Config) error {
 		return nil
 	}
 
-	// Better strategy: Use resolveBuildPlan logic?
-	// resolveBuildPlan works for build.
-	// For binary install, we usually just loop.
-	// But valid ordering helps.
-	// Let's do a simple recursive resolve for deps, then append pkg.
-	// Since these are updates, we know they are installed.
-	// We care about MISSING dependencies (new deps introduced by new version).
+	// 5. Prioritize hokuto update
+	hokutoInUpdates := false
+	for _, pkg := range upgradeList {
+		if pkg.Name == "hokuto" {
+			hokutoInUpdates = true
+			break
+		}
+	}
+
+	if hokutoInUpdates {
+		colArrow.Printf("-> ")
+		colSuccess.Println("Updating Hokuto")
+		pkgNames = []string{"hokuto"}
+	}
 
 	// We'll iterate the upgrade list.
 	// For each package, we'll first ensure its dependencies are met (installing missing ones).
@@ -185,6 +192,12 @@ func checkForRemoteUpgrades(ctx context.Context, cfg *Config) error {
 			colArrow.Print("-> ")
 			colSuccess.Printf("Package %s updated successfully.\n", pkgName)
 		}
+	}
+
+	if hokutoInUpdates && len(upgradeList) > 1 {
+		colArrow.Print("\n-> ")
+		colSuccess.Println("Hokuto has been updated. Run 'hokuto update' again to complete the remaining updates.")
+		return nil
 	}
 
 	colArrow.Print("\n-> ")

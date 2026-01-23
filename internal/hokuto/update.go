@@ -471,8 +471,21 @@ func checkForUpgrades(_ context.Context, cfg *Config) error {
 
 	// 5. Build order and dependency resolution for the updates
 	userRequestedMap := make(map[string]bool)
+	hokutoInUpdates := false
 	for _, pkg := range pkgNames {
 		userRequestedMap[pkg] = true
+		if pkg == "hokuto" {
+			hokutoInUpdates = true
+		}
+	}
+
+	// If hokuto is in the list, we prioritize it and stop afterwards
+	if hokutoInUpdates {
+		colArrow.Printf("-> ")
+		colSuccess.Println("Updating Hokuto")
+		pkgNames = []string{"hokuto"}
+		// Re-initialize userRequestedMap for just hokuto
+		userRequestedMap = map[string]bool{"hokuto": true}
 	}
 
 	plan, err := resolveBuildPlan(pkgNames, userRequestedMap, false)
@@ -605,6 +618,13 @@ func checkForUpgrades(_ context.Context, cfg *Config) error {
 	if len(failedPackages) > 0 {
 		return fmt.Errorf("some packages failed to update: %s", strings.Join(failedPackages, ", "))
 	}
+
+	if hokutoInUpdates && len(filteredUpgradeList) > 1 {
+		colArrow.Print("\n-> ")
+		colSuccess.Println("Hokuto has been updated. Run 'hokuto update' again to complete the remaining updates.")
+		return nil
+	}
+
 	colArrow.Print("-> ")
 	colSuccess.Printf("System update completed successfully (%d/%d) Total Time: %s\n", totalToUpdate, totalToUpdate, totalUpdateDuration.Truncate(time.Second))
 	return nil
