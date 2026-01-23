@@ -58,6 +58,7 @@ func printHelp() {
 		{"init-repos", "", "Initialize repositories"},
 		{"upload", "", "Upload local binaries to R2 and update index"},
 		{"keys", "[--sync]", "Manage trusted public keys (keyring)"},
+		{"depends", "[--reverse] <pkg>", "Show package dependencies or reverse dependencies"},
 	}
 
 	// --- Dynamic Padding Logic ---
@@ -370,6 +371,12 @@ func Main() {
 		}
 		if err := handleSignFileCommand(os.Args[2:]); err != nil {
 			fmt.Fprintf(os.Stderr, "Sign-file failed: %v\n", err)
+			os.Exit(1)
+		}
+
+	case "depends":
+		if err := handleDependsCommand(os.Args[2:], cfg); err != nil {
+			fmt.Fprintf(os.Stderr, "Depends command failed: %v\n", err)
 			os.Exit(1)
 		}
 
@@ -1192,4 +1199,22 @@ func handleSignFileCommand(args []string) error {
 	colArrow.Printf("-> ")
 	colSuccess.Printf("Signature written to %s\n", sigPath)
 	return nil
+}
+
+func handleDependsCommand(args []string, cfg *Config) error {
+	dependsCmd := flag.NewFlagSet("depends", flag.ContinueOnError)
+	reverse := dependsCmd.Bool("reverse", false, "Show reverse dependencies")
+	dependsCmd.BoolVar(reverse, "r", false, "Show reverse dependencies (shorthand)")
+
+	if err := dependsCmd.Parse(args); err != nil {
+		return err
+	}
+
+	remaining := dependsCmd.Args()
+	if len(remaining) < 1 {
+		return fmt.Errorf("missing package name")
+	}
+
+	pkgName := remaining[0]
+	return ShowPackageDependencies(pkgName, *reverse, cfg)
 }

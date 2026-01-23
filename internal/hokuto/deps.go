@@ -936,3 +936,118 @@ type DepSpec struct {
 	Make         bool     // True if dependency is only needed at build time
 	Alternatives []string // List of alternative package names (e.g., ["rust", "rustup"] for "rust | rustup")
 }
+
+func ShowPackageDependencies(pkgName string, reverse bool, cfg *Config) error {
+	if reverse {
+		return showReverseDependencies(pkgName)
+	}
+	return showForwardDependencies(pkgName)
+}
+
+func showForwardDependencies(pkgName string) error {
+	// Try installed first
+	dependsPath := filepath.Join(Installed, pkgName, "depends")
+	data, err := os.ReadFile(dependsPath)
+	if err != nil {
+		// Try repo
+		pkgDir, findErr := findPackageDir(pkgName)
+		if findErr != nil {
+			return fmt.Errorf("package %s not found (installed or in repos)", pkgName)
+		}
+		dependsPath = filepath.Join(pkgDir, "depends")
+		data, err = os.ReadFile(dependsPath)
+		if err != nil {
+			if os.IsNotExist(err) {
+				fmt.Printf("Package %s has no dependencies.\n", pkgName)
+				return nil
+			}
+			return fmt.Errorf("failed to read depends file: %v", err)
+		}
+	}
+
+	if len(data) == 0 {
+		fmt.Printf("Package %s has no dependencies.\n", pkgName)
+		return nil
+	}
+	colArrow.Printf("-> ")
+	colSuccess.Printf("Dependencies for %s:\n", pkgName)
+	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		if line == "" {
+			continue
+		}
+		colArrow.Printf("-> ")
+		colNote.Println(line)
+	}
+	return nil
+}
+
+func showReverseDependencies(targetPkg string) error {
+	foundIn := make(map[string]bool)
+
+	// Scan installed
+	installedEntries, _ := os.ReadDir(Installed)
+	for _, entry := range installedEntries {
+		if !entry.IsDir() {
+			continue
+		}
+		dependsPath := filepath.Join(Installed, entry.Name(), "depends")
+		if containsDep(dependsPath, targetPkg) {
+			foundIn[entry.Name()] = true
+		}
+	}
+
+	// Scan repos
+	paths := strings.Split(repoPaths, ":")
+	for _, repo := range paths {
+		repoEntries, _ := os.ReadDir(repo)
+		for _, entry := range repoEntries {
+			if !entry.IsDir() {
+				continue
+			}
+			dependsPath := filepath.Join(repo, entry.Name(), "depends")
+			if containsDep(dependsPath, targetPkg) {
+				foundIn[entry.Name()] = true
+			}
+		}
+	}
+
+	if len(foundIn) == 0 {
+		fmt.Printf("No reverse dependencies found for %s.\n", targetPkg)
+		return nil
+	}
+
+	colArrow.Printf("-> ")
+	colSuccess.Printf("Packages depending on %s:\n", targetPkg)
+	var sorted []string
+	for k := range foundIn {
+		sorted = append(sorted, k)
+	}
+	sort.Strings(sorted)
+	for _, p := range sorted {
+		colArrow.Printf("-> ")
+		colNote.Println(p)
+	}
+	return nil
+}
+
+func containsDep(dependsPath, targetPkg string) bool {
+	content, err := os.ReadFile(dependsPath)
+	if err != nil {
+		return false
+	}
+	deps, err := parseDependsData(content)
+	if err != nil {
+		return false
+	}
+	for _, dep := range deps {
+		if dep.Name == targetPkg {
+			return true
+		}
+		for _, alt := range dep.Alternatives {
+			if alt == targetPkg {
+				return true
+			}
+		}
+	}
+	return false
+}
