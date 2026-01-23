@@ -482,8 +482,29 @@ func generateDepends(pkgName, pkgDir, outputDir, rootDir string, execCtx *Execut
 		delete(libDepSet, name)
 	}
 
+	// List of packages to ignore in auto-detected dependencies (Part 1/libdeps)
+	// Some binary packages (like antigravity) ship their own system libs and create false dependencies.
+	ignorePackages := []string{
+		"antigravity",
+		"brave-bin",
+		"cursor",
+		"google-chrome",
+	}
+
 	// Then, add library-only dependencies (just package names)
 	for dep := range libDepSet {
+		// Skip ignored packages
+		ignored := false
+		for _, p := range ignorePackages {
+			if dep == p {
+				ignored = true
+				break
+			}
+		}
+		if ignored {
+			continue
+		}
+
 		// Ignore aarch64- packages in auto-detected dependencies (Part 1/libdeps)
 		// unless they were explicitly listed in the repo depends file (Part 2).
 		// repoDepLines packages have already been removed from libDepSet at this point.
