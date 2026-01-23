@@ -13,6 +13,7 @@ import (
 
 // Embedded public key for hokuto package verification.
 // This is used to verify official repositories.
+const officialKeyID = "official"
 const officialPublicKeyHex = "b30f07098a4f98ec90bb169bdd49324d5e22fc09eab79e368e6fafc63453f5f2"
 
 // detectMultilib checks if the staging directory contains multilib libraries
@@ -122,11 +123,19 @@ func WritePackageInfo(stagingDir, pkgName, pkgVer, pkgRev, arch, cflags string, 
 	return nil
 }
 
-// getPrivateKey loads the Ed25519 private key from standard locations.
+// getPrivateKey loads the Ed25519 private key based on activeKeyID.
 func getPrivateKey() (ed25519.PrivateKey, error) {
-	keyPath := "/etc/hokuto/hokuto.key"
-	if val, ok := os.LookupEnv("HOKUTO_SIGNING_KEY"); ok {
-		keyPath = val
+	keyPath := filepath.Join("/etc/hokuto", activeKeyID+".key")
+	if root := os.Getenv("HOKUTO_ROOT"); root != "" {
+		keyPath = filepath.Join(root, "etc", "hokuto", activeKeyID+".key")
+	}
+
+	// Handle the default case where officialKeyID refers to hokuto.key
+	if activeKeyID == officialKeyID {
+		keyPath = filepath.Join("/etc/hokuto", "hokuto.key")
+		if root := os.Getenv("HOKUTO_ROOT"); root != "" {
+			keyPath = filepath.Join(root, "etc", "hokuto", "hokuto.key")
+		}
 	}
 
 	keyData, err := os.ReadFile(keyPath)
@@ -153,6 +162,102 @@ func getPrivateKey() (ed25519.PrivateKey, error) {
 		}
 	}
 	return privateKey, nil
+}
+
+// GenerateKeyPair generates a new Ed25519 key pair and saves it.
+func GenerateKeyPair(id string, execCtx *Executor) error {
+	pub, priv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		return fmt.Errorf("failed to generate key pair: %w", err)
+	}
+
+	keyDir := "/etc/hokuto"
+	if root := os.Getenv("HOKUTO_ROOT"); root != "" {
+		keyDir = filepath.Join(root, "etc", "hokuto")
+	}
+
+	privPath := filepath.Join(keyDir, id+".key")
+	pubPath := filepath.Join(keyDir, "keys", id+".pub")
+
+	// Ensure directories exist
+	if os.Geteuid() == 0 {
+		_ = os.MkdirAll(filepath.Dir(pubPath), 0755)
+	} else if execCtx != nil && execCtx.ShouldRunAsRoot {
+		_ = execCtx.Run(exec.Command("mkdir", "-p", filepath.Dir(pubPath)))
+	}
+
+	// Write private key (hex encoded)
+	privHex := hex.EncodeToString(priv)
+	if err := writeRootFile(privPath, []byte(privHex), 0600, execCtx); err != nil {
+		return fmt.Errorf("failed to save private key: %w", err)
+	}
+
+	// Write public key (hex encoded)
+	pubHex := hex.EncodeToString(pub)
+	if err := writeRootFile(pubPath, []byte(pubHex), 0644, execCtx); err != nil {
+		return fmt.Errorf("failed to save public key: %w", err)
+	}
+
+	return nil
+}
+
+// writeRootFile is a helper to write a file with root privileges if needed.
+func writeRootFile(path string, data []byte, perm os.FileMode, execCtx *Executor) error {
+	if os.Geteuid() == 0 {
+		return os.WriteFile(path, data, perm)
+	}
+
+	tmp, err := os.CreateTemp("", "hokuto-tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	tmp.Close()
+
+	if err := execCtx.Run(exec.Command("mv", tmpPath, path)); err != nil {
+		return err
+	}
+	return execCtx.Run(exec.Command("chmod", fmt.Sprintf("%o", perm), path))
+}
+
+// getPublicKey retrieves an Ed25519 public key by ID.
+func getPublicKey(id string) (ed25519.PublicKey, error) {
+	if id == officialKeyID || id == "" {
+		pubKeyBytes, _ := hex.DecodeString(officialPublicKeyHex)
+		return ed25519.PublicKey(pubKeyBytes), nil
+	}
+
+	// Look in /etc/hokuto/keys/
+	keyPath := filepath.Join("/etc/hokuto/keys", id+".pub")
+	if root := os.Getenv("HOKUTO_ROOT"); root != "" {
+		keyPath = filepath.Join(root, "etc", "hokuto", "keys", id+".pub")
+	}
+
+	keyData, err := os.ReadFile(keyPath)
+	if err != nil {
+		return nil, fmt.Errorf("public key '%s' not found in keyring (%s)", id, keyPath)
+	}
+
+	trimmedKey := strings.TrimSpace(string(keyData))
+	if len(trimmedKey) == 64 {
+		// Hex encoded
+		decoded, err := hex.DecodeString(trimmedKey)
+		if err == nil && len(decoded) == 32 {
+			return ed25519.PublicKey(decoded), nil
+		}
+	}
+
+	if len(keyData) == 32 {
+		return ed25519.PublicKey(keyData), nil
+	}
+
+	return nil, fmt.Errorf("invalid public key format for '%s'", id)
 }
 
 // SignRepoIndex signs the repo-index.json data.
@@ -215,8 +320,11 @@ func SignPackage(stagingDir, pkgName string, execCtx *Executor) error {
 	// 4. Sign
 	signature := ed25519.Sign(privateKey, dataToSign)
 
-	// 5. Write signature
-	signatureData := []byte(hex.EncodeToString(signature))
+	// 5. Use global Key ID
+	keyID := activeKeyID
+
+	// 6. Write signature [keyid]:sig
+	signatureData := []byte(fmt.Sprintf("%s:%s", keyID, hex.EncodeToString(signature)))
 	if execCtx != nil && execCtx.ShouldRunAsRoot {
 		// Write to a temp file first, then copy it using executor
 		tmpFile, err := os.CreateTemp("", "hokuto-signature-")
@@ -284,12 +392,23 @@ func VerifyPackageSignature(stagingDir, pkgName string, execCtx *Executor) error
 		return nil
 	}
 
-	// 1. Read signature
-	sigHex, err := os.ReadFile(signaturePath)
+	// 1. Read signature and extract Key ID
+	sigData, err := os.ReadFile(signaturePath)
 	if err != nil {
 		return fmt.Errorf("failed to read signature: %w", err)
 	}
-	signature, err := hex.DecodeString(strings.TrimSpace(string(sigHex)))
+
+	rawSig := strings.TrimSpace(string(sigData))
+	keyID := officialKeyID
+	sigHex := rawSig
+
+	if strings.Contains(rawSig, ":") {
+		parts := strings.SplitN(rawSig, ":", 2)
+		keyID = parts[0]
+		sigHex = parts[1]
+	}
+
+	signature, err := hex.DecodeString(sigHex)
 	if err != nil {
 		return fmt.Errorf("invalid signature format: %w", err)
 	}
@@ -306,9 +425,11 @@ func VerifyPackageSignature(stagingDir, pkgName string, execCtx *Executor) error
 
 	dataToVerify := append(manifestData, pkgInfoData...)
 
-	// 3. Verify against official key
-	pubKeyBytes, _ := hex.DecodeString(officialPublicKeyHex)
-	publicKey := ed25519.PublicKey(pubKeyBytes)
+	// 3. Verify against identified key
+	publicKey, err := getPublicKey(keyID)
+	if err != nil {
+		return fmt.Errorf("signature verification aborted: %v", err)
+	}
 
 	if ed25519.Verify(publicKey, dataToVerify, signature) {
 		colArrow.Print("-> ")

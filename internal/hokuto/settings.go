@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/gookit/color"
@@ -49,6 +50,12 @@ func handleSettingsCommand(cfg *Config) error {
 			debugStatus = "Enabled"
 		}
 		fmt.Printf("5) Toggle Debug Mode: [%s]\n", color.Note.Sprint(debugStatus))
+
+		// 6. Active Signing Key
+		fmt.Printf("6) Set Active Signing Key: [%s]\n", color.Note.Sprint(activeKeyID))
+
+		// 7. Generate New Key Pair
+		fmt.Println("7) Generate New Key Pair")
 
 		fmt.Println("q) Quit")
 		fmt.Println("--------------------------------")
@@ -134,6 +141,80 @@ func handleSettingsCommand(cfg *Config) error {
 				colError.Printf("Error: %v\n", err)
 			} else {
 				colSuccess.Println("Debug mode updated successfully.")
+			}
+
+		case "6":
+			// Set Active Signing Key
+			keyDir := "/etc/hokuto"
+			if root := os.Getenv("HOKUTO_ROOT"); root != "" {
+				keyDir = filepath.Join(root, "etc", "hokuto")
+			}
+
+			files, _ := filepath.Glob(filepath.Join(keyDir, "*.key"))
+			if len(files) == 0 {
+				colWarn.Println("No signing keys found. Generate one first.")
+				continue
+			}
+
+			fmt.Println("\nAvailable Signing Keys:")
+			keys := make([]string, 0)
+			for i, f := range files {
+				id := strings.TrimSuffix(filepath.Base(f), ".key")
+				// Translate hokuto.key back to "official" for the ID
+				if id == "hokuto" {
+					id = officialKeyID
+				}
+				keys = append(keys, id)
+				fmt.Printf("%d) %s\n", i+1, id)
+			}
+			fmt.Print("Choice: ")
+
+			kChoice, _ := reader.ReadString('\n')
+			kChoice = strings.TrimSpace(kChoice)
+			var selectedID string
+			for i, id := range keys {
+				if kChoice == fmt.Sprintf("%d", i+1) {
+					selectedID = id
+					break
+				}
+			}
+
+			if selectedID != "" {
+				if err := setConfigValue(cfg, "HOKUTO_KEY_ID", selectedID); err != nil {
+					colError.Printf("Error: %v\n", err)
+				} else {
+					colSuccess.Printf("Active signing key set to: %s\n", selectedID)
+				}
+			}
+
+		case "7":
+			// Generate New Key Pair
+			fmt.Print("\nEnter Key ID for new pair (e.g. community): ")
+			keyID, _ := reader.ReadString('\n')
+			keyID = strings.TrimSpace(keyID)
+			if keyID == "" {
+				colWarn.Println("Invalid Key ID.")
+				continue
+			}
+
+			keyDir := "/etc/hokuto"
+			if root := os.Getenv("HOKUTO_ROOT"); root != "" {
+				keyDir = filepath.Join(root, "etc", "hokuto")
+			}
+			privPath := filepath.Join(keyDir, keyID+".key")
+			if _, err := os.Stat(privPath); err == nil {
+				colError.Printf("Error: Key '%s' already exists.\n", keyID)
+				continue
+			}
+
+			colArrow.Print("-> ")
+			fmt.Printf("Generating Ed25519 key pair for '%s'...\n", keyID)
+			if err := GenerateKeyPair(keyID, RootExec); err != nil {
+				colError.Printf("Error: %v\n", err)
+			} else {
+				colSuccess.Printf("Key pair for '%s' generated successfully.\n", keyID)
+				colNote.Printf("Private key: %s\n", privPath)
+				colNote.Printf("Public key: %s/keys/%s.pub\n", keyDir, keyID)
 			}
 
 		default:

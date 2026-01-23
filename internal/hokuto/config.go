@@ -135,6 +135,11 @@ func initConfig(cfg *Config) {
 		HokutoGeneric = true
 	}
 
+	activeKeyID = cfg.Values["HOKUTO_KEY_ID"]
+	if activeKeyID == "" {
+		activeKeyID = officialKeyID
+	}
+
 	// Multilib is only supported on x86_64 architecture
 	// Automatically disable for aarch64 and other architectures
 	EnableMultilib = false
