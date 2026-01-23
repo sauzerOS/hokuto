@@ -116,15 +116,16 @@ func verifyOrCreateChecksums(pkgName, pkgDir string, force bool) error {
 	urlMap := make(map[string]string) // map[filename] -> url
 	for _, line := range strings.Split(string(sourceData), "\n") {
 		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, "files/") || strings.HasPrefix(line, "git+") {
+		// git+ sources are checked out, not checksummed as files here usually.
+		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, "git+") {
 			continue
 		}
 		parts := strings.Fields(line)
 		if len(parts) > 0 {
-			url := parts[0]
-			fname := filepath.Base(url)
+			src := parts[0]
+			fname := filepath.Base(src)
 			expectedFiles = append(expectedFiles, fname)
-			urlMap[fname] = url
+			urlMap[fname] = src
 		}
 	}
 
@@ -133,7 +134,14 @@ func verifyOrCreateChecksums(pkgName, pkgDir string, force bool) error {
 	if !force {
 		for _, fname := range expectedFiles {
 			if _, exists := existing[fname]; exists {
-				filesToVerify = append(filesToVerify, filepath.Join(pkgSrcDir, fname))
+				src := urlMap[fname]
+				var path string
+				if strings.HasPrefix(src, "files/") {
+					path = filepath.Join(pkgDir, src)
+				} else {
+					path = filepath.Join(pkgSrcDir, fname)
+				}
+				filesToVerify = append(filesToVerify, path)
 			}
 		}
 	}
@@ -151,8 +159,16 @@ func verifyOrCreateChecksums(pkgName, pkgDir string, force bool) error {
 	var finalChecksums []string
 
 	for _, fname := range expectedFiles {
-		filePath := filepath.Join(pkgSrcDir, fname)
-		originalURL := urlMap[fname]
+		src := urlMap[fname]
+		isLocal := strings.HasPrefix(src, "files/")
+		var filePath string
+		if isLocal {
+			filePath = filepath.Join(pkgDir, src)
+		} else {
+			filePath = filepath.Join(pkgSrcDir, fname)
+		}
+
+		originalURL := src
 		substitutedURL := applyGnuMirror(originalURL)
 
 		currentSum, sumExists := existing[fname]
@@ -184,6 +200,9 @@ func verifyOrCreateChecksums(pkgName, pkgDir string, force bool) error {
 		} else if sumExists && !isHashValid {
 			// Case C: A checksum exists, but it MISMATCHES. Prompt the user for action.
 			if fileMissing {
+				if isLocal {
+					return fmt.Errorf("local source file %s is missing", src)
+				}
 				shouldRedownload = true
 				actionSummary = "Updated (missing)"
 			} else {
@@ -193,12 +212,22 @@ func verifyOrCreateChecksums(pkgName, pkgDir string, force bool) error {
 					// Print a clean prompt line (helps if prior output was a progress bar).
 					fmt.Fprintln(os.Stderr)
 					colArrow.Print("-> ")
-					colWarn.Printf("Checksum mismatch for %s. (K)eep local file, (r)edownload file? [K/r]: ", fname)
+					if isLocal {
+						colWarn.Printf("Checksum mismatch for local file %s. (K)eep current checksum, (u)pdate checksum? [K/u]: ", fname)
+					} else {
+						colWarn.Printf("Checksum mismatch for %s. (K)eep local file, (r)edownload file? [K/r]: ", fname)
+					}
+
 					var response string
 					_, _ = fmt.Scanln(&response)
-					if strings.ToLower(strings.TrimSpace(response)) == "r" {
+					resp := strings.ToLower(strings.TrimSpace(response))
+					if (isLocal && resp == "u") || (!isLocal && resp == "r") {
 						shouldRedownload = true
-						actionSummary = "Updated (redownloaded)"
+						if isLocal {
+							actionSummary = "Updated (local)"
+						} else {
+							actionSummary = "Updated (redownloaded)"
+						}
 					} else {
 						shouldRedownload = false
 						actionSummary = "Updated (kept local)"
@@ -217,33 +246,38 @@ func verifyOrCreateChecksums(pkgName, pkgDir string, force bool) error {
 		// 3. PERFORM REDOWNLOAD (if decided in the logic above)
 
 		if shouldRedownload {
-			colArrow.Print("-> ")
-			colSuccess.Printf("Downloading %s\n", fname)
-			actionSummary = "Updated"
+			if isLocal {
+				// Local bits can't be redownloaded. We just updated shouldRedownload to true
+				// so that the recalculate block below runs and updates the checksum file.
+			} else {
+				colArrow.Print("-> ")
+				colSuccess.Printf("Downloading %s\n", fname)
+				actionSummary = "Updated"
 
-			//Use version-aware hash and cleanup
-			hashInput := originalURL + pkgVersion
-			hashName := fmt.Sprintf("%s-%s", hashString(hashInput), fname)
-			cachePath := filepath.Join(CacheStore, hashName)
+				//Use version-aware hash and cleanup
+				hashInput := originalURL + pkgVersion
+				hashName := fmt.Sprintf("%s-%s", hashString(hashInput), fname)
+				cachePath := filepath.Join(CacheStore, hashName)
 
-			// Clean up old versions/hashes of this file
-			globPattern := filepath.Join(CacheStore, "*-"+fname)
-			if matches, err := filepath.Glob(globPattern); err == nil {
-				for _, match := range matches {
-					if match != cachePath {
-						_ = os.Remove(match)
+				// Clean up old versions/hashes of this file
+				globPattern := filepath.Join(CacheStore, "*-"+fname)
+				if matches, err := filepath.Glob(globPattern); err == nil {
+					for _, match := range matches {
+						if match != cachePath {
+							_ = os.Remove(match)
+						}
 					}
 				}
-			}
 
-			_ = os.Remove(cachePath)
-			_ = os.Remove(filePath)
+				_ = os.Remove(cachePath)
+				_ = os.Remove(filePath)
 
-			if err := downloadFile(originalURL, substitutedURL, cachePath); err != nil {
-				return fmt.Errorf("failed to redownload %s: %v", fname, err)
-			}
-			if err := os.Symlink(cachePath, filePath); err != nil {
-				return fmt.Errorf("failed to symlink %s -> %s: %v", cachePath, filePath, err)
+				if err := downloadFile(originalURL, substitutedURL, cachePath); err != nil {
+					return fmt.Errorf("failed to redownload %s: %v", fname, err)
+				}
+				if err := os.Symlink(cachePath, filePath); err != nil {
+					return fmt.Errorf("failed to symlink %s -> %s: %v", cachePath, filePath, err)
+				}
 			}
 		} else {
 			colArrow.Print("-> ")
