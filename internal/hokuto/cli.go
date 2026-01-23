@@ -56,6 +56,7 @@ func printHelp() {
 		{"settings", "", "Manage hokuto configuration interactively"},
 		{"init-repos", "", "Initialize repositories"},
 		{"upload", "", "Upload local binaries to R2 and update index"},
+		{"keys", "[--sync]", "Manage trusted public keys (keyring)"},
 	}
 
 	// --- Dynamic Padding Logic ---
@@ -352,6 +353,12 @@ func Main() {
 	case "upload":
 		if err := handleUploadCommand(os.Args[2:], cfg); err != nil {
 			fmt.Fprintf(os.Stderr, "Upload failed: %v\n", err)
+			os.Exit(1)
+		}
+
+	case "keys":
+		if err := handleKeysCommand(os.Args[2:], cfg); err != nil {
+			fmt.Fprintf(os.Stderr, "Keys command failed: %v\n", err)
 			os.Exit(1)
 		}
 
@@ -1124,4 +1131,26 @@ func findNewestTarball(pkgName, variant string) (string, string, string) {
 	}
 
 	return newestTarball, foundVersion, foundRevision
+}
+
+func handleKeysCommand(args []string, cfg *Config) error {
+	keysCmd := flag.NewFlagSet("keys", flag.ContinueOnError)
+	var sync = keysCmd.Bool("sync", false, "Scan local keys and update remote keyring")
+	if err := keysCmd.Parse(args); err != nil {
+		return nil
+	}
+	if *sync {
+		return SyncKeyring(context.Background(), cfg)
+	}
+
+	keyring, err := FetchKeyring(cfg)
+	if err != nil {
+		return err
+	}
+	colSuccess.Println("Trusted Public Keys (Keyring):")
+	for _, e := range keyring {
+		colNote.Printf("  %-15s ", e.ID)
+		fmt.Printf("%s\n", e.Pub)
+	}
+	return nil
 }

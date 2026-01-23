@@ -184,14 +184,14 @@ func FetchRemoteIndex(cfg *Config) ([]RepoEntry, error) {
 		if len(sigData) == 0 {
 			return nil, fmt.Errorf("MISSING REPO INDEX SIGNATURE: the remote index is not signed and signature verification is enforced")
 		}
-		if vErr := VerifyRepoIndexSignature(data, sigData); vErr != nil {
+		if vErr := VerifyRepoIndexSignature(data, sigData, cfg); vErr != nil {
 			return nil, vErr
 		}
 		colArrow.Print("-> ")
 		colSuccess.Println("Remote index signature OK")
 	} else if len(sigData) > 0 {
 		// Even if not enforced, if it's there, verify it for safety
-		if vErr := VerifyRepoIndexSignature(data, sigData); vErr != nil {
+		if vErr := VerifyRepoIndexSignature(data, sigData, cfg); vErr != nil {
 			colWarn.Printf("Warning: remote index signature verification failed: %v\n", vErr)
 		}
 	}

@@ -164,7 +164,7 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 	}
 
 	// 1.5. Verify package signature
-	if err := VerifyPackageSignature(stagingDir, pkgName, execCtx); err != nil {
+	if err := VerifyPackageSignature(stagingDir, pkgName, cfg, execCtx); err != nil {
 		return err
 	}
 

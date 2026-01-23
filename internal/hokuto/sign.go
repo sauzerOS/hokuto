@@ -9,6 +9,9 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
+
+	"golang.org/x/term"
 )
 
 // Embedded public key for hokuto package verification.
@@ -257,7 +260,39 @@ func getPublicKey(id string) (ed25519.PublicKey, error) {
 		return ed25519.PublicKey(keyData), nil
 	}
 
-	return nil, fmt.Errorf("invalid public key format for '%s'", id)
+	// 3. Fallback to verified keyring
+	// We need a way to pass cfg here... but getPublicKey is used in VerifyPackageSignature.
+	// We might need to fetch the keyring once and cache it globally or pass cfg around.
+	// For now, let's try to fetch it if we can.
+	// Note: this is expensive if called for every package.
+	// TODO: Cache keyring.
+	return nil, fmt.Errorf("public key '%s' not found in local keyring (%s)", id, keyPath)
+}
+
+// GetPublicKeyVerified retrieves a public key, checking the remote signed keyring if not found locally.
+func GetPublicKeyVerified(id string, cfg *Config) (ed25519.PublicKey, error) {
+	pub, err := getPublicKey(id)
+	if err == nil {
+		return pub, nil
+	}
+
+	// Try remote keyring
+	keyring, err := FetchKeyring(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch keyring for key %s: %w", id, err)
+	}
+
+	for _, entry := range keyring {
+		if entry.ID == id {
+			pubBytes, err := hex.DecodeString(entry.Pub)
+			if err != nil {
+				return nil, fmt.Errorf("invalid public key in keyring for %s: %w", id, err)
+			}
+			return ed25519.PublicKey(pubBytes), nil
+		}
+	}
+
+	return nil, fmt.Errorf("public key '%s' not found in keyring", id)
 }
 
 // SignRepoIndex signs the repo-index.json data.
@@ -271,21 +306,93 @@ func SignRepoIndex(indexData []byte) ([]byte, error) {
 	return []byte(hex.EncodeToString(signature)), nil
 }
 
+// SignData signs arbitrary data with a private key.
+func SignData(data []byte, privateKey ed25519.PrivateKey) []byte {
+	return ed25519.Sign(privateKey, data)
+}
+
+// VerifySignatureRaw verifies a raw signature against public key bytes.
+func VerifySignatureRaw(data, sigHex, pubKeyBytes []byte) error {
+	signature, err := hex.DecodeString(strings.TrimSpace(string(sigHex)))
+	if err != nil {
+		return fmt.Errorf("invalid signature format: %w", err)
+	}
+
+	publicKey := ed25519.PublicKey(pubKeyBytes)
+	if !ed25519.Verify(publicKey, data, signature) {
+		return errors.New("signature verification failed")
+	}
+	return nil
+}
+
+// PromptForMasterPrivateKey securely prompts the user for the master private key.
+func PromptForMasterPrivateKey() (ed25519.PrivateKey, error) {
+	fmt.Print("Enter Master Private Key (hex): ")
+	bytePassword, err := term.ReadPassword(int(syscall.Stdin))
+	fmt.Println() // New line after password entry
+	if err != nil {
+		return nil, err
+	}
+
+	trimmedKey := strings.TrimSpace(string(bytePassword))
+	if len(trimmedKey) != 128 {
+		return nil, fmt.Errorf("invalid master private key length (expected 128 hex chars, got %d)", len(trimmedKey))
+	}
+
+	decoded, err := hex.DecodeString(trimmedKey)
+	if err != nil || len(decoded) != 64 {
+		return nil, fmt.Errorf("invalid master private key format: %w", err)
+	}
+
+	// Verify it matches the hardcoded master public key
+	priv := ed25519.PrivateKey(decoded)
+	pub := priv.Public().(ed25519.PublicKey)
+	masterPubKeyBytes, _ := hex.DecodeString(officialPublicKeyHex)
+
+	if hex.EncodeToString(pub) != hex.EncodeToString(masterPubKeyBytes) {
+		return nil, errors.New("provided private key does not match the hardcoded master public key")
+	}
+
+	return priv, nil
+}
+
 // VerifyRepoIndexSignature verifies the repo-index.json signature.
-func VerifyRepoIndexSignature(indexData, sigHex []byte) error {
+func VerifyRepoIndexSignature(indexData, sigHex []byte, cfg *Config) error {
 	signature, err := hex.DecodeString(strings.TrimSpace(string(sigHex)))
 	if err != nil {
 		return fmt.Errorf("invalid repo index signature format: %w", err)
 	}
 
-	pubKeyBytes, _ := hex.DecodeString(officialPublicKeyHex)
-	publicKey := ed25519.PublicKey(pubKeyBytes)
+	// 1. Try master key first
+	masterPubKeyBytes, _ := hex.DecodeString(officialPublicKeyHex)
+	masterPublicKey := ed25519.PublicKey(masterPubKeyBytes)
 
-	if !ed25519.Verify(publicKey, indexData, signature) {
-		return errors.New("REPO INDEX SIGNATURE VERIFICATION FAILED: the remote index has been tampered with or is from an untrusted source")
+	if ed25519.Verify(masterPublicKey, indexData, signature) {
+		return nil
 	}
 
-	return nil
+	// 2. Try keys from the keyring
+	keyring, err := FetchKeyring(cfg)
+	if err == nil {
+		for _, entry := range keyring {
+			if entry.ID == officialKeyID {
+				continue
+			}
+			pubBytes, err := hex.DecodeString(entry.Pub)
+			if err != nil {
+				continue
+			}
+			publicKey := ed25519.PublicKey(pubBytes)
+			if ed25519.Verify(publicKey, indexData, signature) {
+				debugf("Repo index verified using trusted key: %s\n", entry.ID)
+				return nil
+			}
+		}
+	} else {
+		debugf("Warning: could not fetch keyring for extended verification: %v\n", err)
+	}
+
+	return errors.New("REPO INDEX SIGNATURE VERIFICATION FAILED: the remote index has been tampered with or is from an unknown source")
 }
 
 // SignPackage signs a package manifest and metadata.
@@ -376,7 +483,7 @@ func SignPackage(stagingDir, pkgName string, execCtx *Executor) error {
 }
 
 // VerifyPackageSignature verifies the package signature in the staging directory.
-func VerifyPackageSignature(stagingDir, pkgName string, execCtx *Executor) error {
+func VerifyPackageSignature(stagingDir, pkgName string, cfg *Config, execCtx *Executor) error {
 	metadataDir := filepath.Join(stagingDir, "var", "db", "hokuto", "installed", pkgName)
 	manifestPath := filepath.Join(metadataDir, "manifest")
 	pkgInfoPath := filepath.Join(metadataDir, "pkginfo")
@@ -426,7 +533,7 @@ func VerifyPackageSignature(stagingDir, pkgName string, execCtx *Executor) error
 	dataToVerify := append(manifestData, pkgInfoData...)
 
 	// 3. Verify against identified key
-	publicKey, err := getPublicKey(keyID)
+	publicKey, err := GetPublicKeyVerified(keyID, cfg)
 	if err != nil {
 		return fmt.Errorf("signature verification aborted: %v", err)
 	}
