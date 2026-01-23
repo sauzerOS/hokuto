@@ -484,6 +484,13 @@ func generateDepends(pkgName, pkgDir, outputDir, rootDir string, execCtx *Execut
 
 	// Then, add library-only dependencies (just package names)
 	for dep := range libDepSet {
+		// Ignore aarch64- packages in auto-detected dependencies (Part 1/libdeps)
+		// unless they were explicitly listed in the repo depends file (Part 2).
+		// repoDepLines packages have already been removed from libDepSet at this point.
+		if strings.HasPrefix(dep, "aarch64-") {
+			continue
+		}
+
 		// Also apply cleanup to auto-detected library dependencies if in normal mode
 		if !bootstrap {
 			if dep == "19-binutils-2" {
