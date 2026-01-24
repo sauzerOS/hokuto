@@ -145,14 +145,14 @@ func handleSettingsCommand(cfg *Config) error {
 
 		case "6":
 			// Set Active Signing Key
-			keyDir := "/etc/hokuto"
+			keyDir := "/etc/hokuto/keys"
 			if root := os.Getenv("HOKUTO_ROOT"); root != "" {
-				keyDir = filepath.Join(root, "etc", "hokuto")
+				keyDir = filepath.Join(root, "etc", "hokuto", "keys")
 			}
 
 			files, _ := filepath.Glob(filepath.Join(keyDir, "*.key"))
 			if len(files) == 0 {
-				colWarn.Println("No signing keys found. Generate one first.")
+				colWarn.Println("No signing keys found in", keyDir)
 				continue
 			}
 
@@ -197,9 +197,9 @@ func handleSettingsCommand(cfg *Config) error {
 				continue
 			}
 
-			keyDir := "/etc/hokuto"
+			keyDir := "/etc/hokuto/keys"
 			if root := os.Getenv("HOKUTO_ROOT"); root != "" {
-				keyDir = filepath.Join(root, "etc", "hokuto")
+				keyDir = filepath.Join(root, "etc", "hokuto", "keys")
 			}
 			privPath := filepath.Join(keyDir, keyID+".key")
 			if _, err := os.Stat(privPath); err == nil {
@@ -214,7 +214,7 @@ func handleSettingsCommand(cfg *Config) error {
 			} else {
 				colSuccess.Printf("Key pair for '%s' generated successfully.\n", keyID)
 				colNote.Printf("Private key: %s\n", privPath)
-				colNote.Printf("Public key: %s/keys/%s.pub\n", keyDir, keyID)
+				colNote.Printf("Public key: %s/keys/%s.pub\n", filepath.Dir(keyDir), keyID)
 			}
 
 		default:

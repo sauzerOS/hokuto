@@ -45,14 +45,14 @@ func handleUploadCommand(args []string, cfg *Config) error {
 	var cleanup = uploadCmd.Bool("cleanup", false, "Prompt to remove older versions on remote")
 	var reindex = uploadCmd.Bool("reindex", false, "Regenerate the remote index by scanning the bucket")
 	var sync = uploadCmd.Bool("sync", false, "Upload all local files missing on remote without prompt")
-	var prompt = uploadCmd.Bool("prompt", false, "Prompt for confirmation for each local file missing on remote")
+	var prompt = uploadCmd.Bool("prompt", false, "Prompt for each local file missing on remote (optionally filtered by name)")
 	var deletePkg = uploadCmd.String("delete", "", "Delete all variants of a package from remote")
 
 	// Set output to stderr to avoid polluting stdout if captured
 	uploadCmd.SetOutput(os.Stderr)
 
 	if len(args) == 0 {
-		fmt.Println("Usage: hk upload [options]")
+		fmt.Println("Usage: hk upload [options] [pkgname...]")
 		fmt.Println("")
 		fmt.Println("Options:")
 		uploadCmd.PrintDefaults()
@@ -60,14 +60,14 @@ func handleUploadCommand(args []string, cfg *Config) error {
 	}
 
 	if err := uploadCmd.Parse(args); err != nil {
-		// flag.ContinueOnError means parsing failed (e.g. unknown flag).
-		// usage is accepted printed by Parse().
-		return nil // Return nil to just "do nothing" as requested
+		return nil
 	}
+
+	filters := uploadCmd.Args()
 
 	// Usage check if not deleting
 	if *deletePkg == "" && !*sync && !*prompt && !*cleanup && !*reindex {
-		fmt.Println("Usage: hk upload [options]")
+		fmt.Println("Usage: hk upload [options] [pkgname...]")
 		fmt.Println("")
 		fmt.Println("Options:")
 		uploadCmd.PrintDefaults()
@@ -310,16 +310,27 @@ func handleUploadCommand(args []string, cfg *Config) error {
 		}
 
 		if needsUpload {
-			if !*sync && !*prompt {
-				// If neither --sync nor --prompt is used, we only upload if we have an explicit reason
-				// but based on user request, hk upload without args shows help.
-				// So if we are here, some other flag like --cleanup or --reindex was used.
-				// In that case, we should probably SKIP uploads unless asked.
+			activePrompt := *prompt
+			if activePrompt && len(filters) > 0 {
+				matched := false
+				for _, f := range filters {
+					if strings.Contains(local.Name, f) {
+						matched = true
+						break
+					}
+				}
+				if !matched {
+					activePrompt = false
+				}
+			}
+
+			if !*sync && !activePrompt {
+				// skip if no sync and the prompt was disabled (either by flag or filter)
 				continue
 			}
 
 			colArrow.Print("-> ")
-			if *prompt {
+			if activePrompt {
 				reasonText := ""
 				if !exists {
 					reasonText = " (remote missing)"

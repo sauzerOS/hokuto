@@ -56,7 +56,7 @@ func printHelp() {
 		{"alt", "<pkg>", "List packages with alternatives or show/switch alternatives for a package"},
 		{"settings", "", "Manage hokuto configuration interactively"},
 		{"init-repos", "", "Initialize repositories"},
-		{"upload", "", "Upload local binaries to R2 and update index"},
+		{"upload", "[options] [pkgname...]", "Upload local binaries to R2 and update index"},
 		{"keys", "[--sync]", "Manage trusted public keys (keyring)"},
 		{"depends", "[--reverse] <pkg>", "Show package dependencies or reverse dependencies"},
 	}
