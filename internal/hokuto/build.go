@@ -25,18 +25,11 @@ import (
 )
 
 // loadBuildOptions reads the 'options' file from the package directory
-// and returns a map of enabled tweaks. It also checks for legacy individual files
-// to maintain backward compatibility.
+// and returns a map of enabled tweaks.
 func loadBuildOptions(pkgDir string) map[string]bool {
 	options := make(map[string]bool)
 
-	// 1. Supported options/files
-	supported := []string{
-		"noram", "clang", "asroot", "nolto", "nostrip",
-		"interactive", "cross-simple", "nocrossopt",
-	}
-
-	// 2. Load from centralized 'options' file if it exists
+	// Load from centralized 'options' file if it exists
 	optionsFile := filepath.Join(pkgDir, "options")
 	if data, err := os.ReadFile(optionsFile); err == nil {
 		scanner := bufio.NewScanner(strings.NewReader(string(data)))
@@ -49,15 +42,6 @@ func loadBuildOptions(pkgDir string) map[string]bool {
 			fields := strings.Fields(line)
 			for _, f := range fields {
 				options[f] = true
-			}
-		}
-	}
-
-	// 3. Fallback/Support for legacy individual files
-	for _, s := range supported {
-		if _, ok := options[s]; !ok {
-			if _, err := os.Stat(filepath.Join(pkgDir, s)); err == nil {
-				options[s] = true
 			}
 		}
 	}
