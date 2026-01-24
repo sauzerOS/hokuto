@@ -86,13 +86,19 @@ func sanitizeFlagsForCrossCompilation(flags string, _ string) string {
 
 // getOutputPackageName returns the output package name, which may be renamed for cross-system builds
 func getOutputPackageName(pkgName string, cfg *Config) string {
+	// Only apply renaming for cross-system builds (system-wide toolchain packages)
+	// cross-simple is just a build strategy and shouldn't affect the output package name
 	if cfg.Values["HOKUTO_CROSS_SYSTEM"] == "1" && cfg.Values["HOKUTO_CROSS_ARCH"] != "" {
 		// Rename package for cross-system builds: aarch64-pkgname
 		normalizedArch := cfg.Values["HOKUTO_CROSS_ARCH"]
 		if normalizedArch == "arm64" {
 			normalizedArch = "aarch64"
 		}
-		return normalizedArch + "-" + pkgName
+		prefix := normalizedArch + "-"
+		if strings.HasPrefix(pkgName, prefix) {
+			return pkgName
+		}
+		return prefix + pkgName
 	}
 	return pkgName
 }
@@ -116,6 +122,42 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 	pkgDir, err := findPackageDir(pkgName)
 	if err != nil {
 		return 0, fmt.Errorf("package %s not found in HOKUTO_PATH: %v", pkgName, err)
+	}
+
+	// Save current cross settings to restore them later (prevent pollution across packages in the same run)
+	origCrossSystem := cfg.Values["HOKUTO_CROSS_SYSTEM"]
+	origCrossSimple := cfg.Values["HOKUTO_CROSS_SIMPLE"]
+	origCrossArch := cfg.Values["HOKUTO_CROSS_ARCH"]
+	defer func() {
+		cfg.Values["HOKUTO_CROSS_SYSTEM"] = origCrossSystem
+		cfg.Values["HOKUTO_CROSS_SIMPLE"] = origCrossSimple
+		cfg.Values["HOKUTO_CROSS_ARCH"] = origCrossArch
+	}()
+
+	// NEW: Detect if we are building a cross-system package via fallback
+	// (e.g. pkgName is aarch64-pkg but pkgDir belongs to pkg)
+	if filepath.Base(pkgDir) != pkgName {
+		prefixes := []string{"aarch64-", "x86_64-"}
+		for _, pref := range prefixes {
+			if strings.HasPrefix(pkgName, pref) && filepath.Base(pkgDir) == strings.TrimPrefix(pkgName, pref) {
+				debugf("Detected cross-system fallback build for %s using source %s\n", pkgName, filepath.Base(pkgDir))
+				cfg.Values["HOKUTO_CROSS_SYSTEM"] = "1"
+				switch pref {
+				case "aarch64-":
+					cfg.Values["HOKUTO_CROSS_ARCH"] = "arm64"
+				case "x86_64-":
+					cfg.Values["HOKUTO_CROSS_ARCH"] = "x86_64"
+				}
+				break
+			}
+		}
+	}
+
+	// NEW: Check for 'cross-simple' file to override toolchain settings
+	crossSimpleFile := filepath.Join(pkgDir, "cross-simple")
+	if _, err := os.Stat(crossSimpleFile); err == nil {
+		debugf("Local 'cross-simple' file found in %s. Enabling cross-simple mode toolchain.\n", pkgDir)
+		cfg.Values["HOKUTO_CROSS_SIMPLE"] = "1"
 	}
 
 	// Read version and revision early for lock check
@@ -230,10 +272,17 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 
 	// Check if strip should be disabled
 	shouldStrip := cfg.DefaultStrip
+	// Disable stripping for cross-compilation as host 'strip' doesn't support target binaries
+	if cfg.Values["HOKUTO_CROSS_ARCH"] != "" {
+		shouldStrip = false
+	}
+
 	noStripFile := filepath.Join(pkgDir, "nostrip")
 	if _, err := os.Stat(noStripFile); err == nil {
-		colArrow.Print("-> ")
-		colSuccess.Printf("Disabling stripping.\n")
+		if shouldStrip { // Only print if it wasn't already disabled
+			colArrow.Print("-> ")
+			colSuccess.Printf("Disabling stripping.\n")
+		}
 		shouldStrip = false // Override the global setting for this package only
 	}
 
@@ -568,12 +617,12 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 			}
 			// In simple mode, keep normal compiler/linker settings (already set above)
 
-			// Set CROSS_PREFIX based on system flag
-			if cfg.Values["HOKUTO_CROSS_SYSTEM"] == "1" {
-				// System cross-compilation: use /usr/<arch>-linux-gnu
+			// Set CROSS_PREFIX based on cross-compilation mode
+			if cfg.Values["HOKUTO_CROSS_SYSTEM"] == "1" || cfg.Values["HOKUTO_CROSS_SIMPLE"] == "1" {
+				// Use /usr/<arch>-linux-gnu for toolchain/system packages in both cross modes
 				defaults["CROSS_PREFIX"] = fmt.Sprintf("/usr/%s-linux-gnu", normalizedArch)
 			} else {
-				// Regular cross-compilation: use /usr
+				// Regular cross-compilation (user packages): use /usr
 				defaults["CROSS_PREFIX"] = "/usr"
 			}
 		}
@@ -2222,7 +2271,7 @@ func handleBuildCommand(args []string, cfg *Config) error {
 		masterProcessed := make(map[string]bool)
 		var missingDeps []string
 		for _, pkgName := range packagesToProcess {
-			if err := resolveMissingDeps(pkgName, masterProcessed, &missingDeps, userRequestedMap); err != nil {
+			if err := resolveMissingDeps(pkgName, masterProcessed, &missingDeps, userRequestedMap, cfg); err != nil {
 				return fmt.Errorf("error resolving dependencies for %s: %v", pkgName, err)
 			}
 		}
@@ -2299,7 +2348,7 @@ func handleBuildCommand(args []string, cfg *Config) error {
 				colArrow.Print("-> ")
 				colSuccess.Printf("Processing Top-Level Dependency %d/%d: %s \n", i+1, len(orderedTopLevelDeps), pkgName)
 
-				plan, err := resolveBuildPlan([]string{pkgName}, userRequestedMap, effectiveRebuilds)
+				plan, err := resolveBuildPlan([]string{pkgName}, userRequestedMap, effectiveRebuilds, cfg)
 				if err != nil {
 					return fmt.Errorf("error generating build plan for '%s': %v", pkgName, err)
 				}
@@ -2336,7 +2385,7 @@ func handleBuildCommand(args []string, cfg *Config) error {
 
 			colArrow.Print("-> ")
 			colSuccess.Println("Generating Build Plan")
-			initialPlan, err := resolveBuildPlan(buildListInput, userRequestedMap, effectiveRebuilds)
+			initialPlan, err := resolveBuildPlan(buildListInput, userRequestedMap, effectiveRebuilds, cfg)
 			if err != nil {
 				return fmt.Errorf("error generating build plan: %v", err)
 			}
@@ -2464,6 +2513,11 @@ func executeBuildPass(plan *BuildPlan, _ string, installAllTargets bool, cfg *Co
 			deps, _ := parseDependsFile(pkgDir)
 			for _, dep := range deps {
 				if dep.Optional {
+					continue
+				}
+
+				// FILTER: Ignore cross dependencies if not cross-compiling
+				if dep.Cross && cfg.Values["HOKUTO_CROSS_ARCH"] == "" {
 					continue
 				}
 

@@ -270,23 +270,40 @@ func findPackageDir(pkgName string) (string, error) {
 		return dir, nil
 	}
 
-	paths := strings.Split(repoPaths, ":")
-	for _, repoPath := range paths {
-		repoPath = strings.TrimSpace(repoPath)
-		if repoPath == "" {
-			continue
+	searchNames := []string{pkgName}
+
+	// For cross-compilation system packages (aarch64-pkg), fallback to the base package (pkg)
+	// if the prefixed directory doesn't exist.
+	prefixes := []string{"aarch64-", "x86_64-"}
+	for _, pref := range prefixes {
+		if strings.HasPrefix(pkgName, pref) {
+			baseName := strings.TrimPrefix(pkgName, pref)
+			searchNames = append(searchNames, baseName)
+			break
 		}
-		pkgDir := filepath.Join(repoPath, pkgName)
-		if info, err := os.Stat(pkgDir); err == nil && info.IsDir() {
-			return pkgDir, nil
+	}
+
+	paths := strings.Split(repoPaths, ":")
+	for _, name := range searchNames {
+		for _, repoPath := range paths {
+			repoPath = strings.TrimSpace(repoPath)
+			if repoPath == "" {
+				continue
+			}
+			pkgDir := filepath.Join(repoPath, name)
+			if info, err := os.Stat(pkgDir); err == nil && info.IsDir() {
+				return pkgDir, nil
+			}
 		}
 	}
 
 	// FALLBACK: Check if it's already installed.
 	// This is crucial for resolving dependencies of renamed packages (pkg-MAJOR)
 	// which only exist in the installed database and have no source in repositories.
-	if checkPackageExactMatch(pkgName) {
-		return filepath.Join(Installed, pkgName), nil
+	for _, name := range searchNames {
+		if checkPackageExactMatch(name) {
+			return filepath.Join(Installed, name), nil
+		}
 	}
 
 	return "", fmt.Errorf("package %s not found in any repository", pkgName)

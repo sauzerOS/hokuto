@@ -426,7 +426,7 @@ func generateDepends(pkgName, pkgDir, outputDir, rootDir string, execCtx *Execut
 			line = strings.TrimSpace(line)
 			if line != "" && !strings.HasPrefix(line, "#") {
 				// Extract package name to use as key in the map
-				name, op, ver, optional, rebuild, makeDep := parseDepToken(line)
+				name, op, ver, optional, rebuild, makeDep, _ := parseDepToken(line)
 				if name != "" {
 					// Skip build-time only dependencies
 					if makeDep {

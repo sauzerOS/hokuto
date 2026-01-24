@@ -488,7 +488,7 @@ func checkForUpgrades(_ context.Context, cfg *Config) error {
 		userRequestedMap = map[string]bool{"hokuto": true}
 	}
 
-	plan, err := resolveBuildPlan(pkgNames, userRequestedMap, false)
+	plan, err := resolveBuildPlan(pkgNames, userRequestedMap, false, cfg)
 	if err != nil {
 		return fmt.Errorf("failed to resolve upgrade plan: %w", err)
 	}

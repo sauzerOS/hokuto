@@ -148,17 +148,13 @@ func resolveBinaryDependencies(pkgName string, visited map[string]bool, plan *[]
 // - creates directory $newPackageDir/<pkg>
 // - creates build, version, sources files with the right modes and contents
 
-func resolveMissingDeps(pkgName string, processed map[string]bool, missing *[]string, forceBuild map[string]bool) error {
+func resolveMissingDeps(pkgName string, processed map[string]bool, missing *[]string, forceBuild map[string]bool, cfg *Config) error {
 
 	// 1. Mark this package as processed to prevent infinite recursion
 	if processed[pkgName] {
 		return nil
 	}
 	processed[pkgName] = true
-
-	// 2. [OLD POSITION - REMOVED]
-	// The check for isPackageInstalled(pkgName) was here.
-	// It must be moved to the end.
 
 	// --- 3. Find the Package Source Directory (pkgDir) ---
 	pkgDir, err := findPackageDir(pkgName)
@@ -175,9 +171,12 @@ func resolveMissingDeps(pkgName string, processed map[string]bool, missing *[]st
 	}
 
 	// --- 5. Recursively check all dependencies ---
-	// This loop will now run even for installed packages, allowing the
-	// version check to happen.
 	for _, dep := range dependencies {
+		// New filtering: skip cross dependencies if not cross-compiling
+		if dep.Cross && cfg.Values["HOKUTO_CROSS_ARCH"] == "" {
+			continue
+		}
+
 		depName := dep.Name
 
 		// Resolve alternative dependencies if present
@@ -227,14 +226,13 @@ func resolveMissingDeps(pkgName string, processed map[string]bool, missing *[]st
 			}
 		}
 
-		if err := resolveMissingDeps(depName, processed, missing, forceBuild); err != nil {
+		if err := resolveMissingDeps(depName, processed, missing, forceBuild, cfg); err != nil {
 			// Propagate the error up
 			return err
 		}
 	}
 
 	// --- 6. Add the missing package to the list ---
-	// [NEW POSITION]
 	// Only *after* checking all dependencies, we check if the
 	// package itself is installed. If it is, we're done.
 	if isPackageInstalled(pkgName) {
@@ -499,16 +497,14 @@ func resolveAlternativeDep(dep DepSpec, yes bool) (string, error) {
 
 // parseDepToken parses tokens like "pkg", "pkg<=1.2.3 optional", "pkg rebuild" and returns name, op, version, and flags.
 
-func parseDepToken(token string) (string, string, string, bool, bool, bool) {
+func parseDepToken(token string) (name string, op string, ver string, optional bool, rebuild bool, makeDep bool, cross bool) {
 	// Split by whitespace to separate package spec from flags
 	parts := strings.Fields(token)
 	if len(parts) == 0 {
-		return "", "", "", false, false, false
+		return "", "", "", false, false, false, false
 	}
 
 	pkgSpec := parts[0]
-	var optional, rebuild, makeDep bool
-
 	// Check for flags in remaining parts
 	for i := 1; i < len(parts); i++ {
 		switch parts[i] {
@@ -518,6 +514,8 @@ func parseDepToken(token string) (string, string, string, bool, bool, bool) {
 			rebuild = true
 		case "make":
 			makeDep = true
+		case "cross":
+			cross = true
 		}
 	}
 
@@ -527,10 +525,10 @@ func parseDepToken(token string) (string, string, string, bool, bool, bool) {
 		if idx := strings.Index(pkgSpec, op); idx != -1 {
 			name := pkgSpec[:idx]
 			ver := pkgSpec[idx+len(op):]
-			return strings.TrimSpace(name), op, strings.TrimSpace(ver), optional, rebuild, makeDep
+			return strings.TrimSpace(name), op, strings.TrimSpace(ver), optional, rebuild, makeDep || cross, cross
 		}
 	}
-	return pkgSpec, "", "", optional, rebuild, makeDep
+	return pkgSpec, "", "", optional, rebuild, makeDep || cross, cross
 }
 
 // BuildPlan represents the complete build plan with proper ordering
@@ -546,7 +544,7 @@ type BuildPlan struct {
 // resolveBuildPlan creates a dynamic, context-aware build plan.
 // It correctly handles resolvable circular dependencies caused by optional dependencies.
 
-func resolveBuildPlan(targetPackages []string, userRequestedPackages map[string]bool, withRebuilds bool) (*BuildPlan, error) {
+func resolveBuildPlan(targetPackages []string, userRequestedPackages map[string]bool, withRebuilds bool, cfg *Config) (*BuildPlan, error) {
 	plan := &BuildPlan{
 		Order:             []string{},
 		SkippedPackages:   make(map[string]string),
@@ -587,6 +585,11 @@ func resolveBuildPlan(targetPackages []string, userRequestedPackages map[string]
 
 		// Process all dependencies recursively first.
 		for _, dep := range deps {
+			// New filtering: skip cross dependencies if not cross-compiling
+			if dep.Cross && cfg.Values["HOKUTO_CROSS_ARCH"] == "" {
+				continue
+			}
+
 			depName := dep.Name
 
 			// Resolve alternative dependencies if present
@@ -915,7 +918,7 @@ func getInstalledDeps(pkgName string) ([]string, error) {
 			continue
 		}
 		// Parse "pkgname>=1.0" -> "pkgname"
-		name, _, _, _, _, _ := parseDepToken(line)
+		name, _, _, _, _, _, _ := parseDepToken(line)
 		if name != "" && name != pkgName {
 			// FILTER: Ignore 32-bit dependencies if multilib is disabled
 			if !EnableMultilib && strings.HasSuffix(name, "-32") {
@@ -934,6 +937,7 @@ type DepSpec struct {
 	Optional     bool
 	Rebuild      bool
 	Make         bool     // True if dependency is only needed at build time
+	Cross        bool     // True if dependency is only for cross-compilation
 	Alternatives []string // List of alternative package names (e.g., ["rust", "rustup"] for "rust | rustup")
 }
 
