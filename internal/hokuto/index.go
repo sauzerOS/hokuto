@@ -19,6 +19,18 @@ import (
 
 // GetSystemArch returns the current system architecture, normalized (e.g., x86_64, aarch64).
 func GetSystemArch(cfg *Config) string {
+	// If cross-compiling, use the cross architecture
+	if cfg.Values["HOKUTO_CROSS_ARCH"] != "" {
+		arch := cfg.Values["HOKUTO_CROSS_ARCH"]
+		if arch == "arm64" || arch == "aarch64" {
+			return "aarch64"
+		}
+		if arch == "amd64" || arch == "x86_64" {
+			return "x86_64"
+		}
+		return arch
+	}
+
 	arch := cfg.Values["HOKUTO_ARCH"]
 	if arch == "" {
 		cmd := exec.Command("uname", "-m")
@@ -53,7 +65,8 @@ func GetSystemVariantForPackage(cfg *Config, pkgName string) string {
 	}
 
 	// Check if multilib is enabled and package supports it
-	if cfg.Values["HOKUTO_MULTILIB"] == "1" && pkgName != "" && pkgName != "sauzeros-base" {
+	// FIX: Disable multilib for cross builds to match build-time packaging logic
+	if cfg.Values["HOKUTO_CROSS_ARCH"] == "" && cfg.Values["HOKUTO_MULTILIB"] == "1" && pkgName != "" && pkgName != "sauzeros-base" {
 		if isMultilibPackage(pkgName) {
 			return "multi-" + baseVariant
 		}

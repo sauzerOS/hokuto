@@ -743,16 +743,31 @@ func Main() {
 				}
 				// Keep package name as-is, but use multi variant in filename if multilib is enabled
 
-				version, revision, err := getRepoVersion2(arg)
+				version, revision, err := "", "", error(nil)
 				tarballFoundDirectly := false
 
-				// If --remote is used, try to get version from remote index if local fails
-				if err != nil && *remote {
+				// If --remote is used and a version is specified with @, prioritize remote index.
+				// This allows installing specific versions that might not be in the local HOKUTO_PATH.
+				if *remote && strings.Contains(arg, "@") {
 					rv, rr, rerr := GetRemotePackageVersion(arg, cfg, remoteIndex)
 					if rerr == nil {
 						version = rv
 						revision = rr
 						err = nil
+					} else {
+						// Fallback to local repo if remote doesn't have it (might be a local-only package)
+						version, revision, err = getRepoVersion2(arg)
+					}
+				} else {
+					version, revision, err = getRepoVersion2(arg)
+					// If --remote is used and local lookup failed, try remote index
+					if err != nil && *remote {
+						rv, rr, rerr := GetRemotePackageVersion(arg, cfg, remoteIndex)
+						if rerr == nil {
+							version = rv
+							revision = rr
+							err = nil
+						}
 					}
 				}
 
