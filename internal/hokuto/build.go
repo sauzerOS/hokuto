@@ -5,6 +5,7 @@ package hokuto
 
 import (
 	"archive/tar"
+	"bufio"
 	"flag"
 	"fmt"
 	"io"
@@ -22,6 +23,47 @@ import (
 	"github.com/gookit/color"
 	"github.com/ulikunitz/xz"
 )
+
+// loadBuildOptions reads the 'options' file from the package directory
+// and returns a map of enabled tweaks. It also checks for legacy individual files
+// to maintain backward compatibility.
+func loadBuildOptions(pkgDir string) map[string]bool {
+	options := make(map[string]bool)
+
+	// 1. Supported options/files
+	supported := []string{
+		"noram", "clang", "asroot", "nolto", "nostrip",
+		"interactive", "cross-simple", "nocrossopt",
+	}
+
+	// 2. Load from centralized 'options' file if it exists
+	optionsFile := filepath.Join(pkgDir, "options")
+	if data, err := os.ReadFile(optionsFile); err == nil {
+		scanner := bufio.NewScanner(strings.NewReader(string(data)))
+		for scanner.Scan() {
+			line := strings.TrimSpace(scanner.Text())
+			if line == "" || strings.HasPrefix(line, "#") {
+				continue
+			}
+			// Split line into fields (allow multiple options per line)
+			fields := strings.Fields(line)
+			for _, f := range fields {
+				options[f] = true
+			}
+		}
+	}
+
+	// 3. Fallback/Support for legacy individual files
+	for _, s := range supported {
+		if _, ok := options[s]; !ok {
+			if _, err := os.Stat(filepath.Join(pkgDir, s)); err == nil {
+				options[s] = true
+			}
+		}
+	}
+
+	return options
+}
 
 // getScriptExitCode extracts the exit code from a script log file
 // script writes: "Script done on ... [COMMAND_EXIT_CODE="1"]"
@@ -124,6 +166,9 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 		return 0, fmt.Errorf("package %s not found in HOKUTO_PATH: %v", pkgName, err)
 	}
 
+	// NEW: Load build options (consolidated from 'options' file or individual files)
+	options := loadBuildOptions(pkgDir)
+
 	// Save current cross settings to restore them later (prevent pollution across packages in the same run)
 	origCrossSystem := cfg.Values["HOKUTO_CROSS_SYSTEM"]
 	origCrossSimple := cfg.Values["HOKUTO_CROSS_SIMPLE"]
@@ -153,10 +198,9 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 		}
 	}
 
-	// NEW: Check for 'cross-simple' file to override toolchain settings
-	crossSimpleFile := filepath.Join(pkgDir, "cross-simple")
-	if _, err := os.Stat(crossSimpleFile); err == nil {
-		debugf("Local 'cross-simple' file found in %s. Enabling cross-simple mode toolchain.\n", pkgDir)
+	// NEW: Check for 'cross-simple' option to override toolchain settings
+	if options["cross-simple"] {
+		debugf("Cross-simple mode enabled for %s. Using host toolchain.\n", pkgName)
 		cfg.Values["HOKUTO_CROSS_SIMPLE"] = "1"
 	}
 
@@ -199,8 +243,7 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 	// 1. Initialize a LOCAL temporary directory variable with the global default.
 	currentTmpDir := tmpDir
 	// override tmpDir if noram is set
-	tmpDirfile := filepath.Join(pkgDir, "noram")
-	if _, err := os.Stat(tmpDirfile); err == nil {
+	if options["noram"] {
 		currentTmpDir = cfg.Values["TMPDIR2"]
 	}
 
@@ -234,18 +277,12 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 
 	// 1. Determine the Execution Context for THIS PACKAGE.
 	// This check MUST stay here as it is package-specific.
-	asRootFile := filepath.Join(pkgDir, "asroot")
-	needsRootBuild := false
-	if _, err := os.Stat(asRootFile); err == nil {
-		needsRootBuild = true
-	}
+	needsRootBuild := options["asroot"]
 
 	//Check for an 'interactive' file to control build mode ---
-	interactiveFile := filepath.Join(pkgDir, "interactive")
-	needsInteractiveBuild := false
-	if _, err := os.Stat(interactiveFile); err == nil {
-		needsInteractiveBuild = true
-		debugf("Local 'interactive' file found in %s. Enabling interactive build mode.\n", pkgDir)
+	needsInteractiveBuild := options["interactive"]
+	if needsInteractiveBuild {
+		debugf("Interactive build mode enabled for %s.\n", pkgName)
 	}
 
 	// 2. CLONE AND SELECT EXECUTOR
@@ -277,8 +314,7 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 		shouldStrip = false
 	}
 
-	noStripFile := filepath.Join(pkgDir, "nostrip")
-	if _, err := os.Stat(noStripFile); err == nil {
+	if options["nostrip"] {
 		if shouldStrip { // Only print if it wasn't already disabled
 			colArrow.Print("-> ")
 			colSuccess.Printf("Disabling stripping.\n")
@@ -288,8 +324,7 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 
 	// Check if LTO should be enabled
 	shouldLTO := cfg.DefaultLTO
-	noLTOFile := filepath.Join(pkgDir, "nolto")
-	if _, err := os.Stat(noLTOFile); err == nil {
+	if options["nolto"] {
 		colArrow.Print("-> ")
 		colSuccess.Printf("Disabling LTO.\n")
 		shouldLTO = false // Override the global setting for this package only
@@ -321,16 +356,15 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 		numCores = runtime.NumCPU()
 	}
 
-	// Check for 'clang' file to determine LTOJOBS value
-	ltoJobString := fmt.Sprintf("%d", numCores) // Default to core count (for GCC)
-	clangFlagFile := filepath.Join(pkgDir, "clang")
-	if _, err := os.Stat(clangFlagFile); err == nil {
-		// 'clang' file exists, use "auto" for LTO jobs
+	// Jobs for LTO (if enabled)
+	ltoJobString := fmt.Sprintf("%d", numCores)
+	if options["clang"] {
+		// 'clang' option exists, use "auto" for LTO jobs
 		ltoJobString = "auto"
-		debugf("Local 'clang' file found. Setting LTOJOBS=auto.\n")
+		debugf("Using LTOJOBS=auto (clang option).\n")
 	} else {
-		// No 'clang' file, use core count
-		debugf("No 'clang' file found. Setting LTOJOBS=%s.\n", ltoJobString)
+		// No 'clang' option, use core count
+		debugf("Using LTOJOBS=%s.\n", ltoJobString)
 	}
 
 	// Build environment
@@ -480,9 +514,32 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 			}
 		} else if isCross {
 			// Case: Cross-compilation
-			// Use generic flags to ensure compatibility with host compiler
-			cflagsVal = "-O2 -pipe -mtune=generic"
-			cxxflagsVal = "-O2 -pipe -mtune=generic"
+			// Determine if we should use optimized flags
+			// - Is ARM64 target
+			// - nocrossopt is NOT set
+			// - cross-simple is NOT active (per user request: use generic for simple)
+			// - CFLAGS_ARM64 is configured
+			useOptimized := isARM && !options["nocrossopt"] && cfg.Values["HOKUTO_CROSS_SIMPLE"] != "1" && cfg.Values["CFLAGS_ARM64"] != ""
+
+			if useOptimized {
+				// Use ARM64 optimized flags
+				cflagsVal = cfg.Values["CFLAGS_ARM64"]
+				cxxflagsVal = cfg.Values["CXXFLAGS_ARM64"]
+				debugf("Using optimized ARM64 flags for cross-compilation: %s\n", cflagsVal)
+			} else {
+				// Use generic flags to ensure compatibility with host compiler
+				cflagsVal = "-O2 -pipe -mtune=generic"
+				cxxflagsVal = "-O2 -pipe -mtune=generic"
+
+				// Log reason for generic flags if relevant
+				if isARM {
+					if options["nocrossopt"] {
+						debugf("Using generic flags for ARM64 cross-compilation (nocrossopt set).\n")
+					} else if cfg.Values["HOKUTO_CROSS_SIMPLE"] == "1" {
+						debugf("Using generic flags for ARM64 cross-compilation (cross-simple enabled).\n")
+					}
+				}
+			}
 			ldflagsVal = cfg.Values["LDFLAGS"]
 		} else if isARM {
 			// Case A: Native ARM64 build ONLY
@@ -1179,11 +1236,13 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 		return fmt.Errorf("package %s not found in HOKUTO_PATH", pkgName)
 	}
 
+	// NEW: Load build options (consolidated from 'options' file or individual files)
+	options := loadBuildOptions(pkgDir)
+
 	// 1. Initialize a LOCAL temporary directory variable with the global default.
 	currentTmpDir := tmpDir
 	// override tmpDir if noram is set
-	tmpDirfile := filepath.Join(pkgDir, "noram")
-	if _, err := os.Stat(tmpDirfile); err == nil {
+	if options["noram"] {
 		currentTmpDir = cfg.Values["TMPDIR2"]
 	}
 
@@ -1209,18 +1268,12 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 	}
 
 	// 1. Determine the Execution Context
-	asRootFile := filepath.Join(pkgDir, "asroot")
-	needsRootBuild := false
-	if _, err := os.Stat(asRootFile); err == nil {
-		needsRootBuild = true
-	}
+	needsRootBuild := options["asroot"]
 
 	//Check for an 'interactive' file to control build mode ---
-	interactiveFile := filepath.Join(pkgDir, "interactive")
-	needsInteractiveBuild := false
-	if _, err := os.Stat(interactiveFile); err == nil {
-		needsInteractiveBuild = true
-		debugf("Local 'interactive' file found in %s. Enabling interactive build mode.\n", pkgDir)
+	needsInteractiveBuild := options["interactive"]
+	if needsInteractiveBuild {
+		debugf("Interactive build mode enabled for %s.\n", pkgName)
 	}
 
 	buildExec := &Executor{
@@ -1245,17 +1298,22 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 
 	// Check if strip should be disabled
 	shouldStrip := cfg.DefaultStrip
-	noStripFile := filepath.Join(pkgDir, "nostrip")
-	if _, err := os.Stat(noStripFile); err == nil {
-		cPrintf(colInfo, "Local 'nostrip' file found in %s. Disabling stripping.\n", pkgDir)
+	// Disable stripping for cross-compilation
+	if cfg.Values["HOKUTO_CROSS_ARCH"] != "" {
+		shouldStrip = false
+	}
+
+	if options["nostrip"] {
+		if shouldStrip {
+			cPrintf(colInfo, "Disabling stripping.\n")
+		}
 		shouldStrip = false // Override the global setting for this package only
 	}
 
 	// Check if LTO should be enabled
 	shouldLTO := cfg.DefaultLTO
-	noLTOFile := filepath.Join(pkgDir, "nolto")
-	if _, err := os.Stat(noLTOFile); err == nil {
-		cPrintf(colInfo, "Local 'nolto' file found in %s. Disabling LTO.\n", pkgDir)
+	if options["nolto"] {
+		cPrintf(colInfo, "Disabling LTO.\n")
 		shouldLTO = false // Override the global setting for this package only
 	}
 
@@ -1299,14 +1357,13 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 		numCores = runtime.NumCPU()
 	}
 
-	// Check for 'clang' file to determine LTOJOBS value
-	ltoJobString := fmt.Sprintf("%d", numCores) // Default to core count (for GCC)
-	clangFlagFile := filepath.Join(pkgDir, "clang")
-	if _, err := os.Stat(clangFlagFile); err == nil {
+	// Jobs for LTO (if enabled)
+	ltoJobString := fmt.Sprintf("%d", numCores)
+	if options["clang"] {
 		ltoJobString = "auto"
-		debugf("Local 'clang' file found. Setting LTOJOBS=auto.\n")
+		debugf("Using LTOJOBS=auto (clang option).\n")
 	} else {
-		debugf("No 'clang' file found. Setting LTOJOBS=%s.\n", ltoJobString)
+		debugf("Using LTOJOBS=%s.\n", ltoJobString)
 	}
 
 	// Initialize Defaults Map
