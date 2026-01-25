@@ -433,9 +433,12 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 
 	} else {
 
-		// 1. Detect Architecture
-		// ----------------------
-		targetArch := cfg.Values["HOKUTO_ARCH"]
+		// 1. Detect Target Architecture
+		// -----------------------------
+		targetArch := cfg.Values["HOKUTO_CROSS_ARCH"]
+		if targetArch == "" {
+			targetArch = cfg.Values["HOKUTO_ARCH"]
+		}
 		if targetArch == "" {
 			cmd := exec.Command("uname", "-m")
 			out, err := cmd.Output()
@@ -486,51 +489,26 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 		if isGeneric {
 			// Generic build: use CFLAGS_GEN and CFLAGS_GEN_LTO
 			if shouldLTO {
-				// Case: Generic with LTO
 				cflagsVal = cfg.Values["CFLAGS_GEN_LTO"]
 				cxxflagsVal = cfg.Values["CXXFLAGS_GEN_LTO"]
 				ldflagsVal = cfg.Values["LDFLAGS_LTO"]
 			} else {
-				// Case: Generic without LTO
 				cflagsVal = cfg.Values["CFLAGS_GEN"]
 				cxxflagsVal = cfg.Values["CXXFLAGS_GEN"]
 				ldflagsVal = cfg.Values["LDFLAGS"]
 			}
-		} else if isCross {
-			// Case: Cross-compilation
-			// Determine if we should use optimized flags
-			// - Is ARM64 target
-			// - nocrossopt is NOT set
-			// - cross-simple is NOT active (per user request: use generic for simple)
-			// - CFLAGS_ARM64 is configured
-			useOptimized := isARM && !options["nocrossopt"] && cfg.Values["HOKUTO_CROSS_SIMPLE"] != "1" && cfg.Values["CFLAGS_ARM64"] != ""
-
-			if useOptimized {
-				// Use ARM64 optimized flags
+		} else if isARM {
+			// Case: ARM64 (Native or Cross)
+			// Use optimized flags unless explicitly disabled or in simple cross mode
+			if !options["nocrossopt"] && cfg.Values["HOKUTO_CROSS_SIMPLE"] != "1" && cfg.Values["CFLAGS_ARM64"] != "" {
 				cflagsVal = cfg.Values["CFLAGS_ARM64"]
 				cxxflagsVal = cfg.Values["CXXFLAGS_ARM64"]
-				debugf("Using optimized ARM64 flags for cross-compilation: %s\n", cflagsVal)
+				debugf("Using optimized ARM64 flags: %s\n", cflagsVal)
 			} else {
-				// Use generic flags to ensure compatibility with host compiler
 				cflagsVal = "-O2 -pipe -mtune=generic"
 				cxxflagsVal = "-O2 -pipe -mtune=generic"
-
-				// Log reason for generic flags if relevant
-				if isARM {
-					if options["nocrossopt"] {
-						debugf("Using generic flags for ARM64 cross-compilation (nocrossopt set).\n")
-					} else if cfg.Values["HOKUTO_CROSS_SIMPLE"] == "1" {
-						debugf("Using generic flags for ARM64 cross-compilation (cross-simple enabled).\n")
-					}
-				}
+				debugf("Using generic flags for ARM64 target.\n")
 			}
-			ldflagsVal = cfg.Values["LDFLAGS"]
-		} else if isARM {
-			// Case A: Native ARM64 build ONLY
-			// We only use CFLAGS_ARM64 (which might have -mcpu=native etc) if we are actually building ON ARM
-			// and NOT doing a cross-compile.
-			cflagsVal = cfg.Values["CFLAGS_ARM64"]
-			cxxflagsVal = cfg.Values["CXXFLAGS_ARM64"]
 			ldflagsVal = cfg.Values["LDFLAGS"]
 		} else if shouldLTO {
 			// Case B: x86_64 with LTO
@@ -1373,9 +1351,12 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 
 	// --- START REFACTORED FLAG LOGIC (Matches pkgBuild) ---
 
-	// 1. Detect Architecture
-	// ----------------------
-	targetArch := cfg.Values["HOKUTO_ARCH"]
+	// 1. Detect Target Architecture
+	// -----------------------------
+	targetArch := cfg.Values["HOKUTO_CROSS_ARCH"]
+	if targetArch == "" {
+		targetArch = cfg.Values["HOKUTO_ARCH"]
+	}
 	if targetArch == "" {
 		cmd := exec.Command("uname", "-m")
 		out, err := cmd.Output()
@@ -1415,10 +1396,15 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 	// Check if cross-compilation is enabled
 	isCross := cfg.Values["HOKUTO_CROSS_ARCH"] != ""
 
-	if isCross || isARM {
-		// Case A: ARM64 (either native ARM64 or cross-compiling to ARM64)
-		cflagsVal = cfg.Values["CFLAGS_ARM64"]
-		cxxflagsVal = cfg.Values["CXXFLAGS_ARM64"]
+	if isARM {
+		// Case A: ARM64 (Native or Cross)
+		if cfg.Values["HOKUTO_CROSS_SIMPLE"] != "1" && cfg.Values["CFLAGS_ARM64"] != "" {
+			cflagsVal = cfg.Values["CFLAGS_ARM64"]
+			cxxflagsVal = cfg.Values["CXXFLAGS_ARM64"]
+		} else {
+			cflagsVal = "-O2 -pipe -mtune=generic"
+			cxxflagsVal = "-O2 -pipe -mtune=generic"
+		}
 		ldflagsVal = cfg.Values["LDFLAGS"]
 	} else if shouldLTO {
 		// Case B: x86_64 with LTO

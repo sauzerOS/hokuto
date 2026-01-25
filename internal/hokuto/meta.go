@@ -551,9 +551,12 @@ func SearchPkgDB(args []string, cfg *Config) error {
 		colSuccess.Printf("%-20s ", r.Name)
 		fmt.Printf("%-10s ", r.Version)
 		if len(r.Metadata.Tags) > 0 {
-			color.Cyan.Printf("[%s] ", strings.Join(r.Metadata.Tags, ", "))
+			color.Cyan.Printf("[%s]", strings.Join(r.Metadata.Tags, ", "))
 		}
-		fmt.Printf("%s\n", r.Metadata.Description)
+		fmt.Println()
+		if r.Metadata.Description != "" {
+			fmt.Printf("  %s\n", r.Metadata.Description)
+		}
 	}
 	fmt.Println()
 
