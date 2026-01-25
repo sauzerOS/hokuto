@@ -47,7 +47,7 @@ var validTags = []string{
 	"network", "optical-tools", "perl", "print", "python", "scan", "search",
 	"server", "shell", "sync", "torrent", "utility", "virtual-machine",
 	"wallet", "wine", "xfce", "compression", "usenet", "vpn", "x11", "wayland", "meta",
-	"database", "archive",
+	"database", "archive", "pdf", "office",
 }
 
 func init() {

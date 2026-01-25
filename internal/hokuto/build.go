@@ -328,16 +328,21 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 
 	// Define core count to use
 	var numCores int
-	switch buildPriority {
-	case "idle":
-		numCores = runtime.NumCPU() / 2
-		if numCores < 1 {
+	if options["idle"] {
+		numCores = max(runtime.NumCPU()/2, 1)
+		debugf("Idle mode enabled for %s. Using %d cores.\n", pkgName, numCores)
+	} else {
+		switch buildPriority {
+		case "idle":
+			numCores = runtime.NumCPU() / 2
+			if numCores < 1 {
+				numCores = 1
+			}
+		case "superidle":
 			numCores = 1
+		default: // "normal"
+			numCores = runtime.NumCPU()
 		}
-	case "superidle":
-		numCores = 1
-	default: // "normal"
-		numCores = runtime.NumCPU()
 	}
 
 	// Jobs for LTO (if enabled)
@@ -1307,16 +1312,21 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 
 	// Define core count to use
 	var numCores int
-	switch buildPriority {
-	case "idle":
-		numCores = runtime.NumCPU() / 2
-		if numCores < 1 {
+	if options["idle"] {
+		numCores = max(runtime.NumCPU()/2, 1)
+		debugf("Idle mode enabled for %s. Using %d cores.\n", pkgName, numCores)
+	} else {
+		switch buildPriority {
+		case "idle":
+			numCores = runtime.NumCPU() / 2
+			if numCores < 1 {
+				numCores = 1
+			}
+		case "superidle":
 			numCores = 1
+		default: // "normal"
+			numCores = runtime.NumCPU()
 		}
-	case "superidle":
-		numCores = 1
-	default: // "normal"
-		numCores = runtime.NumCPU()
 	}
 
 	// Jobs for LTO (if enabled)

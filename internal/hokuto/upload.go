@@ -136,6 +136,11 @@ func handleUploadCommand(args []string, cfg *Config) error {
 				debugf("Warning: skipping %s: %v\n", file, err)
 				continue
 			}
+			// --- NEW: Sanity Check ---
+			if entry.Name == "" || entry.Version == "" {
+				debugf("Warning: skipping %s: missing metadata Name or Version (corruption?)\n", filename)
+				continue
+			}
 			cache[filename] = uploadCacheEntry{
 				Size:  info.Size(),
 				Mtime: info.ModTime(),
@@ -282,6 +287,11 @@ func handleUploadCommand(args []string, cfg *Config) error {
 				debugf("Warning: failed to parse metadata for %s: %v\n", obj.Key, err)
 				continue
 			}
+			// --- NEW: Sanity Check ---
+			if entry.Name == "" || entry.Version == "" {
+				debugf("Warning: skipping remote file %s: missing metadata Name or Version\n", obj.Key)
+				continue
+			}
 
 			key := fmt.Sprintf("%s-%s-%s", entry.Name, entry.Arch, entry.Variant)
 			reconciledMap[key] = entry
@@ -423,7 +433,9 @@ func handleUploadCommand(args []string, cfg *Config) error {
 
 		var finalizedIndex []RepoEntry
 		for _, k := range sortedKeys {
-			finalizedIndex = append(finalizedIndex, newIndexMap[k])
+			if entry, ok := newIndexMap[k]; ok {
+				finalizedIndex = append(finalizedIndex, entry)
+			}
 		}
 		// Also add entries from remote that weren't in sortedKeys (local)
 		for k, entry := range newIndexMap {

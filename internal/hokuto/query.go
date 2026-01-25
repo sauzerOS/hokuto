@@ -61,8 +61,8 @@ func listPackages(searchTerm string) error {
 		return nil
 	}
 
-	// Step 4: Print the information for the final list of packages.
-	// ... (rest of the function is unchanged)
+	// Step 4: Collect the information for the final list of packages.
+	var output []string
 	for _, p := range pkgsToShow {
 		versionFile := filepath.Join(Installed, p, "version")
 		versionInfo := "unknown"
@@ -109,15 +109,15 @@ func listPackages(searchTerm string) error {
 			}
 		}
 
-		// Print aligned: versionInfo then some spacing then buildtime if present
+		// Add to output slice
 		if buildtimeStr != "" {
-			cPrintf(color.Cyan, "%-30s %s\n", fmt.Sprintf("%s %s", p, versionInfo), buildtimeStr)
+			output = append(output, color.Cyan.Sprintf("%-30s %s", fmt.Sprintf("%s %s", p, versionInfo), buildtimeStr))
 		} else {
-			cPrintf(color.Cyan, "%s %s\n", p, versionInfo)
+			output = append(output, color.Cyan.Sprintf("%s %s", p, versionInfo))
 		}
 	}
 
-	return nil
+	return RunPager("Installed Packages", output)
 }
 
 func FetchRemoteIndex(cfg *Config) ([]RepoEntry, error) {
@@ -205,6 +205,7 @@ func listRemotePackages(searchTerm string, cfg *Config) error {
 		return err
 	}
 
+	var output []string
 	foundAny := false
 	for _, entry := range remoteIndex {
 		if searchTerm != "" && !strings.Contains(entry.Name, searchTerm) {
@@ -225,16 +226,22 @@ func listRemotePackages(searchTerm string, cfg *Config) error {
 			variantDisplay = "native"
 		}
 
-		cPrintf(color.Cyan, "%-25s %-15s %-10s %s%s\n", entry.Name, fmt.Sprintf("%s-%s", entry.Version, entry.Revision), entry.Arch, variantDisplay, multiSuffix)
+		output = append(output, color.Cyan.Sprintf("%-25s %-15s %-10s %s%s",
+			entry.Name,
+			fmt.Sprintf("%s-%s", entry.Version, entry.Revision),
+			entry.Arch,
+			variantDisplay,
+			multiSuffix))
 		foundAny = true
 	}
 
 	if !foundAny && searchTerm != "" {
 		colArrow.Print("-> ")
 		colSuccess.Printf("No remote packages found matching: %s\n", searchTerm)
+		return nil
 	}
 
-	return nil
+	return RunPager("Remote Packages", output)
 }
 
 // GetRemotePackageVersion searches the remote index for a package matching system criteria.
