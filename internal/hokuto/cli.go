@@ -57,8 +57,10 @@ func printHelp() {
 		{"settings", "", "Manage hokuto configuration interactively"},
 		{"init-repos", "", "Initialize repositories"},
 		{"upload", "[options] [pkgname...]", "Upload local binaries to R2 and update index"},
-		{"keys", "[--sync]", "Manage trusted public keys (keyring)"},
 		{"depends", "[--reverse] <pkg>", "Show package dependencies or reverse dependencies"},
+		{"meta", "pkgname [-e] [-db]", "Show/edit package metadata or generate global DB"},
+		{"search", "[query | -tag <tag>]", "Search global package database"},
+		{"sync", "", "Manually sync global package database from mirror"},
 	}
 
 	// --- Dynamic Padding Logic ---
@@ -1097,6 +1099,24 @@ func Main() {
 				fmt.Fprintf(os.Stderr, "Bump failed: %v\n", err)
 				os.Exit(1)
 			}
+		}
+
+	case "meta":
+		if err := HandleMetaCommand(os.Args[2:], cfg); err != nil {
+			fmt.Fprintf(os.Stderr, "Meta command failed: %v\n", err)
+			os.Exit(1)
+		}
+
+	case "sync":
+		if err := SyncPkgDB(cfg); err != nil {
+			fmt.Fprintf(os.Stderr, "Sync failed: %v\n", err)
+			os.Exit(1)
+		}
+
+	case "search":
+		if err := SearchPkgDB(os.Args[2:], cfg); err != nil {
+			fmt.Fprintf(os.Stderr, "Search failed: %v\n", err)
+			os.Exit(1)
 		}
 
 	default:

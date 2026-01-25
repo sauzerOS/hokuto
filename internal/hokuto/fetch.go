@@ -7,6 +7,7 @@ import (
 	"bufio"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -18,6 +19,7 @@ import (
 	"time"
 
 	"github.com/gookit/color"
+	"github.com/klauspost/compress/zstd"
 	"golang.org/x/sys/unix"
 )
 
@@ -561,4 +563,97 @@ func fetchSourcesWithOptions(pkgName, pkgDir string, processGit bool, quiet bool
 	}
 
 	return nil
+}
+
+// SyncPkgDB downloads the global package database from the mirror if newer.
+func SyncPkgDB(cfg *Config) error {
+	if BinaryMirror == "" {
+		return fmt.Errorf("no HOKUTO_MIRROR configured")
+	}
+
+	filename := filepath.Base(PkgDBPath)
+	url := fmt.Sprintf("%s/%s", BinaryMirror, filename)
+	tmpPath := filepath.Join(os.TempDir(), filename)
+
+	colArrow.Print("-> ")
+	colNote.Printf("Checking for updated global database from mirror\n")
+
+	// Use downloadFileQuiet to check mirror
+	if err := downloadFileQuiet(url, url, tmpPath); err != nil {
+		return fmt.Errorf("failed to download database from mirror: %w", err)
+	}
+	defer os.Remove(tmpPath)
+
+	// Read remote revision
+	remoteDB, err := readPkgDB(tmpPath)
+	if err != nil {
+		return fmt.Errorf("failed to read remote database: %w", err)
+	}
+
+	// Read local revision
+	var localRevision int64
+	if localDB, err := readPkgDB(PkgDBPath); err == nil {
+		localRevision = localDB.Revision
+	}
+
+	if remoteDB.Revision > localRevision {
+		colArrow.Print("-> ")
+		colSuccess.Printf("Newer database found (revision: %d > %d). Updating local copy.\n", remoteDB.Revision, localRevision)
+
+		// Ensure directory exists
+		if err := os.MkdirAll(filepath.Dir(PkgDBPath), 0755); err != nil {
+			return fmt.Errorf("failed to create database directory: %w", err)
+		}
+
+		// Use RootExec to move the file if target is not writable
+		// Actually, /var/db/hokuto is usually owned by root.
+		// Let's copy it using standard methods first, or use RootExec if needed.
+
+		data, err := os.ReadFile(tmpPath)
+		if err != nil {
+			return err
+		}
+
+		if os.Geteuid() == 0 {
+			err = os.WriteFile(PkgDBPath, data, 0644)
+		} else {
+			// Write to a temporary file and move with sudo
+			tempFile, _ := os.CreateTemp("", "pkg-db-sync-*.zst")
+			_ = os.WriteFile(tempFile.Name(), data, 0644)
+			tempFile.Close()
+			mvCmd := exec.Command("mv", tempFile.Name(), PkgDBPath)
+			err = RootExec.Run(mvCmd)
+		}
+
+		if err != nil {
+			return fmt.Errorf("failed to update local database: %w", err)
+		}
+		colSuccess.Println("Global database updated successfully.")
+	} else {
+		colArrow.Print("-> ")
+		colSuccess.Printf("Local database is already up to date (revision: %d).\n", localRevision)
+	}
+
+	return nil
+}
+
+func readPkgDB(path string) (*PkgDB, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	zr, err := zstd.NewReader(f)
+	if err != nil {
+		return nil, err
+	}
+	defer zr.Close()
+
+	var db PkgDB
+	if err := json.NewDecoder(zr).Decode(&db); err != nil {
+		return nil, err
+	}
+
+	return &db, nil
 }

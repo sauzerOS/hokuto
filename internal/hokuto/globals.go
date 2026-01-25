@@ -59,6 +59,7 @@ var (
 	LockFile         = "/etc/hokuto/hokuto.lock"
 	PkgsetFile       = "/etc/hokuto/hokuto.pkgset"
 	versionedPkgDirs = make(map[string]string) // pkgName@version -> tmpDir
+	PkgDBPath        = "/var/db/hokuto/pkg-db.json.zst"
 )
 
 // Packages that have multilib variants (32-bit library support)

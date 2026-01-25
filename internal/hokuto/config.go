@@ -181,6 +181,7 @@ func initConfig(cfg *Config) {
 	WorldFile = filepath.Join(rootDir, "/var/db/hokuto/world")
 	WorldMakeFile = filepath.Join(rootDir, "/var/db/hokuto/world_make")
 	LockFile = filepath.Join(rootDir, "/etc/hokuto/hokuto.lock")
+	PkgDBPath = filepath.Join(rootDir, "/var/db/hokuto/pkg-db.json.zst")
 	newPackageDir = "/repo/sauzeros/extra" // default for 'hokuto new'
 }
 

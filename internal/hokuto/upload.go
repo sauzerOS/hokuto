@@ -46,6 +46,7 @@ func handleUploadCommand(args []string, cfg *Config) error {
 	var reindex = uploadCmd.Bool("reindex", false, "Regenerate the remote index by scanning the bucket")
 	var sync = uploadCmd.Bool("sync", false, "Upload all local files missing on remote without prompt")
 	var prompt = uploadCmd.Bool("prompt", false, "Prompt for each local file missing on remote (optionally filtered by name)")
+	var syncdb = uploadCmd.Bool("syncdb", false, "Upload only the global package database (pkg-db.json.zst)")
 	var deletePkg = uploadCmd.String("delete", "", "Delete all variants of a package from remote")
 
 	// Set output to stderr to avoid polluting stdout if captured
@@ -66,8 +67,8 @@ func handleUploadCommand(args []string, cfg *Config) error {
 	filters := uploadCmd.Args()
 
 	// Usage check if not deleting
-	if *deletePkg == "" && !*sync && !*prompt && !*cleanup && !*reindex {
-		fmt.Println("Usage: hk upload [options] [pkgname...]")
+	if *deletePkg == "" && !*sync && !*prompt && !*cleanup && !*reindex && !*syncdb {
+		fmt.Println("Usage: hk upload [options] [pkgname]")
 		fmt.Println("")
 		fmt.Println("Options:")
 		uploadCmd.PrintDefaults()
@@ -82,6 +83,10 @@ func handleUploadCommand(args []string, cfg *Config) error {
 	r2, err := NewR2Client(cfg)
 	if err != nil {
 		return err
+	}
+
+	if *syncdb {
+		return uploadPkgDB(ctx, r2)
 	}
 
 	// 3. Fetch Remote Index
@@ -471,6 +476,32 @@ func handleUploadCommand(args []string, cfg *Config) error {
 		colSuccess.Printf("Everything up to date.\n")
 	}
 
+	if *sync {
+		_ = uploadPkgDB(ctx, r2)
+	}
+
+	return nil
+}
+
+func uploadPkgDB(ctx context.Context, r2 *R2Client) error {
+	colArrow.Print("-> ")
+	colNote.Println("Syncing global package database to R2")
+
+	data, err := os.ReadFile(PkgDBPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("local database not found: %s. Generate it first with 'hokuto meta -db'", PkgDBPath)
+		}
+		return fmt.Errorf("failed to read local database: %w", err)
+	}
+
+	filename := filepath.Base(PkgDBPath)
+	if err := r2.UploadFile(ctx, filename, data); err != nil {
+		return fmt.Errorf("failed to upload database: %w", err)
+	}
+
+	colArrow.Print("-> ")
+	colSuccess.Println("Global package database synced successfully.")
 	return nil
 }
 
