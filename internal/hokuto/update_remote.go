@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/gookit/color"
 )
@@ -34,6 +35,7 @@ func checkForRemoteUpgrades(_ context.Context, cfg *Config) error {
 	// 3. Identify Upgrades
 	var upgradeList []Package
 	targetPacketMap := make(map[string]RepoEntry)
+	fallbackMap := make(map[string]bool)
 
 	for name, pkg := range installedPackages {
 		// Find matching entry in remote index with correct Arch/Variant
@@ -45,27 +47,30 @@ func checkForRemoteUpgrades(_ context.Context, cfg *Config) error {
 		// We need to match based on system arch/variant preferences
 		targetArch := GetSystemArchForPackage(cfg, name)
 		// Determine variant (generic/optimized/multilib)
-		// Note: installed variant might differ, but we check what we WOULD install
-		targetVariant := GetSystemVariantForPackage(cfg, name)
+		preferredVariant := GetSystemVariantForPackage(cfg, name)
 
 		for _, entry := range remoteIndex {
-			if entry.Name == name && entry.Arch == targetArch && entry.Variant == targetVariant {
+			if entry.Name == name && entry.Arch == targetArch && entry.Variant == preferredVariant {
 				remoteEntry = entry
 				found = true
 				break
 			}
 		}
 
-		if !found {
-			// Maybe generic fallback?
-			if targetVariant != "generic" {
-				targetVariant = "generic"
-				for _, entry := range remoteIndex {
-					if entry.Name == name && entry.Arch == targetArch && entry.Variant == targetVariant {
-						remoteEntry = entry
-						found = true
-						break
-					}
+		usingFallback := false
+		if !found && !strings.Contains(preferredVariant, "generic") {
+			// Try generic fallback
+			fallbackVariant := "generic"
+			if strings.HasPrefix(preferredVariant, "multi-") {
+				fallbackVariant = "multi-generic"
+			}
+
+			for _, entry := range remoteIndex {
+				if entry.Name == name && entry.Arch == targetArch && entry.Variant == fallbackVariant {
+					remoteEntry = entry
+					found = true
+					usingFallback = true
+					break
 				}
 			}
 		}
@@ -74,28 +79,30 @@ func checkForRemoteUpgrades(_ context.Context, cfg *Config) error {
 			continue // Package not in remote repo
 		}
 
+		// If using fallback, prompt now or mark it?
+		// Better to mark it in the version string or similar for the final table.
+		repoVersionDisplay := remoteEntry.Version
+		if usingFallback {
+			repoVersionDisplay += " (generic fallback)"
+		}
+
 		// Store for later use
 		targetPacketMap[name] = remoteEntry
 
 		// Compare versions
-		// Using RepoEntry struct which has string Version/Revision
 		pkg.RepoVersion = remoteEntry.Version
 		pkg.RepoRevision = remoteEntry.Revision
 
-		isVersionMismatch := pkg.InstalledVersion != pkg.RepoVersion
-		isRevisionMismatch := pkg.InstalledRevision != pkg.RepoRevision
-
-		if isVersionMismatch || isRevisionMismatch {
-			// Check if new version is actually newer?
-			// Using helper isNewer(remoteEntry, currentEntry) would be better if we constructed a RepoEntry for current.
-			// Currently we trust textual difference triggers update?
-			// Let's use compareVersions logic if possible, or build a temp RepoEntry
-			currentEntry := RepoEntry{
-				Version:  pkg.InstalledVersion,
-				Revision: pkg.InstalledRevision,
-			}
-			if isNewer(remoteEntry, currentEntry) {
-				upgradeList = append(upgradeList, pkg)
+		currentEntry := RepoEntry{
+			Version:  pkg.InstalledVersion,
+			Revision: pkg.InstalledRevision,
+		}
+		if isNewer(remoteEntry, currentEntry) {
+			// If it's a fallback, we need to ask permission specifically for this or inform the user
+			pkg.RepoVersion = repoVersionDisplay // Hack to show fallback in the confirmation list
+			upgradeList = append(upgradeList, pkg)
+			if usingFallback {
+				fallbackMap[name] = true
 			}
 		}
 	}
@@ -120,6 +127,21 @@ func checkForRemoteUpgrades(_ context.Context, cfg *Config) error {
 	if !askForConfirmation(colWarn, "Do you want to upgrade these packages from remote?") {
 		cPrintln(colNote, "Upgrade canceled by user.")
 		return nil
+	}
+
+	// 4a. Specific confirmation for fallbacks
+	var fallbacksFound []string
+	for name := range fallbackMap {
+		fallbacksFound = append(fallbacksFound, name)
+	}
+
+	if len(fallbacksFound) > 0 {
+		colArrow.Print("-> ")
+		colSuccess.Printf("No optimized variants found for: %v\n", fallbacksFound)
+		if !askForConfirmation(colSuccess, "Use generic fallbacks for these packages?") {
+			cPrintln(colNote, "Upgrade canceled by user.")
+			return nil
+		}
 	}
 
 	// 5. Prioritize hokuto update
@@ -210,24 +232,51 @@ func installRemotePackage(pkgName string, cfg *Config, remoteIndex []RepoEntry) 
 	// Find entry
 	var entry RepoEntry
 	found := false
+	arch := GetSystemArchForPackage(cfg, pkgName)
+	preferredVariant := GetSystemVariantForPackage(cfg, pkgName)
+
+	var bestMatch *RepoEntry
 	for _, e := range remoteIndex {
-		if e.Name == pkgName {
-			entry = e
-			found = true
-			break
+		if e.Name == pkgName && e.Arch == arch && e.Variant == preferredVariant {
+			if bestMatch == nil || isNewer(e, *bestMatch) {
+				bestMatch = &e
+			}
 		}
 	}
+
+	if bestMatch != nil {
+		entry = *bestMatch
+		found = true
+	}
+
+	// FALLBACK: Try generic
+	if !found && !strings.Contains(preferredVariant, "generic") {
+		fallbackVariant := "generic"
+		if strings.HasPrefix(preferredVariant, "multi-") {
+			fallbackVariant = "multi-generic"
+		}
+
+		for _, e := range remoteIndex {
+			if e.Name == pkgName && e.Arch == arch && e.Variant == fallbackVariant {
+				if bestMatch == nil || isNewer(e, *bestMatch) {
+					bestMatch = &e
+				}
+			}
+		}
+		if bestMatch != nil {
+			entry = *bestMatch
+			found = true
+		}
+	}
+
 	if !found {
-		// Should not happen if resolved via remoteIndex, but safe check
-		return fmt.Errorf("package %s not in remote index", pkgName)
+		return fmt.Errorf("package %s not in remote index for %s (%s)", pkgName, arch, preferredVariant)
 	}
 
 	version := entry.Version
 	revision := entry.Revision
-	arch := GetSystemArchForPackage(cfg, pkgName)
-	variant := GetSystemVariantForPackage(cfg, pkgName)
-
-	tarballName := StandardizeRemoteName(pkgName, version, revision, arch, variant)
+	// Note: entry.Arch and entry.Variant are the ones we FOUND
+	tarballName := StandardizeRemoteName(pkgName, version, revision, entry.Arch, entry.Variant)
 	tarballPath := filepath.Join(BinDir, tarballName)
 
 	// Fetch if missing

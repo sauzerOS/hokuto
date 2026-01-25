@@ -282,13 +282,13 @@ func resolveRemoteDependencies(pkgName string, visited map[string]bool, plan *[]
 
 	var entry RepoEntry
 	found := false
-	arch := GetSystemArch(cfg)
-	variant := GetSystemVariantForPackage(cfg, lookupName)
+	arch := GetSystemArchForPackage(cfg, lookupName)
+	preferredVariant := GetSystemVariantForPackage(cfg, lookupName)
 
 	var bestMatch *RepoEntry
 	for i := range remoteIndex {
 		e := &remoteIndex[i]
-		if e.Name == lookupName && e.Arch == arch && e.Variant == variant {
+		if e.Name == lookupName && e.Arch == arch && e.Variant == preferredVariant {
 			if targetVersion != "" {
 				if e.Version == targetVersion {
 					entry = *e
@@ -307,6 +307,36 @@ func resolveRemoteDependencies(pkgName string, visited map[string]bool, plan *[]
 	if !found && bestMatch != nil {
 		entry = *bestMatch
 		found = true
+	}
+
+	// FALLBACK: Try generic if preferred variant not found
+	if !found && !strings.Contains(preferredVariant, "generic") {
+		fallbackVariant := "generic"
+		if strings.HasPrefix(preferredVariant, "multi-") {
+			fallbackVariant = "multi-generic"
+		}
+
+		for i := range remoteIndex {
+			e := &remoteIndex[i]
+			if e.Name == lookupName && e.Arch == arch && e.Variant == fallbackVariant {
+				if targetVersion != "" {
+					if e.Version == targetVersion {
+						entry = *e
+						found = true
+						break
+					}
+					continue
+				}
+
+				if bestMatch == nil || isNewer(*e, *bestMatch) {
+					bestMatch = e
+				}
+			}
+		}
+		if !found && bestMatch != nil {
+			entry = *bestMatch
+			found = true
+		}
 	}
 
 	if !found {

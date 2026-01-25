@@ -1111,7 +1111,19 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 	// Determine architecture and flags for metadata
 	targetArch := defaults["HOKUTO_ARCH"]
 	cflagsVal := defaults["CFLAGS"]
-	isGeneric := cfg.Values["HOKUTO_GENERIC"] == "1" || cfg.Values["HOKUTO_CROSS_ARCH"] != ""
+
+	// Determine if this is a generic build
+	isGeneric := cfg.Values["HOKUTO_GENERIC"] == "1"
+
+	// If ARM64, it's ONLY generic if cross-simple/nocrossopt was used or CFLAGS_ARM64 was missing
+	if !isGeneric && targetArch == "aarch64" {
+		if options["nocrossopt"] || cfg.Values["HOKUTO_CROSS_SIMPLE"] == "1" || cfg.Values["CFLAGS_ARM64"] == "" {
+			isGeneric = true
+		}
+	} else if !isGeneric && cfg.Values["HOKUTO_CROSS_ARCH"] != "" {
+		// For other cross builds, default to generic for now
+		isGeneric = true
+	}
 
 	// Detect multilib in output directory
 	isMultilib := detectMultilib(outputDir)

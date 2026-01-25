@@ -279,6 +279,34 @@ func GetRemotePackageVersion(pkgName string, cfg *Config, remoteIndex []RepoEntr
 		return bestMatch.Version, bestMatch.Revision, nil
 	}
 
+	// FALLBACK: If preferred variant not found, try 'generic'
+	if !strings.Contains(variant, "generic") {
+		// multi-optimized -> multi-generic, optimized -> generic
+		fallbackVariant := "generic"
+		if strings.HasPrefix(variant, "multi-") {
+			fallbackVariant = "multi-generic"
+		}
+
+		for i := range remoteIndex {
+			entry := &remoteIndex[i]
+			if entry.Name == lookupName && entry.Arch == arch && entry.Variant == fallbackVariant {
+				if targetVersion != "" {
+					if entry.Version == targetVersion {
+						return entry.Version, entry.Revision, nil
+					}
+					continue
+				}
+				if bestMatch == nil || isNewer(*entry, *bestMatch) {
+					bestMatch = entry
+				}
+			}
+		}
+	}
+
+	if bestMatch != nil {
+		return bestMatch.Version, bestMatch.Revision, nil
+	}
+
 	if targetVersion != "" {
 		return "", "", fmt.Errorf("package %s@%s not found in remote index for %s (%s)", lookupName, targetVersion, arch, variant)
 	}

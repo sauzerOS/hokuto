@@ -811,6 +811,30 @@ func Main() {
 								foundOnMirror = true
 							} else {
 								debugf("Mirror fetch failed for %s: %v\n", pkgName, err)
+
+								// 2a. FALLBACK: Try generic if optimized failed
+								variant := GetSystemVariantForPackage(cfg, pkgName)
+								if !strings.Contains(variant, "generic") {
+									fallbackVariant := "generic"
+									if strings.HasPrefix(variant, "multi-") {
+										fallbackVariant = "multi-generic"
+									}
+									colArrow.Print("-> ")
+									cPrintf(colInfo, "Optimized binary not found, trying fallback: %s\n", fallbackVariant)
+
+									// Temporarily override HOKUTO_GENERIC for this lookup
+									oldGeneric := cfg.Values["HOKUTO_GENERIC"]
+									cfg.Values["HOKUTO_GENERIC"] = "1"
+
+									if err := fetchBinaryPackage(pkgName, version, revision, cfg); err == nil {
+										foundOnMirror = true
+										// Update tarballPath for installation
+										arch := GetSystemArchForPackage(cfg, pkgName)
+										tarballPath = filepath.Join(BinDir, StandardizeRemoteName(pkgName, version, revision, arch, fallbackVariant))
+									}
+
+									cfg.Values["HOKUTO_GENERIC"] = oldGeneric
+								}
 							}
 						}
 
