@@ -795,7 +795,7 @@ func Main() {
 						continue
 					}
 				} else {
-					arch := GetSystemArch(cfg)
+					arch := GetSystemArchForPackage(cfg, pkgName)
 					variant := GetSystemVariantForPackage(cfg, pkgName)
 					tarballPath = filepath.Join(BinDir, StandardizeRemoteName(pkgName, version, revision, arch, variant))
 				}

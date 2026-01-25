@@ -19,7 +19,22 @@ import (
 
 // GetSystemArch returns the current system architecture, normalized (e.g., x86_64, aarch64).
 func GetSystemArch(cfg *Config) string {
-	// If cross-compiling, use the cross architecture
+	return GetSystemArchForPackage(cfg, "")
+}
+
+// GetSystemArchForPackage returns the appropriate architecture for a given package.
+// If the package name starts with an architecture prefix (e.g., aarch64-curl), it returns that architecture.
+func GetSystemArchForPackage(cfg *Config, pkgName string) string {
+	// 1. Explicit package prefix detection
+	// We handle prefixes like aarch64-, x86_64-
+	if strings.HasPrefix(pkgName, "aarch64-") {
+		return "aarch64"
+	}
+	if strings.HasPrefix(pkgName, "x86_64-") {
+		return "x86_64"
+	}
+
+	// 2. Cross-compilation override
 	if cfg.Values["HOKUTO_CROSS_ARCH"] != "" {
 		arch := cfg.Values["HOKUTO_CROSS_ARCH"]
 		if arch == "arm64" || arch == "aarch64" {
@@ -31,6 +46,7 @@ func GetSystemArch(cfg *Config) string {
 		return arch
 	}
 
+	// 3. System detection
 	arch := cfg.Values["HOKUTO_ARCH"]
 	if arch == "" {
 		cmd := exec.Command("uname", "-m")
@@ -60,13 +76,16 @@ func GetSystemVariant(cfg *Config) string {
 // If multilib is enabled and the package supports it, returns "multi-generic" or "multi-optimized".
 func GetSystemVariantForPackage(cfg *Config, pkgName string) string {
 	baseVariant := "optimized"
-	if HokutoGeneric || cfg.Values["HOKUTO_GENERIC"] == "1" || cfg.Values["HOKUTO_CROSS_ARCH"] != "" {
+
+	// Cross-packages (prefixed with architecture) or forced generic logic
+	isCrossPkg := strings.HasPrefix(pkgName, "aarch64-") || strings.HasPrefix(pkgName, "x86_64-")
+	if HokutoGeneric || cfg.Values["HOKUTO_GENERIC"] == "1" || cfg.Values["HOKUTO_CROSS_ARCH"] != "" || isCrossPkg {
 		baseVariant = "generic"
 	}
 
 	// Check if multilib is enabled and package supports it
 	// FIX: Disable multilib for cross builds to match build-time packaging logic
-	if cfg.Values["HOKUTO_CROSS_ARCH"] == "" && cfg.Values["HOKUTO_MULTILIB"] == "1" && pkgName != "" && pkgName != "sauzeros-base" {
+	if cfg.Values["HOKUTO_CROSS_ARCH"] == "" && cfg.Values["HOKUTO_MULTILIB"] == "1" && pkgName != "" && pkgName != "sauzeros-base" && !isCrossPkg {
 		if isMultilibPackage(pkgName) {
 			return "multi-" + baseVariant
 		}

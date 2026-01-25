@@ -11,7 +11,7 @@ import (
 
 // checkForRemoteUpgrades implements 'hokuto update --remote'
 // It compares installed packages against the remote index and updates them if newer versions exist.
-func checkForRemoteUpgrades(ctx context.Context, cfg *Config) error {
+func checkForRemoteUpgrades(_ context.Context, cfg *Config) error {
 	colArrow.Print("-> ")
 	colSuccess.Println("Checking for Remote Package Upgrades (Binary Mirror)")
 
@@ -43,7 +43,7 @@ func checkForRemoteUpgrades(ctx context.Context, cfg *Config) error {
 		found := false
 
 		// We need to match based on system arch/variant preferences
-		targetArch := GetSystemArch(cfg)
+		targetArch := GetSystemArchForPackage(cfg, name)
 		// Determine variant (generic/optimized/multilib)
 		// Note: installed variant might differ, but we check what we WOULD install
 		targetVariant := GetSystemVariantForPackage(cfg, name)
@@ -224,8 +224,8 @@ func installRemotePackage(pkgName string, cfg *Config, remoteIndex []RepoEntry) 
 
 	version := entry.Version
 	revision := entry.Revision
-	arch := entry.Arch
-	variant := entry.Variant
+	arch := GetSystemArchForPackage(cfg, pkgName)
+	variant := GetSystemVariantForPackage(cfg, pkgName)
 
 	tarballName := StandardizeRemoteName(pkgName, version, revision, arch, variant)
 	tarballPath := filepath.Join(BinDir, tarballName)
