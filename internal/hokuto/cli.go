@@ -199,8 +199,11 @@ func Main() {
 	initConfig(cfg)
 
 	// Ensure critical directories have correct ownership
-	if err := ensureHokutoOwnership(cfg); err != nil {
-		fmt.Fprintf(os.Stderr, "Warning: Ownership check failed: %v\n", err)
+	// Skip for 'check' command to avoid nested sudo prompts in builds
+	if len(os.Args) > 1 && os.Args[1] != "check" {
+		if err := ensureHokutoOwnership(cfg); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: Ownership check failed: %v\n", err)
+		}
 	}
 
 	// 4.5 Handle versioned package requests (pkg@version)

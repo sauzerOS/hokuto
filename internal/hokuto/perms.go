@@ -21,30 +21,41 @@ func ensureHokutoOwnership(cfg *Config) error {
 
 	// 1. Determine target user and group
 	targetUser := os.Getenv("SUDO_USER")
-	if targetUser == "" {
-		currentUser, err := user.Current()
-		if err != nil {
-			return fmt.Errorf("failed to get current user: %w", err)
-		}
-		targetUser = currentUser.Username
+	targetGroup := ""
+	var targetGID string
+
+	// Get current user (of the process)
+	currentUser, err := user.Current()
+	if err != nil {
+		return fmt.Errorf("failed to get current user: %w", err)
 	}
 
-	// We strictly require 'wheel' group.
-	targetGroup := "wheel"
+	if targetUser == "" {
+		targetUser = currentUser.Username
+		targetGID = currentUser.Gid
+	} else {
+		// If running via sudo, we want the SUDO_USER's primary group
+		u, err := user.Lookup(targetUser)
+		if err != nil {
+			return fmt.Errorf("failed to lookup user %s: %w", targetUser, err)
+		}
+		targetGID = u.Gid
+	}
 
-	// Resolve UID/GID for comparison
+	// Lookup group name for display/logging if needed, or verification
+	g, err := user.LookupGroupId(targetGID)
+	if err == nil {
+		targetGroup = g.Name
+	} else {
+		targetGroup = targetGID // Fallback to GID
+	}
+
+	// Resolve UID
 	u, err := user.Lookup(targetUser)
 	if err != nil {
 		return fmt.Errorf("failed to lookup user %s: %w", targetUser, err)
 	}
 	targetUID := u.Uid
-	g, err := user.LookupGroup(targetGroup)
-	if err != nil {
-		// If 'wheel' doesn't exist, we might be on a system where it's called something else,
-		// but the user's request was specific.
-		return fmt.Errorf("failed to lookup group %s: %w", targetGroup, err)
-	}
-	targetGID := g.Gid
 
 	// 2. Identify Paths to check
 	// The user requested: HOKUTO_ROOT/$TMPDIR, HOKUTO_ROOT/$TMPDIR2, HOKUTO_ROOT/repo/,
