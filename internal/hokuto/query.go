@@ -110,10 +110,19 @@ func listPackages(searchTerm string) error {
 		}
 
 		// Add to output slice
+		prefix := colArrow.Sprint("->")
+
 		if buildtimeStr != "" {
-			output = append(output, color.Cyan.Sprintf("%-30s %s", fmt.Sprintf("%s %s", p, versionInfo), buildtimeStr))
+			output = append(output, fmt.Sprintf("%s %s %s %s",
+				prefix,
+				colSuccess.Sprintf("%-25s", p),
+				colNote.Sprintf("%-15s", versionInfo),
+				color.Cyan.Sprint(buildtimeStr)))
 		} else {
-			output = append(output, color.Cyan.Sprintf("%s %s", p, versionInfo))
+			output = append(output, fmt.Sprintf("%s %s %s",
+				prefix,
+				colSuccess.Sprintf("%-25s", p),
+				colNote.Sprintf("%-15s", versionInfo)))
 		}
 	}
 
@@ -226,12 +235,14 @@ func listRemotePackages(searchTerm string, cfg *Config) error {
 			variantDisplay = "native"
 		}
 
-		output = append(output, color.Cyan.Sprintf("%-25s %-15s %-10s %s%s",
-			entry.Name,
-			fmt.Sprintf("%s-%s", entry.Version, entry.Revision),
-			entry.Arch,
-			variantDisplay,
-			multiSuffix))
+		output = append(output, fmt.Sprintf("%s %s %s %s",
+			colArrow.Sprint("->"),
+			colSuccess.Sprintf("%-25s", entry.Name),
+			colNote.Sprintf("%-15s", fmt.Sprintf("%s-%s", entry.Version, entry.Revision)),
+			color.Cyan.Sprintf("%-10s %s%s",
+				entry.Arch,
+				variantDisplay,
+				multiSuffix)))
 		foundAny = true
 	}
 

@@ -206,5 +206,5 @@ var (
 	colError   = color.Error
 	colSuccess = color.HEX("#1976D2")
 	colArrow   = color.HEX("#FFEB3B")
-	colNote    = color.Tag("notice")
+	colNote    = color.HEX("#0ba913") // Grey-ish color for notes/versions
 )
