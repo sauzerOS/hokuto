@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/gookit/color"
@@ -113,20 +114,33 @@ func checkForRemoteUpgrades(_ context.Context, cfg *Config) error {
 		return nil
 	}
 
-	// 4. Prompt User
-	cPrintf(colInfo, "\n--- %d Remote Package(s) to Upgrade ---\n", len(upgradeList))
-	var pkgNames []string
-	for _, pkg := range upgradeList {
-		cPrintf(colInfo, "  - %s: %s %s -> %s %s\n",
-			pkg.Name,
+	// Sort upgrade list alphabetically
+	sort.SliceStable(upgradeList, func(i, j int) bool {
+		return upgradeList[i].Name < upgradeList[j].Name
+	})
+
+	fmt.Println()
+	colSuccess.Printf("--- %d Remote Package(s) to Upgrade ---\n", len(upgradeList))
+	for i, pkg := range upgradeList {
+		colArrow.Print("-> ")
+		fmt.Printf("%2d) ", i+1)
+		color.Bold.Printf("%s", pkg.Name)
+		fmt.Print(": ")
+		colNote.Printf("%s %s -> %s %s\n",
 			pkg.InstalledVersion, pkg.InstalledRevision,
 			pkg.RepoVersion, pkg.RepoRevision)
-		pkgNames = append(pkgNames, pkg.Name)
 	}
 
-	if !askForConfirmation(colWarn, "Do you want to upgrade these packages from remote?") {
-		cPrintln(colNote, "Upgrade canceled by user.")
+	// 4. Prompt User
+	indices, ok := AskForSelection("Update (a)ll or pick packages to update/ignore (numbers or -numbers):", len(upgradeList))
+	if !ok {
+		colNote.Println("Upgrade canceled by user.")
 		return nil
+	}
+
+	var pkgNames []string
+	for _, idx := range indices {
+		pkgNames = append(pkgNames, upgradeList[idx].Name)
 	}
 
 	// 4a. Specific confirmation for fallbacks

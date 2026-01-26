@@ -177,6 +177,18 @@ func resolveMissingDeps(pkgName string, processed map[string]bool, missing *[]st
 			continue
 		}
 
+		// FILTER: When in cross-mode, ignore dependencies that don't match the target architecture
+		if cfg.Values["HOKUTO_CROSS_ARCH"] != "" {
+			normalizedArch := cfg.Values["HOKUTO_CROSS_ARCH"]
+			if normalizedArch == "arm64" {
+				normalizedArch = "aarch64"
+			}
+			prefix := normalizedArch + "-"
+			if !strings.HasPrefix(dep.Name, prefix) {
+				continue
+			}
+		}
+
 		depName := dep.Name
 
 		// Resolve alternative dependencies if present
@@ -618,6 +630,18 @@ func resolveBuildPlan(targetPackages []string, userRequestedPackages map[string]
 			// New filtering: skip cross dependencies if not cross-compiling
 			if dep.Cross && cfg.Values["HOKUTO_CROSS_ARCH"] == "" {
 				continue
+			}
+
+			// FILTER: When in cross-mode, ignore dependencies that don't match the target architecture
+			if cfg.Values["HOKUTO_CROSS_ARCH"] != "" {
+				normalizedArch := cfg.Values["HOKUTO_CROSS_ARCH"]
+				if normalizedArch == "arm64" {
+					normalizedArch = "aarch64"
+				}
+				prefix := normalizedArch + "-"
+				if !strings.HasPrefix(dep.Name, prefix) {
+					continue
+				}
 			}
 
 			depName := dep.Name

@@ -452,21 +452,33 @@ func checkForUpgrades(_ context.Context, cfg *Config) error {
 		return nil
 	}
 
-	cPrintf(colInfo, "\n--- %d Package(s) to Upgrade ---\n", len(filteredUpgradeList))
-	var pkgNames []string
-	for _, pkg := range filteredUpgradeList {
-		// Print full version/revision information for clarity
-		cPrintf(colInfo, "  - %s: %s %s -> %s %s\n",
-			pkg.Name,
+	// Sort upgrade list alphabetically
+	sort.SliceStable(filteredUpgradeList, func(i, j int) bool {
+		return filteredUpgradeList[i].Name < filteredUpgradeList[j].Name
+	})
+
+	fmt.Println()
+	colSuccess.Printf("--- %d Package(s) to Upgrade ---\n", len(filteredUpgradeList))
+	for i, pkg := range filteredUpgradeList {
+		colArrow.Print("-> ")
+		fmt.Printf("%2d) ", i+1)
+		color.Bold.Printf("%s", pkg.Name)
+		fmt.Print(": ")
+		colNote.Printf("%s %s -> %s %s\n",
 			pkg.InstalledVersion, pkg.InstalledRevision,
 			pkg.RepoVersion, pkg.RepoRevision)
-		pkgNames = append(pkgNames, pkg.Name)
 	}
 
 	// 4. Prompt user for upgrade
-	if !askForConfirmation(colWarn, "Do you want to upgrade these packages?") {
-		cPrintln(colNote, "Upgrade canceled by user.")
+	indices, ok := AskForSelection("Update (a)ll or pick packages to update/ignore (numbers or -numbers):", len(filteredUpgradeList))
+	if !ok {
+		colNote.Println("Upgrade canceled by user.")
 		return nil
+	}
+
+	var pkgNames []string
+	for _, idx := range indices {
+		pkgNames = append(pkgNames, filteredUpgradeList[idx].Name)
 	}
 
 	// 5. Build order and dependency resolution for the updates

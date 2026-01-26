@@ -61,6 +61,7 @@ func printHelp() {
 		{"meta", "pkgname [-e] [-db]", "Show/edit package metadata or generate global DB"},
 		{"search", "[query | -tag <tag>]", "Search global package database"},
 		{"sync", "", "Manually sync global package database from mirror"},
+		{"cross-sync", "", "Identify and build missing native cross packages"},
 	}
 
 	// --- Dynamic Padding Logic ---
@@ -382,6 +383,12 @@ func Main() {
 	case "depends":
 		if err := handleDependsCommand(os.Args[2:], cfg); err != nil {
 			fmt.Fprintf(os.Stderr, "Depends command failed: %v\n", err)
+			os.Exit(1)
+		}
+
+	case "cross-sync":
+		if err := handleCrossSyncCommand(os.Args[2:], cfg); err != nil {
+			fmt.Fprintf(os.Stderr, "Cross-sync failed: %v\n", err)
 			os.Exit(1)
 		}
 
