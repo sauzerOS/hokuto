@@ -504,8 +504,8 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 			}
 		} else if isARM {
 			// Case: ARM64 (Native or Cross)
-			// Use optimized flags unless explicitly disabled or in simple cross mode
-			if !options["nocrossopt"] && cfg.Values["HOKUTO_CROSS_SIMPLE"] != "1" && cfg.Values["CFLAGS_ARM64"] != "" {
+			// Use optimized flags unless explicitly disabled, in simple cross mode, or cross-system build
+			if !options["nocrossopt"] && cfg.Values["HOKUTO_CROSS_SIMPLE"] != "1" && cfg.Values["HOKUTO_CROSS_SYSTEM"] != "1" && cfg.Values["CFLAGS_ARM64"] != "" {
 				cflagsVal = cfg.Values["CFLAGS_ARM64"]
 				cxxflagsVal = cfg.Values["CXXFLAGS_ARM64"]
 				debugf("Using optimized ARM64 flags: %s\n", cflagsVal)
@@ -631,20 +631,40 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 			// Disable MULTILIB for cross-compilation
 			defaults["MULTILIB"] = "0"
 
-			// Replace compiler tools with cross-compilation toolchain (unless simple mode)
-			if cfg.Values["HOKUTO_CROSS_SIMPLE"] != "1" {
+			// Replace compiler tools with cross-compilation toolchain (unless simple mode or host tool for cross-system)
+			isCrossSystem := cfg.Values["HOKUTO_CROSS_SYSTEM"] == "1"
+			shouldBuildHostNative := options["host-tool"] && (isCrossSystem || cfg.Values["HOKUTO_CROSS_SIMPLE"] == "1")
+
+			if cfg.Values["HOKUTO_CROSS_SIMPLE"] != "1" && !shouldBuildHostNative {
 				toolchainPrefix := normalizedArch + "-linux-gnu-"
 				defaults["CC"] = toolchainPrefix + "gcc"
 				defaults["CXX"] = toolchainPrefix + "g++"
 				defaults["AR"] = toolchainPrefix + "ar"
 				defaults["RANLIB"] = toolchainPrefix + "ranlib"
+				defaults["PKG_CONFIG"] = toolchainPrefix + "pkg-config"
 			}
 			// In simple mode, keep normal compiler/linker settings (already set above)
 
 			// Set CROSS_PREFIX based on cross-compilation mode
 			if cfg.Values["HOKUTO_CROSS_SYSTEM"] == "1" || cfg.Values["HOKUTO_CROSS_SIMPLE"] == "1" {
 				// Use /usr/<arch>-linux-gnu for toolchain/system packages in both cross modes
-				defaults["CROSS_PREFIX"] = fmt.Sprintf("/usr/%s-linux-gnu", normalizedArch)
+				prefix := fmt.Sprintf("/usr/%s-linux-gnu", normalizedArch)
+				defaults["CROSS_PREFIX"] = prefix
+
+				// Ensure the cross-bin directory is in the PATH so tools like pkg-config can be found
+				// BUT only if we are NOT building a host-tool (otherwise we break the host compiler)
+				if !options["host-tool"] || !isCrossSystem {
+					currentPath := os.Getenv("PATH")
+					defaults["PATH"] = filepath.Join(prefix, "bin") + ":" + currentPath
+				}
+
+				// Set PKG_CONFIG environment variables to avoid host pollution
+				defaults["PKG_CONFIG_LIBDIR"] = filepath.Join(prefix, "lib", "pkgconfig") + ":" + filepath.Join(prefix, "share", "pkgconfig")
+				defaults["PKG_CONFIG_SYSROOT_DIR"] = prefix
+				defaults["PKG_CONFIG_PATH"] = "" // Clear to avoid host pollution
+
+				// Set PYTHONPATH to include target site-packages for build-time module detection
+				defaults["PYTHONPATH"] = filepath.Join(prefix, "lib", "python3.14", "site-packages")
 			} else {
 				// Regular cross-compilation (user packages): use /usr
 				defaults["CROSS_PREFIX"] = "/usr"
@@ -661,6 +681,12 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 		}
 	}
 
+	// Set QEMU_LD_PREFIX if we have a non-standard prefix (sysroot)
+	// This allows running target binaries via QEMU emulation on the host
+	if defaults["CROSS_PREFIX"] != "/usr" {
+		defaults["QEMU_LD_PREFIX"] = defaults["CROSS_PREFIX"]
+	}
+
 	// Sort keys for deterministic order
 	keys := make([]string, 0, len(defaults))
 	for k := range defaults {
@@ -671,6 +697,19 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 	var envVarsBuilder strings.Builder
 	for _, k := range keys {
 		v := defaults[k]
+
+		// Handle PATH specially to avoid duplicate entries in env if defaults already has it
+		if k == "PATH" {
+			// Find and remove existing PATH from env if we are setting a new one from defaults
+			newEnv := make([]string, 0, len(env))
+			for _, e := range env {
+				if !strings.HasPrefix(e, "PATH=") {
+					newEnv = append(newEnv, e)
+				}
+			}
+			env = newEnv
+		}
+
 		env = append(env, fmt.Sprintf("%s=%s", k, v))
 		// Escape single quotes for the command string
 		vEscaped := strings.ReplaceAll(v, "'", "'\\''")
@@ -1115,9 +1154,9 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 	// Determine if this is a generic build
 	isGeneric := cfg.Values["HOKUTO_GENERIC"] == "1"
 
-	// If ARM64, it's ONLY generic if cross-simple/nocrossopt was used or CFLAGS_ARM64 was missing
+	// If ARM64, it's ONLY generic if cross-simple/nocrossopt/cross-system was used or CFLAGS_ARM64 was missing
 	if !isGeneric && targetArch == "aarch64" {
-		if options["nocrossopt"] || cfg.Values["HOKUTO_CROSS_SIMPLE"] == "1" || cfg.Values["CFLAGS_ARM64"] == "" {
+		if options["nocrossopt"] || cfg.Values["HOKUTO_CROSS_SIMPLE"] == "1" || cfg.Values["HOKUTO_CROSS_SYSTEM"] == "1" || cfg.Values["CFLAGS_ARM64"] == "" {
 			isGeneric = true
 		}
 	} else if !isGeneric && cfg.Values["HOKUTO_CROSS_ARCH"] != "" {
@@ -1417,10 +1456,22 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 
 	// Check if cross-compilation is enabled
 	isCross := cfg.Values["HOKUTO_CROSS_ARCH"] != ""
+	isCrossSystem := cfg.Values["HOKUTO_CROSS_SYSTEM"] == "1"
+	shouldBuildHostNative := options["host-tool"] && isCrossSystem
+
+	if isCross && !shouldBuildHostNative {
+		// Use cross tools unless it's explicitly a host-tool for cross-system build
+		toolchainPrefix := targetArch + "-linux-gnu-"
+		defaults["CC"] = toolchainPrefix + "gcc"
+		defaults["CXX"] = toolchainPrefix + "g++"
+		defaults["AR"] = toolchainPrefix + "ar"
+		defaults["RANLIB"] = toolchainPrefix + "ranlib"
+	}
 
 	if isARM {
 		// Case A: ARM64 (Native or Cross)
-		if cfg.Values["HOKUTO_CROSS_SIMPLE"] != "1" && cfg.Values["CFLAGS_ARM64"] != "" {
+		// Use optimized flags unless explicitly disabled, in simple cross mode, or cross-system build
+		if !options["nocrossopt"] && cfg.Values["HOKUTO_CROSS_SIMPLE"] != "1" && cfg.Values["HOKUTO_CROSS_SYSTEM"] != "1" && cfg.Values["CFLAGS_ARM64"] != "" {
 			cflagsVal = cfg.Values["CFLAGS_ARM64"]
 			cxxflagsVal = cfg.Values["CXXFLAGS_ARM64"]
 		} else {
@@ -1500,6 +1551,15 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 	defaults["LDFLAGS"] = ldflagsVal
 	defaults["HOKUTO_ARCH"] = targetArch
 	defaults["MULTILIB"] = multilibVal
+
+	// Ensure CROSS_PREFIX/bin is in PATH for cross-compilation
+	if isCross && isCrossSystem && !shouldBuildHostNative {
+		prefix := fmt.Sprintf("/usr/%s-linux-gnu", targetArch)
+		if targetArch == "arm64" {
+			prefix = "/usr/aarch64-linux-gnu"
+		}
+		defaults["PATH"] = filepath.Join(prefix, "bin") + ":" + os.Getenv("PATH")
+	}
 	// --- END REFACTORED FLAG LOGIC ---
 
 	// Prepare Environment Array
@@ -1526,21 +1586,25 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 
 	// Update PATH
 	currentPath := os.Getenv("PATH")
+	if defaults["PATH"] != "" {
+		currentPath = defaults["PATH"]
+	}
 	newPath := fmt.Sprintf("PATH=%s:%s:%s", oldLibBin, oldLibUsrBin, currentPath)
 	env = append(env, newPath)
 
 	// Update LD_LIBRARY_PATH
 	currentLdLibPath := os.Getenv("LD_LIBRARY_PATH")
+	if defaults["LD_LIBRARY_PATH"] != "" {
+		currentLdLibPath = defaults["LD_LIBRARY_PATH"]
+	}
 	newLdLibPath := fmt.Sprintf("LD_LIBRARY_PATH=%s:%s:%s", oldLibLib, oldLibUsrLib, currentLdLibPath)
 	env = append(env, newLdLibPath)
 
 	// 5. Final loop to assemble the environment array
 	for k, def := range defaults {
-		// Check if the current key should be excluded from being appended.
-		// This prevents the build process from overriding the system's PATH
-		// or LD_LIBRARY_PATH with an (potentially empty) value from 'defaults'.
+		// PATH and LD_LIBRARY_PATH were already handled specially above
 		if k == "PATH" || k == "LD_LIBRARY_PATH" {
-			continue // Skip appending the variable to respect the system's value
+			continue
 		}
 
 		// Append the build variable and its calculated value.

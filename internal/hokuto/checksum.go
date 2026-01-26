@@ -406,15 +406,24 @@ func ComputeChecksums(paths []string, execCtx *Executor) (map[string]string, err
 
 	// 1. Try system b3sum if available
 	if hasB3sum() {
+		// Filter out paths with backslashes or special characters that confuse b3sum output parsing
+		// These files will fall back to the recursive Go implementation below.
+		var b3Paths []string
+		for _, p := range paths {
+			if !strings.Contains(p, "\\") {
+				b3Paths = append(b3Paths, p)
+			}
+		}
+
 		// Batch files to avoid ARG_MAX issues. On Linux, ARG_MAX is typically 2MB.
 		// 5000 files with ~200 byte paths is ~1MB, which is safe.
 		const batchSize = 5000
-		for i := 0; i < len(paths); i += batchSize {
+		for i := 0; i < len(b3Paths); i += batchSize {
 			end := i + batchSize
-			if end > len(paths) {
-				end = len(paths)
+			if end > len(b3Paths) {
+				end = len(b3Paths)
 			}
-			batch := paths[i:end]
+			batch := b3Paths[i:end]
 
 			cmd := exec.Command("b3sum", batch...)
 			var out bytes.Buffer
