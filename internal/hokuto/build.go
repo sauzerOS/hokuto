@@ -1075,7 +1075,11 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 		fmt.Fprintf(os.Stderr, "Warning: failed to save build time to %s: %v\n", buildTimeFile, err)
 	}
 	// delete /usr/share/info/dir and /tools/info/dir
-	for _, infoPath := range []string{"/usr/share/info/dir", "/tools/share/info/dir"} {
+	for _, infoPath := range []string{
+		"/usr/share/info/dir",
+		"/tools/share/info/dir",
+		"/usr/aarch64-linux-gnu/share/info/dir",
+	} {
 		infodirPath := filepath.Join(outputDir, infoPath)
 		infoRmCmd := exec.Command("rm", "-rf", infodirPath)
 		if err := buildExec.Run(infoRmCmd); err != nil {
@@ -1084,10 +1088,11 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 	}
 
 	// delete /usr/lib/perl5/*/core_perl/perllocal.pod
-	// Check both /lib/perl5 and /usr/lib/perl5 locations
+	// Check both /lib/perl5, /usr/lib/perl5 and /usr/aarch64-linux-gnu/lib/perl5 locations
 	perllocalPatterns := []string{
 		filepath.Join(outputDir, "lib", "perl5", "*", "core_perl", "perllocal.pod"),
 		filepath.Join(outputDir, "usr", "lib", "perl5", "*", "core_perl", "perllocal.pod"),
+		filepath.Join(outputDir, "usr", "aarch64-linux-gnu", "lib", "perl5", "*", "core_perl", "perllocal.pod"),
 	}
 
 	var matches []string
@@ -1127,13 +1132,19 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 			}
 		}
 	}
-	// delete /usr/share/doc directory
-	docPath := filepath.Join(outputDir, "usr", "share", "doc")
-	if os.Geteuid() == 0 {
-		_ = os.RemoveAll(docPath)
-	} else {
-		docRmCmd := exec.Command("rm", "-rf", docPath)
-		_ = buildExec.Run(docRmCmd)
+	// delete /usr/share/doc directory and /usr/aarch64-linux-gnu/share/doc
+	docPaths := []string{
+		filepath.Join(outputDir, "usr", "share", "doc"),
+		filepath.Join(outputDir, "usr", "aarch64-linux-gnu", "share", "doc"),
+	}
+
+	for _, docPath := range docPaths {
+		if os.Geteuid() == 0 {
+			_ = os.RemoveAll(docPath)
+		} else {
+			docRmCmd := exec.Command("rm", "-rf", docPath)
+			_ = buildExec.Run(docRmCmd)
+		}
 	}
 
 	// Compress build log to package metadata
