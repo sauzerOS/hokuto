@@ -708,6 +708,8 @@ func resolveBuildPlan(targetPackages []string, userRequestedPackages map[string]
 			if withRebuilds && dep.Rebuild {
 				// This is a post-build action. Add it to the map for the current package.
 				plan.PostBuildRebuilds[pkgName] = append(plan.PostBuildRebuilds[pkgName], depName)
+				// Mark this package for rebuild so its make dependencies are processed
+				plan.RebuildPackages[depName] = true
 
 			} else if dep.Optional {
 				if !isPackageInstalled(depName) {

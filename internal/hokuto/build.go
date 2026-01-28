@@ -344,19 +344,6 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 		colWarn.Println("Permitting build, but installation will be blocked.")
 	}
 
-	// Special handling: Uninstall python before building/updating if it's already installed
-	if pkgName == "python" && isPackageInstalled("python") {
-		colArrow.Print("-> ")
-		colWarn.Printf("Uninstalling python to ensure Pip is built\n")
-		// Use force=true and yes=true to ensure non-interactive uninstallation
-		if err := pkgUninstall("python", cfg, RootExec, true, true); err != nil {
-			// This is a warning, not fatal - continue with build even if uninstall fails
-			debugf("Warning: failed to uninstall python before build: %v\n", err)
-		} else {
-			debugf("Successfully uninstalled python before build.\n")
-		}
-	}
-
 	// 1. Initialize a LOCAL temporary directory variable with the global default.
 	currentTmpDir := tmpDir
 	// override tmpDir if noram is set
@@ -2370,6 +2357,9 @@ func handleBuildCommand(args []string, cfg *Config) error {
 		cfg.Values["LFS"] = *bootstrapDir
 		cfg.Values["HOKUTO_ROOT"] = *bootstrapDir
 		cfg.Values["HOKUTO_CACHE_DIR"] = filepath.Join(*bootstrapDir, "var", "cache", "hokuto")
+		// Disable signature verification during bootstrap
+		cfg.Values["HOKUTO_VERIFY_SIGNATURE"] = "0"
+		VerifySignature = false
 
 		if fi, err := os.Stat("/repo/bootstrap"); err == nil && fi.IsDir() {
 			cfg.Values["HOKUTO_PATH"] = "/repo/bootstrap"

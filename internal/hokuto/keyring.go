@@ -54,31 +54,70 @@ func FetchKeyring(cfg *Config) ([]KeyringEntry, error) {
 	return keyring, nil
 }
 
-// SyncKeyring scans local keys, updates the keyring, and uploads it.
+// SyncKeyring synchronizes keys bidirectionally:
+// - Downloads remote keyring and installs missing keys locally
+// - Uploads local keys to update the remote keyring
 func SyncKeyring(ctx context.Context, cfg *Config) error {
 	r2, err := NewR2Client(cfg)
 	if err != nil {
 		return err
 	}
 
-	// 1. Scan local /etc/hokuto/keys/ for .pub files
 	keyDir := "/etc/hokuto/keys"
 	if root := os.Getenv("HOKUTO_ROOT"); root != "" {
 		keyDir = filepath.Join(root, "etc", "hokuto", "keys")
 	}
 
+	// 1. Download remote keyring (if it exists)
+	colArrow.Print("-> ")
+	colSuccess.Println("Fetching remote keyring...")
+	remoteKeyring, err := FetchKeyring(cfg)
+	if err != nil {
+		colWarn.Printf("Warning: could not fetch remote keyring: %v\n", err)
+		colWarn.Println("Will create new keyring from local keys only")
+		remoteKeyring = []KeyringEntry{}
+	}
+
+	// 2. Install remote keys locally if they don't exist
+	installedCount := 0
+	for _, entry := range remoteKeyring {
+		// Skip the official key (it's hardcoded)
+		if entry.ID == officialKeyID {
+			continue
+		}
+
+		pubPath := filepath.Join(keyDir, entry.ID+".pub")
+		if _, err := os.Stat(pubPath); os.IsNotExist(err) {
+			// Key doesn't exist locally, install it
+			if err := writeRootFile(pubPath, []byte(entry.Pub), 0644, RootExec); err != nil {
+				colWarn.Printf("Warning: failed to install key %s: %v\n", entry.ID, err)
+				continue
+			}
+			colArrow.Print("-> ")
+			colSuccess.Printf("Installed public key: %s\n", entry.ID)
+			installedCount++
+		}
+	}
+
+	if installedCount > 0 {
+		colSuccess.Printf("Installed %d new public key(s) from remote\n", installedCount)
+	}
+
+	// 3. Scan local /etc/hokuto/keys/ for .pub files
 	files, err := filepath.Glob(filepath.Join(keyDir, "*.pub"))
 	if err != nil {
 		return fmt.Errorf("failed to scan for local keys: %w", err)
 	}
 
-	newKeyring := []KeyringEntry{
+	// 4. Build merged keyring (start with official key)
+	mergedKeyring := []KeyringEntry{
 		{ID: officialKeyID, Pub: officialPublicKeyHex},
 	}
 
 	foundIDs := make(map[string]bool)
 	foundIDs[officialKeyID] = true
 
+	// Add all local keys
 	for _, file := range files {
 		id := strings.TrimSuffix(filepath.Base(file), ".pub")
 		if foundIDs[id] {
@@ -102,33 +141,35 @@ func SyncKeyring(ctx context.Context, cfg *Config) error {
 			continue
 		}
 
-		newKeyring = append(newKeyring, KeyringEntry{ID: id, Pub: pubHex})
+		mergedKeyring = append(mergedKeyring, KeyringEntry{ID: id, Pub: pubHex})
 		foundIDs[id] = true
 	}
 
 	// Sort for consistency
-	sort.Slice(newKeyring, func(i, j int) bool {
-		return newKeyring[i].ID < newKeyring[j].ID
+	sort.Slice(mergedKeyring, func(i, j int) bool {
+		return mergedKeyring[i].ID < mergedKeyring[j].ID
 	})
 
-	keyringBytes, err := json.MarshalIndent(newKeyring, "", "  ")
+	keyringBytes, err := json.MarshalIndent(mergedKeyring, "", "  ")
 	if err != nil {
 		return err
 	}
 
-	// 2. Prompt for master private key
+	// 5. Prompt for master private key
+	colArrow.Print("-> ")
+	colNote.Println("Master private key required to sign keyring")
 	masterPriv, err := PromptForMasterPrivateKey()
 	if err != nil {
 		return fmt.Errorf("failed to get master private key: %w", err)
 	}
 
-	// 3. Sign the new keyring
+	// 6. Sign the merged keyring
 	sig := SignData(keyringBytes, masterPriv)
 	sigHex := hex.EncodeToString(sig)
 
-	// 4. Upload
+	// 7. Upload
 	colArrow.Print("-> ")
-	colSuccess.Println("Uploading updated keyring and signature")
+	colSuccess.Println("Uploading updated keyring and signature to remote")
 	if err := r2.UploadFile(ctx, "keyring.json", keyringBytes); err != nil {
 		return fmt.Errorf("failed to upload keyring: %w", err)
 	}
@@ -136,6 +177,7 @@ func SyncKeyring(ctx context.Context, cfg *Config) error {
 		return fmt.Errorf("failed to upload keyring signature: %w", err)
 	}
 
-	colSuccess.Printf("Keyring updated successfully with %d keys.\n", len(newKeyring))
+	colArrow.Print("-> ")
+	colSuccess.Printf("Keyring synchronized successfully with %d total keys\n", len(mergedKeyring))
 	return nil
 }

@@ -781,8 +781,8 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 			}
 
 			// Check if any file in filesToDelete is a libdep of otherPkgName
-			lines := strings.Split(string(libdepsContent), "\n")
-			for _, line := range lines {
+			lines := strings.SplitSeq(string(libdepsContent), "\n")
+			for line := range lines {
 				libPath := strings.TrimSpace(line)
 				if libPath == "" {
 					continue

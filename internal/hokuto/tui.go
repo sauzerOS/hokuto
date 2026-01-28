@@ -23,20 +23,24 @@ type logInfo struct {
 }
 
 var (
-	tuiApp         *tview.Application
-	tuiLogs        []logInfo
-	tuiActiveIdx   int
-	tuiHeaderBox   *tview.TextView
-	tuiLogView     *tview.TextView
-	tuiFooterBox   *tview.TextView
-	tuiFlex        *tview.Flex
-	tuiUpdateChan  chan []logInfo
-	tuiPrevContent string // Track previous content to detect changes
+	tuiApp          *tview.Application
+	tuiLogs         []logInfo
+	tuiActiveIdx    int
+	tuiPrevIdx      int // Track previous index to detect tab switches
+	tuiHeaderBox    *tview.TextView
+	tuiLogView      *tview.TextView
+	tuiFooterBox    *tview.TextView
+	tuiFlex         *tview.Flex
+	tuiUpdateChan   chan []logInfo
+	tuiPrevContent  map[string]string // Track previous content per log path
+	tuiShouldScroll bool              // Flag to force scroll to end on next update
 )
 
 func runTUI() int {
-	// Initialize channels
+	// Initialize channels and maps
 	tuiUpdateChan = make(chan []logInfo, 10)
+	tuiPrevContent = make(map[string]string)
+	tuiPrevIdx = -1
 
 	// Create the application
 	tuiApp = tview.NewApplication()
@@ -90,6 +94,7 @@ func runTUI() int {
 				if tuiActiveIdx < 0 {
 					tuiActiveIdx = len(tuiLogs) - 1
 				}
+				tuiShouldScroll = true
 				updateTUI()
 			}
 			return nil
@@ -99,6 +104,7 @@ func runTUI() int {
 				if tuiActiveIdx >= len(tuiLogs) {
 					tuiActiveIdx = 0
 				}
+				tuiShouldScroll = true
 				updateTUI()
 			}
 			return nil
@@ -164,6 +170,7 @@ func runTUI() int {
 					if tuiActiveIdx < 0 {
 						tuiActiveIdx = len(tuiLogs) - 1
 					}
+					tuiShouldScroll = true
 					updateTUI()
 				}
 				return nil
@@ -173,6 +180,7 @@ func runTUI() int {
 					if tuiActiveIdx >= len(tuiLogs) {
 						tuiActiveIdx = 0
 					}
+					tuiShouldScroll = true
 					updateTUI()
 				}
 				return nil
@@ -197,11 +205,30 @@ func runTUI() int {
 	// Start update handler goroutine
 	go func() {
 		for logs := range tuiUpdateChan {
-			tuiLogs = logs
-			// Ensure activeIdx is valid
-			if tuiActiveIdx >= len(tuiLogs) && len(tuiLogs) > 0 {
-				tuiActiveIdx = len(tuiLogs) - 1
+			// Track the currently viewed log path to maintain focus
+			var currentLogPath string
+			if tuiActiveIdx < len(tuiLogs) {
+				currentLogPath = tuiLogs[tuiActiveIdx].path
 			}
+
+			tuiLogs = logs
+
+			// Try to maintain focus on the same log file
+			if currentLogPath != "" {
+				found := false
+				for i, log := range tuiLogs {
+					if log.path == currentLogPath {
+						tuiActiveIdx = i
+						found = true
+						break
+					}
+				}
+				// Only adjust if the log we were viewing disappeared
+				if !found && tuiActiveIdx >= len(tuiLogs) && len(tuiLogs) > 0 {
+					tuiActiveIdx = len(tuiLogs) - 1
+				}
+			}
+
 			// Use QueueUpdateDraw to ensure thread-safe UI updates
 			tuiApp.QueueUpdateDraw(func() {
 				updateTUI()
@@ -250,60 +277,66 @@ func updateTUI() {
 	tuiHeaderBox.SetText(headerText.String())
 
 	// Update log content
-	// Use ANSIWriter to convert ANSI escape sequences to tview color tags
 	if len(tuiLogs) == 0 {
 		tuiLogView.SetText("No build log yet. Run 'hokuto build <package>' to start a build.")
-		tuiPrevContent = ""
 	} else if tuiActiveIdx < len(tuiLogs) {
 		log := tuiLogs[tuiActiveIdx]
-		// Only update if content actually changed
-		if log.content != tuiPrevContent {
+		logPath := log.path
+		prevContent, hadPrevContent := tuiPrevContent[logPath]
+
+		// Detect if we switched tabs
+		switchedTabs := (tuiPrevIdx != tuiActiveIdx)
+		if switchedTabs {
+			tuiPrevIdx = tuiActiveIdx
+		}
+
+		// Only update if content actually changed or we switched tabs
+		if log.content != prevContent || switchedTabs {
 			// Save current scroll position before clearing
 			row, _ := tuiLogView.GetScrollOffset()
 
-			// Check if we're at the bottom by trying to scroll down
-			// If we can't scroll down, we're at the bottom
-			tuiLogView.ScrollTo(row+1, 0)
-			newRow, _ := tuiLogView.GetScrollOffset()
-			wasAtBottom := (newRow == row)
-			// Restore original position
-			tuiLogView.ScrollTo(row, 0)
+			// Check if we're at the bottom (only relevant if not switching tabs)
+			wasAtBottom := false
+			if !switchedTabs && hadPrevContent {
+				tuiLogView.ScrollTo(row+1, 0)
+				newRow, _ := tuiLogView.GetScrollOffset()
+				wasAtBottom = (newRow == row)
+				tuiLogView.ScrollTo(row, 0)
+			}
 
 			// Clear the view first
 			tuiLogView.Clear()
 			// Use ANSIWriter to convert ANSI escape sequences to tview color tags
-			// ANSIWriter wraps an io.Writer and converts ANSI codes to tview format
 			ansiWriter := tview.ANSIWriter(tuiLogView)
 			ansiWriter.Write([]byte(log.content))
 
-			// Only auto-scroll to bottom if user was already at bottom
-			if wasAtBottom {
+			// Scroll logic:
+			// 1. If we switched tabs or tuiShouldScroll flag is set, always scroll to end
+			// 2. If content updated and we were at bottom, scroll to end
+			// 3. Otherwise, try to maintain scroll position
+			if switchedTabs || tuiShouldScroll {
 				tuiLogView.ScrollToEnd()
-			} else {
+				tuiShouldScroll = false
+			} else if wasAtBottom {
+				tuiLogView.ScrollToEnd()
+			} else if hadPrevContent {
 				// Try to restore scroll position
-				// Calculate relative position based on content length
-				if len(tuiPrevContent) > 0 && len(log.content) > 0 {
-					// Calculate approximate line number based on content growth
-					prevLines := strings.Count(tuiPrevContent, "\n")
-					newLines := strings.Count(log.content, "\n")
-					if newLines > prevLines {
-						// Content grew, try to maintain relative position
-						// If we were at line X of Y, try to be at line X of (Y + growth)
-						linesAdded := newLines - prevLines
-						newRow := row + linesAdded
-						tuiLogView.ScrollTo(newRow, 0)
-					} else {
-						// Content didn't grow or shrunk, try to restore exact position
-						tuiLogView.ScrollTo(row, 0)
-					}
+				prevLines := strings.Count(prevContent, "\n")
+				newLines := strings.Count(log.content, "\n")
+				if newLines > prevLines {
+					// Content grew, adjust scroll position
+					linesAdded := newLines - prevLines
+					tuiLogView.ScrollTo(row+linesAdded, 0)
+				} else {
+					// Try to restore exact position
+					tuiLogView.ScrollTo(row, 0)
 				}
 			}
 
-			tuiPrevContent = log.content
+			tuiPrevContent[logPath] = log.content
 		}
 	} else {
 		tuiLogView.SetText("")
-		tuiPrevContent = ""
 	}
 
 	// Update footer

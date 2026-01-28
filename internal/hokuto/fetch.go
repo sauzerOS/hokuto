@@ -388,6 +388,11 @@ func fetchSourcesWithOptions(pkgName, pkgDir string, processGit bool, quiet bool
 	}
 	pkgVersion := fields[0] // Get just the version string, e.g., "1.2.3"
 
+	// Special handling for 'hokuto' package: invalidate cache on revision change
+	if pkgName == "hokuto" && len(fields) > 1 {
+		pkgVersion += "-" + fields[1]
+	}
+
 	lines := strings.Split(string(data), "\n")
 	pkgLinkDir := filepath.Join(SourcesDir, pkgName)
 

@@ -143,7 +143,15 @@ func getPrivateKey() (ed25519.PrivateKey, error) {
 
 	keyData, err := os.ReadFile(keyPath)
 	if err != nil {
-		return nil, fmt.Errorf("private key not found at %s", keyPath)
+		// Try reading as root if permission denied
+		if os.IsPermission(err) {
+			keyData, err = readFileAsRoot(keyPath)
+			if err != nil {
+				return nil, fmt.Errorf("private key not found at %s", keyPath)
+			}
+		} else {
+			return nil, fmt.Errorf("private key not found at %s", keyPath)
+		}
 	}
 
 	var privateKey ed25519.PrivateKey
@@ -182,20 +190,28 @@ func GenerateKeyPair(id string, execCtx *Executor) error {
 	privPath := filepath.Join(keyDir, id+".key")
 	pubPath := filepath.Join(keyDir, id+".pub")
 
-	// Ensure directories exist
+	// Ensure directories exist with proper permissions (0755 so users can access)
 	if os.Geteuid() == 0 {
-		_ = os.MkdirAll(filepath.Dir(pubPath), 0755)
+		if err := os.MkdirAll(keyDir, 0755); err != nil {
+			return fmt.Errorf("failed to create key directory: %w", err)
+		}
 	} else if execCtx != nil && execCtx.ShouldRunAsRoot {
-		_ = execCtx.Run(exec.Command("mkdir", "-p", filepath.Dir(pubPath)))
+		if err := execCtx.Run(exec.Command("mkdir", "-p", keyDir)); err != nil {
+			return fmt.Errorf("failed to create key directory: %w", err)
+		}
+		// Ensure directory is accessible
+		if err := execCtx.Run(exec.Command("chmod", "755", keyDir)); err != nil {
+			return fmt.Errorf("failed to set key directory permissions: %w", err)
+		}
 	}
 
-	// Write private key (hex encoded)
+	// Write private key (hex encoded) - only root can read
 	privHex := hex.EncodeToString(priv)
 	if err := writeRootFile(privPath, []byte(privHex), 0600, execCtx); err != nil {
 		return fmt.Errorf("failed to save private key: %w", err)
 	}
 
-	// Write public key (hex encoded)
+	// Write public key (hex encoded) - world readable
 	pubHex := hex.EncodeToString(pub)
 	if err := writeRootFile(pubPath, []byte(pubHex), 0644, execCtx); err != nil {
 		return fmt.Errorf("failed to save public key: %w", err)
@@ -407,6 +423,23 @@ func VerifyRepoIndexSignature(indexData, sigHex []byte, cfg *Config) error {
 			publicKey := ed25519.PublicKey(pubBytes)
 			if ed25519.Verify(publicKey, indexData, signature) {
 				debugf("Repo index verified using trusted key: %s\n", entry.ID)
+
+				// Automatically install this key locally if it doesn't exist
+				keyDir := "/etc/hokuto/keys"
+				if root := os.Getenv("HOKUTO_ROOT"); root != "" {
+					keyDir = filepath.Join(root, "etc", "hokuto", "keys")
+				}
+				pubPath := filepath.Join(keyDir, entry.ID+".pub")
+				if _, statErr := os.Stat(pubPath); os.IsNotExist(statErr) {
+					// Key doesn't exist locally, install it
+					if writeErr := writeRootFile(pubPath, []byte(entry.Pub), 0644, RootExec); writeErr != nil {
+						debugf("Warning: failed to auto-install key %s: %v\n", entry.ID, writeErr)
+					} else {
+						colArrow.Print("-> ")
+						colSuccess.Printf("Auto-installed public key from remote keyring: %s\n", entry.ID)
+					}
+				}
+
 				return nil
 			}
 		}
@@ -506,6 +539,12 @@ func SignPackage(stagingDir, pkgName string, execCtx *Executor) error {
 
 // VerifyPackageSignature verifies the package signature in the staging directory.
 func VerifyPackageSignature(stagingDir, pkgName string, cfg *Config, execCtx *Executor) error {
+	// If verification is disabled, skip everything
+	if !VerifySignature {
+		debugf("Skipping signature verification for %s (disabled)\n", pkgName)
+		return nil
+	}
+
 	metadataDir := filepath.Join(stagingDir, "var", "db", "hokuto", "installed", pkgName)
 	manifestPath := filepath.Join(metadataDir, "manifest")
 	pkgInfoPath := filepath.Join(metadataDir, "pkginfo")

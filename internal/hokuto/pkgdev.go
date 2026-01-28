@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 )
 
@@ -312,18 +313,28 @@ func bumpPackage(pkgName, expectedOldVersion, newVersion string) (string, error)
 		return "", fmt.Errorf("%s: version file empty", pkgName)
 	}
 	currentVer := fields[0]
-	// currentRev := "1"
-	// if len(fields) > 1 {
-	// 	currentRev = fields[1]
-	// }
+	currentRev := 1
+	if len(fields) > 1 {
+		if r, err := strconv.Atoi(fields[1]); err == nil {
+			currentRev = r
+		}
+	}
 
 	if expectedOldVersion != "" && currentVer != expectedOldVersion {
 		return "", fmt.Errorf("%s: wrong version (found %s, expected %s)", pkgName, currentVer, expectedOldVersion)
 	}
 
 	// 3) Amend version to newVersion
-	// Reset revision to 1 on bump
-	newVersionContent := fmt.Sprintf("%s 1\n", newVersion)
+	// Logic: If version changed, reset revision to 1
+	//        If version same, increment revision
+	var newRev int
+	if newVersion == currentVer {
+		newRev = currentRev + 1
+	} else {
+		newRev = 1
+	}
+
+	newVersionContent := fmt.Sprintf("%s %d\n", newVersion, newRev)
 	if err := os.WriteFile(versionPath, []byte(newVersionContent), 0o644); err != nil {
 		return "", fmt.Errorf("%s: failed to update version file", pkgName)
 	}
