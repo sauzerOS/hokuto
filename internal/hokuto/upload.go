@@ -47,8 +47,7 @@ func handleUploadCommand(args []string, cfg *Config) error {
 	var sync = uploadCmd.Bool("sync", false, "Upload all local files missing on remote without prompt")
 	var prompt = uploadCmd.Bool("prompt", false, "Prompt for each local file missing on remote (optionally filtered by name)")
 	var syncdb = uploadCmd.Bool("syncdb", false, "Upload only the global package database (pkg-db.json.zst)")
-	var deletePkg = uploadCmd.String("delete", "", "Delete all variants of a package from remote (use 'all' to delete everything)")
-	var deleteAll = uploadCmd.Bool("all", false, "Use with --delete to delete all packages from remote")
+	var deletePkg = uploadCmd.String("delete", "", "Delete all variants of a package from remote (use --delete=all to delete everything)")
 
 	// Set output to stderr to avoid polluting stdout if captured
 	uploadCmd.SetOutput(os.Stderr)
@@ -177,7 +176,7 @@ func handleUploadCommand(args []string, cfg *Config) error {
 	var deletionsOccurred bool
 	if *deletePkg != "" {
 		// Check if user wants to delete everything
-		if *deletePkg == "all" || *deleteAll {
+		if *deletePkg == "all" {
 			colArrow.Print("-> ")
 			colError.Println("WARNING: This will delete ALL packages from the remote repository!")
 			if !askForConfirmation(colError, "Are you absolutely sure you want to delete ALL remote packages? ") {
