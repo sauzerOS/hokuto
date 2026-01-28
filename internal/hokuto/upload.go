@@ -47,7 +47,8 @@ func handleUploadCommand(args []string, cfg *Config) error {
 	var sync = uploadCmd.Bool("sync", false, "Upload all local files missing on remote without prompt")
 	var prompt = uploadCmd.Bool("prompt", false, "Prompt for each local file missing on remote (optionally filtered by name)")
 	var syncdb = uploadCmd.Bool("syncdb", false, "Upload only the global package database (pkg-db.json.zst)")
-	var deletePkg = uploadCmd.String("delete", "", "Delete all variants of a package from remote")
+	var deletePkg = uploadCmd.String("delete", "", "Delete all variants of a package from remote (use 'all' to delete everything)")
+	var deleteAll = uploadCmd.Bool("all", false, "Use with --delete to delete all packages from remote")
 
 	// Set output to stderr to avoid polluting stdout if captured
 	uploadCmd.SetOutput(os.Stderr)
@@ -175,49 +176,94 @@ func handleUploadCommand(args []string, cfg *Config) error {
 	// Handle --delete logic explicitly
 	var deletionsOccurred bool
 	if *deletePkg != "" {
-		colArrow.Print("-> ")
-		colSuccess.Printf("Scanning remote for package: %s\n", *deletePkg)
+		// Check if user wants to delete everything
+		if *deletePkg == "all" || *deleteAll {
+			colArrow.Print("-> ")
+			colError.Println("WARNING: This will delete ALL packages from the remote repository!")
+			if !askForConfirmation(colError, "Are you absolutely sure you want to delete ALL remote packages? ") {
+				colSuccess.Println("Deletion cancelled.")
+				return nil
+			}
 
-		remoteObjects, err := r2.ListObjects(ctx, "")
-		if err != nil {
-			return fmt.Errorf("failed to list remote objects: %w", err)
-		}
+			colArrow.Print("-> ")
+			colSuccess.Println("Scanning all remote packages...")
 
-		// Pattern to match: pkgname-version-revision-arch-variant.tar.zst
-		// We want to verify that the filename starts with "pkgname-" to avoid partial matches (e.g. "foobar" matching "foo")
-		// But verify it carefully.
-		// StandardizedRemoteName uses dashes.
-		// A stricter check: matches "{pkgName}-*.tar.zst"
-		prefix := *deletePkg + "-"
+			remoteObjects, err := r2.ListObjects(ctx, "")
+			if err != nil {
+				return fmt.Errorf("failed to list remote objects: %w", err)
+			}
 
-		var foundCount int
-		for _, obj := range remoteObjects {
-			if strings.HasPrefix(obj.Key, prefix) && strings.HasSuffix(obj.Key, ".tar.zst") {
-				colArrow.Print("-> ")
-				if askForConfirmation(colWarn, "Delete remote file %s? ", obj.Key) {
+			var foundCount int
+			for _, obj := range remoteObjects {
+				if strings.HasSuffix(obj.Key, ".tar.zst") {
 					if err := r2.DeleteFile(ctx, obj.Key); err != nil {
 						fmt.Fprintf(os.Stderr, "Error deleting %s: %v\n", obj.Key, err)
 					} else {
 						foundCount++
 						colSuccess.Printf("Deleted %s\n", obj.Key)
-						// Update in-memory index
 						deletionsOccurred = true
+						// Clear the entire index since we're deleting everything
 						for k, v := range newIndexMap {
 							if v.Filename == obj.Key {
 								delete(newIndexMap, k)
-								// Do NOT break, in case of duplicate entries or just to be safe (though keys are unique)
 							}
 						}
 					}
 				}
 			}
-		}
 
-		if foundCount == 0 {
-			colWarn.Printf("No remote files found for package '%s'.\n", *deletePkg)
+			if foundCount == 0 {
+				colWarn.Println("No remote packages found.")
+			} else {
+				colArrow.Print("-> ")
+				colSuccess.Printf("Deleted %d packages from remote.\n", foundCount)
+			}
 		} else {
+			// Delete specific package
 			colArrow.Print("-> ")
-			colSuccess.Println("Deletions complete.")
+			colSuccess.Printf("Scanning remote for package: %s\n", *deletePkg)
+
+			remoteObjects, err := r2.ListObjects(ctx, "")
+			if err != nil {
+				return fmt.Errorf("failed to list remote objects: %w", err)
+			}
+
+			// Pattern to match: pkgname-version-revision-arch-variant.tar.zst
+			// We want to verify that the filename starts with "pkgname-" to avoid partial matches (e.g. "foobar" matching "foo")
+			// But verify it carefully.
+			// StandardizedRemoteName uses dashes.
+			// A stricter check: matches "{pkgName}-*.tar.zst"
+			prefix := *deletePkg + "-"
+
+			var foundCount int
+			for _, obj := range remoteObjects {
+				if strings.HasPrefix(obj.Key, prefix) && strings.HasSuffix(obj.Key, ".tar.zst") {
+					colArrow.Print("-> ")
+					if askForConfirmation(colWarn, "Delete remote file %s? ", obj.Key) {
+						if err := r2.DeleteFile(ctx, obj.Key); err != nil {
+							fmt.Fprintf(os.Stderr, "Error deleting %s: %v\n", obj.Key, err)
+						} else {
+							foundCount++
+							colSuccess.Printf("Deleted %s\n", obj.Key)
+							// Update in-memory index
+							deletionsOccurred = true
+							for k, v := range newIndexMap {
+								if v.Filename == obj.Key {
+									delete(newIndexMap, k)
+									// Do NOT break, in case of duplicate entries or just to be safe (though keys are unique)
+								}
+							}
+						}
+					}
+				}
+			}
+
+			if foundCount == 0 {
+				colWarn.Printf("No remote files found for package '%s'.\n", *deletePkg)
+			} else {
+				colArrow.Print("-> ")
+				colSuccess.Println("Deletions complete.")
+			}
 		}
 	}
 
