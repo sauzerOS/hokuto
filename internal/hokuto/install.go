@@ -749,6 +749,15 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 	}()
 
 	// 4a. Check filesToDelete against all libdeps
+
+	// Optimization: Pre-compute lookups
+	filesToDeleteMap := make(map[string]struct{}, len(filesToDelete))
+	filesToDeleteBasenameMap := make(map[string]string, len(filesToDelete))
+	for _, f := range filesToDelete {
+		filesToDeleteMap[f] = struct{}{}
+		filesToDeleteBasenameMap[filepath.Base(f)] = f
+	}
+
 	allInstalledEntries, err := os.ReadDir(Installed)
 	if err == nil {
 		for _, entry := range allInstalledEntries {
@@ -759,9 +768,16 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 			otherPkgName := entry.Name()
 			libdepsPath := filepath.Join(Installed, otherPkgName, "libdeps")
 
-			libdepsContent, err := readFileAsRoot(libdepsPath)
-			if err != nil {
-				continue // Skip if libdeps file is unreadable
+			// Optimization: Try fast read first
+			var libdepsContent []byte
+			var err error
+			if data, lerr := os.ReadFile(libdepsPath); lerr == nil {
+				libdepsContent = data
+			} else {
+				libdepsContent, err = readFileAsRoot(libdepsPath)
+				if err != nil {
+					continue // Skip if libdeps file is unreadable
+				}
 			}
 
 			// Check if any file in filesToDelete is a libdep of otherPkgName
@@ -772,51 +788,26 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 					continue
 				}
 
-				// Construct the absolute path to the library file currently on the system
-				// This is primarily for the OLD format (full path in libdeps).
-				absLibPath := libPath
-				if rootDir != "/" && strings.HasPrefix(libPath, "/") {
-					// Old format: path is absolute, reconstruct relative to rootDir
-					absLibPath = filepath.Join(rootDir, libPath[1:])
-				} else if !strings.HasPrefix(libPath, "/") {
-					// Handle defensively, but for the NEW format (basename), we will use the full path
-					// from filesToDelete, ignoring this potentially incorrect path construction.
-					absLibPath = filepath.Join(rootDir, libPath)
+				var matchFile string
+				if strings.HasPrefix(libPath, "/") {
+					// Old format: absolute path
+					absLibPath := libPath
+					if rootDir != "/" {
+						absLibPath = filepath.Join(rootDir, libPath[1:])
+					}
+					if _, ok := filesToDeleteMap[absLibPath]; ok {
+						matchFile = absLibPath
+					}
+				} else {
+					// New format: basename only
+					if fullPath, ok := filesToDeleteBasenameMap[libPath]; ok {
+						matchFile = fullPath
+					}
 				}
 
-				// Determine if the libPath is a full absolute path or just a basename.
-				isFullPath := strings.HasPrefix(libPath, "/")
-
-				// Check if this library is scheduled for deletion
-				matchFound := false
-				finalAbsPath := "" // Stores the correct absolute path of the file being deleted
-
-				for _, fileToDelete := range filesToDelete {
-
-					if isFullPath {
-						// Case 1: Old format (full path in libdeps).
-						// Match the full path (relying on absLibPath reconstruction).
-						if fileToDelete == absLibPath {
-							finalAbsPath = absLibPath
-							matchFound = true
-						}
-					} else {
-						// Case 2: New format (basename only in libdeps).
-						// Match the basename of the file being deleted against the libdep entry.
-						fileToDeleteBasename := filepath.Base(fileToDelete)
-						if fileToDeleteBasename == libPath {
-							// Found a match, use the actual path being deleted
-							finalAbsPath = fileToDelete
-							matchFound = true
-						}
-					}
-
-					if matchFound {
-						affectedPackages[otherPkgName] = struct{}{}
-						libFilesToDelete[finalAbsPath] = struct{}{}
-						// Break inner loop (over filesToDelete) and check the next libdep
-						break
-					}
+				if matchFile != "" {
+					affectedPackages[otherPkgName] = struct{}{}
+					libFilesToDelete[matchFile] = struct{}{}
 				}
 			}
 		}

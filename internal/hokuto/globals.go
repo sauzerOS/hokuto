@@ -158,6 +158,7 @@ var MultilibPackages = []string{
 	"libxpresent",
 	"libxshmfence",
 	"llvm-32",
+	"lz4",
 	"mangohud",
 	"mesa-32",
 	"mesa-gbm",

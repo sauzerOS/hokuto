@@ -1023,13 +1023,15 @@ func Main() {
 	case "new", "n":
 		newCmd := flag.NewFlagSet("new", flag.ExitOnError)
 		var here = newCmd.Bool("here", false, "Create package in current working directory")
+		var fromArch = newCmd.Bool("from-arch", false, "Import package from Arch Linux official repos")
+		var fromAUR = newCmd.Bool("from-aur", false, "Import package from AUR")
 		if err := newCmd.Parse(os.Args[2:]); err != nil {
 			fmt.Fprintf(os.Stderr, "Error parsing new flags: %v\n", err)
 			os.Exit(1)
 		}
 		args := newCmd.Args()
 		if len(args) < 1 {
-			fmt.Println("Usage: hokuto new [-here] <pkgname>")
+			fmt.Println("Usage: hokuto new [-here] [--from-arch | --from-aur] <pkgname>")
 			os.Exit(1)
 		}
 		pkg := args[0]
@@ -1046,9 +1048,58 @@ func Main() {
 			// Use default newPackageDir
 			targetDir = ""
 		}
-		if err := newPackage(pkg, targetDir); err != nil {
-			fmt.Fprintln(os.Stderr, "Error:", err)
-			os.Exit(1)
+
+		// Handle import from Arch/AUR
+		if *fromArch || *fromAUR {
+			source := "Arch"
+			if *fromAUR {
+				source = "AUR"
+			}
+
+			// Try exact match first
+			if err := generatePackageFromArch(pkg, source, targetDir); err != nil {
+				// If exact match fails, try fuzzy search
+				colWarn.Printf("Exact match failed: %v\n", err)
+				colArrow.Print("-> ")
+				colNote.Println("Searching for similar packages...")
+
+				candidates, searchErr := searchMetadata(pkg)
+				if searchErr != nil || len(candidates) == 0 {
+					fmt.Fprintf(os.Stderr, "Error: No packages found matching '%s'\n", pkg)
+					os.Exit(1)
+				}
+
+				// Filter candidates by source if specified
+				var filtered []MetadataCandidate
+				for _, c := range candidates {
+					if (*fromArch && c.Source == "Arch") || (*fromAUR && c.Source == "AUR") || (!*fromArch && !*fromAUR) {
+						filtered = append(filtered, c)
+					}
+				}
+
+				if len(filtered) == 0 {
+					fmt.Fprintf(os.Stderr, "Error: No packages found in %s matching '%s'\n", source, pkg)
+					os.Exit(1)
+				}
+
+				selected := promptSelection(filtered)
+				if selected == nil {
+					fmt.Println("Package creation cancelled.")
+					os.Exit(0)
+				}
+
+				// Try again with selected package
+				if err := generatePackageFromArch(selected.Name, selected.Source, targetDir); err != nil {
+					fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+					os.Exit(1)
+				}
+			}
+		} else {
+			// Original behavior - create empty skeleton
+			if err := newPackage(pkg, targetDir); err != nil {
+				fmt.Fprintln(os.Stderr, "Error:", err)
+				os.Exit(1)
+			}
 		}
 
 	case "cd":

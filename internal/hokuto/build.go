@@ -129,6 +129,139 @@ func getOutputPackageName(pkgName string, cfg *Config) string {
 	return pkgName
 }
 
+// buildRustFlags constructs RUSTFLAGS based on CFLAGS and CPU flags
+// This mirrors the C/C++ optimization strategy for Rust builds
+func buildRustFlags(cflags string, cpuFlags string, buildDir string, isGeneric bool) string {
+	// Always include path remapping for reproducible builds
+	rustflags := fmt.Sprintf("--remap-path-prefix=%s=.", buildDir)
+
+	// In generic mode, use generic target-cpu
+	if isGeneric {
+		return rustflags
+	}
+
+	// Parse CFLAGS to extract -march and -mtune values
+	var targetCPU string
+
+	// Check for -march flag in CFLAGS
+	if strings.Contains(cflags, "-march=native") {
+		targetCPU = "native"
+	} else if strings.Contains(cflags, "-march=") {
+		// Extract specific march value (e.g., -march=alderlake, -march=x86-64-v3)
+		parts := strings.Fields(cflags)
+		for _, part := range parts {
+			if strings.HasPrefix(part, "-march=") {
+				marchValue := strings.TrimPrefix(part, "-march=")
+				// Map GCC march values to Rust target-cpu values
+				switch {
+				// x86-64 variants
+				case marchValue == "x86-64":
+					targetCPU = "x86-64"
+				case marchValue == "x86-64-v2":
+					targetCPU = "x86-64-v2"
+				case marchValue == "x86-64-v3":
+					targetCPU = "x86-64-v3"
+				case marchValue == "x86-64-v4":
+					targetCPU = "x86-64-v4"
+				// x86 specific CPUs
+				case marchValue == "alderlake":
+					targetCPU = "alderlake"
+				case marchValue == "skylake":
+					targetCPU = "skylake"
+				case marchValue == "haswell":
+					targetCPU = "haswell"
+				case marchValue == "broadwell":
+					targetCPU = "broadwell"
+				case marchValue == "znver1":
+					targetCPU = "znver1"
+				case marchValue == "znver2":
+					targetCPU = "znver2"
+				case marchValue == "znver3":
+					targetCPU = "znver3"
+				case marchValue == "znver4":
+					targetCPU = "znver4"
+				case marchValue == "generic":
+					targetCPU = "generic"
+				// ARM march values - Rust doesn't support GCC-style ARM march values
+				case strings.HasPrefix(marchValue, "armv8"):
+					// armv8-a, armv8-a+crc, etc. -> use cortex-a72 for Raspberry Pi 4
+					// This provides proper optimizations for ARMv8-A architecture
+					targetCPU = "cortex-a72"
+				case marchValue == "cortex-a72", marchValue == "cortex-a53", marchValue == "cortex-a57":
+					// Specific ARM cores
+					targetCPU = "cortex-a72"
+				default:
+					// For unknown values, don't set target-cpu
+					targetCPU = ""
+				}
+				break
+			}
+		}
+	}
+
+	// If we found a target CPU from march, use it
+	if targetCPU != "" && targetCPU != "generic" {
+		rustflags = fmt.Sprintf("-C target-cpu=%s %s", targetCPU, rustflags)
+	}
+
+	// Add CPU feature flags if specified
+	// Convert CPU_FLAGS_X86 format (space-separated) to Rust target-feature format
+	if cpuFlags != "" {
+		features := strings.Fields(cpuFlags)
+		if len(features) > 0 {
+			var rustFeatures []string
+			for _, feature := range features {
+				// Map x86 CPU flags to Rust target features
+				switch feature {
+				case "aes":
+					rustFeatures = append(rustFeatures, "+aes")
+				case "avx":
+					rustFeatures = append(rustFeatures, "+avx")
+				case "avx2":
+					rustFeatures = append(rustFeatures, "+avx2")
+				case "fma":
+					rustFeatures = append(rustFeatures, "+fma")
+				case "pclmul", "pclmulqdq":
+					rustFeatures = append(rustFeatures, "+pclmulqdq")
+				case "popcnt":
+					rustFeatures = append(rustFeatures, "+popcnt")
+				case "sha":
+					rustFeatures = append(rustFeatures, "+sha")
+				case "sse":
+					rustFeatures = append(rustFeatures, "+sse")
+				case "sse2":
+					rustFeatures = append(rustFeatures, "+sse2")
+				case "sse3":
+					rustFeatures = append(rustFeatures, "+sse3")
+				case "sse4_1", "sse4.1":
+					rustFeatures = append(rustFeatures, "+sse4.1")
+				case "sse4_2", "sse4.2":
+					rustFeatures = append(rustFeatures, "+sse4.2")
+				case "ssse3":
+					rustFeatures = append(rustFeatures, "+ssse3")
+				// ARM features
+				case "neon":
+					rustFeatures = append(rustFeatures, "+neon")
+				case "crypto":
+					rustFeatures = append(rustFeatures, "+crypto")
+				case "crc":
+					rustFeatures = append(rustFeatures, "+crc")
+				// Skip mmx as it's legacy and not typically used in Rust
+				case "mmx":
+					continue
+				}
+			}
+
+			if len(rustFeatures) > 0 {
+				featureString := strings.Join(rustFeatures, ",")
+				rustflags = fmt.Sprintf("-C target-feature=%s %s", featureString, rustflags)
+			}
+		}
+	}
+
+	return rustflags
+}
+
 func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, currentIndex int, totalCount int) (time.Duration, error) {
 
 	// Define the ANSI escape code format for setting the terminal title.
@@ -584,7 +717,23 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 			}
 		}
 
+		// 5. Apply CPU Flags
+		cpuFlags := ""
+		if !isGeneric {
+			if isX86 {
+				cpuFlags = cfg.Values["HOKUTO_CPU_FLAGS_X86"]
+				if cpuFlags == "" {
+					cpuFlags = cfg.Values["HOKUTO_CPU_FLAGS"] // legacy/fallback
+				}
+			} else if isARM {
+				cpuFlags = cfg.Values["HOKUTO_CPU_FLAGS_ARM"]
+			}
+		}
+
 		// --- Normal build environment---
+		// Build RUSTFLAGS based on CFLAGS and CPU flags
+		rustflags := buildRustFlags(cflagsVal, cpuFlags, buildDir, isGeneric)
+
 		defaults = map[string]string{
 			"AR":                         "gcc-ar",
 			"CC":                         "cc",
@@ -594,9 +743,10 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 			"CFLAGS":                     cflagsVal,
 			"CXXFLAGS":                   cxxflagsVal,
 			"LDFLAGS":                    ldflagsVal,
+			"CPUFLAGS":                   cpuFlags,
 			"MAKEFLAGS":                  fmt.Sprintf("-j%d", numCores),
 			"CMAKE_BUILD_PARALLEL_LEVEL": fmt.Sprintf("%d", numCores),
-			"RUSTFLAGS":                  fmt.Sprintf("--remap-path-prefix=%s=.", buildDir),
+			"RUSTFLAGS":                  rustflags,
 			"GOFLAGS":                    "-trimpath -modcacherw",
 			"GOPATH":                     filepath.Join(buildDir, "go"),
 			"HOKUTO_ROOT":                cfg.Values["HOKUTO_ROOT"],
@@ -606,6 +756,14 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 			"MULTILIB":                   multilibVal,
 			"HOKUTO_BUILD_DIR":           buildDir,
 			"GNU_MIRROR":                 cfg.Values["GNU_MIRROR"],
+		}
+
+		if !isGeneric {
+			if isX86 && cpuFlags != "" {
+				defaults["CPU_FLAGS_X86"] = cpuFlags
+			} else if isARM && cpuFlags != "" {
+				defaults["CPU_FLAGS_ARM"] = cpuFlags
+			}
 		}
 
 		if buildPriority == "idle" || buildPriority == "superidle" {
@@ -668,7 +826,37 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 			} else {
 				// Regular cross-compilation (user packages): use /usr
 				defaults["CROSS_PREFIX"] = "/usr"
+
+				// For regular cross builds, also add the cross toolchain bin to PATH
+				// This ensures we use the cross Rust compiler which has the target installed
+				prefix := fmt.Sprintf("/usr/%s-linux-gnu", normalizedArch)
+				currentPath := os.Getenv("PATH")
+				defaults["PATH"] = filepath.Join(prefix, "bin") + ":" + currentPath
 			}
+
+			// Rust cross-compilation setup
+			// Set CARGO_BUILD_TARGET and linker for cross-compilation
+			var rustTarget string
+			switch normalizedArch {
+			case "aarch64":
+				rustTarget = "aarch64-unknown-linux-gnu"
+			case "x86_64":
+				rustTarget = "x86_64-unknown-linux-gnu"
+			default:
+				rustTarget = normalizedArch + "-unknown-linux-gnu"
+			}
+
+			// Set the default target for cargo
+			defaults["CARGO_BUILD_TARGET"] = rustTarget
+
+			// Set the linker for the target architecture
+			// Environment variable format: CARGO_TARGET_<TRIPLE>_LINKER
+			// Triple needs to be uppercase with dashes replaced by underscores
+			linkerEnvVar := "CARGO_TARGET_" + strings.ToUpper(strings.ReplaceAll(rustTarget, "-", "_")) + "_LINKER"
+			defaults[linkerEnvVar] = normalizedArch + "-linux-gnu-gcc"
+
+			debugf("Rust cross-compilation: target=%s, linker_var=%s, linker=%s\n",
+				rustTarget, linkerEnvVar, defaults[linkerEnvVar])
 		}
 	}
 
@@ -681,10 +869,15 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 		}
 	}
 
-	// Set QEMU_LD_PREFIX if we have a non-standard prefix (sysroot)
-	// This allows running target binaries via QEMU emulation on the host
-	if defaults["CROSS_PREFIX"] != "/usr" {
-		defaults["QEMU_LD_PREFIX"] = defaults["CROSS_PREFIX"]
+	// Set QEMU_LD_PREFIX for cross-compilation to allow running target binaries via QEMU
+	// The cross toolchain and libraries are always in /usr/<arch>-linux-gnu
+	if cfg.Values["HOKUTO_CROSS_ARCH"] != "" {
+		normalizedArch := cfg.Values["HOKUTO_CROSS_ARCH"]
+		if normalizedArch == "arm64" {
+			normalizedArch = "aarch64"
+		}
+		sysroot := fmt.Sprintf("/usr/%s-linux-gnu", normalizedArch)
+		defaults["QEMU_LD_PREFIX"] = sysroot
 	}
 
 	// Sort keys for deterministic order
@@ -1409,7 +1602,6 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 		"RANLIB":                     "gcc-ranlib",
 		"MAKEFLAGS":                  fmt.Sprintf("-j%d", numCores),
 		"CMAKE_BUILD_PARALLEL_LEVEL": fmt.Sprintf("%d", numCores),
-		"RUSTFLAGS":                  fmt.Sprintf("--remap-path-prefix=%s=.", buildDir),
 		"GOFLAGS":                    "-trimpath -modcacherw",
 		"GOPATH":                     filepath.Join(buildDir, "go"),
 		"HOKUTO_ROOT":                rootDir,
@@ -1461,6 +1653,22 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 	} else if cfg.Values["HOKUTO_MULTILIB"] == "1" {
 		debugf("Disabling MULTILIB for %s architecture (rebuild).\n", targetArch)
 	}
+
+	// Add CPU Flags to environment
+	cpuFlags := ""
+	if !HokutoGeneric { // Only enable if NOT in generic mode
+		if isX86 {
+			cpuFlags = cfg.Values["HOKUTO_CPU_FLAGS_X86"]
+			if cpuFlags == "" {
+				cpuFlags = cfg.Values["HOKUTO_CPU_FLAGS"] // legacy/fallback
+			}
+			defaults["CPU_FLAGS_X86"] = cpuFlags
+		} else if isARM {
+			cpuFlags = cfg.Values["HOKUTO_CPU_FLAGS_ARM"]
+			defaults["CPU_FLAGS_ARM"] = cpuFlags
+		}
+	}
+	defaults["CPUFLAGS"] = cpuFlags
 
 	// 3. Select Compiler Flags
 	var cflagsVal, cxxflagsVal, ldflagsVal string
@@ -1563,13 +1771,53 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 	defaults["HOKUTO_ARCH"] = targetArch
 	defaults["MULTILIB"] = multilibVal
 
+	// Build RUSTFLAGS based on finalized CFLAGS and CPU flags
+	defaults["RUSTFLAGS"] = buildRustFlags(cflagsVal, cpuFlags, buildDir, HokutoGeneric)
+
 	// Ensure CROSS_PREFIX/bin is in PATH for cross-compilation
-	if isCross && isCrossSystem && !shouldBuildHostNative {
-		prefix := fmt.Sprintf("/usr/%s-linux-gnu", targetArch)
-		if targetArch == "arm64" {
-			prefix = "/usr/aarch64-linux-gnu"
+	if isCross {
+		normalizedArch := targetArch
+		if normalizedArch == "arm64" {
+			normalizedArch = "aarch64"
 		}
+		prefix := fmt.Sprintf("/usr/%s-linux-gnu", normalizedArch)
 		defaults["PATH"] = filepath.Join(prefix, "bin") + ":" + os.Getenv("PATH")
+	}
+
+	// Rust cross-compilation setup for pkgBuildRebuild
+	if isCross {
+		normalizedArch := targetArch
+		if normalizedArch == "arm64" {
+			normalizedArch = "aarch64"
+		}
+
+		var rustTarget string
+		switch normalizedArch {
+		case "aarch64":
+			rustTarget = "aarch64-unknown-linux-gnu"
+		case "x86_64":
+			rustTarget = "x86_64-unknown-linux-gnu"
+		default:
+			rustTarget = normalizedArch + "-unknown-linux-gnu"
+		}
+
+		defaults["CARGO_BUILD_TARGET"] = rustTarget
+		linkerEnvVar := "CARGO_TARGET_" + strings.ToUpper(strings.ReplaceAll(rustTarget, "-", "_")) + "_LINKER"
+		defaults[linkerEnvVar] = normalizedArch + "-linux-gnu-gcc"
+
+		debugf("Rust cross-compilation (rebuild): target=%s, linker_var=%s, linker=%s\n",
+			rustTarget, linkerEnvVar, defaults[linkerEnvVar])
+	}
+
+	// Set QEMU_LD_PREFIX for cross-compilation to allow running target binaries via QEMU
+	// The cross toolchain and libraries are always in /usr/<arch>-linux-gnu
+	if isCross {
+		normalizedArch := targetArch
+		if normalizedArch == "arm64" {
+			normalizedArch = "aarch64"
+		}
+		sysroot := fmt.Sprintf("/usr/%s-linux-gnu", normalizedArch)
+		defaults["QEMU_LD_PREFIX"] = sysroot
 	}
 	// --- END REFACTORED FLAG LOGIC ---
 

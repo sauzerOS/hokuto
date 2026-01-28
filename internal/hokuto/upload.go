@@ -315,6 +315,13 @@ func handleUploadCommand(args []string, cfg *Config) error {
 
 	for _, key := range sortedKeys {
 		local := latestLocals[key]
+
+		// Skip cuda package during automatic sync (it's too large for automatic uploads)
+		if *sync && strings.HasPrefix(local.Name, "cuda") {
+			debugf("Skipping cuda package during automatic sync: %s\n", local.Name)
+			continue
+		}
+
 		remote, exists := newIndexMap[key]
 
 		needsUpload := false

@@ -129,7 +129,7 @@ func ensureHokutoOwnership(cfg *Config) error {
 		// Inform the user what we are doing (only in debug mode)
 		if Debug {
 			colArrow.Print("-> ")
-			fmt.Printf("Ensuring ownership for Hokuto directories (current user:wheel)...\n")
+			fmt.Printf("Ensuring ownership for Hokuto directories (current user:user)\n")
 			for _, p := range pathsToFix {
 				fmt.Printf("   Fixing: %s\n", p)
 			}

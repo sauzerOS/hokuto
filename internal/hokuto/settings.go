@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 
 	"github.com/gookit/color"
@@ -56,6 +57,9 @@ func handleSettingsCommand(cfg *Config) error {
 
 		// 7. Generate New Key Pair
 		fmt.Println("7) Generate New Key Pair")
+
+		// 8. Detect Hardware
+		fmt.Println("8) Detect Hardware & Suggest Optimizations")
 
 		fmt.Println("q) Quit")
 		fmt.Println("--------------------------------")
@@ -208,13 +212,44 @@ func handleSettingsCommand(cfg *Config) error {
 			}
 
 			colArrow.Print("-> ")
-			fmt.Printf("Generating Ed25519 key pair for '%s'...\n", keyID)
+			fmt.Printf("Generating Ed25519 key pair for '%s'\n", keyID)
 			if err := GenerateKeyPair(keyID, RootExec); err != nil {
 				colError.Printf("Error: %v\n", err)
 			} else {
 				colSuccess.Printf("Key pair for '%s' generated successfully.\n", keyID)
 				colNote.Printf("Private key: %s\n", privPath)
 				colNote.Printf("Public key: %s/keys/%s.pub\n", filepath.Dir(keyDir), keyID)
+			}
+
+		case "8":
+			colArrow.Print("-> ")
+			colSuccess.Println("Detecting CPU features and generating configuration")
+
+			cpuFlags := DetectCPUFlags()
+			cflags := SuggestCFLAGS()
+			arch := runtime.GOARCH
+			if arch == "amd64" {
+				arch = "x86"
+			}
+
+			fmt.Println()
+			color.Bold.Println("Recommended configuration for this machine:")
+			fmt.Println("-------------------------------------------")
+			color.Cyan.Printf("HOKUTO_CPU_FLAGS_%s=\"%s\"\n", strings.ToUpper(arch), cpuFlags)
+			color.Cyan.Printf("HOKUTO_CFLAGS=\"%s\"\n", cflags)
+			fmt.Println("-------------------------------------------")
+			fmt.Println()
+
+			colNote.Println("HOKUTO_CFLAGS will be used when -march=native is not possible.")
+			colNote.Println("HOKUTO_CPU_FLAGS enable manual ASSEMBLY logic in build scripts.")
+			fmt.Println()
+
+			if askForConfirmation(colSuccess, "Would you like to add HOKUTO_CPU_FLAGS to your config now?") {
+				keyFlags := fmt.Sprintf("HOKUTO_CPU_FLAGS_%s", strings.ToUpper(arch))
+				_ = setConfigValue(cfg, keyFlags, cpuFlags)
+
+				colArrow.Print("-> ")
+				colSuccess.Println("Configuration updated successfully.")
 			}
 
 		default:
