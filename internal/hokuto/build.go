@@ -545,6 +545,7 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 			"CONFIG_SITE":      filepath.Join(lfsRoot, "usr/share/config.site"),
 			"HOKUTO_ROOT":      lfsRoot,
 			"TMPDIR":           currentTmpDir,
+			"XDG_CACHE_HOME":   filepath.Join(buildDir, ".cache"), // Prevent g-ir-scanner from using ~/.cache
 			"HOKUTO_ARCH":      targetArch,
 			"HOKUTO_BUILD_DIR": buildDir,
 			"GNU_MIRROR":       cfg.Values["GNU_MIRROR"],
@@ -738,6 +739,7 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 			"GOPATH":                     filepath.Join(buildDir, "go"),
 			"HOKUTO_ROOT":                cfg.Values["HOKUTO_ROOT"],
 			"TMPDIR":                     currentTmpDir,
+			"XDG_CACHE_HOME":             filepath.Join(buildDir, ".cache"), // Prevent g-ir-scanner from using ~/.cache
 			"CONFIG_SITE":                ("/usr/share/config.site"),
 			"HOKUTO_ARCH":                targetArch,
 			"MULTILIB":                   multilibVal,
@@ -2264,6 +2266,7 @@ func handleBuildCommand(args []string, cfg *Config) error {
 	var orderedBuild = buildCmd.Bool("ordered", false, "Force build order based on the target package's depends file.")
 	var genericBuild = buildCmd.Bool("generic", false, "Use _GEN flags and store packages in generic subfolder")
 	var crossArch = buildCmd.String("cross", "", "Enable cross-compilation for target architecture (e.g., arm64)")
+	var noDeps = buildCmd.Bool("nodeps", false, "Skip dependency checking and build only the specified package(s)")
 
 	// Custom usage function that excludes bootstrap flags from help
 	buildCmd.Usage = func() {
@@ -2628,49 +2631,62 @@ func handleBuildCommand(args []string, cfg *Config) error {
 
 	} else {
 		// ** STRATEGY 2: Normal Build Mode **
-		colArrow.Print("-> ")
-		colSuccess.Println("Discovering all required dependencies")
-		masterProcessed := make(map[string]bool)
-		var missingDeps []string
-		for _, pkgName := range packagesToProcess {
-			if err := resolveMissingDeps(pkgName, masterProcessed, &missingDeps, userRequestedMap, cfg); err != nil {
-				return fmt.Errorf("error resolving dependencies for %s: %v", pkgName, err)
-			}
-		}
-		missingDeps = MovePackageToFront(missingDeps, "sauzeros-base")
+		var packagesThatMustBeBuilt map[string]bool
 
-		packagesThatMustBeBuilt := make(map[string]bool)
-		for pkg := range userRequestedMap {
-			packagesThatMustBeBuilt[pkg] = true
-		}
+		if *noDeps {
+			// Skip dependency resolution when --nodeps is set
+			colArrow.Print("-> ")
+			colWarn.Println("Skipping dependency checking (--nodeps enabled)")
+			packagesThatMustBeBuilt = make(map[string]bool)
+			for pkg := range userRequestedMap {
+				packagesThatMustBeBuilt[pkg] = true
+			}
+		} else {
+			// Normal dependency resolution
+			colArrow.Print("-> ")
+			colSuccess.Println("Discovering all required dependencies")
+			masterProcessed := make(map[string]bool)
+			var missingDeps []string
+			for _, pkgName := range packagesToProcess {
+				if err := resolveMissingDeps(pkgName, masterProcessed, &missingDeps, userRequestedMap, cfg); err != nil {
+					return fmt.Errorf("error resolving dependencies for %s: %v", pkgName, err)
+				}
+			}
+			missingDeps = MovePackageToFront(missingDeps, "sauzeros-base")
 
-		for _, depPkg := range missingDeps {
-			if packagesThatMustBeBuilt[depPkg] {
-				continue
+			packagesThatMustBeBuilt = make(map[string]bool)
+			for pkg := range userRequestedMap {
+				packagesThatMustBeBuilt[pkg] = true
 			}
-			version, revision, err := getRepoVersion2(depPkg)
-			if err != nil {
-				return fmt.Errorf("error: could not get version for dependency %s: %v", depPkg, err)
-			}
-			// Use output package name for dependencies too (may be renamed for cross-system)
-			outputDepPkg := getOutputPackageName(depPkg, cfg)
-			arch := GetSystemArch(cfg)
-			variant := GetSystemVariantForPackage(cfg, depPkg)
-			tarballPath := filepath.Join(BinDir, StandardizeRemoteName(outputDepPkg, version, revision, arch, variant))
-			if _, err := os.Stat(tarballPath); err == nil {
-				if askForConfirmation(colInfo, "Dependency '%s' is missing. Use available binary package?", depPkg) {
-					isCriticalAtomic.Store(1)
-					handlePreInstallUninstall(outputDepPkg, cfg, RootExec)
-					if err := pkgInstall(tarballPath, outputDepPkg, cfg, RootExec, false); err != nil {
+
+			for _, depPkg := range missingDeps {
+				if packagesThatMustBeBuilt[depPkg] {
+					continue
+				}
+				version, revision, err := getRepoVersion2(depPkg)
+				if err != nil {
+					return fmt.Errorf("error: could not get version for dependency %s: %v", depPkg, err)
+				}
+				// Use output package name for dependencies too (may be renamed for cross-system)
+				outputDepPkg := getOutputPackageName(depPkg, cfg)
+				arch := GetSystemArch(cfg)
+				variant := GetSystemVariantForPackage(cfg, depPkg)
+				tarballPath := filepath.Join(BinDir, StandardizeRemoteName(outputDepPkg, version, revision, arch, variant))
+				if _, err := os.Stat(tarballPath); err == nil {
+					if askForConfirmation(colInfo, "Dependency '%s' is missing. Use available binary package?", depPkg) {
+						isCriticalAtomic.Store(1)
+						handlePreInstallUninstall(outputDepPkg, cfg, RootExec)
+						if err := pkgInstall(tarballPath, outputDepPkg, cfg, RootExec, false); err != nil {
+							isCriticalAtomic.Store(0)
+							return fmt.Errorf("fatal error installing binary %s: %v", depPkg, err)
+						}
 						isCriticalAtomic.Store(0)
-						return fmt.Errorf("fatal error installing binary %s: %v", depPkg, err)
+					} else {
+						packagesThatMustBeBuilt[depPkg] = true
 					}
-					isCriticalAtomic.Store(0)
 				} else {
 					packagesThatMustBeBuilt[depPkg] = true
 				}
-			} else {
-				packagesThatMustBeBuilt[depPkg] = true
 			}
 		}
 
