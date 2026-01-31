@@ -50,7 +50,7 @@ func needsRootPrivileges(args []string) bool {
 }
 
 // authenticateOnce performs a single authentication check at program start
-func authenticateOnce() error {
+func authenticateOnce(quiet bool) error {
 	if os.Geteuid() == 0 {
 		return nil // Already root
 	}
@@ -87,8 +87,10 @@ func authenticateOnce() error {
 		}
 	}()
 
-	//cPrintln(colNote, "-> Authenticated via sudo")
-	colArrow.Print("-> ")
-	colSuccess.Println("Authenticated via sudo")
+	if !quiet {
+		//cPrintln(colNote, "-> Authenticated via sudo")
+		colArrow.Print("-> ")
+		colSuccess.Println("Authenticated via sudo")
+	}
 	return nil
 }

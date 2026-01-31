@@ -74,7 +74,10 @@ func withSharedDownloadLock(lockBase string, fn func() error) error {
 
 // verifyOrCreateChecksums checks source file integrity, prompting the user for action on mismatch.
 
-func verifyOrCreateChecksums(pkgName, pkgDir string, force bool) error {
+func verifyOrCreateChecksums(pkgName, pkgDir string, force bool, logger io.Writer) error {
+	if logger == nil {
+		logger = os.Stdout
+	}
 	pkgSrcDir := filepath.Join(SourcesDir, pkgName)
 	checksumFile := filepath.Join(pkgDir, "checksums")
 
@@ -190,98 +193,85 @@ func verifyOrCreateChecksums(pkgName, pkgDir string, force bool) error {
 		}
 
 		// If we are here, the hash is either invalid, missing, or we are forcing an update.
-		var shouldRedownload bool
+		// If we are here, the hash is either invalid, missing, or we are forcing an update.
 		var actionSummary string
 
 		if force {
-			// Case B: Force mode is enabled. Always redownload.
-			shouldRedownload = true
-			actionSummary = "Updated (forced)"
+			if isLocal {
+				// Local files are not downloaded, just re-read.
+				if _, err := os.Stat(filePath); os.IsNotExist(err) {
+					return fmt.Errorf("local source file %s is missing", src)
+				}
+				actionSummary = "Updated (local)"
+			} else {
+				// Case B: Force mode is enabled. Always redownload.
+				actionSummary = "Updated (forced)"
+				WithPrompt(func() {
+					performRedownload(fname, originalURL, substitutedURL, pkgVersion, pkgSrcDir)
+				})
+			}
+
 		} else if sumExists && !isHashValid {
 			// Case C: A checksum exists, but it MISMATCHES. Prompt the user for action.
 			if fileMissing {
 				if isLocal {
 					return fmt.Errorf("local source file %s is missing", src)
 				}
-				shouldRedownload = true
 				actionSummary = "Updated (missing)"
+				WithPrompt(func() {
+					performRedownload(fname, originalURL, substitutedURL, pkgVersion, pkgSrcDir)
+				})
 			} else {
-				interactiveMu.Lock()
-				func() {
-					defer interactiveMu.Unlock()
-					// Print a clean prompt line (helps if prior output was a progress bar).
-					fmt.Fprintln(os.Stderr)
-					colArrow.Print("-> ")
+				WithPrompt(func() {
+					// Try to use /dev/tty for direct user interaction
+					var in io.Reader = os.Stdin
+					var out io.Writer = os.Stdout
+
+					tty, err := os.OpenFile("/dev/tty", os.O_RDWR, 0)
+					if err == nil {
+						defer tty.Close()
+						in = tty
+						out = tty
+					}
+
+					// Print a clean prompt line
+					fmt.Fprint(out, colArrow.Sprint("-> "))
 					if isLocal {
-						colWarn.Printf("Checksum mismatch for local file %s. (K)eep current checksum, (u)pdate checksum? [K/u]: ", fname)
+						fmt.Fprintf(out, "%s\n", colWarn.Sprintf("Checksum mismatch for local file %s. (K)eep current checksum, (u)pdate checksum? [K/u]: ", fname))
 					} else {
-						colWarn.Printf("Checksum mismatch for %s. (K)eep local file, (r)edownload file? [K/r]: ", fname)
+						fmt.Fprintf(out, "%s\n", colWarn.Sprintf("Checksum mismatch for %s. (K)eep local file, (r)edownload file? [K/r]: ", fname))
+					}
+
+					// Explicitly sync if it's a file (like stdout/tty)
+					if f, ok := out.(*os.File); ok {
+						f.Sync()
 					}
 
 					var response string
-					_, _ = fmt.Scanln(&response)
+					scanner := bufio.NewScanner(in)
+					if scanner.Scan() {
+						response = scanner.Text()
+					}
 					resp := strings.ToLower(strings.TrimSpace(response))
 					if (isLocal && resp == "u") || (!isLocal && resp == "r") {
-						shouldRedownload = true
 						if isLocal {
 							actionSummary = "Updated (local)"
 						} else {
-							actionSummary = "Updated (redownloaded)"
+							actionSummary = "Redownloaded"
+							// PERFORM REDOWNLOAD INSIDE PROMPT LOCK
+							performRedownload(fname, originalURL, substitutedURL, pkgVersion, pkgSrcDir)
 						}
 					} else {
-						shouldRedownload = false
-						actionSummary = "Updated (kept local)"
+						actionSummary = "Kept (mismatch)"
 					}
-				}()
+				})
 			}
 		} else {
 			// Case D: No checksum exists and not in force mode.
 			// Automatically keep the local file and generate a new checksum. NO PROMPT.
-			shouldRedownload = false
 			actionSummary = "Generated"
-			colArrow.Print("-> ")
-			colSuccess.Printf("No checksum for %s, generating from local file.\n", fname)
-		}
-
-		// 3. PERFORM REDOWNLOAD (if decided in the logic above)
-
-		if shouldRedownload {
-			if isLocal {
-				// Local bits can't be redownloaded. We just updated shouldRedownload to true
-				// so that the recalculate block below runs and updates the checksum file.
-			} else {
-				colArrow.Print("-> ")
-				colSuccess.Printf("Downloading %s\n", fname)
-				actionSummary = "Updated"
-
-				//Use version-aware hash and cleanup
-				hashInput := originalURL + pkgVersion
-				hashName := fmt.Sprintf("%s-%s", hashString(hashInput), fname)
-				cachePath := filepath.Join(CacheStore, hashName)
-
-				// Clean up old versions/hashes of this file
-				globPattern := filepath.Join(CacheStore, "*-"+fname)
-				if matches, err := filepath.Glob(globPattern); err == nil {
-					for _, match := range matches {
-						if match != cachePath {
-							_ = os.Remove(match)
-						}
-					}
-				}
-
-				_ = os.Remove(cachePath)
-				_ = os.Remove(filePath)
-
-				if err := downloadFile(originalURL, substitutedURL, cachePath); err != nil {
-					return fmt.Errorf("failed to redownload %s: %v", fname, err)
-				}
-				if err := os.Symlink(cachePath, filePath); err != nil {
-					return fmt.Errorf("failed to symlink %s -> %s: %v", cachePath, filePath, err)
-				}
-			}
-		} else {
-			colArrow.Print("-> ")
-			colSuccess.Printf("Keeping existing local file for %s.\n", fname)
+			fmt.Fprint(logger, colArrow.Sprint("-> "))
+			fmt.Fprintf(logger, "%s", colSuccess.Sprintf("No checksum for %s, generating from local file.\n", fname))
 		}
 
 		// 4. RECALCULATE: Generate the new checksum for the file now on disk.
@@ -302,8 +292,8 @@ func verifyOrCreateChecksums(pkgName, pkgDir string, force bool) error {
 
 	debugf("-> Checksums summary for %s:\n", pkgName)
 	for _, s := range summary {
-		colArrow.Print("-> ")
-		colSuccess.Println("Checksum", s)
+		fmt.Fprint(logger, colArrow.Sprint("-> "))
+		fmt.Fprintln(logger, colSuccess.Sprintf("Checksum %s", s))
 	}
 
 	// 6. SIGNATURE VERIFICATION PASS: Check all files for accompanying signatures
@@ -350,7 +340,7 @@ func hokutoChecksum(pkgName string, force bool, unpack bool) error {
 	if err := fetchSources(pkgName, pkgDir, false); err != nil {
 		return fmt.Errorf("error fetching sources: %v", err)
 	}
-	if err := verifyOrCreateChecksums(pkgName, pkgDir, force); err != nil {
+	if err := verifyOrCreateChecksums(pkgName, pkgDir, force, nil); err != nil {
 		return fmt.Errorf("error verifying checksums: %v", err)
 	}
 
@@ -560,4 +550,37 @@ func computeSingleGoHash(path string, execCtx *Executor, buf []byte) (string, er
 		return "", err
 	}
 	return "", fmt.Errorf("hashing failed")
+}
+
+// Helper to perform redownload with logging
+func performRedownload(fname, originalURL, substitutedURL, pkgVersion, pkgSrcDir string) {
+	colArrow.Print("-> ")
+	colSuccess.Printf("Downloading %s\n", fname)
+
+	//Use version-aware hash and cleanup
+	hashInput := originalURL + pkgVersion
+	hashName := fmt.Sprintf("%s-%s", hashString(hashInput), fname)
+	cachePath := filepath.Join(CacheStore, hashName)
+	filePath := filepath.Join(pkgSrcDir, fname)
+
+	// Clean up old versions/hashes of this file
+	globPattern := filepath.Join(CacheStore, "*-"+fname)
+	if matches, err := filepath.Glob(globPattern); err == nil {
+		for _, match := range matches {
+			if match != cachePath {
+				_ = os.Remove(match)
+			}
+		}
+	}
+
+	_ = os.Remove(cachePath)
+	_ = os.Remove(filePath)
+
+	if dErr := downloadFile(originalURL, substitutedURL, cachePath); dErr != nil {
+		fmt.Printf("Msg: failed to redownload %s: %v\n", fname, dErr)
+	} else {
+		if sErr := os.Symlink(cachePath, filepath.Join(pkgSrcDir, fname)); sErr != nil {
+			fmt.Printf("Msg: failed to symlink %s -> %s: %v\n", cachePath, filepath.Join(pkgSrcDir, fname), sErr)
+		}
+	}
 }

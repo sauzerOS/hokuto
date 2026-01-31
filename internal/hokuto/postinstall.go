@@ -14,13 +14,13 @@ import (
 	"sync"
 )
 
-// PostInstallTasks runs common system cache updates after package installs.
-// It uses a worker pool to execute tasks with limited concurrency,
-// preventing I/O contention and providing a significant speedup.
-
-func PostInstallTasks(e *Executor) error {
-	colArrow.Print("-> ")
-	colSuccess.Println("Executing post-install tasks")
+// PostInstallTasks runs global post-install hooks like ldconfig, icon cache updates, etc.
+func PostInstallTasks(execCtx *Executor, logger io.Writer) error {
+	if logger == nil {
+		logger = os.Stdout
+	}
+	fmt.Fprint(logger, colArrow.Sprint("-> "))
+	fmt.Fprintln(logger, colSuccess.Sprint("Executing post-install tasks"))
 
 	var mu sync.Mutex
 	var errs []error
@@ -60,7 +60,7 @@ func PostInstallTasks(e *Executor) error {
 			var stderr bytes.Buffer
 			cmd.Stderr = &stderr
 			cmd.Stdin = nil
-			if err := e.Run(cmd); err != nil {
+			if err := execCtx.Run(cmd); err != nil {
 				debugf("%s failed: %v\n", task.name, err)
 				mu.Lock()
 				errMsg := fmt.Errorf("%s failed: %w", task.name, err)
@@ -120,7 +120,7 @@ func PostInstallTasks(e *Executor) error {
 				cmd.Stderr = &stderr
 				cmd.Stdin = nil
 
-				if err := e.Run(cmd); err != nil {
+				if err := execCtx.Run(cmd); err != nil {
 					mu.Lock()
 					errMsg := fmt.Errorf("%s failed: %w", job.name, err)
 					if stderr.Len() > 0 {

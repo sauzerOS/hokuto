@@ -86,6 +86,7 @@ func handleUploadCommand(args []string, cfg *Config) error {
 	}
 
 	if *syncdb {
+		debugf("Flag -syncdb detected. Uploading DB\n")
 		return uploadPkgDB(ctx, r2)
 	}
 
@@ -551,6 +552,7 @@ func uploadPkgDB(ctx context.Context, r2 *R2Client) error {
 	colArrow.Print("-> ")
 	colNote.Println("Syncing global package database to R2")
 
+	debugf("Reading local database from %s\n", PkgDBPath)
 	data, err := os.ReadFile(PkgDBPath)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -558,8 +560,10 @@ func uploadPkgDB(ctx context.Context, r2 *R2Client) error {
 		}
 		return fmt.Errorf("failed to read local database: %w", err)
 	}
+	debugf("Read %d bytes from database\n", len(data))
 
 	filename := filepath.Base(PkgDBPath)
+	debugf("Uploading to R2 as %s\n", filename)
 	if err := r2.UploadFile(ctx, filename, data); err != nil {
 		return fmt.Errorf("failed to upload database: %w", err)
 	}

@@ -373,7 +373,12 @@ func unpackTarballFallback(tarballPath, dest string) error {
 
 // createPackageTarball creates a .tar.zst archive of outputDir into BinDir.
 // It uses system tar if available, otherwise falls back to pure-Go tar+zstd.
-func createPackageTarball(pkgName, pkgVer, pkgRev, arch, variant, outputDir string, execCtx *Executor) error {
+// createPackageTarball creates a .tar.zst archive of outputDir into BinDir.
+// It uses system tar if available, otherwise falls back to pure-Go tar+zstd.
+func createPackageTarball(pkgName, pkgVer, pkgRev, arch, variant, outputDir string, execCtx *Executor, logger io.Writer) error {
+	if logger == nil {
+		logger = os.Stdout
+	}
 	// Ensure BinDir exists
 	if err := os.MkdirAll(BinDir, 0o755); err != nil {
 		return fmt.Errorf("failed to create BinDir: %v", err)
@@ -405,8 +410,8 @@ func createPackageTarball(pkgName, pkgVer, pkgRev, arch, variant, outputDir stri
 		tarCmd := exec.Command("tar", args...)
 		debugf("Creating package tarball with system tar: %s\n", tarballPath)
 		if err := execCtx.Run(tarCmd); err == nil {
-			colArrow.Print("-> ")
-			colSuccess.Println("Package tarball created successfully")
+			fmt.Fprint(logger, colArrow.Sprint("-> "))
+			fmt.Fprintln(logger, colSuccess.Sprint("Package tarball created successfully"))
 			return nil
 		}
 		// fall through to internal if tar fails
@@ -491,8 +496,8 @@ func createPackageTarball(pkgName, pkgVer, pkgRev, arch, variant, outputDir stri
 	if err != nil {
 		return fmt.Errorf("failed to add files to tarball: %v", err)
 	}
-	colArrow.Print("-> ")
-	colSuccess.Printf("Package tarball created successfully: %s\n", tarballPath)
+	fmt.Fprint(logger, colArrow.Sprint("-> "))
+	fmt.Fprintf(logger, "%s", colSuccess.Sprintf("Package tarball created successfully: %s\n", tarballPath))
 	return nil
 }
 

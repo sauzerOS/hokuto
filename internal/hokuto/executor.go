@@ -17,6 +17,9 @@ type Executor struct {
 	ShouldRunAsRoot   bool            // ShouldRunAsRoot specifies whether the command MUST be executed with root privileges.
 	ApplyIdlePriority bool            // Apply nice -n 19 to this specific command
 	Interactive       bool            // Interactive indicates whether the command may prompt the user
+	Stdout            io.Writer       // Optional redirect for Stdout
+	Stderr            io.Writer       // Optional redirect for Stderr
+	LogPath           string          // Optional path to write output logs to
 }
 
 // Update the constructor/factory function for Executor
@@ -79,10 +82,18 @@ func (e *Executor) Run(cmd *exec.Cmd) error {
 		cmd.Stdin = os.Stdin
 	}
 	if cmd.Stdout == nil {
-		cmd.Stdout = os.Stdout
+		if e.Stdout != nil {
+			cmd.Stdout = e.Stdout
+		} else {
+			cmd.Stdout = os.Stdout
+		}
 	}
 	if cmd.Stderr == nil {
-		cmd.Stderr = os.Stderr
+		if e.Stderr != nil {
+			cmd.Stderr = e.Stderr
+		} else {
+			cmd.Stderr = os.Stderr
+		}
 	}
 
 	// --- Phase 1: maybe check privilege ---

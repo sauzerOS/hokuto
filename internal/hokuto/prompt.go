@@ -15,9 +15,29 @@ import (
 // This prevents background goroutines from hanging invisibly while waiting for input.
 var interactiveMu sync.Mutex
 
+// Hooks for UI coordination (e.g., pausing TUI updates during prompts)
+var (
+	promptStartHook func()
+	promptEndHook   func()
+)
+
+// SetPromptHooks registers callbacks to be executed before and after an interactive prompt.
+// These are useful for pausing/resuming background UI updates.
+func SetPromptHooks(onStart, onEnd func()) {
+	promptStartHook = onStart
+	promptEndHook = onEnd
+}
+
 func askForConfirmation(p colorPrinter, format string, a ...any) bool {
 	interactiveMu.Lock()
 	defer interactiveMu.Unlock()
+
+	if promptStartHook != nil {
+		promptStartHook()
+	}
+	if promptEndHook != nil {
+		defer promptEndHook()
+	}
 
 	reader := bufio.NewReader(os.Stdin)
 	// First, create the main part of the prompt using the provided arguments.
@@ -44,4 +64,20 @@ func askForConfirmation(p colorPrinter, format string, a ...any) bool {
 		}
 		cPrintln(colWarn, "Invalid input.")
 	}
+}
+
+// WithPrompt executes a function within the prompt hooks (pausing UI).
+// It also acquires the interactive lock.
+func WithPrompt(fn func()) {
+	interactiveMu.Lock()
+	defer interactiveMu.Unlock()
+
+	if promptStartHook != nil {
+		promptStartHook()
+	}
+	if promptEndHook != nil {
+		defer promptEndHook()
+	}
+
+	fn()
 }

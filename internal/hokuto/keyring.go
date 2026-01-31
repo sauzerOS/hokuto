@@ -63,7 +63,7 @@ func SyncKeyring(ctx context.Context, cfg *Config) error {
 		return err
 	}
 
-	keyDir := "/etc/hokuto/keys"
+	keyDir := DefaultKeyDir
 	if root := os.Getenv("HOKUTO_ROOT"); root != "" {
 		keyDir = filepath.Join(root, "etc", "hokuto", "keys")
 	}

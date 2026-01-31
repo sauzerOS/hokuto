@@ -60,7 +60,7 @@ func NewR2Client(cfg *Config) (*R2Client, error) {
 	}
 
 	if Debug {
-		options = append(options, config.WithClientLogMode(aws.LogSigning|aws.LogRetries|aws.LogRequest|aws.LogResponse|aws.LogRequestWithBody|aws.LogResponseWithBody))
+		options = append(options, config.WithClientLogMode(aws.LogSigning|aws.LogRetries|aws.LogRequest|aws.LogResponse))
 	}
 
 	awsCfg, err := config.LoadDefaultConfig(context.TODO(), options...)

@@ -268,7 +268,7 @@ func downloadFileWithOptions(originalURL, finalURL, destFile string, opt downloa
 
 // fetchBinaryPackage attempts to download a binary package from the configured mirror.
 
-func fetchBinaryPackage(pkgName, version, revision string, cfg *Config) error {
+func fetchBinaryPackage(pkgName, version, revision string, cfg *Config, quiet bool) error {
 	lookupName := pkgName
 	if idx := strings.Index(pkgName, "@"); idx != -1 {
 		lookupName = pkgName[:idx]
@@ -284,8 +284,10 @@ func fetchBinaryPackage(pkgName, version, revision string, cfg *Config) error {
 	url := fmt.Sprintf("%s/%s", BinaryMirror, filename)
 	destPath := filepath.Join(BinDir, filename)
 
-	colArrow.Print("-> ")
-	colSuccess.Printf("Checking mirror for binary: %s\n", filename)
+	if !quiet {
+		colArrow.Print("-> ")
+		colSuccess.Printf("Checking mirror for binary: %s\n", filename)
+	}
 
 	// Use downloadFileQuiet so we don't see curl errors (e.g. 404) during update loop
 	if err := downloadFileQuiet(url, url, destPath); err != nil {

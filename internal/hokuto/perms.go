@@ -136,7 +136,7 @@ func ensureHokutoOwnership(cfg *Config) error {
 		}
 
 		// We need root to fix ownership. Prompt for sudo.
-		if err := authenticateOnce(); err != nil {
+		if err := authenticateOnce(true); err != nil {
 			return fmt.Errorf("failed to authenticate for ownership fix: %w", err)
 		}
 
@@ -163,6 +163,19 @@ func ensureHokutoOwnership(cfg *Config) error {
 				cmd := exec.Command("sudo", "chown", "-R", fmt.Sprintf("%s:%s", targetUser, targetGroup), path)
 				if err := cmd.Run(); err != nil {
 					return fmt.Errorf("failed to fix ownership of %s: %w", path, err)
+				}
+			}
+		}
+
+		// Inform user that ownership was fixed
+		colArrow.Print("-> ")
+		if len(pathsToFix) == 1 {
+			colSuccess.Printf("Fixed ownership for %s\n", pathsToFix[0])
+		} else {
+			colSuccess.Printf("Fixed ownership for %d directories\n", len(pathsToFix))
+			if Debug {
+				for _, p := range pathsToFix {
+					colNote.Printf("   - %s\n", p)
 				}
 			}
 		}

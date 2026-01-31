@@ -358,7 +358,7 @@ func checkDependencyBlocks(pkgName string, newVersion string, installedPackages 
 
 // checkForUpgrades is the main function for the upgrade logic.
 
-func checkForUpgrades(_ context.Context, cfg *Config) error {
+func checkForUpgrades(_ context.Context, cfg *Config, maxJobs int) error {
 	colArrow.Print("-> ")
 	colSuccess.Println("Checking for Package Upgrades")
 
@@ -515,7 +515,65 @@ func checkForUpgrades(_ context.Context, cfg *Config) error {
 		go prefetchSources(pkgNames[1:])
 	}
 
-	// --- REFACTORED BUILD AND INSTALL LOGIC ---
+	// --- PARALLEL EXECUTION PATH ---
+	if maxJobs > 1 {
+		colArrow.Print("-> ")
+		colSuccess.Printf("Executing parallel update (jobs: %d)\n", maxJobs)
+
+		// Create a temporary plan for parallel execution
+		updatePlan := &BuildPlan{
+			Order: pkgNames,
+			// PostBuildRebuilds isn't typically used in updates, and we don't calculate them here.
+			// The update logic is simpler than a full world rebuild.
+			PostBuildRebuilds: make(map[string][]string),
+		}
+
+		// Use a custom builder that incorporates binary checks
+		smartBuilder := func(pkgName string, cfg *Config, exec *Executor, opts BuildOptions) (time.Duration, error) {
+			// 1. Check for binary (cache or mirror)
+			version, revision, err := getRepoVersion2(pkgName)
+			if err != nil {
+				return 0, fmt.Errorf("failed to get version: %w", err)
+			}
+
+			// Try to fetch binary if configured (mirror check logic reused logic from sequential)
+			if BinaryMirror != "" {
+				// Errors here are ignored, we just fail to find binary and proceed to build
+				// Parallel mode: pass quiet=true
+				_ = fetchBinaryPackage(pkgName, version, revision, cfg, true)
+			}
+
+			outputPkgName := getOutputPackageName(pkgName, cfg)
+			arch := GetSystemArch(cfg)
+			variant := GetSystemVariantForPackage(cfg, pkgName)
+			tarballPath := filepath.Join(BinDir, StandardizeRemoteName(outputPkgName, version, revision, arch, variant))
+
+			if _, err := os.Stat(tarballPath); err == nil {
+				// Found binary! Return success with 0 duration to signal "skipped build" (ready for install)
+				return 0, nil
+			}
+
+			// 2. Not found ? Build it.
+			return pkgBuild(pkgName, cfg, exec, opts)
+		}
+
+		if err := RunParallelBuilds(updatePlan, cfg, maxJobs, userRequestedMap, false, smartBuilder); err != nil {
+			return err
+		}
+
+		// Recheck specific condition: Hokuto itself updated?
+		if hokutoInUpdates && len(filteredUpgradeList) > 1 {
+			colArrow.Print("-> ")
+			colSuccess.Println("Hokuto has been updated. Run 'hokuto update' again to complete the remaining updates.")
+			return nil
+		}
+
+		colArrow.Print("-> ")
+		colSuccess.Printf("System update completed successfully.\n")
+		return nil
+	}
+
+	// --- SEQUENTIAL EXECUTION LOGIC ---
 	var failedPackages []string
 	var totalUpdateDuration time.Duration // Accumulator for the whole update process
 	totalToUpdate := len(pkgNames)
@@ -550,7 +608,8 @@ func checkForUpgrades(_ context.Context, cfg *Config) error {
 			colSuccess.Printf("Using cached binary package: %s\n", tarballName)
 			foundBinary = true
 		} else if BinaryMirror != "" {
-			if err := fetchBinaryPackage(pkgName, version, revision, cfg); err == nil {
+			// Sequential mode: output is fine (quiet=false)
+			if err := fetchBinaryPackage(pkgName, version, revision, cfg, false); err == nil {
 				foundBinary = true
 			} else {
 				colArrow.Print("-> ")
@@ -560,11 +619,11 @@ func checkForUpgrades(_ context.Context, cfg *Config) error {
 
 		if foundBinary {
 			isCriticalAtomic.Store(1)
-			handlePreInstallUninstall(outputPkgName, cfg, RootExec)
+			handlePreInstallUninstall(outputPkgName, cfg, RootExec, false)
 			colArrow.Print("-> ")
 			colSuccess.Printf("Installing")
 			colNote.Printf(" %s\n", outputPkgName)
-			if err := pkgInstall(tarballPath, outputPkgName, cfg, RootExec, false); err != nil {
+			if err := pkgInstall(tarballPath, outputPkgName, cfg, RootExec, false, nil); err != nil {
 				isCriticalAtomic.Store(0)
 				color.Danger.Printf("Binary installation failed for %s: %v. Falling back to build.\n", outputPkgName, err)
 			} else {
@@ -588,7 +647,11 @@ func checkForUpgrades(_ context.Context, cfg *Config) error {
 		}
 
 		// A. Fallback: Directly call pkgBuild within the current process
-		duration, err := pkgBuild(pkgName, cfg, UserExec, false, i+1, totalToUpdate)
+		duration, err := pkgBuild(pkgName, cfg, UserExec, BuildOptions{
+			Bootstrap:    false,
+			CurrentIndex: i + 1,
+			TotalCount:   totalToUpdate,
+		})
 		if err != nil {
 			color.Danger.Printf("Build failed for %s: %v\n", pkgName, err)
 			failedPackages = append(failedPackages, pkgName)
@@ -598,11 +661,11 @@ func checkForUpgrades(_ context.Context, cfg *Config) error {
 
 		// B. If build is successful, install the package
 		isCriticalAtomic.Store(1)
-		handlePreInstallUninstall(outputPkgName, cfg, RootExec)
+		handlePreInstallUninstall(outputPkgName, cfg, RootExec, false)
 		colArrow.Print("-> ")
 		colSuccess.Printf("Installing")
 		colNote.Printf(" %s\n", outputPkgName)
-		if err := pkgInstall(tarballPath, outputPkgName, cfg, RootExec, false); err != nil {
+		if err := pkgInstall(tarballPath, outputPkgName, cfg, RootExec, false, nil); err != nil {
 			isCriticalAtomic.Store(0)
 			color.Danger.Printf("Installation failed for %s: %v\n", outputPkgName, err)
 			failedPackages = append(failedPackages, pkgName)

@@ -208,6 +208,63 @@ func FetchRemoteIndex(cfg *Config) ([]RepoEntry, error) {
 	return ParseRepoIndex(data)
 }
 
+// GetCachedRemoteIndex returns the global remote index, fetching it if necessary.
+func GetCachedRemoteIndex(cfg *Config) ([]RepoEntry, error) {
+	GlobalRemoteIndexMu.Lock()
+	defer GlobalRemoteIndexMu.Unlock()
+
+	if GlobalRemoteIndexLoaded {
+		return GlobalRemoteIndex, nil
+	}
+
+	index, err := FetchRemoteIndex(cfg)
+	if err != nil {
+		return nil, err
+	}
+
+	GlobalRemoteIndex = index
+	GlobalRemoteIndexLoaded = true
+	return GlobalRemoteIndex, nil
+}
+
+// IsPackageInIndex checks if a specific package version exists in the index.
+func IsPackageInIndex(index []RepoEntry, name, version, revision string, cfg *Config) bool {
+	arch := GetSystemArch(cfg)
+	variant := GetSystemVariantForPackage(cfg, name)
+
+	// Fallback logic for generic/multi-generic variants should match GetRemotePackageVersion's looseness
+	// OR be strict. Since build plan gives specific version/revision, we probably want exact match
+	// on version/revision, but allow variant fallback if the system allows it?
+	// Actually, getRepoVersion2 usually returns the version from the *source* repo.
+	// We want to see if a binary of that version exists.
+
+	// Check preferred variant first
+	for _, entry := range index {
+		if entry.Name == name && entry.Arch == arch && entry.Variant == variant && entry.Version == version && entry.Revision == revision {
+			return true
+		}
+	}
+
+	// Fallback variants (optimized -> generic, etc)
+	fallbackVariant := ""
+	switch variant {
+	case "optimized":
+		fallbackVariant = "generic"
+	case "multi-optimized":
+		fallbackVariant = "multi-generic"
+	}
+
+	if fallbackVariant != "" {
+		for _, entry := range index {
+			if entry.Name == name && entry.Arch == arch && entry.Variant == fallbackVariant && entry.Version == version && entry.Revision == revision {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
 func listRemotePackages(searchTerm string, cfg *Config) error {
 	remoteIndex, err := FetchRemoteIndex(cfg)
 	if err != nil {

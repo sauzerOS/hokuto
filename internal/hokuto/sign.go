@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -18,6 +19,10 @@ import (
 // This is used to verify official repositories.
 const officialKeyID = "official"
 const officialPublicKeyHex = "b30f07098a4f98ec90bb169bdd49324d5e22fc09eab79e368e6fafc63453f5f2"
+
+// DefaultKeyDir is the path on the host system where keys are stored.
+// It is a variable so it can be overwritten in tests.
+var DefaultKeyDir = "/etc/hokuto/keys"
 
 // detectMultilib checks if the staging directory contains multilib libraries
 // (checks for /usr/lib32 or /lib32 directories)
@@ -128,14 +133,14 @@ func WritePackageInfo(stagingDir, pkgName, pkgVer, pkgRev, arch, cflags string, 
 
 // getPrivateKey loads the Ed25519 private key based on activeKeyID.
 func getPrivateKey() (ed25519.PrivateKey, error) {
-	keyPath := filepath.Join("/etc/hokuto/keys", activeKeyID+".key")
+	keyPath := filepath.Join(DefaultKeyDir, activeKeyID+".key")
 	if root := os.Getenv("HOKUTO_ROOT"); root != "" {
 		keyPath = filepath.Join(root, "etc", "hokuto", "keys", activeKeyID+".key")
 	}
 
 	// Handle the default case where officialKeyID refers to hokuto.key
 	if activeKeyID == officialKeyID {
-		keyPath = filepath.Join("/etc/hokuto/keys", "hokuto.key")
+		keyPath = filepath.Join(DefaultKeyDir, "hokuto.key")
 		if root := os.Getenv("HOKUTO_ROOT"); root != "" {
 			keyPath = filepath.Join(root, "etc", "hokuto", "keys", "hokuto.key")
 		}
@@ -182,7 +187,7 @@ func GenerateKeyPair(id string, execCtx *Executor) error {
 		return fmt.Errorf("failed to generate key pair: %w", err)
 	}
 
-	keyDir := "/etc/hokuto/keys"
+	keyDir := DefaultKeyDir
 	if root := os.Getenv("HOKUTO_ROOT"); root != "" {
 		keyDir = filepath.Join(root, "etc", "hokuto", "keys")
 	}
@@ -253,9 +258,19 @@ func getPublicKey(id string) (ed25519.PublicKey, error) {
 	}
 
 	// Look in /etc/hokuto/keys/
-	keyPath := filepath.Join("/etc/hokuto/keys", id+".pub")
+	keyPath := filepath.Join(DefaultKeyDir, id+".pub")
 	if root := os.Getenv("HOKUTO_ROOT"); root != "" {
-		keyPath = filepath.Join(root, "etc", "hokuto", "keys", id+".pub")
+		rootKeyPath := filepath.Join(root, "etc", "hokuto", "keys", id+".pub")
+		if _, err := os.Stat(rootKeyPath); err == nil {
+			keyPath = rootKeyPath
+		} else if root != "/" {
+			// Fallback to host key if not found in root (and root is not host)
+			if _, err := os.Stat(keyPath); err != nil {
+				// Both missing, error will be caught by ReadFile below
+			} else {
+				// Found in host, keep keyPath as is
+			}
+		}
 	}
 
 	keyData, err := os.ReadFile(keyPath)
@@ -344,7 +359,7 @@ func VerifySignatureRaw(data, sigHex, pubKeyBytes []byte) error {
 // PromptForMasterPrivateKey securely prompts the user for the master private key,
 // but first checks if hokuto.key exists in the local keyring.
 func PromptForMasterPrivateKey() (ed25519.PrivateKey, error) {
-	keyPath := filepath.Join("/etc/hokuto/keys", "hokuto.key")
+	keyPath := filepath.Join(DefaultKeyDir, "hokuto.key")
 	if root := os.Getenv("HOKUTO_ROOT"); root != "" {
 		keyPath = filepath.Join(root, "etc", "hokuto", "keys", "hokuto.key")
 	}
@@ -425,7 +440,7 @@ func VerifyRepoIndexSignature(indexData, sigHex []byte, cfg *Config) error {
 				debugf("Repo index verified using trusted key: %s\n", entry.ID)
 
 				// Automatically install this key locally if it doesn't exist
-				keyDir := "/etc/hokuto/keys"
+				keyDir := DefaultKeyDir
 				if root := os.Getenv("HOKUTO_ROOT"); root != "" {
 					keyDir = filepath.Join(root, "etc", "hokuto", "keys")
 				}
@@ -447,11 +462,73 @@ func VerifyRepoIndexSignature(indexData, sigHex []byte, cfg *Config) error {
 		debugf("Warning: could not fetch keyring for extended verification: %v\n", err)
 	}
 
+	// 3. Try local keys (both chroot and host)
+	// We scan for *.pub files in both locations and try them.
+	localKeyDirs := []string{}
+
+	// Default/Host keys
+	localKeyDirs = append(localKeyDirs, DefaultKeyDir)
+
+	// Chroot keys (prioritized if exists)
+	if root := os.Getenv("HOKUTO_ROOT"); root != "" {
+		chrootKeys := filepath.Join(root, "etc", "hokuto", "keys")
+		// Prepend to check chroot first
+		localKeyDirs = append([]string{chrootKeys}, localKeyDirs...)
+	}
+
+	processedKeys := make(map[string]bool)
+
+	for _, keyDir := range localKeyDirs {
+		files, err := filepath.Glob(filepath.Join(keyDir, "*.pub"))
+		if err != nil {
+			continue
+		}
+
+		for _, file := range files {
+			// Read key
+			keyData, err := os.ReadFile(file)
+			if err != nil {
+				continue
+			}
+
+			// Clean and decode
+			trimmedKey := strings.TrimSpace(string(keyData))
+			var pubKeyBytes []byte
+			if len(trimmedKey) == 64 {
+				pubKeyBytes, err = hex.DecodeString(trimmedKey)
+				if err != nil {
+					continue
+				}
+			} else if len(keyData) == 32 {
+				pubKeyBytes = keyData
+			} else {
+				continue
+			}
+
+			// Deduplicate checks (same key content might be in multiple files or both dirs)
+			keyHex := hex.EncodeToString(pubKeyBytes)
+			if processedKeys[keyHex] {
+				continue
+			}
+			processedKeys[keyHex] = true
+
+			publicKey := ed25519.PublicKey(pubKeyBytes)
+			if ed25519.Verify(publicKey, indexData, signature) {
+				id := strings.TrimSuffix(filepath.Base(file), ".pub")
+				debugf("Repo index verified using local key: %s (%s)\n", id, file)
+				return nil
+			}
+		}
+	}
+
 	return errors.New("REPO INDEX SIGNATURE VERIFICATION FAILED: the remote index has been tampered with or is from an unknown source")
 }
 
 // SignPackage signs a package manifest and metadata.
-func SignPackage(stagingDir, pkgName string, execCtx *Executor) error {
+func SignPackage(stagingDir, pkgName string, execCtx *Executor, logger io.Writer) error {
+	if logger == nil {
+		logger = os.Stdout
+	}
 	metadataDir := filepath.Join(stagingDir, "var", "db", "hokuto", "installed", pkgName)
 	manifestPath := filepath.Join(metadataDir, "manifest")
 	pkgInfoPath := filepath.Join(metadataDir, "pkginfo")
@@ -531,14 +608,17 @@ func SignPackage(stagingDir, pkgName string, execCtx *Executor) error {
 		}
 	}
 
-	colArrow.Print("-> ")
-	colSuccess.Printf("Package %s signed successfully\n", pkgName)
+	fmt.Fprint(logger, colArrow.Sprint("-> "))
+	fmt.Fprintf(logger, "%s", colSuccess.Sprintf("Package %s signed successfully\n", pkgName))
 
 	return nil
 }
 
 // VerifyPackageSignature verifies the package signature in the staging directory.
-func VerifyPackageSignature(stagingDir, pkgName string, cfg *Config, execCtx *Executor) error {
+func VerifyPackageSignature(stagingDir, pkgName string, cfg *Config, execCtx *Executor, logger io.Writer) error {
+	if logger == nil {
+		logger = os.Stdout
+	}
 	// If verification is disabled, skip everything
 	if !VerifySignature {
 		debugf("Skipping signature verification for %s (disabled)\n", pkgName)
@@ -600,10 +680,8 @@ func VerifyPackageSignature(stagingDir, pkgName string, cfg *Config, execCtx *Ex
 	}
 
 	if ed25519.Verify(publicKey, dataToVerify, signature) {
-		colArrow.Print("-> ")
-		colSuccess.Printf("Package ")
-		colNote.Printf("%s", pkgName)
-		colSuccess.Printf(" signature OK\n")
+		fmt.Fprint(logger, colArrow.Sprint("-> "))
+		fmt.Fprintf(logger, "%s", colSuccess.Sprintf("Package %s signature OK\n", pkgName))
 
 		// 4. Verify integrity of all files against the signed manifest
 		if err := VerifyPackageIntegrity(stagingDir, pkgName, manifestPath, execCtx); err != nil {

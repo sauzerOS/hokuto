@@ -253,7 +253,7 @@ func Main() {
 
 	// 5. CHECK IF ROOT PRIVILEGES ARE NEEDED
 	if needsRootPrivileges(os.Args[1:]) {
-		if err := authenticateOnce(); err != nil {
+		if err := authenticateOnce(false); err != nil {
 			fmt.Fprintf(os.Stderr, "Authentication failed: %v\n", err)
 			os.Exit(1)
 		}
@@ -817,7 +817,7 @@ func Main() {
 
 						// 2. Not in local cache? Try Mirror.
 						if BinaryMirror != "" {
-							if err := fetchBinaryPackage(pkgName, version, revision, cfg); err == nil {
+							if err := fetchBinaryPackage(pkgName, version, revision, cfg, false); err == nil {
 								foundOnMirror = true
 							} else {
 								debugf("Mirror fetch failed for %s: %v\n", pkgName, err)
@@ -836,7 +836,7 @@ func Main() {
 									oldGeneric := cfg.Values["HOKUTO_GENERIC"]
 									cfg.Values["HOKUTO_GENERIC"] = "1"
 
-									if err := fetchBinaryPackage(pkgName, version, revision, cfg); err == nil {
+									if err := fetchBinaryPackage(pkgName, version, revision, cfg, false); err == nil {
 										foundOnMirror = true
 										// Update tarballPath for installation
 										arch := GetSystemArchForPackage(cfg, pkgName)
@@ -863,13 +863,13 @@ func Main() {
 				}
 			}
 
-			handlePreInstallUninstall(pkgName, cfg, RootExec)
+			handlePreInstallUninstall(pkgName, cfg, RootExec, false)
 
 			colArrow.Print("-> ")
 			colSuccess.Printf("Installing:")
 			colNote.Printf(" %s (%d/%d)\n", pkgName, i+1, len(installPlan))
 
-			if err := pkgInstall(tarballPath, pkgName, cfg, RootExec, effectiveYes); err != nil {
+			if err := pkgInstall(tarballPath, pkgName, cfg, RootExec, effectiveYes, nil); err != nil {
 				fmt.Fprintln(os.Stderr,
 					colArrow.Sprint("->"),
 					colSuccess.Sprintf("Error installing package"),
@@ -952,19 +952,24 @@ func Main() {
 		if err := ensureHokutoOwnership(cfg); err != nil {
 			fmt.Fprintf(os.Stderr, "Ownership check failed: %v\n", err)
 		}
+		// Preprocess arguments to handle custom flag formats (e.g. -j4)
+		args := PreprocessBuildArgs(os.Args[2:])
+
 		// Use a proper FlagSet to parse arguments and set buildPriority
 		updateCmd := flag.NewFlagSet("update", flag.ExitOnError)
 		var idleBuild = updateCmd.Bool("i", false, "Use half CPU cores and lowest niceness for build process.")
 		var superidleBuild = updateCmd.Bool("ii", false, "Use one CPU core and lowest niceness for build process.")
 		var verbose = updateCmd.Bool("v", false, "Enable verbose output.")
+		var parallel = updateCmd.Int("j", 1, "Number of parallel jobs (default: 1)")
 		// Add long flags for consistency
 		var idleBuildLong = updateCmd.Bool("idle", false, "Use half CPU cores and lowest niceness for build process.")
 		var superidleBuildLong = updateCmd.Bool("superidle", false, "Use one CPU core and lowest niceness for build process.")
+		var parallelLong = updateCmd.Int("parallel", 1, "Number of parallel jobs (default: 1)")
 
 		var verboseLong = updateCmd.Bool("verbose", false, "Enable verbose output.")
 		var remote = updateCmd.Bool("remote", false, "Check for updates from remote binary mirror only.")
 
-		if err := updateCmd.Parse(os.Args[2:]); err != nil {
+		if err := updateCmd.Parse(args); err != nil {
 			fmt.Fprintf(os.Stderr, "Error parsing update flags: %v\n", err)
 			os.Exit(1)
 		}
@@ -989,11 +994,17 @@ func Main() {
 
 		updateRepos()
 
-		if err := PostInstallTasks(RootExec); err != nil {
+		if err := PostInstallTasks(RootExec, nil); err != nil {
 			fmt.Fprintf(os.Stderr, "post-remove tasks completed with warnings: %v\n", err)
 		}
 
-		if err := checkForUpgrades(ctx, cfg); err != nil {
+		// Determine max jobs
+		maxJobs := *parallel
+		if *parallelLong > maxJobs {
+			maxJobs = *parallelLong
+		}
+
+		if err := checkForUpgrades(ctx, cfg, maxJobs); err != nil {
 			fmt.Fprintf(os.Stderr, "Upgrade process failed: %v\n", err)
 			os.Exit(1)
 		}

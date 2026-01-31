@@ -7,6 +7,7 @@ import (
 	"bufio"
 	"bytes"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -66,7 +67,10 @@ func getRebuildTriggers(triggerPkg string, rootDir string) []string {
 	return packagesToRebuild
 }
 
-func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes bool) error {
+func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes bool, logger io.Writer) error {
+	if logger == nil {
+		logger = os.Stdout
+	}
 	// "Installing" message is now handled by the caller (cli.go, update.go, build.go)
 	// to avoid duplicate output.
 
@@ -122,7 +126,7 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 		}
 
 		// Always run post-install hook for glibc
-		if err := executePostInstall(pkgName, rootDir, execCtx, cfg); err != nil {
+		if err := executePostInstall(pkgName, rootDir, execCtx, cfg, logger); err != nil {
 			colArrow.Print("-> ")
 			color.Danger.Printf("post-install for %s returned error: %v\n", pkgName, err)
 		}
@@ -164,7 +168,7 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 	}
 
 	// 1.5. Verify package signature
-	if err := VerifyPackageSignature(stagingDir, pkgName, cfg, execCtx); err != nil {
+	if err := VerifyPackageSignature(stagingDir, pkgName, cfg, execCtx, logger); err != nil {
 		return err
 	}
 
@@ -656,7 +660,7 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 					rmCmd := exec.Command("rm", "-f", currentFile)
 					if err := execCtx.Run(rmCmd); err != nil {
 						// warn but continue install; do not abort the whole install for a removal failure
-						cPrintf(colWarn, "Warning: failed to remove %s: %v\n", currentFile, err)
+						fmt.Fprintf(logger, "Warning: failed to remove %s: %v\n", currentFile, err)
 					} else {
 						debugf("Removed user-modified file: %s\n", file)
 					}
@@ -730,7 +734,9 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 
 	// --- NEW: Dependency Check and Backup (Before deletion) ---
 	debugf("Dependency check")
-	affectedPackages := make(map[string]struct{})
+	// --- NEW: Dependency Check and Backup (Before deletion) ---
+	debugf("Dependency check")
+	affectedPackages := make(map[string][]string) // Changed to map[string][]string
 	libFilesToDelete := make(map[string]struct{})
 	tempLibBackupDir, err := os.MkdirTemp(tmpDir, "hokuto-lib-backup-")
 	if err != nil {
@@ -806,7 +812,19 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 				}
 
 				if matchFile != "" {
-					affectedPackages[otherPkgName] = struct{}{}
+					// Store just the basename for display
+					libName := filepath.Base(matchFile)
+					// Avoid duplicates
+					exists := false
+					for _, l := range affectedPackages[otherPkgName] {
+						if l == libName {
+							exists = true
+							break
+						}
+					}
+					if !exists {
+						affectedPackages[otherPkgName] = append(affectedPackages[otherPkgName], libName)
+					}
 					libFilesToDelete[matchFile] = struct{}{}
 				}
 			}
@@ -836,7 +854,7 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 			if err := copyFile(libPath, backupPath); err != nil {
 				fmt.Fprintf(os.Stderr, "warning: failed to backup library %s natively: %v\n", libPath, err)
 			} else {
-				cPrintf(colInfo, "Backed up affected library %s to %s\n", libPath, backupPath)
+				fmt.Fprintf(logger, "%s", colInfo.Sprintf("Backed up affected library %s to %s\n", libPath, backupPath))
 			}
 		} else {
 			mkdirCmd := exec.Command("mkdir", "-p", backupDir)
@@ -849,7 +867,7 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 			if err := execCtx.Run(cpCmd); err != nil {
 				fmt.Fprintf(os.Stderr, "warning: failed to backup library %s: %v\n", libPath, err)
 			} else {
-				cPrintf(colInfo, "Backed up affected library %s to %s\n", libPath, backupPath)
+				fmt.Fprintf(logger, "%s", colInfo.Sprintf("Backed up affected library %s to %s\n", libPath, backupPath))
 			}
 		}
 	}
@@ -871,9 +889,13 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 	}
 
 	// 7. Run package post-install script
-	colArrow.Print("-> ")
-	colSuccess.Println("Executing package post-install script")
-	if err := executePostInstall(pkgName, rootDir, execCtx, cfg); err != nil {
+	if logger == nil {
+		logger = os.Stdout
+	}
+
+	fmt.Fprint(logger, colArrow.Sprint("-> "))
+	fmt.Fprintln(logger, colSuccess.Sprint("Executing package post-install script"))
+	if err := executePostInstall(pkgName, rootDir, execCtx, cfg, logger); err != nil {
 		fmt.Printf("warning: post-install for %s returned error: %v\n", pkgName, err)
 	}
 
@@ -882,20 +904,22 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 	if len(rebuildTriggerPkgs) > 0 {
 		colArrow.Print("-> ")
 		colSuccess.Print("DKMS trigger: ")
-		cPrintf(colNote, "%s\n", strings.Join(rebuildTriggerPkgs, " "))
+		fmt.Fprintf(logger, "%s", colNote.Sprintf("%s\n", strings.Join(rebuildTriggerPkgs, " ")))
 		shouldRebuild := yes // Default to true if --yes flag is set
 		if !yes {
 			// Use custom prompt to match requested format
-			colArrow.Print("-> ")
-			colWarn.Printf("Rebuild the packages? [Y/n]")
-			os.Stdout.Sync()
-			response, err := stdinReader.ReadString('\n')
-			if err != nil {
-				shouldRebuild = false // Default to no on read error
-			} else {
-				response = strings.ToLower(strings.TrimSpace(response))
-				shouldRebuild = response == "y" || response == "yes" || response == ""
-			}
+			WithPrompt(func() {
+				colArrow.Print("-> ")
+				colWarn.Printf("Rebuild the packages? [Y/n]")
+				os.Stdout.Sync()
+				response, err := stdinReader.ReadString('\n')
+				if err != nil {
+					shouldRebuild = false // Default to no on read error
+				} else {
+					response = strings.ToLower(strings.TrimSpace(response))
+					shouldRebuild = response == "y" || response == "yes" || response == ""
+				}
+			})
 		}
 
 		if shouldRebuild {
@@ -903,9 +927,9 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 				debugf("\n--- Rebuilding %s (triggered by %s) ---\n", rebuildPkg, pkgName)
 
 				// Pass empty string for oldLibsDir since this is a trigger-based rebuild, not a library dependency rebuild
-				if err := pkgBuildRebuild(rebuildPkg, cfg, execCtx, ""); err != nil {
+				if err := pkgBuildRebuild(rebuildPkg, cfg, execCtx, "", nil); err != nil {
 					failed = append(failed, fmt.Sprintf("rebuild of %s (triggered by %s) failed: %v", rebuildPkg, pkgName, err))
-					cPrintf(colWarn, "WARNING: Rebuild of %s failed: %v\n", rebuildPkg, err)
+					fmt.Fprintf(logger, "%s", colWarn.Sprintf("WARNING: Rebuild of %s failed: %v\n", rebuildPkg, err))
 					continue
 				}
 
@@ -913,7 +937,7 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 
 				if err := rsyncStaging(rebuildOutputDir, rootDir, execCtx); err != nil {
 					failed = append(failed, fmt.Sprintf("failed to sync rebuilt package %s to root: %v", rebuildPkg, err))
-					cPrintf(colWarn, "WARNING: Failed to sync rebuilt package %s to root: %v\n", rebuildPkg, err)
+					fmt.Fprintf(logger, "%s", colWarn.Sprintf("WARNING: Failed to sync rebuilt package %s to root: %v\n", rebuildPkg, err))
 					continue
 				}
 
@@ -922,13 +946,13 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 					fmt.Fprintf(os.Stderr, "failed to cleanup rebuild tmpdirs for %s: %v\n", rebuildPkg, err)
 				}
 				colArrow.Print("-> ")
-				cPrintf(colSuccess, "Rebuild of ")
+				fmt.Fprintf(logger, "%s", colSuccess.Sprint("Rebuild of "))
 				colNote.Printf("%s ", rebuildPkg)
 				colSuccess.Printf("finished and installed.\n")
 			}
 		} else {
 			colArrow.Print("-> ")
-			cPrintf(colInfo, "Skipping rebuild of %s\n", strings.Join(rebuildTriggerPkgs, ", "))
+			fmt.Fprintf(logger, "%s", colInfo.Sprintf("Skipping rebuild of %s\n", strings.Join(rebuildTriggerPkgs, ", ")))
 		}
 	}
 
@@ -941,53 +965,68 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 		sort.Strings(affectedList)
 
 		// 8a. Prompt for rebuild (Hokuto is guaranteed to be run in a terminal)
-		cPrintf(colWarn, "\nWARNING: The following packages depend on libraries that were removed/upgraded:\n  %s\n", strings.Join(affectedList, ", "))
-
+		var sb strings.Builder
+		sb.WriteString("\nWARNING: The following packages depend on libraries that were removed/upgraded:\n")
+		for _, pkg := range affectedList {
+			libs := affectedPackages[pkg]
+			sb.WriteString(fmt.Sprintf("  %s (needs: %s)\n", pkg, strings.Join(libs, ", ")))
+		}
 		// Interactive rebuild selection
 		var packagesToRebuild []string
 		rebuildAll := false // Flag to track if 'a' (all) was selected
 
 		if !yes {
 			// Use the same robust reader we defined earlier
-			for _, pkg := range affectedList {
-				if rebuildAll {
-					// 'all' was selected, just add and continue
-					packagesToRebuild = append(packagesToRebuild, pkg)
-					cPrintf(colInfo, "Rebuilding %s (auto-selected by 'all')\n", pkg)
-					continue
-				}
+			shouldQuit := false
+			WithPrompt(func() {
+				// Print warning inside the prompt block to ensure it's not overwritten
+				cPrintf(colWarn, "%s", sb.String())
 
-				// Prompt for this specific package
-				cPrintf(colInfo, "Rebuild %s? [Y/n/a(ll)/q(uit)]: ", pkg)
-				response, err := stdinReader.ReadString('\n')
-				if err != nil {
-					response = "q" // Treat error (like Ctrl+D) as 'quit'
-				}
-				response = strings.ToLower(strings.TrimSpace(response))
+				for _, pkg := range affectedList {
+					if shouldQuit {
+						break
+					}
 
-				switch response {
-				case "y", "": // Default is Yes
-					packagesToRebuild = append(packagesToRebuild, pkg)
-				case "n": // No
-					cPrintf(colInfo, "Skipping rebuild for %s\n", pkg)
-					continue
-				case "a": // All
-					cPrintf(colInfo, "Rebuilding %s and all subsequent packages\n", pkg)
-					rebuildAll = true
-					packagesToRebuild = append(packagesToRebuild, pkg)
-				case "q": // Quit
-					cPrintf(colInfo, "Quitting rebuild selection. No more packages will be rebuilt.\n")
-					goto RebuildSelectionDone // Break out of the loop
-				default: // Invalid, treat as 'No' for safety
-					cPrintf(colInfo, "Invalid input. Skipping rebuild for %s\n", pkg)
-					continue
+					if rebuildAll {
+						// 'all' was selected, just add and continue
+						packagesToRebuild = append(packagesToRebuild, pkg)
+						cPrintf(colInfo, "Rebuilding %s (auto-selected by 'all')\n", pkg)
+						// continue // continue doesn't render well here since we are inside closure inside loop?
+						// actually we are inside closure.
+						// Wait, if we wrap the WHOLE loop in WithPrompt, then we can use continue naturally?
+						// No, WithPrompt accepts a func().
+						continue
+					}
+
+					// Prompt for this specific package
+					cPrintf(colInfo, "Rebuild %s? [Y/n/a(ll)/q(uit)]: ", pkg)
+					os.Stdout.Sync()
+					response, err := stdinReader.ReadString('\n')
+					if err != nil {
+						response = "q" // Treat error (like Ctrl+D) as 'quit'
+					}
+					response = strings.ToLower(strings.TrimSpace(response))
+
+					switch response {
+					case "y", "": // Default is Yes
+						packagesToRebuild = append(packagesToRebuild, pkg)
+					case "n": // No
+						cPrintf(colInfo, "Skipping rebuild for %s\n", pkg)
+					case "a": // All
+						cPrintf(colInfo, "Rebuilding %s and all subsequent packages\n", pkg)
+						rebuildAll = true
+						packagesToRebuild = append(packagesToRebuild, pkg)
+					case "q": // Quit
+						cPrintf(colInfo, "Quitting rebuild selection. No more packages will be rebuilt.\n")
+						shouldQuit = true // Signal to break loop
+					default: // Invalid, treat as 'No' for safety
+						cPrintf(colInfo, "Invalid input. Skipping rebuild for %s\n", pkg)
+					}
 				}
-			}
-		RebuildSelectionDone: // Label for the 'quit' jump
-			// This is just a label, execution continues normally after the loop if 'q' wasn't used.
+			})
 		} else {
 			// If --yes is passed, just rebuild all affected packages (original behavior)
-			cPrintf(colInfo, "Rebuilding all affected packages due to --yes flag.\n")
+			fmt.Fprintf(logger, "%s", colInfo.Sprint("Rebuilding all affected packages due to --yes flag.\n"))
 			packagesToRebuild = affectedList
 		}
 
@@ -996,11 +1035,11 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 			colArrow.Print("-> ")
 			colSuccess.Println("Starting rebuild of affected packages")
 			for _, pkg := range packagesToRebuild {
-				cPrintf(colInfo, "\n--- Rebuilding %s ---\n", pkg)
+				fmt.Fprintf(logger, "%s", colInfo.Sprintf("\n--- Rebuilding %s ---\n", pkg))
 
-				if err := pkgBuildRebuild(pkg, cfg, execCtx, tempLibBackupDir); err != nil {
+				if err := pkgBuildRebuild(pkg, cfg, execCtx, tempLibBackupDir, nil); err != nil {
 					failed = append(failed, fmt.Sprintf("rebuild of %s failed: %v", pkg, err))
-					cPrintf(colWarn, "WARNING: Rebuild of %s failed: %v\n", pkg, err)
+					fmt.Fprintf(logger, "%s", colWarn.Sprintf("WARNING: Rebuild of %s failed: %v\n", pkg, err))
 					continue // Skip to next package on failure, same as hokuto update
 				}
 
@@ -1008,7 +1047,7 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 
 				if err := rsyncStaging(rebuildOutputDir, rootDir, execCtx); err != nil {
 					failed = append(failed, fmt.Sprintf("failed to sync rebuilt package %s to root: %v", pkg, err))
-					cPrintf(colWarn, "WARNING: Failed to sync rebuilt package %s to root: %v\n", pkg, err)
+					fmt.Fprintf(logger, "%s", colWarn.Sprintf("WARNING: Failed to sync rebuilt package %s to root: %v\n", pkg, err))
 					continue // Skip cleanup on sync failure
 				}
 
@@ -1036,7 +1075,7 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 	}
 
 	// 11. Run global post-install tasks
-	if err := PostInstallTasks(RootExec); err != nil {
+	if err := PostInstallTasks(RootExec, logger); err != nil {
 		fmt.Fprintf(os.Stderr, "post-remove tasks completed with warnings: %v\n", err)
 	}
 	return nil
@@ -1118,9 +1157,13 @@ func checkStagingConflicts(pkgName, stagingDir, rootDir, stagingManifest string,
 	}
 
 	stdinReader := bufio.NewReader(os.Stdin)
-	skipAllPrompts := false
-	useOriginalForAll := false  // Flag to use original for all remaining alternatives (unmanaged)
-	useNewForAll := false       // Flag to use new for all remaining alternatives (unmanaged)
+	skipAllPrompts := yes
+	useOriginalForAll := false // Flag to use original for all remaining alternatives (unmanaged)
+	useNewForAll := false      // Flag to use new for all remaining alternatives (unmanaged)
+	// If auto-confirming, set flags to default to "new"
+	if yes {
+		useNewForAll = true
+	}
 	keepAllConflicts := false   // Flag to keep all conflicting files items (package conflicts)
 	useNewAllConflicts := false // Flag to use new file for all conflicting items (package conflicts)
 

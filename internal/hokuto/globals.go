@@ -60,6 +60,10 @@ var (
 	PkgsetFile       = "/etc/hokuto/hokuto.pkgset"
 	versionedPkgDirs = make(map[string]string) // pkgName@version -> tmpDir
 	PkgDBPath        = "/var/db/hokuto/pkg-db.json.zst"
+	// Cache for remote index to avoid multiple fetches
+	GlobalRemoteIndex       []RepoEntry
+	GlobalRemoteIndexLoaded bool
+	GlobalRemoteIndexMu     sync.Mutex
 )
 
 // Packages that have multilib variants (32-bit library support)

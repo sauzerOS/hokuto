@@ -295,16 +295,16 @@ func installRemotePackage(pkgName string, cfg *Config, remoteIndex []RepoEntry) 
 
 	// Fetch if missing
 	if _, err := os.Stat(tarballPath); err != nil {
-		if err := fetchBinaryPackage(pkgName, version, revision, cfg); err != nil {
+		if err := fetchBinaryPackage(pkgName, version, revision, cfg, false); err != nil {
 			return fmt.Errorf("download failed: %w", err)
 		}
 	}
 
 	// Install
-	handlePreInstallUninstall(pkgName, cfg, RootExec)
+	handlePreInstallUninstall(pkgName, cfg, RootExec, false)
 	// We use 'true' for force/yes usually for updates? or pass explicit 'yes' flag?
 	// Implicit 'yes' for updates usually.
-	if err := pkgInstall(tarballPath, pkgName, cfg, RootExec, true); err != nil {
+	if err := pkgInstall(tarballPath, pkgName, cfg, RootExec, true, nil); err != nil {
 		return err
 	}
 	return nil

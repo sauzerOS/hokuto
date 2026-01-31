@@ -14,9 +14,12 @@ import (
 	"sync"
 )
 
-func stripPackage(outputDir string, buildExec *Executor) error {
-	colArrow.Print("-> ")
-	colSuccess.Println("Stripping executables in parallel")
+func stripPackage(outputDir string, buildExec *Executor, logger io.Writer) error {
+	if logger == nil {
+		logger = os.Stdout
+	}
+	fmt.Fprint(logger, colArrow.Sprint("-> "))
+	fmt.Fprintln(logger, colSuccess.Sprint("Stripping executables in parallel"))
 
 	var wg sync.WaitGroup
 

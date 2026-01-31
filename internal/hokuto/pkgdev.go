@@ -354,7 +354,7 @@ func bumpPackage(pkgName, expectedOldVersion, newVersion string) (string, error)
 	if err := fetchSources(pkgName, pkgDir, false); err != nil {
 		return "", fmt.Errorf("%s: could not download sources: %v", pkgName, err)
 	}
-	if err := verifyOrCreateChecksums(pkgName, pkgDir, false); err != nil {
+	if err := verifyOrCreateChecksums(pkgName, pkgDir, false, nil); err != nil {
 		return "", fmt.Errorf("%s: failed to generate checksums: %v", pkgName, err)
 	}
 

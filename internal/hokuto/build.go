@@ -262,7 +262,16 @@ func buildRustFlags(cflags string, cpuFlags string, buildDir string, isGeneric b
 	return rustflags
 }
 
-func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, currentIndex int, totalCount int) (time.Duration, error) {
+// BuildOptions encapsulates parameters for the build process
+type BuildOptions struct {
+	Bootstrap    bool
+	CurrentIndex int
+	TotalCount   int
+	Quiet        bool      // If true, suppress standard output logging (except errors/warnings)
+	LogWriter    io.Writer // Optional: redirect output to this writer (e.g., for parallel builds)
+}
+
+func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, opts BuildOptions) (time.Duration, error) {
 
 	// Define the ANSI escape code format for setting the terminal title.
 	// \033]0; sets the title, and \a (bell character) terminates the sequence.
@@ -272,7 +281,9 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 	// Helper function to set the title in the TTY.
 	setTerminalTitle := func(title string) {
 		//	// Outputting directly to os.Stdout sets the title in the terminal session.
-		fmt.Printf(setTitleFormat, title)
+		if !opts.Quiet {
+			fmt.Printf(setTitleFormat, title)
+		}
 	}
 
 	// Track build time
@@ -339,9 +350,11 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 
 	// Check if package version is locked
 	if err := checkLock(pkgName, version); err != nil {
-		colArrow.Print("-> ")
-		colWarn.Println(err)
-		colWarn.Println("Permitting build, but installation will be blocked.")
+		if !opts.Quiet {
+			colArrow.Print("-> ")
+			colWarn.Println(err)
+			colWarn.Println("Permitting build, but installation will be blocked.")
+		}
 	}
 
 	// 1. Initialize a LOCAL temporary directory variable with the global default.
@@ -395,6 +408,8 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 		Context:         execCtx.Context,       // Inherit the main cancellation context
 		ShouldRunAsRoot: needsRootBuild,        // Set the privilege based on 'asroot' file
 		Interactive:     needsInteractiveBuild, // SET INTERACTIVE MODE
+		Stdout:          opts.LogWriter,
+		Stderr:          opts.LogWriter,
 	}
 	// Fetch all sources for the build, including git repositories.
 	if err := fetchSources(pkgName, pkgDir, true); err != nil {
@@ -402,7 +417,7 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 	}
 
 	// Perform checksum verification.
-	if err := verifyOrCreateChecksums(pkgName, pkgDir, false); err != nil {
+	if err := verifyOrCreateChecksums(pkgName, pkgDir, false, opts.LogWriter); err != nil {
 		return 0, fmt.Errorf("source verification failed: %w", err)
 	}
 
@@ -489,7 +504,7 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 	}
 	var defaults = map[string]string{}
 
-	if bootstrap {
+	if opts.Bootstrap {
 		// --- Bootstrap environment ---
 		lfsRoot := cfg.Values["LFS"]
 		if lfsRoot == "" {
@@ -1031,11 +1046,11 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 					select {
 					case <-ticker.C:
 						elapsed := time.Since(startTime).Truncate(time.Second)
-						title := fmt.Sprintf("Building: %s (%d/%d) elapsed: %s", pkgName, currentIndex, totalCount, elapsed)
+						title := fmt.Sprintf("Building: %s (%d/%d) elapsed: %s", pkgName, opts.CurrentIndex, opts.TotalCount, elapsed)
 						setTerminalTitle(title)
 						// Only print elapsed time to console if not in verbose mode
 						// In verbose mode, the build output is already visible, so we only update the title
-						if !Verbose {
+						if !Verbose && !opts.Quiet {
 							colArrow.Print("-> ")
 							colSuccess.Printf("Building %s elapsed: %s\r", pkgName, elapsed)
 						}
@@ -1176,7 +1191,7 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 	}
 
 	// Generate depends (use outputPkgName for cross-system builds)
-	if err := generateDepends(outputPkgName, pkgDir, outputDir, rootDir, buildExec, bootstrap); err != nil {
+	if err := generateDepends(outputPkgName, pkgDir, outputDir, rootDir, buildExec, opts.Bootstrap); err != nil {
 		return 0, fmt.Errorf("failed to generate depends: %v", err)
 	}
 	debugf("Depends written to %s\n", filepath.Join(installedDir, "depends"))
@@ -1186,7 +1201,7 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 	// Strip the package
 	if shouldStrip {
 		// NOTE: stripPackage uses buildExec (UserExec) to run the external 'strip' command
-		if err := stripPackage(outputDir, buildExec); err != nil {
+		if err := stripPackage(outputDir, buildExec, opts.LogWriter); err != nil {
 			// Treat strip failure as a build failure (or a warning, depending on policy)
 			return 0, fmt.Errorf("build failed during stripping phase for %s: %w", pkgName, err)
 		}
@@ -1381,7 +1396,7 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 	if buildExec.ShouldRunAsRoot {
 		signExec = RootExec
 	}
-	if err := SignPackage(outputDir, outputPkgName, signExec); err != nil {
+	if err := SignPackage(outputDir, outputPkgName, signExec, opts.LogWriter); err != nil {
 		return 0, fmt.Errorf("failed to sign package: %v", err)
 	}
 
@@ -1389,7 +1404,7 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 	variant := IdentifyVariant(pkgName, isGeneric, isMultilib)
 
 	// Generate package archive (using output package name if cross-system is enabled)
-	if err := createPackageTarball(outputPkgName, version, revision, targetArch, variant, outputDir, buildExec); err != nil {
+	if err := createPackageTarball(outputPkgName, version, revision, targetArch, variant, outputDir, buildExec, opts.LogWriter); err != nil {
 		return 0, fmt.Errorf("failed to package tarball: %v", err)
 	}
 
@@ -1416,7 +1431,11 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, bootstrap bool, cu
 // It skips tarball creation, cleanup, and runs with an adjusted environment.
 // oldLibsDir is the path to the temporary directory containing backed-up libraries.
 
-func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir string) error {
+// pkgBuildRebuild rebuilds a package that was triggered by another package install.
+func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir string, logger io.Writer) error {
+	if logger == nil {
+		logger = os.Stdout
+	}
 
 	// Define the ANSI escape code format for setting the terminal title.
 	// \033]0; sets the title, and \a (bell character) terminates the sequence.
@@ -1499,7 +1518,7 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 	}
 
 	// Perform a strict, non-interactive checksum verification.
-	if err := verifyOrCreateChecksums(pkgName, pkgDir, false); err != nil {
+	if err := verifyOrCreateChecksums(pkgName, pkgDir, false, nil); err != nil {
 		return fmt.Errorf("source verification failed: %w", err)
 	}
 	// Prepare sources
@@ -2067,7 +2086,7 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 	// Strip the package
 	if shouldStrip {
 		// NOTE: stripPackage uses buildExec (UserExec) to run the external 'strip' command
-		if err := stripPackage(outputDir, buildExec); err != nil {
+		if err := stripPackage(outputDir, buildExec, logger); err != nil {
 			// Treat strip failure as a build failure (or a warning, depending on policy)
 			return fmt.Errorf("build failed during stripping phase for %s: %w", pkgName, err)
 		}
@@ -2236,7 +2255,7 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 
 	// Generate package archive (using output package name if cross-system is enabled)
 	// This ensures the binary cache is kept in sync with the rebuild.
-	if err := createPackageTarball(outputPkgName, version, revision, targetArch, variant, outputDir, buildExec); err != nil {
+	if err := createPackageTarball(outputPkgName, version, revision, targetArch, variant, outputDir, buildExec, logger); err != nil {
 		return fmt.Errorf("failed to package tarball: %v", err)
 	}
 
@@ -2251,6 +2270,9 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 // handleBuildCommand orchestrates the entire build process, intelligently selecting the
 // correct dependency resolution strategy based on the build mode (normal, bootstrap, or alldeps).
 func handleBuildCommand(args []string, cfg *Config) error {
+	// Preprocess arguments to handle custom flag formats (e.g. -j4)
+	args = PreprocessBuildArgs(args)
+
 	// --- 1. Flag Parsing & Initial Setup ---
 	buildCmd := flag.NewFlagSet("build", flag.ExitOnError)
 	var autoInstall = buildCmd.Bool("a", false, "Automatically install the package(s) after successful build.")
@@ -2267,6 +2289,8 @@ func handleBuildCommand(args []string, cfg *Config) error {
 	var genericBuild = buildCmd.Bool("generic", false, "Use _GEN flags and store packages in generic subfolder")
 	var crossArch = buildCmd.String("cross", "", "Enable cross-compilation for target architecture (e.g., arm64)")
 	var noDeps = buildCmd.Bool("nodeps", false, "Skip dependency checking and build only the specified package(s)")
+	var parallel = buildCmd.Int("j", 1, "Number of parallel jobs (default: 1)")
+	var parallelLong = buildCmd.Int("parallel", 1, "Number of parallel jobs (default: 1)")
 
 	// Custom usage function that excludes bootstrap flags from help
 	buildCmd.Usage = func() {
@@ -2590,7 +2614,11 @@ func handleBuildCommand(args []string, cfg *Config) error {
 
 			colArrow.Print("-> ")
 			colSuccess.Printf("Building: %s (%d/%d)\n", pkgName, i+1, totalBuildCount)
-			duration, err := pkgBuild(pkgName, cfg, UserExec, *bootstrap, i+1, totalBuildCount)
+			duration, err := pkgBuild(pkgName, cfg, UserExec, BuildOptions{
+				Bootstrap:    *bootstrap,
+				CurrentIndex: i + 1,
+				TotalCount:   totalBuildCount,
+			})
 			if err != nil {
 				failedBuilds[pkgName] = err
 				colArrow.Print("-> ")
@@ -2610,8 +2638,8 @@ func handleBuildCommand(args []string, cfg *Config) error {
 			variant := GetSystemVariantForPackage(cfg, pkgName)
 			tarballPath := filepath.Join(BinDir, StandardizeRemoteName(outputPkgName, version, revision, arch, variant))
 			isCriticalAtomic.Store(1)
-			handlePreInstallUninstall(outputPkgName, cfg, RootExec)
-			if installErr := pkgInstall(tarballPath, outputPkgName, cfg, RootExec, true); installErr != nil {
+			handlePreInstallUninstall(outputPkgName, cfg, RootExec, false)
+			if installErr := pkgInstall(tarballPath, outputPkgName, cfg, RootExec, true, nil); installErr != nil {
 				isCriticalAtomic.Store(0)
 				colArrow.Print("-> ")
 				color.Danger.Printf("Installation failed for %s: %v\n", outputPkgName, installErr)
@@ -2675,8 +2703,8 @@ func handleBuildCommand(args []string, cfg *Config) error {
 				if _, err := os.Stat(tarballPath); err == nil {
 					if askForConfirmation(colInfo, "Dependency '%s' is missing. Use available binary package?", depPkg) {
 						isCriticalAtomic.Store(1)
-						handlePreInstallUninstall(outputDepPkg, cfg, RootExec)
-						if err := pkgInstall(tarballPath, outputDepPkg, cfg, RootExec, false); err != nil {
+						handlePreInstallUninstall(outputDepPkg, cfg, RootExec, false)
+						if err := pkgInstall(tarballPath, outputDepPkg, cfg, RootExec, false, nil); err != nil {
 							isCriticalAtomic.Store(0)
 							return fmt.Errorf("fatal error installing binary %s: %v", depPkg, err)
 						}
@@ -2685,7 +2713,43 @@ func handleBuildCommand(args []string, cfg *Config) error {
 						packagesThatMustBeBuilt[depPkg] = true
 					}
 				} else {
-					packagesThatMustBeBuilt[depPkg] = true
+					// Local binary missing. Try to fetch from remote mirror.
+					foundRemote := false
+					if BinaryMirror != "" {
+						// Optimization: Check remote index first
+						index, err := GetCachedRemoteIndex(cfg)
+						shouldTryDownload := true
+						if err == nil {
+							if !IsPackageInIndex(index, depPkg, version, revision, cfg) {
+								shouldTryDownload = false
+								debugf("Message: Skipping download for %s (not found in remote index)\n", depPkg)
+							}
+						}
+
+						if shouldTryDownload {
+							if err := fetchBinaryPackage(depPkg, version, revision, cfg, true); err == nil {
+								// Successfully fetched! Check stat again to be sure.
+								if _, err := os.Stat(tarballPath); err == nil {
+									foundRemote = true
+									if askForConfirmation(colInfo, "Dependency '%s' found on remote mirror. Use binary?", depPkg) {
+										isCriticalAtomic.Store(1)
+										handlePreInstallUninstall(outputDepPkg, cfg, RootExec, false)
+										if err := pkgInstall(tarballPath, outputDepPkg, cfg, RootExec, false, nil); err != nil {
+											isCriticalAtomic.Store(0)
+											return fmt.Errorf("fatal error installing downloaded binary %s: %v", depPkg, err)
+										}
+										isCriticalAtomic.Store(0)
+									} else {
+										packagesThatMustBeBuilt[depPkg] = true
+									}
+								}
+							}
+						}
+					}
+
+					if !foundRemote {
+						packagesThatMustBeBuilt[depPkg] = true
+					}
 				}
 			}
 		}
@@ -2761,9 +2825,23 @@ func handleBuildCommand(args []string, cfg *Config) error {
 				buildListInput = append(buildListInput, pkg)
 			}
 
-			colArrow.Print("-> ")
-			colSuccess.Println("Generating Build Plan")
-			initialPlan, err := resolveBuildPlan(buildListInput, userRequestedMap, effectiveRebuilds, cfg)
+			var initialPlan *BuildPlan
+			var err error
+			if *noDeps {
+				initialPlan = &BuildPlan{
+					Order:             buildListInput,
+					SkippedPackages:   make(map[string]string),
+					RebuildPackages:   make(map[string]bool),
+					PostRebuilds:      make(map[string][]string),
+					PostBuildRebuilds: make(map[string][]string),
+				}
+				initialPlan.Order = MovePackageToFront(initialPlan.Order, "sauzeros-base")
+				err = nil
+			} else {
+				colArrow.Print("-> ")
+				colSuccess.Println("Generating Build Plan")
+				initialPlan, err = resolveBuildPlan(buildListInput, userRequestedMap, effectiveRebuilds, cfg)
+			}
 			if err != nil {
 				return fmt.Errorf("error generating build plan: %v", err)
 			}
@@ -2790,6 +2868,73 @@ func handleBuildCommand(args []string, cfg *Config) error {
 			}
 
 			progressCount := 0
+
+			// Determine max jobs
+			maxJobs := *parallel
+			if *parallelLong > maxJobs {
+				maxJobs = *parallelLong
+			}
+
+			if maxJobs > 1 {
+				colArrow.Print("-> ")
+				colSuccess.Printf("Executing parallel build (jobs: %d)\n", maxJobs)
+
+				// Define smart builder to check for binaries first
+				smartBuildBuilder := func(pkgName string, cfg *Config, exec *Executor, opts BuildOptions) (time.Duration, error) {
+					// 1. If user specifically requested this package, we usually force build
+					// unless -a logic implies otherwise. But generally build command means build.
+					if userRequestedMap[pkgName] {
+						return pkgBuild(pkgName, cfg, exec, opts)
+					}
+
+					// 2. Ideally we should respect rebuild flags/logic, but for now:
+					// If it's a dependency, check for binary availability.
+					// Similar to sequential logic above.
+
+					version, revision, err := getRepoVersion2(pkgName)
+					if err != nil {
+						// Fallback to build if version lookup fails (shouldn't happen if plan resolved)
+						return pkgBuild(pkgName, cfg, exec, opts)
+					}
+
+					// Try to fetch binary if configured
+					if BinaryMirror != "" {
+						// Optimization: Check remote index first
+						index, err := GetCachedRemoteIndex(cfg)
+						shouldTryDownload := true
+						if err == nil {
+							if !IsPackageInIndex(index, pkgName, version, revision, cfg) {
+								shouldTryDownload = false
+							}
+						}
+
+						if shouldTryDownload {
+							_ = fetchBinaryPackage(pkgName, version, revision, cfg, true)
+						}
+					}
+
+					outputPkgName := getOutputPackageName(pkgName, cfg)
+					arch := GetSystemArch(cfg)
+					variant := GetSystemVariantForPackage(cfg, pkgName)
+					tarballPath := filepath.Join(BinDir, StandardizeRemoteName(outputPkgName, version, revision, arch, variant))
+
+					if _, err := os.Stat(tarballPath); err == nil {
+						// Found binary! Return success with 0 duration to signal "skipped build" (ready for install)
+						return 0, nil
+					}
+
+					// Not found? Build it.
+					return pkgBuild(pkgName, cfg, exec, opts)
+				}
+
+				// Start parallel build
+				if err := RunParallelBuilds(initialPlan, cfg, maxJobs, userRequestedMap, false, smartBuildBuilder); err != nil {
+					return err
+				}
+				// Skip the rest of sequential logic
+				return nil
+			}
+
 			failedPass1, targetsPass1, elapsedPass1 := executeBuildPass(initialPlan, "Initial Pass", false, cfg, bootstrap, userRequestedMap, &progressCount)
 			totalElapsedTime = elapsedPass1
 			failedBuilds = failedPass1
@@ -2824,8 +2969,8 @@ func handleBuildCommand(args []string, cfg *Config) error {
 						variant := GetSystemVariantForPackage(cfg, finalPkg)
 						tarballPath := filepath.Join(BinDir, StandardizeRemoteName(outputFinalPkg, version, revision, arch, variant))
 						isCriticalAtomic.Store(1)
-						handlePreInstallUninstall(outputFinalPkg, cfg, RootExec)
-						if err := pkgInstall(tarballPath, outputFinalPkg, cfg, RootExec, false); err != nil {
+						handlePreInstallUninstall(outputFinalPkg, cfg, RootExec, false)
+						if err := pkgInstall(tarballPath, outputFinalPkg, cfg, RootExec, false, nil); err != nil {
 							isCriticalAtomic.Store(0)
 							colArrow.Print("-> ")
 							color.Danger.Printf("Installation failed for %s: %v\n", outputFinalPkg, err)
@@ -2972,7 +3117,11 @@ func executeBuildPass(plan *BuildPlan, _ string, installAllTargets bool, cfg *Co
 			colSuccess.Print("Building: ")
 			colNote.Printf("%s (%d/%d)\n", pkgName, currentIndex, totalInPlan)
 
-			duration, err := pkgBuild(pkgName, cfg, UserExec, *bootstrap, currentIndex, totalInPlan)
+			duration, err := pkgBuild(pkgName, cfg, UserExec, BuildOptions{
+				Bootstrap:    *bootstrap,
+				CurrentIndex: currentIndex,
+				TotalCount:   totalInPlan,
+			})
 			if err != nil {
 				failed[pkgName] = err
 				color.Danger.Printf("Build failed for %s: %v\n\n", pkgName, err)
@@ -3028,8 +3177,8 @@ func executeBuildPass(plan *BuildPlan, _ string, installAllTargets bool, cfg *Co
 					variant := GetSystemVariantForPackage(cfg, pkgName)
 					tarballPath := filepath.Join(BinDir, StandardizeRemoteName(outputPkgName, version, revision, arch, variant))
 					isCriticalAtomic.Store(1)
-					handlePreInstallUninstall(outputPkgName, cfg, RootExec)
-					if installErr := pkgInstall(tarballPath, outputPkgName, cfg, RootExec, true); installErr != nil {
+					handlePreInstallUninstall(outputPkgName, cfg, RootExec, false)
+					if installErr := pkgInstall(tarballPath, outputPkgName, cfg, RootExec, true, nil); installErr != nil {
 						isCriticalAtomic.Store(0)
 						colArrow.Print("-> ")
 						color.Danger.Printf("Installation failed for %s: %v\n", outputPkgName, installErr)
@@ -3108,7 +3257,11 @@ func executeBuildPass(plan *BuildPlan, _ string, installAllTargets bool, cfg *Co
 						// Rebuild the parent package
 						*progressCount++
 						rebuildIdx := *progressCount
-						duration, err := pkgBuild(parent, cfg, UserExec, *bootstrap, rebuildIdx, totalInPlan)
+						duration, err := pkgBuild(parent, cfg, UserExec, BuildOptions{
+							Bootstrap:    *bootstrap,
+							CurrentIndex: rebuildIdx,
+							TotalCount:   totalInPlan,
+						})
 						if err != nil {
 							color.Danger.Printf("Inline rebuild of '%s' failed: %v\n", parent, err)
 							failed[parent] = fmt.Errorf("inline rebuild failed: %w", err)
@@ -3122,8 +3275,8 @@ func executeBuildPass(plan *BuildPlan, _ string, installAllTargets bool, cfg *Co
 						variant := GetSystemVariantForPackage(cfg, parent)
 						tarballPath := filepath.Join(BinDir, StandardizeRemoteName(outputParent, version, revision, arch, variant))
 						isCriticalAtomic.Store(1)
-						handlePreInstallUninstall(outputParent, cfg, RootExec)
-						if installErr := pkgInstall(tarballPath, outputParent, cfg, RootExec, true); installErr != nil {
+						handlePreInstallUninstall(outputParent, cfg, RootExec, false)
+						if installErr := pkgInstall(tarballPath, outputParent, cfg, RootExec, true, nil); installErr != nil {
 							isCriticalAtomic.Store(0)
 							colArrow.Print("-> ")
 							color.Danger.Printf("Installation failed for rebuilt %s: %v\n", outputParent, installErr)
@@ -3150,7 +3303,11 @@ func executeBuildPass(plan *BuildPlan, _ string, installAllTargets bool, cfg *Co
 					// A. Build the package again
 					*progressCount++
 					rebuildIdx := *progressCount
-					duration, err := pkgBuild(rebuildPkg, cfg, UserExec, *bootstrap, rebuildIdx, totalInPlan)
+					duration, err := pkgBuild(rebuildPkg, cfg, UserExec, BuildOptions{
+						Bootstrap:    *bootstrap,
+						CurrentIndex: rebuildIdx,
+						TotalCount:   totalInPlan,
+					})
 					if err != nil {
 						color.Danger.Printf("Post-build of '%s' failed: %v\n", rebuildPkg, err)
 						// Mark the PARENT package as failed, because its post-build action failed.
@@ -3166,9 +3323,9 @@ func executeBuildPass(plan *BuildPlan, _ string, installAllTargets bool, cfg *Co
 					variant := GetSystemVariantForPackage(cfg, rebuildPkg)
 					tarballPath := filepath.Join(BinDir, StandardizeRemoteName(outputRebuildPkg, version, revision, arch, variant))
 					isCriticalAtomic.Store(1)
-					handlePreInstallUninstall(outputRebuildPkg, cfg, RootExec)
+					handlePreInstallUninstall(outputRebuildPkg, cfg, RootExec, false)
 					// Always run this non-interactively
-					if installErr := pkgInstall(tarballPath, outputRebuildPkg, cfg, RootExec, true); installErr != nil {
+					if installErr := pkgInstall(tarballPath, outputRebuildPkg, cfg, RootExec, true, nil); installErr != nil {
 						isCriticalAtomic.Store(0)
 						colArrow.Print("-> ")
 						color.Danger.Printf("Installation failed for post-build %s: %v\n", outputRebuildPkg, installErr)

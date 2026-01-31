@@ -433,21 +433,19 @@ func generateDepends(pkgName, pkgDir, outputDir, rootDir string, execCtx *Execut
 						continue
 					}
 
-					if !bootstrap {
-						// Cleanup bootstrap names in normal mode
-						if name == "19-binutils-2" {
-							continue
-						}
+					// Cleanup bootstrap names
+					if name == "19-binutils-2" {
+						continue
+					}
 
-						newName := ""
-						switch name {
-						case "08-bash":
-							newName = "bash"
-						case "11-file":
-							newName = "file"
-						case "07-ncurses":
-							newName = "ncurses"
-						}
+					newName := ""
+					switch name {
+					case "08-bash":
+						newName = "bash"
+					case "11-file":
+						newName = "file"
+					case "07-ncurses":
+						newName = "ncurses"
 
 						if newName != "" {
 							// Rebuild the line with the new name but preserve everything else
@@ -558,7 +556,10 @@ func generateDepends(pkgName, pkgDir, outputDir, rootDir string, execCtx *Execut
 // isDirectoryPrivileged uses the Executor to check if a path is a directory.
 // helper for listOutputFiles
 
-func executePostInstall(pkgName, rootDir string, execCtx *Executor, cfg *Config) error {
+func executePostInstall(pkgName, rootDir string, execCtx *Executor, cfg *Config, logger io.Writer) error {
+	if logger == nil {
+		logger = os.Stdout
+	}
 
 	// absolute path inside the chroot
 	const relScript = "/var/db/hokuto/installed"
@@ -604,7 +605,7 @@ func executePostInstall(pkgName, rootDir string, execCtx *Executor, cfg *Config)
 	// If chroot is used and fails, print a warning and continue (non-fatal).
 	if rootDir != "/" {
 		if err := execCtx.Run(cmd); err != nil {
-			cPrintf(colWarn, "Warning: chroot to %s failed or post-install could not run: %v\n", rootDir, err)
+			fmt.Fprintf(logger, "Warning: chroot to %s failed or post-install could not run: %v\n", rootDir, err)
 			return nil
 		}
 		return nil
@@ -687,13 +688,21 @@ func getPackageDependenciesToUninstall(name string) []string {
 // handlePreInstallUninstall checks for and removes packages that must be uninstalled
 // before a new package can be installed. It now verifies packages are installed
 // before attempting removal.
-
-func handlePreInstallUninstall(pkgName string, cfg *Config, execCtx *Executor) {
+// forceYes: if true, skips the confirmation prompt.
+func handlePreInstallUninstall(pkgName string, cfg *Config, execCtx *Executor, forceYes bool) {
 	// 1. Check if a -bin version of this package is already installed
 	// (e.g., if we are installing 'make', check for 'make-bin')
 	binPkgName := pkgName + "-bin"
 	if !strings.HasSuffix(pkgName, "-bin") && checkPackageExactMatch(binPkgName) {
-		if askForConfirmation(colWarn, "-> Uninstall conflicting package '%s'?", binPkgName) {
+		shouldUninstall := forceYes
+		if !shouldUninstall {
+			shouldUninstall = askForConfirmation(colWarn, "-> Uninstall conflicting package '%s'?", binPkgName)
+		}
+
+		if shouldUninstall {
+			// In parallel mode (forceYes=true), we might not want to print interactive prompts,
+			// but we still print status.
+			// If forceYes implies skipping prompt, we proceed.
 			if err := pkgUninstall(binPkgName, cfg, execCtx, true, true); err != nil {
 				cPrintf(colWarn, "Warning: failed to uninstall conflicting package %s: %v\n", binPkgName, err)
 			} else {
