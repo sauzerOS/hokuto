@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"strings"
 	"syscall"
 	"time"
@@ -587,9 +588,20 @@ func Main() {
 
 		packagesToInstall := installCmd.Args()
 		if len(packagesToInstall) == 0 {
-			fmt.Println("Usage: hokuto install [options] <tarball|pkgname>...")
+			fmt.Println("Usage: hokuto install [options] <tarball|pkgname>")
 			installCmd.PrintDefaults()
 			os.Exit(1)
+		}
+
+		// Ensure 'sauzeros-base' is installed first if missing
+		if !checkPackageExactMatch("sauzeros-base") {
+			alreadyRequested := slices.Contains(packagesToInstall, "sauzeros-base")
+			if !alreadyRequested {
+				colArrow.Print("-> ")
+				colSuccess.Println("Adding implicit dependency: sauzeros-base")
+				// Prepend to ensure it's processed first
+				packagesToInstall = append([]string{"sauzeros-base"}, packagesToInstall...)
+			}
 		}
 
 		effectiveYes := *yes || *yesLong
@@ -831,7 +843,6 @@ func Main() {
 									}
 									colArrow.Print("-> ")
 									cPrintf(colInfo, "Optimized binary not found, trying fallback: %s\n", fallbackVariant)
-
 									// Temporarily override HOKUTO_GENERIC for this lookup
 									oldGeneric := cfg.Values["HOKUTO_GENERIC"]
 									cfg.Values["HOKUTO_GENERIC"] = "1"
@@ -844,6 +855,36 @@ func Main() {
 									}
 
 									cfg.Values["HOKUTO_GENERIC"] = oldGeneric
+								}
+
+								// 2b. FALLBACK: Try multi-lib variants if standard failed
+								if !foundOnMirror && isMultilibPackage(pkgName) && cfg.Values["HOKUTO_MULTILIB"] != "1" {
+									cPrintf(colInfo, "Standard binary not found, trying fallback: multi-lib\n")
+
+									oldMulti := cfg.Values["HOKUTO_MULTILIB"]
+									cfg.Values["HOKUTO_MULTILIB"] = "1"
+
+									// Try multi-optimized (default for multilib=1)
+									if err := fetchBinaryPackage(pkgName, version, revision, cfg, false); err == nil {
+										foundOnMirror = true
+										arch := GetSystemArchForPackage(cfg, pkgName)
+										variant := GetSystemVariantForPackage(cfg, pkgName)
+										tarballPath = filepath.Join(BinDir, StandardizeRemoteName(pkgName, version, revision, arch, variant))
+									} else {
+										// Try multi-generic
+										oldGeneric := cfg.Values["HOKUTO_GENERIC"]
+										if oldGeneric != "1" {
+											cfg.Values["HOKUTO_GENERIC"] = "1"
+											if err := fetchBinaryPackage(pkgName, version, revision, cfg, false); err == nil {
+												foundOnMirror = true
+												arch := GetSystemArchForPackage(cfg, pkgName)
+												variant := GetSystemVariantForPackage(cfg, pkgName)
+												tarballPath = filepath.Join(BinDir, StandardizeRemoteName(pkgName, version, revision, arch, variant))
+											}
+											cfg.Values["HOKUTO_GENERIC"] = oldGeneric
+										}
+									}
+									cfg.Values["HOKUTO_MULTILIB"] = oldMulti
 								}
 							}
 						}

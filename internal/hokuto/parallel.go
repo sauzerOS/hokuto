@@ -238,6 +238,11 @@ func (pm *ParallelManager) Run() error {
 			// NOW close and remove from map
 			if f, ok := pm.LogFiles[res.pkgName]; ok {
 				f.Close()
+				// Only remove the log file if the build succeeded.
+				// If it failed, we leave it for debugging.
+				if res.err == nil {
+					os.Remove(f.Name())
+				}
 				delete(pm.LogFiles, res.pkgName)
 			}
 			delete(pm.Running, res.pkgName)
@@ -328,7 +333,11 @@ func (pm *ParallelManager) startBuild(pkgName string, idx, total int) {
 	pm.Running[pkgName] = time.Now()
 
 	// Create log file
-	logFile, err := os.CreateTemp(os.TempDir(), fmt.Sprintf("hokuto-build-%s-*.log", pkgName))
+	if err := os.MkdirAll(HokutoTmpDir, 0755); err != nil {
+		// fallback if we can't create the dir? or just let CreateTemp fail?
+		// We can log a debug warning.
+	}
+	logFile, err := os.CreateTemp(HokutoTmpDir, fmt.Sprintf("hokuto-build-%s-*.log", pkgName))
 	var logWriter io.Writer
 	if err == nil {
 		pm.LogFiles[pkgName] = logFile

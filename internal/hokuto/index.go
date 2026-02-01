@@ -180,7 +180,7 @@ func scanTarballMetadata(tarballPath string) (map[string]string, []string, error
 			if err != nil {
 				return nil, nil, fmt.Errorf("failed to read pkginfo from %s: %w", tarballPath, err)
 			}
-			metadata = parsePkgInfo(data)
+			metadata = ParsePkgInfo(data)
 			continue
 		}
 
@@ -211,7 +211,7 @@ func scanTarballMetadata(tarballPath string) (map[string]string, []string, error
 	return metadata, dependencies, nil
 }
 
-func parsePkgInfo(data []byte) map[string]string {
+func ParsePkgInfo(data []byte) map[string]string {
 	meta := make(map[string]string)
 	scanner := bufio.NewScanner(strings.NewReader(string(data)))
 	for scanner.Scan() {

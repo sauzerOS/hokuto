@@ -70,6 +70,36 @@ func listPackages(searchTerm string) error {
 			versionInfo = strings.TrimSpace(string(data))
 		}
 
+		// Read pkginfo for Arch/Variant
+		pkgInfoFile := filepath.Join(Installed, p, "pkginfo")
+		arch := "?"
+		variantDisplay := "?"
+		multiSuffix := ""
+
+		if data, err := os.ReadFile(pkgInfoFile); err == nil {
+			meta := ParsePkgInfo(data)
+			if v, ok := meta["arch"]; ok {
+				arch = v
+			}
+
+			// Compute variant display string
+			isGeneric := meta["generic"] == "1"
+			isMultilib := meta["multilib"] == "1"
+			variant := "optimized"
+			if isGeneric {
+				variant = "generic"
+			}
+
+			variantDisplay = variant
+			if variantDisplay == "optimized" {
+				variantDisplay = "native"
+			}
+
+			if isMultilib {
+				multiSuffix = " (multi)"
+			}
+		}
+
 		// Read buildtime (duration string) if present.
 		buildtimeFile := filepath.Join(Installed, p, "buildtime")
 		buildtimeStr := ""
@@ -112,18 +142,21 @@ func listPackages(searchTerm string) error {
 		// Add to output slice
 		prefix := colArrow.Sprint("->")
 
+		// Format: -> Name Version Arch Variant(multi) [BuildTime]
+		pkgStr := fmt.Sprintf("%s %s %s %s",
+			prefix,
+			colSuccess.Sprintf("%-25s", p),
+			colNote.Sprintf("%-15s", versionInfo),
+			color.Cyan.Sprintf("%-10s %s%s",
+				arch,
+				variantDisplay,
+				multiSuffix))
+
 		if buildtimeStr != "" {
-			output = append(output, fmt.Sprintf("%s %s %s %s",
-				prefix,
-				colSuccess.Sprintf("%-25s", p),
-				colNote.Sprintf("%-15s", versionInfo),
-				color.Cyan.Sprint(buildtimeStr)))
-		} else {
-			output = append(output, fmt.Sprintf("%s %s %s",
-				prefix,
-				colSuccess.Sprintf("%-25s", p),
-				colNote.Sprintf("%-15s", versionInfo)))
+			pkgStr += fmt.Sprintf(" %s", color.Yellow.Sprint(buildtimeStr))
 		}
+
+		output = append(output, pkgStr)
 	}
 
 	return RunPager("Installed Packages", output)

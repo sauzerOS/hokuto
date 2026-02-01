@@ -53,6 +53,7 @@ if gh release view "v$VERSION" >/dev/null 2>&1; then
         hokuto-$VERSION-arm64.tar.xz \
         hokuto-$VERSION-amd64.tar.xz.sig \
         hokuto-$VERSION-arm64.tar.xz.sig \
+        scripts/hokutostrap \
         --clobber
 else
     tmpfile=$(mktemp)
@@ -62,6 +63,7 @@ else
         hokuto-$VERSION-arm64.tar.xz \
         hokuto-$VERSION-amd64.tar.xz.sig \
         hokuto-$VERSION-arm64.tar.xz.sig \
+        scripts/hokutostrap \
         --title "hokuto v$VERSION" \
         --notes-file "$tmpfile"
      rm "$tmpfile"

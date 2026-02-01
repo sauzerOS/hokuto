@@ -1,0 +1,293 @@
+#!/bin/bash
+
+# Hokuto Web Installer
+# Installs Hokuto OS from a remote web server.
+
+set -e
+
+# ANSI Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+CYAN='\033[0;36m'
+YELLOW='\033[1;33m'
+RESET='\033[0m'
+
+log_info() { echo -e "${CYAN}->${RESET} $1"; }
+log_success() { echo -e "${GREEN}SUCCESS:${RESET} $1"; }
+log_warn() { echo -e "${YELLOW}WARNING:${RESET} $1"; }
+log_error() { echo -e "${RED}ERROR:${RESET} $1"; exit 1; }
+
+# Official Public Key (Ed25519)
+HOKUTO_PUBKEY_HEX="b30f07098a4f98ec90bb169bdd49324d5e22fc09eab79e368e6fafc63453f5f2"
+
+# 1. Architecture Detection
+ARCH=$(uname -m)
+case "$ARCH" in
+    x86_64)
+        ARCH="amd64"
+        ;;
+    aarch64|arm64)
+        ARCH="arm64"
+        ;;
+    *)
+        log_error "Unsupported architecture: $ARCH"
+        ;;
+esac
+
+log_info "Detected architecture: ${GREEN}$ARCH${RESET}"
+
+# 2. Preparation
+TMP_DIR=$(mktemp -d)
+trap 'rm -rf "$TMP_DIR"' EXIT
+
+BASE_URL="https://hokuto.xdd.ovh"
+TARBALL="hokuto.tar.xz"
+SIG="hokuto.tar.xz.sig"
+
+# 3. Download
+log_info "Downloading latest Hokuto release"
+
+if command -v curl >/dev/null 2>&1; then
+    curl -s -L -f -o "$TMP_DIR/$TARBALL" "$BASE_URL/$TARBALL?arch=$ARCH"
+    curl -s -L -f -o "$TMP_DIR/$SIG" "$BASE_URL/$SIG?arch=$ARCH"
+elif command -v wget >/dev/null 2>&1; then
+    wget -q -O "$TMP_DIR/$TARBALL" "$BASE_URL/$TARBALL?arch=$ARCH"
+    wget -q -O "$TMP_DIR/$SIG" "$BASE_URL/$SIG?arch=$ARCH"
+else
+    log_warn "Neither curl nor wget found. Trying to proceed if files exist"
+fi
+
+if [ ! -f "$TMP_DIR/$TARBALL" ]; then
+    log_warn "Download appeared to fail (file missing). Will attempt to check anyway."
+fi
+
+# 4. Signature Verification
+verify_signature() {
+    local file="$1"
+    local sig_file="$2"
+    
+    if ! command -v openssl >/dev/null 2>&1; then
+        log_warn "openssl not found. Skipping signature verification."
+        return 0
+    fi
+
+    log_info "Verifying authenticity"
+
+    if [ ! -f "$sig_file" ]; then
+        log_warn "Signature file missing. Skipping verification."
+        return 0
+    fi
+
+    # Read signature hex string
+    local sig_hex=$(cat "$sig_file")
+    
+    # Convert hex signature to binary
+    # Try xxd, then python, then perl
+    if command -v xxd >/dev/null 2>&1; then
+        echo "$sig_hex" | xxd -r -p > "$TMP_DIR/sig.bin"
+    elif command -v python3 >/dev/null 2>&1; then
+        python3 -c "import sys, binascii; sys.stdout.buffer.write(binascii.unhexlify(sys.argv[1]))" "$sig_hex" > "$TMP_DIR/sig.bin"
+    elif command -v perl >/dev/null 2>&1; then
+        perl -e 'print pack("H*", $ARGV[0])' "$sig_hex" > "$TMP_DIR/sig.bin"
+    else
+        log_warn "No hex decoder found (xxd/python/perl). Skipping verification."
+        return 0
+    fi
+
+    # Create Public Key file (DER format for OpenSSL)
+    local der_prefix="302a300506032b6570032100"
+    local pub_hex="${der_prefix}${HOKUTO_PUBKEY_HEX}"
+    
+    if command -v xxd >/dev/null 2>&1; then
+        echo "$pub_hex" | xxd -r -p > "$TMP_DIR/pubkey.der"
+    elif command -v python3 >/dev/null 2>&1; then
+        python3 -c "import sys, binascii; sys.stdout.buffer.write(binascii.unhexlify(sys.argv[1]))" "$pub_hex" > "$TMP_DIR/pubkey.der"
+    elif command -v perl >/dev/null 2>&1; then
+         perl -e 'print pack("H*", $ARGV[0])' "$pub_hex" > "$TMP_DIR/pubkey.der"
+    fi
+
+    # Verify using openssl
+    if openssl pkeyutl -verify -pubin -keyform DER -inkey "$TMP_DIR/pubkey.der" -sigfile "$TMP_DIR/sig.bin" -in "$file" >/dev/null 2>&1; then
+        log_success "Signature Verified"
+    else
+        if openssl pkeyutl -verify -pubin -keyform DER -inkey "$TMP_DIR/pubkey.der" -sigfile "$TMP_DIR/sig.bin" -rawin -in "$file" >/dev/null 2>&1; then
+            log_success "Signature Verified (Raw)"
+        else
+            log_error "Signature verification FAILED! The file may be tampered with."
+        fi
+    fi
+}
+
+verify_signature "$TMP_DIR/$TARBALL" "$TMP_DIR/$SIG"
+
+# 5. Unpack
+log_info "Unpacking"
+# Unpack to a dedicated extract directory to avoid mess
+EXTRACT_ROOT="$TMP_DIR/extract"
+mkdir -p "$EXTRACT_ROOT"
+
+# This unpacks 'hokuto-amd64/...' into EXTRACT_ROOT
+if [ -f "$TMP_DIR/$TARBALL" ]; then
+    tar -xf "$TMP_DIR/$TARBALL" -C "$EXTRACT_ROOT"
+else
+    log_error "Tarball not found: $TMP_DIR/$TARBALL"
+fi
+
+# 6. Prompts
+echo -e "\n${GREEN}Hokuto Configuration${RESET}"
+
+# HOKUTO_ROOT
+default_root="/"
+read -p "Target Installation Directory [${default_root}]: " input_root
+HOKUTO_ROOT="${input_root:-$default_root}"
+
+# Generic Mode
+read -p "Enable Generic Optimization (portable binaries)? [y/N]: " input_generic
+if [[ "$input_generic" =~ ^[Yy]$ ]]; then
+    HOKUTO_GENERIC="1"
+else
+    HOKUTO_GENERIC="0"
+fi
+
+# Multilib (only for amd64)
+HOKUTO_MULTILIB="0"
+if [ "$ARCH" == "amd64" ]; then
+    read -p "Enable Multilib Support (32-bit libs)? [y/N]: " input_multilib
+    if [[ "$input_multilib" =~ ^[Yy]$ ]]; then
+        HOKUTO_MULTILIB="1"
+    fi
+fi
+
+# LTO
+read -p "Enable LTO (Link Time Optimization)? [y/N]: " input_lto
+if [[ "$input_lto" =~ ^[Yy]$ ]]; then
+    HOKUTO_LTO="1"
+else
+    HOKUTO_LTO="0"
+fi
+
+# 7. Installation
+log_info "Starting installation"
+
+# Define minimal package list or use what user requested
+PACKAGES=(
+    "glibc"
+    "gcc"
+    "ncurses"
+    "readline"
+    "bash"
+    "coreutils"
+    "hokuto"
+    "shadow"
+    "nano"
+    "less"
+)
+
+# Convert array to space-separated string
+PKG_LIST="${PACKAGES[*]}"
+
+# Find the binary robustly
+# We look for a file named 'hokuto' or 'hokuto-amd64' or 'hokuto-arm64' that is executable
+BIN=$(find "$EXTRACT_ROOT" -type f -name "hokuto*" -executable | head -n 1)
+
+if [ -z "$BIN" ]; then
+    # Try finding any file named hokuto* that is NOT a directory
+    BIN=$(find "$EXTRACT_ROOT" -type f -name "hokuto*" | head -n 1)
+fi
+
+if [ -z "$BIN" ] || [ ! -e "$BIN" ]; then
+    log_error "Could not find 'hokuto' binary in extracted archive."
+fi
+
+chmod +x "$BIN"
+log_info "Using binary: $BIN"
+
+export HOKUTO_ROOT="$HOKUTO_ROOT"
+export HOKUTO_GENERIC="$HOKUTO_GENERIC"
+export HOKUTO_MULTILIB="$HOKUTO_MULTILIB"
+
+# Run install
+"$BIN" install --remote $PKG_LIST
+
+# 8. Update Configuration
+CONF_DIR="$HOKUTO_ROOT/etc/hokuto"
+CONF_FILE="$CONF_DIR/hokuto.conf"
+
+log_info "Updating configuration at $CONF_FILE"
+
+# Helper to run commands as root if needed
+do_as_root() {
+    if [ "$EUID" -ne 0 ]; then
+        sudo "$@"
+    else
+        "$@"
+    fi
+}
+
+do_as_root mkdir -p "$CONF_DIR"
+
+if [ ! -f "$CONF_FILE" ]; then
+    cat <<EOF | do_as_root tee "$CONF_FILE" >/dev/null
+# Hokuto Configuration File
+
+HOKUTO_ARCH="$ARCH"
+HOKUTO_GENERIC="$HOKUTO_GENERIC"
+HOKUTO_MULTILIB="$HOKUTO_MULTILIB"
+SET_HOKUTO_LTO="$HOKUTO_LTO"
+EOF
+else
+    update_conf() {
+        local key="$1"
+        local val="$2"
+        if do_as_root grep -q "^$key=" "$CONF_FILE"; then
+            do_as_root sed -i "s|^$key=.*|$key=\"$val\"|" "$CONF_FILE"
+        else
+            echo "$key=\"$val\"" | do_as_root tee -a "$CONF_FILE" >/dev/null
+        fi
+    }
+
+    update_conf "HOKUTO_GENERIC" "$HOKUTO_GENERIC"
+    update_conf "HOKUTO_MULTILIB" "$HOKUTO_MULTILIB"
+    update_conf "SET_HOKUTO_LTO" "$HOKUTO_LTO"
+fi
+
+# 9. Set Default Root Password
+log_info "Setting default root password to 'root'"
+
+# Find chpasswd location from outside
+CHPASSWD_PATH=""
+for p in /bin/chpasswd /usr/bin/chpasswd /usr/sbin/chpasswd /sbin/chpasswd; do
+    if [ -x "$HOKUTO_ROOT$p" ]; then
+        CHPASSWD_PATH="$p"
+        break
+    fi
+done
+
+if [ -n "$CHPASSWD_PATH" ]; then
+    # Ensure shadow file exists/synced
+    PWCONV_PATH=""
+    for p in /usr/sbin/pwconv /sbin/pwconv /usr/bin/pwconv /bin/pwconv; do
+        if [ -x "$HOKUTO_ROOT$p" ]; then
+            PWCONV_PATH="$p"
+            break
+        fi
+    done
+    
+    if [ -n "$PWCONV_PATH" ]; then
+        log_info "Synchronizing shadow passwords"
+        do_as_root chroot "$HOKUTO_ROOT" "$PWCONV_PATH"
+    fi
+
+    echo "root:root" | do_as_root chroot "$HOKUTO_ROOT" "$CHPASSWD_PATH"
+    if [ $? -eq 0 ]; then
+        log_success "Root password set to 'root'"
+    else
+        log_warn "Failed to set root password."
+    fi
+else
+    log_warn "chpasswd binary not found in chroot (checked /bin, /usr/bin, /sbin, /usr/sbin)."
+    log_warn "Getting 'root' password requires manual setup."
+fi
+
+log_success "Installation Complete!"
+echo -e "You can now chroot into ${CYAN}$HOKUTO_ROOT${RESET} to check your system."

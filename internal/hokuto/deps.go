@@ -351,6 +351,63 @@ func resolveRemoteDependencies(pkgName string, visited map[string]bool, plan *[]
 		}
 	}
 
+	// FALLBACK 2: If we are looking for non-multi (e.g. optimized) but only multi- exists, try that.
+	// This happens if local system is non-multilib but repo only has multilib package (which is compatible).
+	if !found && !strings.HasPrefix(preferredVariant, "multi-") {
+		// Try multi- + preferredVariant (e.g. "optimized" -> "multi-optimized")
+		fallbackVariant := "multi-" + preferredVariant
+
+		bestMatch = nil // Reset bestMatch for this new search
+		for i := range remoteIndex {
+			e := &remoteIndex[i]
+			if e.Name == lookupName && e.Arch == arch && e.Variant == fallbackVariant {
+				if targetVersion != "" {
+					if e.Version == targetVersion {
+						entry = *e
+						found = true
+						break
+					}
+					continue
+				}
+
+				if bestMatch == nil || isNewer(*e, *bestMatch) {
+					bestMatch = e
+				}
+			}
+		}
+		if !found && bestMatch != nil {
+			entry = *bestMatch
+			found = true
+		}
+
+		// Also try multi-generic if multi-optimized failed
+		if !found {
+			fallbackVariant = "multi-generic"
+			bestMatch = nil
+			for i := range remoteIndex {
+				e := &remoteIndex[i]
+				if e.Name == lookupName && e.Arch == arch && e.Variant == fallbackVariant {
+					if targetVersion != "" {
+						if e.Version == targetVersion {
+							entry = *e
+							found = true
+							break
+						}
+						continue
+					}
+
+					if bestMatch == nil || isNewer(*e, *bestMatch) {
+						bestMatch = e
+					}
+				}
+			}
+			if !found && bestMatch != nil {
+				entry = *bestMatch
+				found = true
+			}
+		}
+	}
+
 	if !found {
 		// If not in remote index, we can't do anything
 		if targetVersion != "" {

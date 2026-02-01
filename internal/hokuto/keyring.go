@@ -22,22 +22,74 @@ func FetchKeyring(cfg *Config) ([]KeyringEntry, error) {
 	// Try to use a cached keyring if available and not too old?
 	// For now, always fetch to ensure we have the latest trusted keys.
 
-	r2, err := NewR2Client(cfg)
-	if err != nil {
-		return nil, err
+	var keyringData []byte
+	var sigData []byte
+	var fetchErr error
+
+	// 1. Try BinaryMirror First (Public URL)
+	if BinaryMirror != "" {
+		tmpDir := os.TempDir()
+		keyringPath := filepath.Join(tmpDir, "keyring.json")
+		sigPath := filepath.Join(tmpDir, "keyring.json.sig")
+
+		// Best effort cleanup
+		defer os.Remove(keyringPath)
+		defer os.Remove(sigPath)
+
+		keyringURL := fmt.Sprintf("%s/keyring.json", BinaryMirror)
+		sigURL := fmt.Sprintf("%s/keyring.json.sig", BinaryMirror)
+
+		// Download keyring
+		if err := downloadFileQuiet(keyringURL, keyringURL, keyringPath); err == nil {
+			// Download signature
+			if err := downloadFileQuiet(sigURL, sigURL, sigPath); err == nil {
+				// Both succeeded
+				keyringData, err = os.ReadFile(keyringPath)
+				if err == nil {
+					sigData, err = os.ReadFile(sigPath)
+					if err == nil {
+						// Success!
+					} else {
+						fetchErr = fmt.Errorf("failed to read downloaded signature: %w", err)
+						keyringData = nil // Invalidate
+					}
+				} else {
+					fetchErr = fmt.Errorf("failed to read downloaded keyring: %w", err)
+				}
+			} else {
+				fetchErr = fmt.Errorf("failed to fetch keyring signature from mirror: %w", err)
+			}
+		} else {
+			fetchErr = fmt.Errorf("failed to fetch keyring from mirror: %w", err)
+		}
 	}
 
-	ctx := context.Background()
-	keyringData, err := r2.DownloadFile(ctx, "keyring.json")
-	if err != nil {
-		// If keyring doesn't exist, return empty or just the master key?
-		// The master key is hardcoded, so we always have it.
-		return nil, fmt.Errorf("failed to download keyring: %w", err)
+	// 2. Fallback to R2 if Mirror failed
+	if keyringData == nil {
+		r2, err := NewR2Client(cfg)
+		if err == nil {
+			ctx := context.Background()
+			keyringData, err = r2.DownloadFile(ctx, "keyring.json")
+			if err == nil {
+				sigData, err = r2.DownloadFile(ctx, "keyring.json.sig")
+				if err != nil {
+					// We have keyring but no signature from R2.
+					keyringData = nil
+					fetchErr = fmt.Errorf("R2 keyring found but signature missing: %w", err)
+				}
+			} else {
+				fetchErr = fmt.Errorf("failed to fetch keyring from R2 (and mirror failed: %v): %w", fetchErr, err)
+			}
+		} else {
+			// R2 client creation failed (likely no creds), and mirror failed
+			if fetchErr == nil {
+				fetchErr = fmt.Errorf("mirror not configured and R2 client init failed: %w", err)
+			}
+		}
 	}
 
-	sigData, err := r2.DownloadFile(ctx, "keyring.json.sig")
-	if err != nil {
-		return nil, fmt.Errorf("keyring signature missing: %w", err)
+	if keyringData == nil {
+		return nil, fmt.Errorf("failed to download keyring: %w", fetchErr)
 	}
 
 	// Verify keyring signature using the hardcoded master key

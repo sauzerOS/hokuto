@@ -602,8 +602,55 @@ func executePostInstall(pkgName, rootDir string, execCtx *Executor, cfg *Config,
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 
-	// If chroot is used and fails, print a warning and continue (non-fatal).
+	// If chroot is used, we must mount communicating filesystems (/dev, /proc, /sys)
+	// to ensure scripts like make-ca (which interacts with /dev/stdin) work correctly.
 	if rootDir != "/" {
+		mounts := []struct {
+			src     string
+			dst     string
+			fsType  string
+			options []string
+			isBind  bool
+		}{
+			{src: "/dev", dst: filepath.Join(rootDir, "dev"), isBind: true},
+			{src: "proc", dst: filepath.Join(rootDir, "proc"), fsType: "proc"},
+			{src: "sysfs", dst: filepath.Join(rootDir, "sys"), fsType: "sysfs"},
+		}
+
+		var mountedPaths []string
+
+		// Ensure cleanup happens even if execution fails
+		defer func() {
+			if len(mountedPaths) > 0 {
+				execCtx.UnmountFilesystems(mountedPaths)
+			}
+		}()
+
+		for _, m := range mounts {
+			// Create mountpoint
+			// We use a simple MkdirAll here. Ideally we should use privileged execution if needed,
+			// but since mounting requires root, we assume we can create dirs in rootDir too (or mount will fail).
+			// Use RootExec-like logic or just rely on mount failing if dir missing?
+			// Best to try creating it.
+			if err := execCtx.Run(exec.Command("mkdir", "-p", m.dst)); err != nil {
+				debugf("Warning: failed to create mountpoint %s: %v\n", m.dst, err)
+				continue
+			}
+
+			var mCmd *exec.Cmd
+			if m.isBind {
+				mCmd = exec.Command("mount", "--bind", m.src, m.dst)
+			} else {
+				mCmd = exec.Command("mount", "-t", m.fsType, m.src, m.dst)
+			}
+
+			if err := execCtx.Run(mCmd); err != nil {
+				debugf("Warning: failed to mount %s to %s: %v\n", m.src, m.dst, err)
+			} else {
+				mountedPaths = append(mountedPaths, m.dst)
+			}
+		}
+
 		if err := execCtx.Run(cmd); err != nil {
 			fmt.Fprintf(logger, "Warning: chroot to %s failed or post-install could not run: %v\n", rootDir, err)
 			return nil
