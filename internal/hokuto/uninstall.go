@@ -29,29 +29,15 @@ func pkgUninstall(pkgName string, cfg *Config, execCtx *Executor, force, yes boo
 	// Path prefix for internal metadata files that should skip the b3sum check.
 	internalFilePrefix := filepath.Join(hRoot, "var", "db", "hokuto", "installed")
 
-	// Check if alternatives exist for this package
-	alternatives, err := loadAlternativesMetadata(pkgName)
-	hasAlternatives := err == nil && len(alternatives) > 0
+	// Check if alternatives exist for this package (Legacy check removed/replaced)
+	// With Global Alternatives DB, we don't need to preload this here for the list check.
+	// We will rely on restoreAlternativesOnUninstall to return the list of preserved files.
+	/*
+		alternatives, err := loadAlternativesMetadata(pkgName)
+		hasAlternatives := err == nil && len(alternatives) > 0
+	*/
+	// We'll init the map empty and let restore populate it.
 	alternativeFilePaths := make(map[string]bool)
-	if hasAlternatives {
-		colArrow.Print("-> ")
-		colInfo.Println("alternatives exist")
-		// Build a map of alternative file paths for quick lookup
-		for filePath := range alternatives {
-			// Convert file path to absolute path
-			var absPath string
-			if filepath.IsAbs(filePath) {
-				if hRoot != "/" {
-					absPath = filepath.Join(hRoot, filePath[1:])
-				} else {
-					absPath = filePath
-				}
-			} else {
-				absPath = filepath.Join(hRoot, filePath)
-			}
-			alternativeFilePaths[filepath.Clean(absPath)] = true
-		}
-	}
 
 	// 1. Verify package exists
 	if _, err := os.Stat(installedDir); err != nil {
@@ -195,10 +181,14 @@ func pkgUninstall(pkgName string, cfg *Config, execCtx *Executor, force, yes boo
 	// 6.5. Restore alternatives BEFORE removing files (so restored files can be preserved)
 	// Track which files were restored and should be kept (from "no package" or other installed packages)
 	restoredFilesToKeep := make(map[string]bool)
-	if hasAlternatives {
-		if err := restoreAlternativesOnUninstall(pkgName, execCtx, hRoot, restoredFilesToKeep); err != nil {
-			debugf("Warning: failed to restore alternatives for %s: %v\n", pkgName, err)
-			// Non-fatal, continue with uninstall
+	// New API: returns map of restored files
+	if restoredMap, err := restoreAlternativesOnUninstall(pkgName, hRoot, execCtx); err != nil {
+		debugf("Warning: failed to restore alternatives for %s: %v\n", pkgName, err)
+		// Non-fatal, continue with uninstall
+	} else {
+		for f := range restoredMap {
+			restoredFilesToKeep[f] = true
+			alternativeFilePaths[f] = true // Also mark as alternative for skip check
 		}
 	}
 
@@ -457,26 +447,6 @@ func pkgUninstall(pkgName string, cfg *Config, execCtx *Executor, force, yes boo
 			fmt.Fprintf(os.Stderr, "warning: post-uninstall script failed: %v\n", err)
 		}
 	}
-
-	// 11. Remove alternatives directory (alternatives were already restored in step 6.5)
-	if hasAlternatives {
-		altDir := filepath.Join(hRoot, "var", "db", "hokuto", "alternatives", pkgName)
-		if os.Geteuid() == 0 {
-			if err := os.RemoveAll(altDir); err != nil {
-				debugf("Warning: failed to remove alternatives directory %s natively: %v\n", altDir, err)
-			} else {
-				debugf("Removed alternatives directory natively: %s\n", altDir)
-			}
-		} else {
-			rmAltCmd := exec.Command("rm", "-rf", altDir)
-			if err := execCtx.Run(rmAltCmd); err != nil {
-				debugf("Warning: failed to remove alternatives directory %s: %v\n", altDir, err)
-			} else {
-				debugf("Removed alternatives directory: %s\n", altDir)
-			}
-		}
-	}
-
 	// 12. Report failures if any (unchanged)
 	if len(failed) > 0 {
 		return fmt.Errorf("some removals failed:\n%s", strings.Join(failed, "\n"))

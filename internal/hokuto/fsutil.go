@@ -1,8 +1,5 @@
 package hokuto
 
-// Code in this file was split out of main.go for readability.
-// No behavior changes intended.
-
 import (
 	"archive/tar"
 	"bufio"
@@ -493,32 +490,42 @@ func getModifiedFiles(pkgName, rootDir string, execCtx *Executor) ([]string, err
 
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
-		if line == "" || strings.HasSuffix(line, "/") {
+		if line == "" {
 			continue
 		}
 
-		parts := strings.Fields(line)
-		if len(parts) == 0 {
+		// Check if the line represents a directory (ends with /)
+		if strings.HasSuffix(line, "/") {
 			continue
 		}
 
-		// Checksum is the last field
-		expectedSum := parts[len(parts)-1]
-		// Path is everything before
-		relPath := strings.Join(parts[:len(parts)-1], " ")
+		// The manifest format is: FILENAME<whitespace>CHECKSUM
+		// or FILENAME<whitespace><whitespace>CHECKSUM
+		// Since filenames can contain spaces, we separate by the LAST whitespace.
 
-		relSlash := filepath.ToSlash(relPath)
+		lastSpace := strings.LastIndexAny(line, " \t")
+		if lastSpace == -1 {
+			continue // Skip invalid lines (e.g. malformed or empty)
+		}
+
+		path := strings.TrimSpace(line[:lastSpace])
+		checksum := strings.TrimSpace(line[lastSpace:])
+
+		if path == "" || checksum == "" {
+			continue
+		}
+
 		// Skip all metadata files under var/db/hokuto (internal package metadata)
 		// Handles both "var/db/hokuto/..." and "/var/db/hokuto/..." paths
-		cleanSlash := strings.TrimPrefix(relSlash, "/")
+		cleanSlash := strings.TrimPrefix(filepath.ToSlash(path), "/")
 		if strings.HasPrefix(cleanSlash, "var/db/hokuto/") {
 			continue
 		}
 
-		absPath := filepath.Join(rootDir, relPath)
+		absPath := filepath.Join(rootDir, path)
 
 		// Skip entries with 000000 hash (symlinks)
-		if expectedSum == "000000" {
+		if checksum == "000000" {
 			continue
 		}
 
@@ -549,24 +556,29 @@ func getModifiedFiles(pkgName, rootDir string, execCtx *Executor) ([]string, err
 	scanner = bufio.NewScanner(strings.NewReader(string(data)))
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
-		if line == "" || strings.HasSuffix(line, "/") {
+		if line == "" {
 			continue
 		}
 
-		parts := strings.Fields(line)
-		if len(parts) < 2 {
+		// Check if the line represents a directory (ends with /)
+		if strings.HasSuffix(line, "/") {
 			continue
 		}
 
-		// Checksum is the last field
-		expectedSum := parts[len(parts)-1]
-		// Path is everything before
-		relPath := strings.Join(parts[:len(parts)-1], " ")
+		lastSpace := strings.LastIndexAny(line, " \t")
+		if lastSpace == -1 {
+			continue
+		}
 
-		relSlash := filepath.ToSlash(relPath)
-		// Skip all metadata files under var/db/hokuto (internal package metadata)
-		// Handles both "var/db/hokuto/..." and "/var/db/hokuto/..." paths
-		cleanSlash := strings.TrimPrefix(relSlash, "/")
+		relPath := strings.TrimSpace(line[:lastSpace])
+		expectedSum := strings.TrimSpace(line[lastSpace:])
+
+		if relPath == "" || expectedSum == "" {
+			continue
+		}
+
+		// Skip all metadata files under var/db/hokuto
+		cleanSlash := strings.TrimPrefix(filepath.ToSlash(relPath), "/")
 		if strings.HasPrefix(cleanSlash, "var/db/hokuto/") {
 			continue
 		}
@@ -582,7 +594,7 @@ func getModifiedFiles(pkgName, rootDir string, execCtx *Executor) ([]string, err
 			continue // file doesn't exist or checksum failed
 		}
 
-		if parts[1] != currentSum {
+		if expectedSum != currentSum {
 			modified = append(modified, relPath)
 		}
 	}
@@ -634,14 +646,74 @@ func isDirectoryPrivileged(path string, execCtx *Executor) (bool, error) {
 }
 
 func readFileAsRoot(path string) ([]byte, error) {
-	if os.Geteuid() == 0 {
-		return os.ReadFile(path)
+	// Try native read first
+	data, err := os.ReadFile(path)
+	if err == nil {
+		return data, nil
+	}
+	// Only force sudo if we are not root and permission denied or similar
+	if os.Geteuid() != 0 {
+		cmd := exec.Command("sudo", "cat", path)
+		out, err := cmd.Output()
+		if err == nil {
+			return out, nil
+		}
+	}
+	return nil, err
+}
+
+func writeFileAsRoot(path string, data []byte, perm os.FileMode, execCtx *Executor) error {
+	// Try native write first
+	err := os.WriteFile(path, data, perm)
+	if err == nil {
+		return nil
 	}
 
-	cmd := exec.Command("sudo", "cat", path)
-	out, err := cmd.Output()
-	if err != nil {
-		return nil, err
+	if os.Geteuid() == 0 {
+		return err // Should have worked if we are root
 	}
-	return out, nil
+
+	// Write to temp file first
+	tmpFile, err := os.CreateTemp("", "hokuto-write-*")
+	if err != nil {
+		return fmt.Errorf("failed to create temp file: %w", err)
+	}
+	tmpName := tmpFile.Name()
+	defer os.Remove(tmpName)
+
+	if _, err := tmpFile.Write(data); err != nil {
+		tmpFile.Close()
+		return fmt.Errorf("failed to write to temp file: %w", err)
+	}
+	tmpFile.Close()
+
+	// Move via sudo cp to preserve content, then chmod
+	cpCmd := exec.Command("sudo", "cp", tmpName, path)
+	if err := execCtx.Run(cpCmd); err != nil {
+		return fmt.Errorf("failed to write file %s as root: %w", path, err)
+	}
+
+	// Set permissions
+	chmodCmd := exec.Command("sudo", "chmod", fmt.Sprintf("%o", perm), path)
+	if err := execCtx.Run(chmodCmd); err != nil {
+		return fmt.Errorf("failed to chmod file %s as root: %w", path, err)
+	}
+
+	return nil
+}
+
+// copyFileAsRoot copies a file using the executor (wrapper around logic or sudo cp)
+func copyFileAsRoot(src, dst string, execCtx *Executor) error {
+	// Try native copy first
+	if err := copyFile(src, dst); err == nil {
+		return nil
+	}
+
+	if os.Geteuid() == 0 {
+		return copyFile(src, dst)
+	}
+
+	// Use sudo cp to preserve attributes if possible
+	cmd := exec.Command("sudo", "cp", "-a", src, dst)
+	return execCtx.Run(cmd)
 }

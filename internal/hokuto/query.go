@@ -443,12 +443,12 @@ func showManifest(pkgName string) error {
 		}
 
 		// Each file line is expected to be: "<path>  <checksum>"
-		// We only want to print the path (first whitespace-separated field).
-		fields := strings.Fields(line)
-		if len(fields) == 0 {
+		// Use LastIndexAny regarding spaces to separate the path from the checksum
+		lastSpace := strings.LastIndexAny(line, " \t")
+		if lastSpace == -1 {
 			continue
 		}
-		path := fields[0]
+		path := strings.TrimSpace(line[:lastSpace])
 
 		// Normalize for checking internal metadata: consider both absolute and relative variants.
 		clean := filepath.Clean(path)
@@ -512,11 +512,11 @@ func findPackagesByManifestString(query string) error {
 			if strings.HasSuffix(line, "/") {
 				continue
 			}
-			fields := strings.Fields(line)
-			if len(fields) == 0 {
+			lastSpace := strings.LastIndexAny(line, " \t")
+			if lastSpace == -1 {
 				continue
 			}
-			path := fields[0]
+			path := strings.TrimSpace(line[:lastSpace])
 
 			// skip internal metadata entries
 			clean := filepath.Clean(path)

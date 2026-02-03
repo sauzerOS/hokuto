@@ -817,7 +817,7 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, opts BuildOptions)
 				// BUT only if we are NOT building a host-tool (otherwise we break the host compiler)
 				if !options["host-tool"] || !isCrossSystem {
 					currentPath := os.Getenv("PATH")
-					defaults["PATH"] = filepath.Join(prefix, "bin") + ":" + currentPath
+					defaults["PATH"] = currentPath + ":" + filepath.Join(prefix, "bin")
 				}
 
 				// Set PKG_CONFIG environment variables to avoid host pollution
@@ -835,7 +835,7 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, opts BuildOptions)
 				// This ensures we use the cross Rust compiler which has the target installed
 				prefix := fmt.Sprintf("/usr/%s-linux-gnu", normalizedArch)
 				currentPath := os.Getenv("PATH")
-				defaults["PATH"] = filepath.Join(prefix, "bin") + ":" + currentPath
+				defaults["PATH"] = currentPath + ":" + filepath.Join(prefix, "bin")
 			}
 
 			// Rust cross-compilation setup
@@ -1789,7 +1789,7 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 			normalizedArch = "aarch64"
 		}
 		prefix := fmt.Sprintf("/usr/%s-linux-gnu", normalizedArch)
-		defaults["PATH"] = filepath.Join(prefix, "bin") + ":" + os.Getenv("PATH")
+		defaults["PATH"] = os.Getenv("PATH") + ":" + filepath.Join(prefix, "bin")
 	}
 
 	// Rust cross-compilation setup for pkgBuildRebuild
@@ -3268,6 +3268,17 @@ func executeBuildPass(plan *BuildPlan, _ string, installAllTargets bool, cfg *Co
 							continue // Move to check the next parent
 						}
 						totalElapsedTime += duration
+
+						// SKIP INSTALLATION FOR CROSS-COMPILED PACKAGES
+						// BUT allow it if we are building the cross-system (toolchain/sysroot packages)
+						if cfg.Values["HOKUTO_CROSS"] == "1" && cfg.Values["HOKUTO_CROSS_SYSTEM"] != "1" {
+							colArrow.Print("-> ")
+							colSuccess.Printf("Inline rebuild of '%s' completed.\n", parent)
+							// CRITICAL: Remove the parent from the map to prevent multiple rebuilds.
+							delete(plan.PostRebuilds, parent)
+							continue
+						}
+
 						// Install the newly rebuilt parent
 						version, revision, _ := getRepoVersion2(parent)
 						outputParent := getOutputPackageName(parent, cfg)

@@ -198,37 +198,28 @@ func parseManifest(filePath string) (map[string]ManifestEntry, error) {
 		}
 
 		// Check if the line represents a directory.
-		// We look for a line that starts with '/' and ends with '/', and has no other fields.
+		// We look for a line that ends with '/'.
 		if strings.HasSuffix(line, "/") {
-			// Check if the line contains ONLY the directory path.
-			// If there's any whitespace, it might be a malformed file entry,
-			// but for a pure directory line like "/etc/", this will be false.
-			if len(strings.Fields(line)) == 1 {
-				continue // Skip directories
-			}
+			// Directories in manifest are just paths ending in /
+			// We don't check for field count because paths can contain spaces.
+			continue
 		}
 
-		fields := strings.Fields(line)
+		// The manifest format is: FILENAME<whitespace>CHECKSUM
+		// or FILENAME<whitespace><whitespace>CHECKSUM
+		// Since filenames can contain spaces, we separate by the LAST whitespace.
 
-		// Now, we expect exactly two fields (Path and Checksum) for a file.
-		// If we get fewer, we return an error indicating a malformed file entry.
-		if len(fields) < 2 {
-			// The user's error message comes from here when processing a directory line.
-			// Since we've pre-filtered pure directory lines, this catches real malformed file lines.
+		lastSpace := strings.LastIndexAny(line, " \t")
+		if lastSpace == -1 {
+			return nil, fmt.Errorf("invalid manifest line format (no separation): %s", line)
+		}
+
+		path := strings.TrimSpace(line[:lastSpace])
+		checksum := strings.TrimSpace(line[lastSpace:])
+
+		if path == "" || checksum == "" {
 			return nil, fmt.Errorf("invalid manifest line format: %s", line)
 		}
-
-		// The manifest format is: FILENAME  CHECKSUM
-		// Since filenames can contain spaces, we can't just take fields[0].
-		// However, the checksum (BLAKE3) is a fixed hex string without spaces, always at the end.
-		checksum := fields[len(fields)-1]
-
-		// The path is everything before the checksum.
-		// We can reconstruct it by joining the fields, or more safely, by string manipulation.
-		// Doing it by index is safer to preserve exact spacing in the filename if needed,
-		// though standard fields split consumes extra whitespace.
-		// Given we used Fields() to split, let's rejoin all but the last.
-		path := strings.Join(fields[:len(fields)-1], " ")
 
 		entries[path] = ManifestEntry{Path: path, Checksum: checksum}
 	}

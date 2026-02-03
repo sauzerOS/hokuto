@@ -161,6 +161,24 @@ func RunParallelBuilds(plan *BuildPlan, cfg *Config, maxJobs int, userRequestedM
 	}
 
 	// colSuccess.Printf("All packages built successfully in %s\n", time.Since(time.Now()).Round(time.Second))
+
+	// Show success summary
+	var builtPkgs []string
+	for pkg, done := range pm.Completed {
+		if done {
+			builtPkgs = append(builtPkgs, pkg)
+		}
+	}
+	sort.Strings(builtPkgs)
+
+	if len(builtPkgs) > 0 {
+		colArrow.Print("-> ")
+		colSuccess.Println("Built/Installed Packages:")
+		for _, pkg := range builtPkgs {
+			fmt.Printf("  - %s\n", colNote.Sprint(pkg))
+		}
+	}
+
 	return nil
 }
 
@@ -382,6 +400,7 @@ func (pm *ParallelManager) uiLoop(done chan struct{}) {
 
 	lastStatus := ""
 	paused := false
+	ticks := 0
 
 	for {
 		select {
@@ -409,6 +428,12 @@ func (pm *ParallelManager) uiLoop(done chan struct{}) {
 				continue
 			}
 
+			// Force redraw every 2 seconds (20 ticks) to recover from log clobbering
+			ticks++
+			if ticks%20 == 0 {
+				lastStatus = ""
+			}
+
 			newStatus := pm.getStatusString()
 			if newStatus != lastStatus {
 				fmt.Print("\r\033[K" + newStatus)
@@ -430,7 +455,7 @@ func (pm *ParallelManager) getStatusString() string {
 	sort.Strings(building) // Stabilize output
 
 	// Use colors consistent with prompts
-	// -> (Arrow) Building [N]: pkg1, pkg2 | Done: M
+	// -> (Arrow) Building [N]: pkg1, pkg2 | Done: M Left: P
 
 	prefix := colArrow.Sprint("->")
 
@@ -444,5 +469,5 @@ func (pm *ParallelManager) getStatusString() string {
 		prefix,
 		colSuccess.Sprintf("Building [%d]:", len(building)),
 		colNote.Sprint(listStr),
-		colSuccess.Sprintf("Done: %d", len(pm.Completed)))
+		colSuccess.Sprintf("Done: %d Left: %d", len(pm.Completed), len(pm.Pending)))
 }

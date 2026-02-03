@@ -796,6 +796,27 @@ func Main() {
 				}
 
 				if err != nil {
+					// Fallback: If local version lookup failed, try remote index
+					if remoteIndex == nil {
+						// Lazily fetch index
+						if idx, rErr := FetchRemoteIndex(cfg); rErr == nil {
+							remoteIndex = idx
+						}
+					}
+
+					if len(remoteIndex) > 0 {
+						rv, rr, rerr := GetRemotePackageVersion(arg, cfg, remoteIndex)
+						if rerr == nil {
+							version = rv
+							revision = rr
+							err = nil
+							// Enable remote mode implicitly since we found it remotely
+							*remote = true
+						}
+					}
+				}
+
+				if err != nil {
 					// If source not found (e.g., renamed cross-system packages), try to find tarball
 					if strings.Contains(err.Error(), "not found") {
 						// Try to find the newest tarball matching this package name with appropriate variant
@@ -829,11 +850,44 @@ func Main() {
 
 						// 2. Not in local cache? Try Mirror.
 						if BinaryMirror != "" {
-							if err := fetchBinaryPackage(pkgName, version, revision, cfg, false); err == nil {
-								foundOnMirror = true
-							} else {
-								debugf("Mirror fetch failed for %s: %v\n", pkgName, err)
+							// Ensure remote index is available
+							if remoteIndex == nil {
+								if idx, rErr := FetchRemoteIndex(cfg); rErr == nil {
+									remoteIndex = idx
+								} else {
+									cPrintf(colWarn, "Warning: Failed to fetch remote index: %v\n", rErr)
+								}
+							}
 
+							// Check if package exists in index BEFORE trying to download
+							targetArch := GetSystemArchForPackage(cfg, pkgName)
+							targetVariant := GetSystemVariantForPackage(cfg, pkgName)
+
+							inIndex := false
+							if len(remoteIndex) > 0 {
+								for _, entry := range remoteIndex {
+									if entry.Name == pkgName && entry.Version == version &&
+										entry.Revision == revision && entry.Arch == targetArch &&
+										entry.Variant == targetVariant {
+										inIndex = true
+										break
+									}
+								}
+							}
+
+							if inIndex {
+								if err := fetchBinaryPackage(pkgName, version, revision, cfg, false); err == nil {
+									foundOnMirror = true
+								} else {
+									debugf("Mirror fetch failed for %s: %v\n", pkgName, err)
+								}
+							} else {
+								// Not in index - don't try to download, just log debug
+								debugf("Package %s %s-%s (%s/%s) not found in remote index\n",
+									pkgName, version, revision, targetArch, targetVariant)
+							}
+
+							if !foundOnMirror {
 								// 2a. FALLBACK: Try generic if optimized failed
 								variant := GetSystemVariantForPackage(cfg, pkgName)
 								if !strings.Contains(variant, "generic") {
@@ -841,20 +895,38 @@ func Main() {
 									if strings.HasPrefix(variant, "multi-") {
 										fallbackVariant = "multi-generic"
 									}
-									colArrow.Print("-> ")
-									cPrintf(colInfo, "Optimized binary not found, trying fallback: %s\n", fallbackVariant)
-									// Temporarily override HOKUTO_GENERIC for this lookup
+
+									// Re-check index for generic variant
 									oldGeneric := cfg.Values["HOKUTO_GENERIC"]
 									cfg.Values["HOKUTO_GENERIC"] = "1"
+									targetVariantGeneric := GetSystemVariantForPackage(cfg, pkgName)
+									cfg.Values["HOKUTO_GENERIC"] = oldGeneric
 
-									if err := fetchBinaryPackage(pkgName, version, revision, cfg, false); err == nil {
-										foundOnMirror = true
-										// Update tarballPath for installation
-										arch := GetSystemArchForPackage(cfg, pkgName)
-										tarballPath = filepath.Join(BinDir, StandardizeRemoteName(pkgName, version, revision, arch, fallbackVariant))
+									inIndexGeneric := false
+									if len(remoteIndex) > 0 {
+										for _, entry := range remoteIndex {
+											if entry.Name == pkgName && entry.Version == version &&
+												entry.Revision == revision && entry.Arch == targetArch &&
+												entry.Variant == targetVariantGeneric {
+												inIndexGeneric = true
+												break
+											}
+										}
 									}
 
-									cfg.Values["HOKUTO_GENERIC"] = oldGeneric
+									if inIndexGeneric {
+										colArrow.Print("-> ")
+										cPrintf(colInfo, "Optimized binary not found, trying fallback: %s\n", fallbackVariant)
+
+										cfg.Values["HOKUTO_GENERIC"] = "1"
+										if err := fetchBinaryPackage(pkgName, version, revision, cfg, false); err == nil {
+											foundOnMirror = true
+											// Update tarballPath for installation
+											arch := GetSystemArchForPackage(cfg, pkgName)
+											tarballPath = filepath.Join(BinDir, StandardizeRemoteName(pkgName, version, revision, arch, fallbackVariant))
+										}
+										cfg.Values["HOKUTO_GENERIC"] = oldGeneric
+									}
 								}
 
 								// 2b. FALLBACK: Try multi-lib variants if standard failed
@@ -864,24 +936,60 @@ func Main() {
 									oldMulti := cfg.Values["HOKUTO_MULTILIB"]
 									cfg.Values["HOKUTO_MULTILIB"] = "1"
 
-									// Try multi-optimized (default for multilib=1)
-									if err := fetchBinaryPackage(pkgName, version, revision, cfg, false); err == nil {
-										foundOnMirror = true
-										arch := GetSystemArchForPackage(cfg, pkgName)
-										variant := GetSystemVariantForPackage(cfg, pkgName)
-										tarballPath = filepath.Join(BinDir, StandardizeRemoteName(pkgName, version, revision, arch, variant))
-									} else {
+									// Try multi-optimized
+									targetVariantMulti := GetSystemVariantForPackage(cfg, pkgName)
+									inIndexMulti := false
+									if len(remoteIndex) > 0 {
+										for _, entry := range remoteIndex {
+											if entry.Name == pkgName && entry.Version == version &&
+												entry.Revision == revision && entry.Arch == targetArch &&
+												entry.Variant == targetVariantMulti {
+												inIndexMulti = true
+												break
+											}
+										}
+									}
+
+									if inIndexMulti {
+										if err := fetchBinaryPackage(pkgName, version, revision, cfg, false); err == nil {
+											foundOnMirror = true
+											arch := GetSystemArchForPackage(cfg, pkgName)
+											variant := GetSystemVariantForPackage(cfg, pkgName)
+											tarballPath = filepath.Join(BinDir, StandardizeRemoteName(pkgName, version, revision, arch, variant))
+										}
+									}
+
+									if !foundOnMirror {
 										// Try multi-generic
 										oldGeneric := cfg.Values["HOKUTO_GENERIC"]
-										if oldGeneric != "1" {
-											cfg.Values["HOKUTO_GENERIC"] = "1"
-											if err := fetchBinaryPackage(pkgName, version, revision, cfg, false); err == nil {
-												foundOnMirror = true
-												arch := GetSystemArchForPackage(cfg, pkgName)
-												variant := GetSystemVariantForPackage(cfg, pkgName)
-												tarballPath = filepath.Join(BinDir, StandardizeRemoteName(pkgName, version, revision, arch, variant))
+										cfg.Values["HOKUTO_GENERIC"] = "1"
+										targetVariantMultiGeneric := GetSystemVariantForPackage(cfg, pkgName)
+										cfg.Values["HOKUTO_GENERIC"] = oldGeneric // reset for now
+
+										inIndexMultiGeneric := false
+										if len(remoteIndex) > 0 {
+											for _, entry := range remoteIndex {
+												if entry.Name == pkgName && entry.Version == version &&
+													entry.Revision == revision && entry.Arch == targetArch &&
+													entry.Variant == targetVariantMultiGeneric {
+													inIndexMultiGeneric = true
+													break
+												}
 											}
-											cfg.Values["HOKUTO_GENERIC"] = oldGeneric
+										}
+
+										if inIndexMultiGeneric {
+											oldGeneric := cfg.Values["HOKUTO_GENERIC"]
+											if oldGeneric != "1" {
+												cfg.Values["HOKUTO_GENERIC"] = "1"
+												if err := fetchBinaryPackage(pkgName, version, revision, cfg, false); err == nil {
+													foundOnMirror = true
+													arch := GetSystemArchForPackage(cfg, pkgName)
+													variant := GetSystemVariantForPackage(cfg, pkgName)
+													tarballPath = filepath.Join(BinDir, StandardizeRemoteName(pkgName, version, revision, arch, variant))
+												}
+												cfg.Values["HOKUTO_GENERIC"] = oldGeneric
+											}
 										}
 									}
 									cfg.Values["HOKUTO_MULTILIB"] = oldMulti

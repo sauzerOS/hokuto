@@ -389,17 +389,31 @@ func createPackageTarball(pkgName, pkgVer, pkgRev, arch, variant, outputDir stri
 
 	// --- Try system tar first ---
 	if _, err := exec.LookPath("tar"); err == nil {
-		// FIX: Correct ownership of the root directory '.' in the archive.
+		// FIX: Correct ownership AND permissions of the root directory '.' in the archive.
 		// If we are building as root, the outputDir itself might still be owned by the user who started the build.
-		// We must ensure the root of the package is owned by root:root.
+		// We must ensure the root of the package is owned by root:root and has 0755 permissions.
 		if os.Geteuid() == 0 {
 			if err := os.Chown(outputDir, 0, 0); err != nil {
 				return fmt.Errorf("failed to chown outputDir to root natively: %v", err)
+			}
+			if err := os.Chmod(outputDir, 0755); err != nil {
+				return fmt.Errorf("failed to chmod outputDir to 0755 natively: %v", err)
 			}
 		} else if execCtx.ShouldRunAsRoot {
 			chownCmd := exec.Command("chown", "0:0", outputDir)
 			if err := execCtx.Run(chownCmd); err != nil {
 				return fmt.Errorf("failed to chown outputDir to root: %v", err)
+			}
+			chmodCmd := exec.Command("chmod", "755", outputDir)
+			if err := execCtx.Run(chmodCmd); err != nil {
+				return fmt.Errorf("failed to chmod outputDir to 0755: %v", err)
+			}
+		} else {
+			// Even if running as user, we should attempt to sanitize permissions.
+			// The user likely owns the directory (created by pkgBuild), so this should succeed.
+			// If it fails (e.g. not owner), we warn but continue, hoping strict mode isn't required.
+			if err := os.Chmod(outputDir, 0755); err != nil {
+				debugf("Warning: failed to chmod outputDir to 0755 as user: %v\n", err)
 			}
 		}
 
@@ -462,6 +476,7 @@ func createPackageTarball(pkgName, pkgVer, pkgRev, arch, variant, outputDir stri
 
 		if rel == "." {
 			hdr.Name = "./"
+			hdr.Mode = 0755 // Force standard permissions for root
 		} else {
 			hdr.Name = rel
 		}

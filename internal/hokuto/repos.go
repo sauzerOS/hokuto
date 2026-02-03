@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 )
 
 func handleInitReposCommand(cfg *Config) error {
@@ -158,6 +159,12 @@ func handleInitReposCommand(cfg *Config) error {
 			lfsPullCmd.Stderr = os.Stderr
 			_ = UserExec.Run(lfsPullCmd)
 		}
+
+		// Install git hooks
+		if err := installGitHooks(targetPath); err != nil {
+			colArrow.Print("-> ")
+			colWarn.Printf("Warning: failed to install git hooks for %s: %v\n", repo, err)
+		}
 	}
 
 	colArrow.Print("-> ")
@@ -172,6 +179,87 @@ func handleInitReposCommand(cfg *Config) error {
 		colSuccess.Println("Configuration file updated.")
 	}
 
+	return nil
+}
+
+const gitHookScript = `#!/bin/sh
+# Auto-generate commit message lines for any package version bump
+
+case "$2" in
+  merge|commit) exit 0 ;;
+esac
+
+packages=$(git diff --cached --name-only | grep '/version$')
+
+msg=""
+for pkg in $packages; do
+  name=$(basename "$(dirname "$pkg")")
+
+  diff_out=$(git diff --cached -U0 "$pkg")
+
+  # Extract old/new upstream versions (field 1 only)
+  old=$(echo "$diff_out" \
+    | grep '^-' | grep -v '^---' \
+    | cut -c2- | awk '{print $1}')
+
+  new=$(echo "$diff_out" \
+    | grep '^+' | grep -v '^+++' \
+    | cut -c2- | awk '{print $1}')
+
+  if [ -n "$old" ] && [ -n "$new" ] && [ "$old" != "$new" ]; then
+    msg="${msg}${name}: ${old} → ${new}\n"
+  fi
+done
+
+if [ -n "$msg" ]; then
+  existing_content=$(cat "$1")
+  printf "%b\n%s" "$msg" "$existing_content" > "$1"
+fi
+`
+
+func installGitHooks(repoPath string) error {
+	hooksDir := filepath.Join(repoPath, ".git", "hooks")
+	if _, err := os.Stat(hooksDir); os.IsNotExist(err) {
+		if err := os.MkdirAll(hooksDir, 0755); err != nil {
+			return fmt.Errorf("failed to create hooks directory: %w", err)
+		}
+	}
+
+	// 1. Write the script file
+	scriptPath := filepath.Join(hooksDir, "git-hook-prepare-commit-msg")
+	if err := os.WriteFile(scriptPath, []byte(gitHookScript), 0755); err != nil {
+		return fmt.Errorf("failed to write hook script: %w", err)
+	}
+
+	// 2. Symlink prepare-commit-msg -> git-hook-prepare-commit-msg
+	linkPath := filepath.Join(hooksDir, "prepare-commit-msg")
+	// Remove if exists to be safe
+	_ = os.Remove(linkPath)
+	if err := os.Symlink("git-hook-prepare-commit-msg", linkPath); err != nil {
+		return fmt.Errorf("failed to create symlink: %w", err)
+	}
+
+	// 3. Ensure ownership if running as root
+	// 3. Ensure ownership if running as root
+	if os.Geteuid() == 0 {
+		// Use the ownership of the repo directory to match
+		info, err := os.Stat(repoPath)
+		if err == nil {
+			stat, ok := info.Sys().(*syscall.Stat_t)
+			if ok {
+				uid := int(stat.Uid)
+				gid := int(stat.Gid)
+				_ = os.Chown(scriptPath, uid, gid)
+				_ = os.Chown(linkPath, uid, gid) // lchown usually
+				// Note: os.Chown on symlink might behave differently on Linux (usually changes target).
+				// We should use os.Lchown for link.
+				_ = os.Lchown(linkPath, uid, gid)
+			}
+		}
+	}
+
+	colArrow.Print("-> ")
+	colSuccess.Printf("Installed git hooks in %s\n", hooksDir)
 	return nil
 }
 

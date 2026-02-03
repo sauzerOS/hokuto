@@ -643,7 +643,14 @@ func VerifyPackageSignature(stagingDir, pkgName string, cfg *Config, execCtx *Ex
 	// 1. Read signature and extract Key ID
 	sigData, err := os.ReadFile(signaturePath)
 	if err != nil {
-		return fmt.Errorf("failed to read signature: %w", err)
+		if os.IsPermission(err) {
+			sigData, err = readFileAsRoot(signaturePath)
+			if err != nil {
+				return fmt.Errorf("failed to read signature (privileged): %w", err)
+			}
+		} else {
+			return fmt.Errorf("failed to read signature: %w", err)
+		}
 	}
 
 	rawSig := strings.TrimSpace(string(sigData))
@@ -664,11 +671,25 @@ func VerifyPackageSignature(stagingDir, pkgName string, cfg *Config, execCtx *Ex
 	// 2. Read manifest and pkginfo
 	manifestData, err := os.ReadFile(manifestPath)
 	if err != nil {
-		return fmt.Errorf("failed to read manifest for verification: %w", err)
+		if os.IsPermission(err) {
+			manifestData, err = readFileAsRoot(manifestPath)
+			if err != nil {
+				return fmt.Errorf("failed to read manifest for verification (privileged): %w", err)
+			}
+		} else {
+			return fmt.Errorf("failed to read manifest for verification: %w", err)
+		}
 	}
 	pkgInfoData, err := os.ReadFile(pkgInfoPath)
 	if err != nil {
-		return fmt.Errorf("failed to read pkginfo for verification: %w", err)
+		if os.IsPermission(err) {
+			pkgInfoData, err = readFileAsRoot(pkgInfoPath)
+			if err != nil {
+				return fmt.Errorf("failed to read pkginfo for verification (privileged): %w", err)
+			}
+		} else {
+			return fmt.Errorf("failed to read pkginfo for verification: %w", err)
+		}
 	}
 
 	dataToVerify := append(manifestData, pkgInfoData...)

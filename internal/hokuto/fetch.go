@@ -4,10 +4,11 @@ package hokuto
 // No behavior changes intended.
 
 import (
-	"bufio"
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -18,8 +19,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/gookit/color"
+	"github.com/chromedp/cdproto/browser"
+	"github.com/chromedp/cdproto/network"
+	"github.com/chromedp/chromedp"
 	"github.com/klauspost/compress/zstd"
+	"github.com/schollz/progressbar/v3"
 	"golang.org/x/sys/unix"
 )
 
@@ -51,6 +55,19 @@ func newHttpClient() (*http.Client, error) {
 	return &http.Client{
 		Transport: transport,
 		Timeout:   300 * time.Second, // 5 min total timeout for large downloads
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 10 {
+				return fmt.Errorf("stopped after 10 redirects")
+			}
+			// Important: Go's http client does NOT forward the User-Agent header by default
+			// when redirecting to a different domain (security feature).
+			// However, for SourceForge and similar mirrors, we NEED the UA to be preserved
+			// or we get an HTML page instead of the file.
+			if len(via) > 0 {
+				req.Header.Set("User-Agent", via[0].Header.Get("User-Agent"))
+			}
+			return nil
+		},
 	}, nil
 }
 
@@ -145,124 +162,338 @@ func downloadFileWithOptions(originalURL, finalURL, destFile string, opt downloa
 		}
 	}()
 
+	// --- Primary Choice: Native Go HTTP Client ---
+	// We try native first for speed and standard behavior.
 	debugf("Downloading %s -> %s\n", finalURL, absPath)
 
-	// --- Primary Choice: Try curl with Go-native colorization ---
-	if _, err := exec.LookPath("curl"); err == nil {
-		curlArgs := []string{"-L", "--fail", "-o", absPath}
-		if opt.Quiet {
-			curlArgs = append(curlArgs, "-sS")
-		} else {
-			curlArgs = append(curlArgs, "-#")
-		}
-		curlArgs = append(curlArgs, finalURL) // Use the final URL for the download
-		cmd := exec.Command("curl", curlArgs...)
+	var resp *http.Response
+	var nativeErr error // Renamed to avoid shadowing the outer 'err'
 
-		if opt.Quiet {
-			cmd.Stdout = io.Discard
-			cmd.Stderr = io.Discard
-			if err := cmd.Run(); err == nil {
-				return nil
+	// Retry loop for download
+	maxRetries := 3
+	for i := 0; i <= maxRetries; i++ {
+		client, err := newHttpClient()
+		if err != nil {
+			nativeErr = fmt.Errorf("failed to create http client: %w", err)
+			break // Cannot proceed with native client
+		}
+
+		req, err := http.NewRequest("GET", finalURL, nil)
+		if err != nil {
+			nativeErr = fmt.Errorf("failed to create http request: %w", err)
+			break
+		}
+		// Set User-Agent to mimic wget to avoid bot checks/HTML redirects (e.g. SourceForge)
+		req.Header.Set("User-Agent", "Wget/1.21.4")
+
+		resp, err = client.Do(req)
+		if err != nil {
+			if i < maxRetries {
+				backoff := time.Duration(1<<i) * time.Second
+				debugf("Native download attempt %d/%d failed: %v. Retrying in %s...\n", i+1, maxRetries+1, err, backoff)
+				time.Sleep(backoff)
+				continue
 			}
-			debugf("curl (quiet) failed, falling back to wget\n")
-		} else {
-			stderrPipe, err := cmd.StderrPipe()
+			// If we exhausted retries on network errors, we might still want to try browser?
+			// The user said "use chromedp as fallback".
+			// So if native fails completely, we fall back.
+			nativeErr = fmt.Errorf("native http get failed after %d attempts: %w", maxRetries+1, err)
+			debugf("Native download failed after %d attempts: %v\n", maxRetries+1, nativeErr)
+			break // Fall through to browser
+		}
+
+		// Check status codes
+		if resp.StatusCode == http.StatusOK {
+			// Sanity Check: If we downloaded text/html but expected a binary, fallback to browser.
+			// This happens when servers return a "Click here to download" page or bot check page with 200 OK.
+			ct := resp.Header.Get("Content-Type")
+			isBinary := strings.HasSuffix(finalURL, ".gz") || strings.HasSuffix(finalURL, ".bz2") ||
+				strings.HasSuffix(finalURL, ".xz") || strings.HasSuffix(finalURL, ".zip") ||
+				strings.HasSuffix(finalURL, ".tgz")
+
+			if strings.HasPrefix(ct, "text/html") && isBinary {
+				resp.Body.Close()
+				nativeErr = fmt.Errorf("server returned text/html content for binary file (likely bot check or redirect page)")
+				debugf("Native download got text/html for binary, falling back to browser...\n")
+				break
+			}
+
+			// Success! Proceed to write file.
+			out, err := os.Create(absPath)
 			if err != nil {
-				cmd.Stderr = os.Stderr
+				resp.Body.Close()
+				return fmt.Errorf("failed to create destination file %s: %w", absPath, err)
 			}
-			cmd.Stdout = os.Stdout
+			defer out.Close()
 
-			if err := cmd.Start(); err != nil {
-				return fmt.Errorf("failed to start curl: %w", err)
-			}
-
-			if stderrPipe != nil {
-				go func() {
-					reader := bufio.NewReader(stderrPipe)
-					blue := "\x1b[" + color.Blue.Code() + "m"
-					reset := "\x1b[0m"
-					for {
-						lineBytes, err := reader.ReadBytes('\r')
-						if len(lineBytes) > 0 {
-							line := string(lineBytes)
-							if strings.HasPrefix(strings.TrimSpace(line), "#") {
-								fmt.Fprintf(os.Stderr, "%s%s%s", blue, line, reset)
-							} else {
-								fmt.Fprint(os.Stderr, line)
-							}
-						}
-						if err != nil {
-							break
-						}
-					}
-				}()
+			var writer io.Writer = out
+			var bar *progressbar.ProgressBar
+			if !opt.Quiet {
+				// Use colored description for progress bar
+				desc := colArrow.Sprint("-> ") + colSuccess.Sprint("Downloading")
+				bar = progressbar.DefaultBytes(
+					resp.ContentLength,
+					desc,
+				)
+				writer = io.MultiWriter(out, bar)
 			}
 
-			if err := cmd.Wait(); err != nil {
-				debugf("\ncurl failed, falling back to wget")
-			} else {
-				debugf("\nDownload successful with curl.")
-				return nil
+			_, err = io.Copy(writer, resp.Body)
+			resp.Body.Close()
+			if bar != nil {
+				bar.Finish()
+				fmt.Println()
 			}
-		}
-	} else {
-		debugf("curl not found, trying wget")
-	}
+			if err != nil {
+				// Write failed
+				return fmt.Errorf("failed to write to destination file: %w", err)
+			}
 
-	// --- Fallback 1: Try wget ---
-	if _, err := exec.LookPath("wget"); err == nil {
-		args := []string{"-O", absPath}
-		if opt.Quiet {
-			args = append([]string{"-q"}, args...)
-		} else {
-			args = append([]string{"-nv"}, args...)
-		}
-		args = append(args, finalURL) // Use the final URL for the download
-		cmd := exec.Command("wget", args...)
-		if opt.Quiet {
-			cmd.Stdout = io.Discard
-			cmd.Stderr = io.Discard
-		} else {
-			cmd.Stdout = os.Stdout
-			cmd.Stderr = os.Stderr
-		}
-		if err := cmd.Run(); err == nil {
-			debugf("\nDownload successful with wget.")
+			if !opt.Quiet {
+				colArrow.Print("-> ")
+				// Show the base name of the URL for cleaner output
+				displayFilename := filepath.Base(finalURL)
+				colSuccess.Printf("Download successful: %s\n", displayFilename)
+			}
+			debugf("\nDownload successful with native Go HTTP client.\n")
 			return nil
 		}
-		debugf("\nwget failed, falling back to native Go HTTP client")
+
+		// If status is 418, 403, or 429, or 5xx, we might fallback or retry.
+		// 418/403 -> Fallback immediately (Bot check).
+		if resp.StatusCode == http.StatusTeapot || resp.StatusCode == http.StatusForbidden {
+			resp.Body.Close()
+			nativeErr = fmt.Errorf("native download failed with status %d (likely bot check)", resp.StatusCode)
+			debugf("Native download failed with status %d (likely bot check), falling back to browser...\n", resp.StatusCode)
+			break // Fall through to browser
+		}
+
+		// 5xx / 429 -> Retry
+		if resp.StatusCode >= 500 || resp.StatusCode == http.StatusTooManyRequests {
+			resp.Body.Close()
+			if i < maxRetries {
+				backoff := time.Duration(1<<i) * time.Second
+				debugf("Native download attempt %d/%d returned status %s. Retrying in %s...\n", i+1, maxRetries+1, resp.Status, backoff)
+				time.Sleep(backoff)
+				continue
+			}
+			nativeErr = fmt.Errorf("native download failed with status %s after retries", resp.Status)
+			debugf("Native download failed with status %s after retries.\n", resp.Status)
+			break // Fall through to browser
+		}
+
+		// 404 or other client errors -> Likely fatal, but maybe browser works?
+		// "Revert and use chromedp as fallback" implies general fallback.
+		// We will fall back for everything that fails native.
+		resp.Body.Close()
+		nativeErr = fmt.Errorf("native download failed with status: %s", resp.Status)
+		debugf("Native download failed with status: %s. Falling back to browser.\n", resp.Status)
+		break
+	}
+
+	// --- Fallback: Browser Download (chromedp) ---
+	debugf("Falling back to browser download (chromedp)\n")
+	if err := downloadViaBrowser(finalURL, absPath, opt.Quiet); err == nil {
+		if !opt.Quiet {
+			colArrow.Print("-> ")
+			displayFilename := filepath.Base(finalURL)
+			colSuccess.Printf("Download successful: %s\n", displayFilename)
+		}
+		debugf("Download successful with browser (chromedp).")
+		return nil
 	} else {
-		debugf("wget not found, using native Go HTTP client")
+		// If browser also failed, combine errors
+		if nativeErr != nil {
+			return fmt.Errorf("all download methods failed. Native error: %w; Browser error: %w", nativeErr, err)
+		}
+		return fmt.Errorf("all download methods failed. Browser error: %w", err)
 	}
+}
 
-	// --- Fallback 2: Native Go HTTP Client ---
-	client, err := newHttpClient()
+// downloadViaBrowser uses a headless browser to download the file, bypassing simple bot checks.
+// downloadViaBrowser uses a headless browser to download the file, bypassing simple bot checks.
+func downloadViaBrowser(url, destPath string, quiet bool) error {
+	// Create a temporary directory for the download
+	tmpDir, err := os.MkdirTemp("", "hokuto-dl-")
 	if err != nil {
-		return fmt.Errorf("failed to create http client: %w", err)
+		return fmt.Errorf("failed to create temp dir: %w", err)
+	}
+	defer os.RemoveAll(tmpDir) // Cleanup temp dir after we are done
+
+	opts := append(chromedp.DefaultExecAllocatorOptions[:],
+		chromedp.Flag("headless", true),
+		chromedp.Flag("disable-gpu", true),
+		chromedp.Flag("no-sandbox", true), // Often needed in containerized environments
+		chromedp.Flag("disable-dev-shm-usage", true),
+
+		// Set a realistic User-Agent to avoid immediate blocking by some filters
+		chromedp.UserAgent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"),
+	)
+
+	allocCtx, cancel := chromedp.NewExecAllocator(context.Background(), opts...)
+	defer cancel()
+
+	ctx, cancel := chromedp.NewContext(allocCtx)
+	defer cancel()
+
+	// Timeout for the entire operation (10 minutes to be safe for large files, though we wait for file existence)
+	ctx, cancel = context.WithTimeout(ctx, 10*time.Minute)
+	defer cancel()
+
+	// Setup Progress Bar
+	var bar *progressbar.ProgressBar
+	var barLock sync.Mutex
+
+	// Channel to signal that we found the downloaded file
+	foundCh := make(chan string, 1)
+	// Channel to signal chromedp error (if any)
+	chromeErrCh := make(chan error, 1)
+
+	// Listen for download events and network responses
+	chromedp.ListenTarget(ctx, func(ev interface{}) {
+		switch e := ev.(type) {
+		case *browser.EventDownloadProgress:
+			barLock.Lock()
+			defer barLock.Unlock()
+
+			if !quiet {
+				if bar == nil && e.TotalBytes > 0 {
+					desc := colArrow.Sprint("-> ") + colSuccess.Sprint("Downloading (browser)")
+					bar = progressbar.DefaultBytes(
+						int64(e.TotalBytes),
+						desc,
+					)
+				}
+				if bar != nil {
+					bar.Set(int(e.ReceivedBytes))
+					if e.State == browser.DownloadProgressStateCompleted {
+						bar.Finish()
+						fmt.Println() // Newline after bar
+					}
+				}
+			}
+
+		case *network.EventResponseReceived:
+			// Check for 404 on the main document or any relevant resource if it might be the download
+			// Note: For downloads, the response might not be "Document" but "Other" if headers trigger download.
+			// But if we get a 404, it's usually a Document/HTML error page.
+			if e.Response.Status == http.StatusNotFound {
+				// We can be strict: if we see a 404, we likely failed.
+				// But to be safe, maybe only for Document type?
+				// A 404 on a favicon should not kill the download.
+				if e.Type == network.ResourceTypeDocument {
+					select {
+					case chromeErrCh <- fmt.Errorf("browser received 404 Not Found"):
+					default:
+					}
+				}
+			}
+		}
+	})
+
+	// 1. Start polling the directory in a separate goroutine.
+	// We do this BEFORE running chromedp so we are ready to catch the file if it downloads instantly.
+	go func() {
+		ticker := time.NewTicker(1 * time.Second)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				entries, err := os.ReadDir(tmpDir)
+				if err != nil {
+					continue
+				}
+				for _, entry := range entries {
+					name := entry.Name()
+					// Check for completed file (not crdownload or tmp)
+					if !strings.HasSuffix(name, ".crdownload") && !strings.HasSuffix(name, ".tmp") {
+						foundCh <- filepath.Join(tmpDir, name)
+						return
+					}
+				}
+			}
+		}
+	}()
+
+	// 2. Run chromedp in a separate goroutine.
+	// We use an indefinite ActionFunc at the end so this goroutine BLOCKS until ctx is done.
+	// This prevents "browser finished" errors when a bot check page loads properly.
+	go func() {
+		err := chromedp.Run(ctx,
+			network.Enable(), // Enable network events to catch 404s
+			browser.SetDownloadBehavior(browser.SetDownloadBehaviorBehaviorAllow).
+				WithDownloadPath(tmpDir).
+				WithEventsEnabled(true), // Enable events for progress bar
+			chromedp.Navigate(url),
+			// Keep the browser open until the context is cancelled (by the poller finding the file)
+			chromedp.ActionFunc(func(ctx context.Context) error {
+				<-ctx.Done()
+				return nil
+			}),
+		)
+		chromeErrCh <- err
+	}()
+
+	// 3. Wait for either the file to be found, or a chrome error/timeout.
+	var downloadedFile string
+
+	select {
+	case file := <-foundCh:
+		downloadedFile = file
+		// Success! The defer cancel() at end of function will kill chrome.
+
+	case err := <-chromeErrCh:
+		// If Chrome exits, check error.
+		if err != nil && !errors.Is(err, context.Canceled) {
+			// Special handling for net::ERR_ABORTED
+			if strings.Contains(err.Error(), "net::ERR_ABORTED") {
+				debugf("Browser navigation aborted (likely download started), waiting for file...\n")
+				select {
+				case file := <-foundCh:
+					downloadedFile = file
+				case <-time.After(10 * time.Second):
+					return fmt.Errorf("browser download failed (aborted and no file found): %w", err)
+				}
+			} else {
+				return fmt.Errorf("browser download failed: %w", err)
+			}
+		} else {
+			// If Chrome exited cleanly (nil error), check for file one last time.
+			select {
+			case file := <-foundCh:
+				downloadedFile = file
+			case <-time.After(5 * time.Second):
+				return fmt.Errorf("browser finished but file was not found")
+			}
+		}
+
+	case <-ctx.Done():
+		return fmt.Errorf("timeout or context cancelled: %w", ctx.Err())
 	}
 
-	out, err := os.Create(absPath)
-	if err != nil {
-		return fmt.Errorf("failed to create destination file %s: %w", absPath, err)
-	}
-	defer out.Close()
+	// Move the downloaded file to the final destination
+	if err := os.Rename(downloadedFile, destPath); err != nil {
+		// Fallback copy if rename fails (cross-device)
+		src, err := os.Open(downloadedFile)
+		if err != nil {
+			return err
+		}
+		defer src.Close()
 
-	resp, err := client.Get(finalURL) // Use the final URL for the download
-	if err != nil {
-		return fmt.Errorf("native http get failed: %w", err)
-	}
-	defer resp.Body.Close()
+		dst, err := os.Create(destPath)
+		if err != nil {
+			return err
+		}
+		defer dst.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("download failed with status: %s", resp.Status)
-	}
-
-	_, err = io.Copy(out, resp.Body)
-	if err != nil {
-		return fmt.Errorf("failed to write to destination file: %w", err)
+		if _, err := io.Copy(dst, src); err != nil {
+			return err
+		}
 	}
 
-	debugf("Download successful with native Go HTTP client.")
 	return nil
 }
 

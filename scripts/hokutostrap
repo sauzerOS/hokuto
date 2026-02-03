@@ -166,6 +166,10 @@ else
     HOKUTO_LTO="0"
 fi
 
+# Hostname
+read -p "Enter Hostname [hokuto]: " input_hostname
+HOSTNAME="${input_hostname:-hokuto}"
+
 # 7. Installation
 log_info "Starting installation"
 
@@ -231,9 +235,9 @@ if [ ! -f "$CONF_FILE" ]; then
 # Hokuto Configuration File
 
 HOKUTO_ARCH="$ARCH"
-HOKUTO_GENERIC="$HOKUTO_GENERIC"
-HOKUTO_MULTILIB="$HOKUTO_MULTILIB"
-SET_HOKUTO_LTO="$HOKUTO_LTO"
+HOKUTO_GENERIC=$HOKUTO_GENERIC
+HOKUTO_MULTILIB=$HOKUTO_MULTILIB
+HOKUTO_LTO=$HOKUTO_LTO
 EOF
 else
     update_conf() {
@@ -246,10 +250,14 @@ else
         fi
     }
 
-    update_conf "HOKUTO_GENERIC" "$HOKUTO_GENERIC"
-    update_conf "HOKUTO_MULTILIB" "$HOKUTO_MULTILIB"
-    update_conf "SET_HOKUTO_LTO" "$HOKUTO_LTO"
+    update_conf "HOKUTO_GENERIC" $HOKUTO_GENERIC
+    update_conf "HOKUTO_MULTILIB" $HOKUTO_MULTILIB
+    update_conf "HOKUTO_LTO" $HOKUTO_LTO
 fi
+
+# 8.1 Set Hostname
+log_info "Setting hostname to '$HOSTNAME'"
+echo "$HOSTNAME" | do_as_root tee "$HOKUTO_ROOT/etc/hostname" >/dev/null
 
 # 9. Set Default Root Password
 log_info "Setting default root password to 'root'"
@@ -287,6 +295,14 @@ if [ -n "$CHPASSWD_PATH" ]; then
 else
     log_warn "chpasswd binary not found in chroot (checked /bin, /usr/bin, /sbin, /usr/sbin)."
     log_warn "Getting 'root' password requires manual setup."
+fi
+
+# 10. Generate Locales
+if [ -x "$HOKUTO_ROOT/usr/bin/locale-gen" ]; then
+    log_info "Generating locales"
+    do_as_root chroot "$HOKUTO_ROOT" locale-gen
+else
+    log_warn "locale-gen not found, skipping locale generation."
 fi
 
 log_success "Installation Complete!"

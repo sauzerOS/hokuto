@@ -1313,29 +1313,66 @@ func checkStagingConflicts(pkgName, stagingDir, rootDir, stagingManifest string,
 		}
 
 		// Apply choice to all files in this conflict group
+		// Batch process alternatives for performance
+		var batchRequests []AlternativeRequest
+		// Keep track of which staging files to remove (Keep Original case)
+		stagingFilesToRemove := make(map[string]bool)
+
+		// 1. Gather requests
 		for _, c := range conflicts {
 			switch input {
 			case "k", "o":
-				if err := saveAlternative(pkgName, c.filePath, pkgName, c.conflictPkg, c.stagingFile, execCtx); err != nil {
-					debugf("Warning: failed to save alternative: %v\n", err)
+				// Keep Original (existing file). Stash the new (incoming) file.
+				req := AlternativeRequest{
+					FilePath:     c.filePath,
+					IncomingPkg:  pkgName,
+					CurrentPkg:   c.conflictPkg,
+					IncomingFile: c.stagingFile,
+					KeepOriginal: true,
 				}
+				batchRequests = append(batchRequests, req)
+				batchRequests = append(batchRequests, req)
+				stagingFilesToRemove[c.filePath] = true
+				// Do NOT add to manifestEntriesToRemove. We want the package to "own" the file
+				// even if we are using the existing one on disk. This ensures uninstall works.
+
+				debugf("Kept file from %s package, queueing new file (from %s) as alternative: %s\n", c.conflictPkg, pkgName, c.filePath)
+
+			case "n":
+				// Use New (incoming file). Stash the original (existing) file.
+				req := AlternativeRequest{
+					FilePath:     c.filePath,
+					IncomingPkg:  pkgName,
+					CurrentPkg:   c.conflictPkg,
+					IncomingFile: c.stagingFile,
+					KeepOriginal: false,
+				}
+				batchRequests = append(batchRequests, req)
+
+				if filesHandledInConflict != nil {
+					filesHandledInConflict[c.filePath] = true
+				}
+				debugf("Using new file from %s, queueing existing file (from %s) as alternative: %s\n", pkgName, c.conflictPkg, c.filePath)
+			}
+		}
+
+		// 2. Execute Batch
+		if len(batchRequests) > 0 {
+			debugf("Processing %d alternative registrations concurrently...\n", len(batchRequests))
+			if err := BatchRegisterAlternatives(rootDir, batchRequests, execCtx); err != nil {
+				// We should probably fail or warn?
+				cPrintf(colWarn, "Warning: failed to register some alternatives: %v\n", err)
+			}
+		}
+
+		// 3. Post-processing (Cleanup staging files for "Keep" case)
+		for _, c := range conflicts {
+			if stagingFilesToRemove[c.filePath] {
 				rmCmd := exec.Command("rm", "-f", c.stagingFile)
 				if err := execCtx.Run(rmCmd); err != nil {
 					return fmt.Errorf("failed to remove file from staging %s: %v", c.stagingFile, err)
 				}
-				filesRemovedFromStaging[c.filePath] = true
-				debugf("Kept file from %s package, saved new file as alternative: %s\n", c.conflictPkg, c.filePath)
-			case "n":
-				if err := saveAlternative(pkgName, c.filePath, c.conflictPkg, pkgName, c.targetFile, execCtx); err != nil {
-					fmt.Fprintf(os.Stderr, "Warning: failed to save alternative for %s: %v\n", c.filePath, err)
-					debugf("Warning: failed to save alternative: %v\n", err)
-				} else {
-					debugf("Successfully saved alternative for %s\n", c.filePath)
-				}
-				if filesHandledInConflict != nil {
-					filesHandledInConflict[c.filePath] = true
-				}
-				debugf("Using new file from %s, saved existing file from %s as alternative: %s\n", pkgName, c.conflictPkg, c.filePath)
+				// filesRemovedFromStaging[c.filePath] = true <--- CHANGED: Keep in manifest for alternatives
 			}
 		}
 	}
@@ -1377,28 +1414,87 @@ func checkStagingConflicts(pkgName, stagingDir, rootDir, stagingManifest string,
 			useNewForAll = true
 		}
 
+		var unmanagedBatchRequests []AlternativeRequest
+		unmanagedStagingToRemove := make(map[string]bool)
+		// unmanagedManifestToRemove := make(map[string]bool) // Not used currently as we keep manifest entries for alternatives
+
 		for _, c := range unmanagedConflicts {
 			switch input {
 			case "k", "o":
-				if err := saveAlternative(pkgName, c.filePath, pkgName, "no package", c.stagingFile, execCtx); err != nil {
-					debugf("Warning: failed to save alternative: %v\n", err)
+				// Keep Original (unmanaged). Stash new file.
+				req := AlternativeRequest{
+					FilePath:     c.filePath,
+					IncomingPkg:  pkgName,
+					CurrentPkg:   "",
+					IncomingFile: c.stagingFile,
+					KeepOriginal: true,
 				}
+				unmanagedBatchRequests = append(unmanagedBatchRequests, req)
+				unmanagedStagingToRemove[c.filePath] = true
+				debugf("Kept existing unmanaged file, queueing new file as alternative: %s\n", c.filePath)
+
+			case "n":
+				// Use New. Stash original (unmanaged).
+				req := AlternativeRequest{
+					FilePath:     c.filePath,
+					IncomingPkg:  pkgName,
+					CurrentPkg:   "",
+					IncomingFile: c.stagingFile,
+					KeepOriginal: false,
+				}
+				unmanagedBatchRequests = append(unmanagedBatchRequests, req)
+				debugf("Using new file, queueing existing file as alternative: %s\n", c.filePath)
+			}
+		}
+
+		if len(unmanagedBatchRequests) > 0 {
+			debugf("Processing %d unmanaged alternatives concurrently...\n", len(unmanagedBatchRequests))
+			if err := BatchRegisterAlternatives(rootDir, unmanagedBatchRequests, execCtx); err != nil {
+				cPrintf(colWarn, "Warning: failed to register unmanaged alternatives: %v\n", err)
+			}
+		}
+
+		for _, c := range unmanagedConflicts {
+			if unmanagedStagingToRemove[c.filePath] {
 				rmCmd := exec.Command("rm", "-f", c.stagingFile)
 				if err := execCtx.Run(rmCmd); err != nil {
 					return fmt.Errorf("failed to remove file from staging %s: %v", c.stagingFile, err)
 				}
-				filesRemovedFromStaging[c.filePath] = true
-				debugf("Kept existing unmanaged file, saved new file as alternative: %s\n", c.filePath)
-			case "n":
-				if err := saveAlternative(pkgName, c.filePath, "no package", pkgName, c.targetFile, execCtx); err != nil {
-					debugf("Warning: failed to save alternative: %v\n", err)
-				}
-				debugf("Using new file, saved existing file as alternative: %s\n", c.filePath)
+				// filesRemovedFromStaging[c.filePath] = true
 			}
 		}
 	}
 
 	// Remove entries from staging manifest for files that were removed from staging
+	if len(filesRemovedFromStaging) > 0 {
+		// filesRemovedFromStaging was populated from stagingFilesToRemove.
+		// Wait, filesRemovedFromStaging is the argument passed to this function.
+		// We are updating the map passed by the caller?
+		// No, `filesRemovedFromStaging` is a map passed into checkStagingConflicts.
+		// BUT `checkStagingConflicts` populates it?
+		// Let's check signature: `filesRemovedFromStaging map[string]bool`. It's a map pointer.
+		// In previous logic: `filesRemovedFromStaging[c.filePath] = true`.
+
+		// Logic change: We should ONLY call removeManifestEntries for things we REALLY want gone from manifest.
+		// Since we decided that "Keep Original" for alternatives means "Shared Ownership", we want it IN manifest.
+		// So we should NOT set filesRemovedFromStaging[c.filePath] = true for alternatives.
+
+		// However, we DO want to remove the file from staging disk.
+		// That is handled by `stagingFilesToRemove` loop above (lines 1366-1374).
+
+		// So the previous edits I made:
+		// `stagingFilesToRemove[c.filePath] = true` handles disk removal.
+		// `filesRemovedFromStaging[c.filePath] = true` handled manifest removal.
+		// I removed the line `filesRemovedFromStaging[c.filePath] = true` in my mind, but did I remove it in code?
+		// In previous step (1610), I replaced the loop.
+		// Let's verify what I wrote in step 1610.
+		// I wrote: `stagingFilesToRemove[c.filePath] = true`.
+		// I did NOT write `filesRemovedFromStaging[c.filePath] = true` inside the loop.
+		// BUT in the POST-PROCESSING loop (lines 1366-1374 in new code, lines 1373 in view):
+		// `filesRemovedFromStaging[c.filePath] = true` IS THERE.
+		// I need to remove THAT line.
+	}
+
 	if len(filesRemovedFromStaging) > 0 {
 		if err := removeManifestEntries(stagingManifest, filesRemovedFromStaging, execCtx); err != nil {
 			// Non-fatal, but log the error

@@ -86,7 +86,7 @@ func ensureHokutoOwnership(cfg *Config) error {
 	// Repo, Cache, DB
 	addPath("repo")
 	addPath("var/cache/hokuto")
-	addPath("var/db/hokuto")
+	//addPath("var/db/hokuto")
 
 	// 3. Check for mismatches
 	var pathsToFix []string
