@@ -177,6 +177,17 @@ func resolveMissingDeps(pkgName string, processed map[string]bool, missing *[]st
 			continue
 		}
 
+		// New filtering: skip crossnative dependencies unless we are in a cross-native build
+		// (Cross-native build = HOKUTO_CROSS_ARCH set AND HOKUTO_CROSS_SYSTEM unset/empty)
+		if dep.CrossNative {
+			if cfg.Values["HOKUTO_CROSS_ARCH"] == "" {
+				continue // Skip on native
+			}
+			if cfg.Values["HOKUTO_CROSS_SYSTEM"] == "1" {
+				continue // Skip on cross-system (toolchain) build
+			}
+		}
+
 		// FILTER: When in cross-mode, ignore dependencies that don't match the target architecture
 		if cfg.Values["HOKUTO_CROSS_ARCH"] != "" {
 			normalizedArch := cfg.Values["HOKUTO_CROSS_ARCH"]
@@ -596,11 +607,11 @@ func resolveAlternativeDep(dep DepSpec, yes bool) (string, error) {
 
 // parseDepToken parses tokens like "pkg", "pkg<=1.2.3 optional", "pkg rebuild" and returns name, op, version, and flags.
 
-func parseDepToken(token string) (name string, op string, ver string, optional bool, rebuild bool, makeDep bool, cross bool) {
+func parseDepToken(token string) (name string, op string, ver string, optional bool, rebuild bool, makeDep bool, cross bool, crossNative bool) {
 	// Split by whitespace to separate package spec from flags
 	parts := strings.Fields(token)
 	if len(parts) == 0 {
-		return "", "", "", false, false, false, false
+		return "", "", "", false, false, false, false, false
 	}
 
 	pkgSpec := parts[0]
@@ -615,6 +626,9 @@ func parseDepToken(token string) (name string, op string, ver string, optional b
 			makeDep = true
 		case "cross":
 			cross = true
+		case "crossnative":
+			crossNative = true
+			cross = true // Implies cross because it's only for cross-compilation scenarios
 		}
 	}
 
@@ -624,10 +638,10 @@ func parseDepToken(token string) (name string, op string, ver string, optional b
 		if idx := strings.Index(pkgSpec, op); idx != -1 {
 			name := pkgSpec[:idx]
 			ver := pkgSpec[idx+len(op):]
-			return strings.TrimSpace(name), op, strings.TrimSpace(ver), optional, rebuild, makeDep || cross, cross
+			return strings.TrimSpace(name), op, strings.TrimSpace(ver), optional, rebuild, makeDep || cross, cross, crossNative
 		}
 	}
-	return pkgSpec, "", "", optional, rebuild, makeDep || cross, cross
+	return pkgSpec, "", "", optional, rebuild, makeDep || cross, cross, crossNative
 }
 
 // BuildPlan represents the complete build plan with proper ordering
@@ -642,8 +656,10 @@ type BuildPlan struct {
 
 // resolveBuildPlan creates a dynamic, context-aware build plan.
 // It correctly handles resolvable circular dependencies caused by optional dependencies.
+// binaryAvailable is a map of package names that have a pre-built binary available (locally or remotely).
+// If a package is in this map, its Make dependencies will be treated as if it were already installed.
 
-func resolveBuildPlan(targetPackages []string, userRequestedPackages map[string]bool, withRebuilds bool, cfg *Config) (*BuildPlan, error) {
+func resolveBuildPlan(targetPackages []string, userRequestedPackages map[string]bool, withRebuilds bool, cfg *Config, binaryAvailable map[string]bool) (*BuildPlan, error) {
 	plan := &BuildPlan{
 		Order:             []string{},
 		SkippedPackages:   make(map[string]string),
@@ -689,6 +705,16 @@ func resolveBuildPlan(targetPackages []string, userRequestedPackages map[string]
 				continue
 			}
 
+			// New filtering: skip crossnative dependencies unless we are in a cross-native build
+			if dep.CrossNative {
+				if cfg.Values["HOKUTO_CROSS_ARCH"] == "" {
+					continue
+				}
+				if cfg.Values["HOKUTO_CROSS_SYSTEM"] == "1" {
+					continue
+				}
+			}
+
 			// FILTER: When in cross-mode, ignore dependencies that don't match the target architecture
 			if cfg.Values["HOKUTO_CROSS_ARCH"] != "" {
 				normalizedArch := cfg.Values["HOKUTO_CROSS_ARCH"]
@@ -715,11 +741,30 @@ func resolveBuildPlan(targetPackages []string, userRequestedPackages map[string]
 				continue
 			}
 
-			// Skip Make dependencies if the package is installed and not forced to rebuild
-			// We check both user requested set and plan.RebuildPackages (though RebuildPackages might not be fully populated yet for downstream,
-			// it tracks explicit rebuilds triggered by other things).
-			if dep.Make && isPackageInstalled(pkgName) && !userRequestedPackages[pkgName] && !plan.RebuildPackages[pkgName] {
-				continue
+			// Skip Make dependencies if:
+			// 1. The package is already installed, OR
+			// 2. A binary is available (locally or remotely) which we intend to use.
+			// AND it's not a forced rebuild.
+			hasBinary := binaryAvailable != nil && binaryAvailable[pkgName]
+			isInstalled := isPackageInstalled(pkgName)
+
+			if dep.Make {
+				skip := false
+				// Case 1: Binary Available (e.g. from update check).
+				// We skip make deps even if userRequestedPackages is true (because update list counts as user requested),
+				// unless specifically forced to rebuild (which update generally doesn't set).
+				if hasBinary && !plan.RebuildPackages[pkgName] {
+					skip = true
+				}
+				// Case 2: Installed and NOT requested by user.
+				// If installed but user requested it (e.g. "build foo"), we do NOT skip make deps because we are rebuilding.
+				if isInstalled && !userRequestedPackages[pkgName] && !plan.RebuildPackages[pkgName] {
+					skip = true
+				}
+
+				if skip {
+					continue
+				}
 			}
 			if depName == pkgName {
 				continue
@@ -1031,7 +1076,7 @@ func getInstalledDeps(pkgName string) ([]string, error) {
 			continue
 		}
 		// Parse "pkgname>=1.0" -> "pkgname"
-		name, _, _, _, _, _, _ := parseDepToken(line)
+		name, _, _, _, _, _, _, _ := parseDepToken(line)
 		if name != "" && name != pkgName {
 			// FILTER: Ignore 32-bit dependencies if multilib is disabled
 			if !EnableMultilib && strings.HasSuffix(name, "-32") {
@@ -1051,6 +1096,7 @@ type DepSpec struct {
 	Rebuild      bool
 	Make         bool     // True if dependency is only needed at build time
 	Cross        bool     // True if dependency is only for cross-compilation
+	CrossNative  bool     // True if dependency is only for cross-compilation AND NOT cross-system
 	Alternatives []string // List of alternative package names (e.g., ["rust", "rustup"] for "rust | rustup")
 }
 

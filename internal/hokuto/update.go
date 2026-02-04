@@ -500,7 +500,41 @@ func checkForUpgrades(_ context.Context, cfg *Config, maxJobs int) error {
 		userRequestedMap = map[string]bool{"hokuto": true}
 	}
 
-	plan, err := resolveBuildPlan(pkgNames, userRequestedMap, false, cfg)
+	// 4.5. Pre-check for available binaries to avoid pulling in build dependencies
+	binaryAvailable := make(map[string]bool)
+	if len(pkgNames) > 0 {
+		colArrow.Print("-> ")
+		colSuccess.Printf("Checking for binary availability\n")
+		// Use fetching logic to populate binaryAvailable
+		for _, pkgName := range pkgNames {
+			version, revision, err := getRepoVersion2(pkgName)
+			if err != nil {
+				continue
+			}
+
+			outputPkgName := getOutputPackageName(pkgName, cfg)
+			arch := GetSystemArch(cfg)
+			variant := GetSystemVariantForPackage(cfg, pkgName)
+			tarballName := StandardizeRemoteName(outputPkgName, version, revision, arch, variant)
+			tarballPath := filepath.Join(BinDir, tarballName)
+
+			// 1. Check local cache
+			if _, err := os.Stat(tarballPath); err == nil {
+				binaryAvailable[pkgName] = true
+				continue
+			}
+
+			// 2. Check remote mirror (prefetch)
+			if BinaryMirror != "" {
+				// Use quiet mode for check
+				if err := fetchBinaryPackage(pkgName, version, revision, cfg, true); err == nil {
+					binaryAvailable[pkgName] = true
+				}
+			}
+		}
+	}
+
+	plan, err := resolveBuildPlan(pkgNames, userRequestedMap, false, cfg, binaryAvailable)
 	if err != nil {
 		return fmt.Errorf("failed to resolve upgrade plan: %w", err)
 	}

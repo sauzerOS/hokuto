@@ -444,8 +444,12 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, opts BuildOptions)
 	// Check if LTO should be enabled
 	shouldLTO := cfg.DefaultLTO
 	if options["nolto"] {
-		colArrow.Print("-> ")
-		colSuccess.Printf("Disabling LTO.\n")
+		if opts.LogWriter == nil {
+			colArrow.Print("-> ")
+			colSuccess.Printf("Disabling LTO.\n")
+		} else {
+			fmt.Fprintf(opts.LogWriter, "Disabling LTO.\n")
+		}
 		shouldLTO = false // Override the global setting for this package only
 	}
 
@@ -646,8 +650,8 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, opts BuildOptions)
 				cxxflagsVal = cfg.Values["CXXFLAGS_ARM64"]
 				debugf("Using optimized ARM64 flags: %s\n", cflagsVal)
 			} else {
-				cflagsVal = "-O2 -pipe -mtune=generic"
-				cxxflagsVal = "-O2 -pipe -mtune=generic"
+				cflagsVal = "-O2 -pipe -mtune=generic -fPIC"
+				cxxflagsVal = "-O2 -pipe -mtune=generic -fPIC"
 				debugf("Using generic flags for ARM64 target.\n")
 			}
 			ldflagsVal = cfg.Values["LDFLAGS"]
@@ -781,6 +785,13 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, opts BuildOptions)
 			crossArch := cfg.Values["HOKUTO_CROSS_ARCH"]
 			defaults["HOKUTO_CARCH"] = crossArch
 
+			if cfg.Values["HOKUTO_CROSS_SYSTEM"] == "1" {
+				defaults["HOKUTO_CROSS_SYSTEM"] = "1"
+			}
+			if cfg.Values["HOKUTO_CROSS_SIMPLE"] == "1" {
+				defaults["HOKUTO_CROSS_SIMPLE"] = "1"
+			}
+
 			// Normalize architecture name for toolchain prefix
 			normalizedArch := crossArch
 			if normalizedArch == "arm64" {
@@ -821,9 +832,12 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, opts BuildOptions)
 				}
 
 				// Set PKG_CONFIG environment variables to avoid host pollution
-				defaults["PKG_CONFIG_LIBDIR"] = filepath.Join(prefix, "lib", "pkgconfig") + ":" + filepath.Join(prefix, "share", "pkgconfig")
-				defaults["PKG_CONFIG_SYSROOT_DIR"] = prefix
-				defaults["PKG_CONFIG_PATH"] = "" // Clear to avoid host pollution
+				// BUT skip this if we are building a host tool (native), so we use host libraries/headers
+				if !shouldBuildHostNative {
+					defaults["PKG_CONFIG_LIBDIR"] = filepath.Join(prefix, "lib", "pkgconfig") + ":" + filepath.Join(prefix, "share", "pkgconfig")
+					defaults["PKG_CONFIG_SYSROOT_DIR"] = prefix
+					defaults["PKG_CONFIG_PATH"] = "" // Clear to avoid host pollution
+				}
 
 				// Set PYTHONPATH to include target site-packages for build-time module detection
 				defaults["PYTHONPATH"] = filepath.Join(prefix, "lib", "python3.14", "site-packages")
@@ -1543,7 +1557,11 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 	// Check if LTO should be enabled
 	shouldLTO := cfg.DefaultLTO
 	if options["nolto"] {
-		cPrintf(colInfo, "Disabling LTO.\n")
+		if logger == nil || logger == os.Stdout {
+			cPrintf(colInfo, "Disabling LTO.\n")
+		} else {
+			fmt.Fprintf(logger, "Disabling LTO.\n")
+		}
 		shouldLTO = false // Override the global setting for this package only
 	}
 
@@ -2790,7 +2808,8 @@ func handleBuildCommand(args []string, cfg *Config) error {
 				colArrow.Print("-> ")
 				colSuccess.Printf("Processing Top-Level Dependency %d/%d: %s \n", i+1, len(orderedTopLevelDeps), pkgName)
 
-				plan, err := resolveBuildPlan([]string{pkgName}, userRequestedMap, effectiveRebuilds, cfg)
+				// ordered build mode typically builds from source
+				plan, err := resolveBuildPlan([]string{pkgName}, userRequestedMap, effectiveRebuilds, cfg, nil)
 				if err != nil {
 					return fmt.Errorf("error generating build plan for '%s': %v", pkgName, err)
 				}
@@ -2840,7 +2859,7 @@ func handleBuildCommand(args []string, cfg *Config) error {
 			} else {
 				colArrow.Print("-> ")
 				colSuccess.Println("Generating Build Plan")
-				initialPlan, err = resolveBuildPlan(buildListInput, userRequestedMap, effectiveRebuilds, cfg)
+				initialPlan, err = resolveBuildPlan(buildListInput, userRequestedMap, effectiveRebuilds, cfg, nil)
 			}
 			if err != nil {
 				return fmt.Errorf("error generating build plan: %v", err)

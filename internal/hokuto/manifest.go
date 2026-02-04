@@ -55,11 +55,12 @@ func generateManifest(outputDir, installedDir string, execCtx *Executor) error {
 		}
 	}
 
-	entries, err := listOutputFiles(outputDir, execCtx)
+	// Optimized file listing
+	entries, err := listOutputFilesWithTypes(outputDir, execCtx)
 	if err != nil {
 		// fallback to RootExec
 		execCtx = RootExec
-		entries, err = listOutputFiles(outputDir, execCtx)
+		entries, err = listOutputFilesWithTypes(outputDir, execCtx)
 		if err != nil {
 			return fmt.Errorf("failed to list output files: %v", err)
 		}
@@ -71,10 +72,26 @@ func generateManifest(outputDir, installedDir string, execCtx *Executor) error {
 	}
 	manifestEntryPath := "/" + relManifest
 
-	filtered := make([]string, 0, len(entries))
+	// Filter and categorize
+	var dirs, symlinks, regularFiles, allEntries []string
+	symlinkMap := make(map[string]bool)
+
 	for _, e := range entries {
-		if e != manifestEntryPath {
-			filtered = append(filtered, e)
+		if e.Path == manifestEntryPath {
+			continue
+		}
+
+		allEntries = append(allEntries, e.Path)
+		absPath := filepath.Join(outputDir, strings.TrimPrefix(e.Path, "/"))
+
+		switch e.FileType {
+		case "d":
+			dirs = append(dirs, e.Path)
+		case "l":
+			symlinks = append(symlinks, e.Path)
+			symlinkMap[e.Path] = true
+		default:
+			regularFiles = append(regularFiles, absPath)
 		}
 	}
 
@@ -82,69 +99,56 @@ func generateManifest(outputDir, installedDir string, execCtx *Executor) error {
 	if err != nil {
 		return fmt.Errorf("failed to open temporary manifest file: %v", err)
 	}
-	defer f.Close()
 
-	var dirs, symlinks, regularFiles []string
-	symlinkMap := make(map[string]bool)
-
-	for _, entry := range filtered {
-		if strings.HasSuffix(entry, "/") {
-			dirs = append(dirs, entry)
-			continue
-		}
-		absPath := filepath.Join(outputDir, strings.TrimPrefix(entry, "/"))
-		fileType, err := lstatViaExecutor(absPath, execCtx)
-		if err != nil {
-			return fmt.Errorf("failed to lstat %s: %v", absPath, err)
-		}
-		if fileType == "symbolic link" {
-			symlinks = append(symlinks, entry)
-			symlinkMap[entry] = true
-		} else {
-			regularFiles = append(regularFiles, absPath)
-		}
-	}
-
-	// Write directory entries correctly
+	// Write directory entries
 	for _, entry := range dirs {
-		rel := strings.TrimPrefix(entry, "/")
-		if !strings.HasSuffix(rel, "/") {
-			rel += "/"
+		// Ensure it ends with /
+		cleaned := entry
+		if !strings.HasSuffix(cleaned, "/") {
+			cleaned += "/"
 		}
-		cleaned := "/" + rel
 		if _, err := fmt.Fprintln(f, cleaned); err != nil {
+			f.Close()
 			return fmt.Errorf("failed to write manifest entry: %v", err)
 		}
 	}
 
+	// Write symlink entries (000000 checksum)
 	for _, entry := range symlinks {
 		if _, err := fmt.Fprintf(f, "%s 000000\n", entry); err != nil {
+			f.Close()
 			return fmt.Errorf("failed to write symlink entry: %v", err)
 		}
 	}
 
+	// Compute checksums for regular files
 	var checksums map[string]string
 	checksums, err = ComputeChecksums(regularFiles, execCtx)
 	if err != nil {
+		f.Close()
 		return fmt.Errorf("failed to compute checksums: %v", err)
 	}
 
-	for _, entry := range filtered {
+	// Write regular file entries
+	for _, entry := range allEntries {
 		if strings.HasSuffix(entry, "/") || symlinkMap[entry] {
 			continue
 		}
 		absPath := filepath.Join(outputDir, strings.TrimPrefix(entry, "/"))
 		checksum, exists := checksums[absPath]
 		if !exists {
+			f.Close()
 			return fmt.Errorf("missing checksum for %s", absPath)
 		}
 		if _, err := fmt.Fprintf(f, "%s  %s\n", entry, checksum); err != nil {
+			f.Close()
 			return fmt.Errorf("failed to write manifest entry: %v", err)
 		}
 	}
 
 	f.Close()
 
+	// Append the manifest's own checksum
 	tempChecksum, err := ComputeChecksum(tmpManifest, execCtx)
 	if err != nil {
 		return fmt.Errorf("failed to compute checksum for temporary manifest %s: %v", tmpManifest, err)
@@ -171,7 +175,7 @@ func generateManifest(outputDir, installedDir string, execCtx *Executor) error {
 		}
 	}
 
-	debugf("Manifest written to %s (%d entries)\n", manifestFile, len(filtered))
+	debugf("Manifest written to %s (%d entries)\n", manifestFile, len(allEntries))
 	return nil
 }
 

@@ -426,7 +426,7 @@ func generateDepends(pkgName, pkgDir, outputDir, rootDir string, execCtx *Execut
 			line = strings.TrimSpace(line)
 			if line != "" && !strings.HasPrefix(line, "#") {
 				// Extract package name to use as key in the map
-				name, op, ver, optional, rebuild, makeDep, _ := parseDepToken(line)
+				name, op, ver, optional, rebuild, makeDep, _, _ := parseDepToken(line)
 				if name != "" {
 					// Skip build-time only dependencies
 					if makeDep {
@@ -554,7 +554,7 @@ func generateDepends(pkgName, pkgDir, outputDir, rootDir string, execCtx *Execut
 }
 
 // isDirectoryPrivileged uses the Executor to check if a path is a directory.
-// helper for listOutputFiles
+// helper for listOutputFilesWithTypes
 
 func executePostInstall(pkgName, rootDir string, execCtx *Executor, cfg *Config, logger io.Writer) error {
 	if logger == nil {

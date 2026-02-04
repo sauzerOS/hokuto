@@ -54,7 +54,7 @@ func newHttpClient() (*http.Client, error) {
 
 	return &http.Client{
 		Transport: transport,
-		Timeout:   300 * time.Second, // 5 min total timeout for large downloads
+		Timeout:   5 * time.Minute, // User requested 5m global timeout
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			if len(via) >= 10 {
 				return fmt.Errorf("stopped after 10 redirects")
@@ -75,6 +75,29 @@ func newHttpClient() (*http.Client, error) {
 
 type downloadOptions struct {
 	Quiet bool // Quiet suppresses all stdout/stderr/progress output
+}
+
+type IdleTimeoutReader struct {
+	src     io.ReadCloser
+	timeout time.Duration
+	timer   *time.Timer
+	cancel  context.CancelFunc
+}
+
+func (r *IdleTimeoutReader) Read(p []byte) (int, error) {
+	if r.timer == nil {
+		r.timer = time.AfterFunc(r.timeout, r.cancel)
+	} else {
+		r.timer.Reset(r.timeout)
+	}
+	return r.src.Read(p)
+}
+
+func (r *IdleTimeoutReader) Close() error {
+	if r.timer != nil {
+		r.timer.Stop()
+	}
+	return r.src.Close()
 }
 
 func tryRemoveCachedFile(path string) {
@@ -178,7 +201,11 @@ func downloadFileWithOptions(originalURL, finalURL, destFile string, opt downloa
 			break // Cannot proceed with native client
 		}
 
-		req, err := http.NewRequest("GET", finalURL, nil)
+		// Local context for this attempt, allowing cancellation on idle timeout
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		req, err := http.NewRequestWithContext(ctx, "GET", finalURL, nil)
 		if err != nil {
 			nativeErr = fmt.Errorf("failed to create http request: %w", err)
 			break
@@ -238,11 +265,18 @@ func downloadFileWithOptions(originalURL, finalURL, destFile string, opt downloa
 				writer = io.MultiWriter(out, bar)
 			}
 
-			_, err = io.Copy(writer, resp.Body)
-			resp.Body.Close()
+			// Wrap response body with idle timeout reader
+			wrappedBody := &IdleTimeoutReader{
+				src:     resp.Body,
+				timeout: 15 * time.Second,
+				cancel:  cancel,
+			}
+
+			_, err = io.Copy(writer, wrappedBody)
+			wrappedBody.Close() // Close response body and stop timer
 			if bar != nil {
 				bar.Finish()
-				fmt.Println()
+				// fmt.Println() // Removed extra newline per user request
 			}
 			if err != nil {
 				// Write failed
@@ -368,7 +402,7 @@ func downloadViaBrowser(url, destPath string, quiet bool) error {
 					bar.Set(int(e.ReceivedBytes))
 					if e.State == browser.DownloadProgressStateCompleted {
 						bar.Finish()
-						fmt.Println() // Newline after bar
+						// fmt.Println() // Newline after bar
 					}
 				}
 			}
@@ -509,7 +543,7 @@ func fetchBinaryPackage(pkgName, version, revision string, cfg *Config, quiet bo
 		return fmt.Errorf("no HOKUTO_MIRROR configured")
 	}
 
-	arch := GetSystemArch(cfg)
+	arch := GetSystemArchForPackage(cfg, lookupName)
 	variant := GetSystemVariantForPackage(cfg, lookupName)
 	filename := StandardizeRemoteName(lookupName, version, revision, arch, variant)
 	url := fmt.Sprintf("%s/%s", BinaryMirror, filename)

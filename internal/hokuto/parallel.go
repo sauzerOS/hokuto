@@ -289,6 +289,25 @@ func (pm *ParallelManager) installPackage(pkgName string, userRequestedMap map[s
 
 	// We use RootExec for installation as it requires privileges
 	isCriticalAtomic.Store(1)
+
+	// Fix: Skip install for cross-builds as we don't want to install target binaries to host
+	// BUT, we MUST install cross-system packages (e.g. aarch64-gcc, aarch64-glibc)
+	if pm.Config.Values["HOKUTO_CROSS"] == "1" || pm.Config.Values["HOKUTO_CROSS_ARCH"] != "" {
+		crossArch := pm.Config.Values["HOKUTO_CROSS_ARCH"]
+		isCrossSystemPkg := false
+		if crossArch != "" {
+			isCrossSystemPkg = strings.HasPrefix(pkgName, crossArch+"-")
+		}
+
+		if !isCrossSystemPkg {
+			isCriticalAtomic.Store(0)
+			if userRequestedMap[pkgName] {
+				addToWorld(pkgName)
+			}
+			return nil
+		}
+	}
+
 	// Check for conflicts before install
 	handlePreInstallUninstall(outputPkgName, pm.Config, RootExec, pm.AutoYes)             // Pass AutoYes
 	err = pkgInstall(tarballPath, outputPkgName, pm.Config, RootExec, pm.AutoYes, logger) // Pass AutoYes

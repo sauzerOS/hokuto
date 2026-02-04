@@ -221,7 +221,7 @@ func generatePackageFromArch(pkgName string, source string, targetDir string) er
 
 	// 3. Create sources file (with version substituted)
 	sourcesPath := filepath.Join(pkgDir, "sources")
-	sourcesContent := applySubstitutions(dotSourcesContent, info.Version, pkgName)
+	sourcesContent := applySubstitutions(dotSourcesContent, info.Version, pkgName, nil)
 	if err := os.WriteFile(sourcesPath, []byte(sourcesContent), 0o644); err != nil {
 		return fmt.Errorf("failed to create sources file: %w", err)
 	}

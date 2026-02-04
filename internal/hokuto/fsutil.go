@@ -55,9 +55,15 @@ func lstatViaExecutor(path string, execCtx *Executor) (string, error) {
 	return strings.TrimSpace(out.String()), nil
 }
 
-func listOutputFiles(outputDir string, execCtx *Executor) ([]string, error) {
+type FileListEntry struct {
+	Path     string
+	FileType string // "f" for file, "d" for directory, "l" for symlink
+}
+
+func listOutputFilesWithTypes(outputDir string, execCtx *Executor) ([]FileListEntry, error) {
+	// Optimization: If we have root (or don't need it), use native Go
 	if os.Geteuid() == 0 || !execCtx.ShouldRunAsRoot {
-		var entries []string
+		var entries []FileListEntry
 		err := filepath.Walk(outputDir, func(path string, info os.FileInfo, err error) error {
 			if err != nil {
 				return err
@@ -75,34 +81,59 @@ func listOutputFiles(outputDir string, execCtx *Executor) ([]string, error) {
 				return nil
 			}
 
+			entry := FileListEntry{}
 			if info.IsDir() {
-				entries = append(entries, "/"+rel+"/")
+				entry.Path = "/" + rel + "/"
+				entry.FileType = "d"
+			} else if info.Mode()&os.ModeSymlink != 0 {
+				entry.Path = "/" + rel
+				entry.FileType = "l"
 			} else {
-				entries = append(entries, "/"+rel)
+				entry.Path = "/" + rel
+				entry.FileType = "f"
 			}
+			entries = append(entries, entry)
 			return nil
 		})
 		if err != nil {
 			return nil, fmt.Errorf("failed to list output files natively: %v", err)
 		}
-		sort.Strings(entries)
+		sort.Slice(entries, func(i, j int) bool {
+			return entries[i].Path < entries[j].Path
+		})
 		return entries, nil
 	}
 
-	var entries []string
-	cmd := exec.Command("find", outputDir)
+	// Privileged path: Use 'find' with -printf for massive speedup
+	// %y returns type (f=file, d=dir, l=link)
+	// %p returns full path
+	// Output format: type path
+	var entries []FileListEntry
+	cmd := exec.Command("find", outputDir, "-printf", "%y %p\\n")
 	var out bytes.Buffer
 	cmd.Stdout = &out
+	// Only capture stderr if debug is on
 	if !Debug {
 		cmd.Stderr = io.Discard
+	} else {
+		cmd.Stderr = os.Stderr
 	}
+
 	if err := execCtx.Run(cmd); err != nil {
 		return nil, fmt.Errorf("failed to list output files via find: %v", err)
 	}
 
 	scanner := bufio.NewScanner(&out)
 	for scanner.Scan() {
-		path := scanner.Text()
+		line := scanner.Text()
+		if len(line) < 2 {
+			continue
+		}
+
+		// Parse "type path"
+		// First char is type (f, d, l)
+		ftype := string(line[0])
+		path := strings.TrimSpace(line[2:])
 
 		rel, err := filepath.Rel(outputDir, path)
 		if err != nil {
@@ -117,23 +148,21 @@ func listOutputFiles(outputDir string, execCtx *Executor) ([]string, error) {
 			continue
 		}
 
-		isDir, err := isDirectoryPrivileged(path, execCtx)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: failed to stat file with privilege, skipping %s: %v\n", path, err)
-			continue
-		}
-
-		if isDir {
-			entries = append(entries, "/"+rel+"/")
+		entry := FileListEntry{FileType: ftype}
+		if ftype == "d" {
+			entry.Path = "/" + rel + "/"
 		} else {
-			entries = append(entries, "/"+rel)
+			entry.Path = "/" + rel
 		}
+		entries = append(entries, entry)
 	}
 	if err := scanner.Err(); err != nil {
 		return nil, fmt.Errorf("scanner error: %v", err)
 	}
 
-	sort.Strings(entries)
+	sort.Slice(entries, func(i, j int) bool {
+		return entries[i].Path < entries[j].Path
+	})
 	return entries, nil
 }
 
@@ -715,5 +744,22 @@ func copyFileAsRoot(src, dst string, execCtx *Executor) error {
 
 	// Use sudo cp to preserve attributes if possible
 	cmd := exec.Command("sudo", "cp", "-a", src, dst)
+	return execCtx.Run(cmd)
+}
+
+// removeFileAsRoot removes a file using the executor
+func removeFileAsRoot(path string, execCtx *Executor) error {
+	// Try native remove first
+	err := os.Remove(path)
+	if err == nil || os.IsNotExist(err) {
+		return nil
+	}
+
+	if os.Geteuid() == 0 {
+		return err
+	}
+
+	// Use sudo rm
+	cmd := exec.Command("sudo", "rm", "-f", path)
 	return execCtx.Run(cmd)
 }

@@ -5,14 +5,73 @@ package hokuto
 
 import (
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 )
 
-func applySubstitutions(content, version, pkgName string) string {
+func getAntigravityString() (string, error) {
+	baseURL := "https://antigravity.google"
+	resp, err := http.Get(baseURL + "/download/linux")
+	if err != nil {
+		return "", fmt.Errorf("failed to fetch download page: %v", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("failed to read response body: %v", err)
+	}
+
+	// Find the main JS file
+	// <script src="main-UR65DTH6.js" type="module"></script>
+	reScript := regexp.MustCompile(`src="(main-[a-zA-Z0-9]+\.js)"`)
+	matchesScript := reScript.FindSubmatch(body)
+	if len(matchesScript) < 2 {
+		return "", fmt.Errorf("could not find main.js script in download page")
+	}
+	jsFile := string(matchesScript[1])
+
+	// Fetch main.js
+	respJS, err := http.Get(baseURL + "/" + jsFile)
+	if err != nil {
+		return "", fmt.Errorf("failed to fetch JS file %s: %v", jsFile, err)
+	}
+	defer respJS.Body.Close()
+
+	jsBody, err := io.ReadAll(respJS.Body)
+	if err != nil {
+		return "", fmt.Errorf("failed to read JS body: %v", err)
+	}
+
+	// Look for the version string in any link (Windows/Mac links are hardcoded in the JS)
+	// href:"https://edgedl.me.gvt1.com/edgedl/release2/j0qc3/antigravity/stable/1.16.5-6703236727046144/windows-x64/Antigravity.exe"
+	re := regexp.MustCompile(`/stable/[\d\.]+-(\d+)/`)
+	matches := re.FindSubmatch(jsBody)
+	if len(matches) < 2 {
+		return "", fmt.Errorf("could not find version string in JS file")
+	}
+
+	return string(matches[1]), nil
+}
+
+func getExtraSubs(pkgName string) (map[string]string, error) {
+	if filepath.Base(pkgName) == "antigravity" {
+		s, err := getAntigravityString()
+		if err != nil {
+			return nil, err
+		}
+		return map[string]string{"${string}": s}, nil
+	}
+	return nil, nil
+}
+
+func applySubstitutions(content, version, pkgName string, extraSubs map[string]string) string {
 	sepFunc := func(r rune) bool {
 		return r == '.' || r == '_' || r == '-'
 	}
@@ -47,7 +106,7 @@ func applySubstitutions(content, version, pkgName string) string {
 		sqliteVer = fmt.Sprintf("%d%02d%02d%02d", v[0], v[1], v[2], v[3])
 	}
 
-	r := strings.NewReplacer(
+	args := []string{
 		"${version}", version,
 		"${version-clean}", strings.ReplaceAll(version, "_", "."),
 		"${version_}", strings.ReplaceAll(version, ".", "_"),
@@ -59,7 +118,13 @@ func applySubstitutions(content, version, pkgName string) string {
 		"${version-glued-last}", versionGluedLast,
 		"${version-last-only}", versionLastOnly,
 		"${pkgname}", pkgName,
-	)
+	}
+
+	for k, v := range extraSubs {
+		args = append(args, k, v)
+	}
+
+	r := strings.NewReplacer(args...)
 	return r.Replace(content)
 }
 
@@ -223,7 +288,14 @@ func editPackage(pkgName string, openAll bool) error {
 			return fmt.Errorf("failed to read .sources file: %v", err)
 		}
 
-		updatedSources := applySubstitutions(string(dotSourcesData), version, pkgName)
+		extraSubs, err := getExtraSubs(pkgName)
+		if err != nil {
+			// If we fail to get extra subs (e.g. download failed), warn but proceed?
+			// Or fail? For editPackage, maybe just warn?
+			fmt.Printf("Warning: failed to get extra substitutions: %v\n", err)
+		}
+
+		updatedSources := applySubstitutions(string(dotSourcesData), version, pkgName, extraSubs)
 		if err := os.WriteFile(sourcesPath, []byte(updatedSources), 0o644); err != nil {
 			return fmt.Errorf("failed to write updated sources file: %v", err)
 		}
@@ -344,7 +416,12 @@ func bumpPackage(pkgName, expectedOldVersion, newVersion string) (string, error)
 	if err != nil {
 		return "", fmt.Errorf("%s: failed to read .sources", pkgName)
 	}
-	updatedSources := applySubstitutions(string(dotSourcesData), newVersion, pkgName)
+	extraSubs, err := getExtraSubs(pkgName)
+	if err != nil {
+		return "", fmt.Errorf("failed to get extra substitutions: %w", err)
+	}
+
+	updatedSources := applySubstitutions(string(dotSourcesData), newVersion, pkgName, extraSubs)
 	sourcesPath := filepath.Join(pkgDir, "sources")
 	if err := os.WriteFile(sourcesPath, []byte(updatedSources), 0o644); err != nil {
 		return "", fmt.Errorf("%s: failed to update sources file", pkgName)

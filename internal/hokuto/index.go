@@ -295,7 +295,7 @@ func parseDependsData(content []byte) ([]DepSpec, error) {
 			dependencies = append(dependencies, altDeps...)
 		} else {
 			// Regular dependency parsing
-			name, op, ver, optional, rebuild, makeDep, cross := parseDepToken(line)
+			name, op, ver, optional, rebuild, makeDep, cross, crossNative := parseDepToken(line)
 			if name != "" {
 				dependencies = append(dependencies, DepSpec{
 					Name:         name,
@@ -305,6 +305,7 @@ func parseDependsData(content []byte) ([]DepSpec, error) {
 					Rebuild:      rebuild,
 					Make:         makeDep,
 					Cross:        cross,
+					CrossNative:  crossNative,
 					Alternatives: nil,
 				})
 			}
@@ -321,11 +322,11 @@ func parseAlternativeDeps(line string) ([]DepSpec, error) {
 	parts := strings.Split(line, "|")
 	var alternatives []string
 	var commonOp, commonVer string
-	var commonOptional, commonRebuild, commonMake, commonCross bool
+	var commonOptional, commonRebuild, commonMake, commonCross, commonCrossNative bool
 
 	for i, part := range parts {
 		part = strings.TrimSpace(part)
-		name, op, ver, optional, rebuild, makeDep, cross := parseDepToken(part)
+		name, op, ver, optional, rebuild, makeDep, cross, crossNative := parseDepToken(part)
 		if name != "" {
 			alternatives = append(alternatives, name)
 			// Assuming common flags for all alternatives in a single line
@@ -336,6 +337,7 @@ func parseAlternativeDeps(line string) ([]DepSpec, error) {
 				commonRebuild = rebuild
 				commonMake = makeDep
 				commonCross = cross
+				commonCrossNative = crossNative
 			}
 		}
 	}
@@ -353,6 +355,7 @@ func parseAlternativeDeps(line string) ([]DepSpec, error) {
 		Rebuild:      commonRebuild,
 		Make:         commonMake,
 		Cross:        commonCross,
+		CrossNative:  commonCrossNative,
 		Alternatives: alternatives,
 	}}, nil
 }

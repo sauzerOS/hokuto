@@ -272,8 +272,21 @@ func registerAlternative(hRoot, filePath string, req AlternativeRequest, execCtx
 				return err
 			}
 			storePath := getStashedFilePath(hRoot, incomingSum)
-			// Check if store file already exists
-			if _, err := os.Stat(storePath); os.IsNotExist(err) {
+			// Check if store file already exists (use Lstat to detect broken links)
+			if _, err := os.Lstat(storePath); os.IsNotExist(err) {
+				// File doesn't exist, proceed to copy
+			} else if err == nil {
+				// File exists. Check if it's a symlink or regular file.
+				// If it's a symlink, it is corrupt/invalid for the store, remove it.
+				info, _ := os.Lstat(storePath)
+				if info.Mode()&os.ModeSymlink != 0 {
+					debugf("Removing invalid symlink in store: %s\n", storePath)
+					os.Remove(storePath)
+				}
+			}
+
+			// Check again (or assume safe if we just removed it)
+			if _, err := os.Lstat(storePath); os.IsNotExist(err) {
 				// Copy incoming (staging) file to store
 				if err := copyFileAsRoot(incomingFile, storePath, execCtx); err != nil {
 					return fmt.Errorf("failed to copy to store: %w", err)
@@ -326,7 +339,20 @@ func registerAlternative(hRoot, filePath string, req AlternativeRequest, execCtx
 				return err
 			}
 			storePath := getStashedFilePath(hRoot, activeAlt.B3Sum)
-			if _, err := os.Stat(storePath); os.IsNotExist(err) {
+
+			// Check if store file already exists (use Lstat)
+			if _, err := os.Lstat(storePath); os.IsNotExist(err) {
+				// ok to copy
+			} else if err == nil {
+				// Exists, check if symlink
+				info, _ := os.Lstat(storePath)
+				if info.Mode()&os.ModeSymlink != 0 {
+					debugf("Removing invalid symlink in store: %s\n", storePath)
+					os.Remove(storePath)
+				}
+			}
+
+			if _, err := os.Lstat(storePath); os.IsNotExist(err) {
 				// Copy from TARGET (current file on disk) to store
 				if err := copyFileAsRoot(targetAbsPath, storePath, execCtx); err != nil {
 					return fmt.Errorf("failed to stash existing file: %w", err)
@@ -367,7 +393,19 @@ func registerAlternative(hRoot, filePath string, req AlternativeRequest, execCtx
 						return err
 					}
 					storePath := getStashedFilePath(hRoot, currentSum)
-					if _, err := os.Stat(storePath); os.IsNotExist(err) {
+					// Check if store file already exists (use Lstat)
+					if _, err := os.Lstat(storePath); os.IsNotExist(err) {
+						// ok to copy
+					} else if err == nil {
+						// Exists, check if symlink
+						info, _ := os.Lstat(storePath)
+						if info.Mode()&os.ModeSymlink != 0 {
+							debugf("Removing invalid symlink in store: %s\n", storePath)
+							os.Remove(storePath)
+						}
+					}
+
+					if _, err := os.Lstat(storePath); os.IsNotExist(err) {
 						if err := copyFileAsRoot(targetAbsPath, storePath, execCtx); err != nil {
 							return fmt.Errorf("failed to stash legacy file: %w", err)
 						}
@@ -710,9 +748,238 @@ func handleAlternativesCommand(args []string) error {
 		return listAlternativesGrouped(db)
 	}
 
+	// Check for subcommands
+	if len(args) > 0 {
+		switch args[0] {
+		case "discard-unmanaged":
+			return discardUnmanagedAlternatives(hRoot, db)
+		case "--help", "-h":
+			printAlternativesHelp()
+			return nil
+		case "-ls", "--list":
+			if len(args) < 2 {
+				return fmt.Errorf("usage: hokuto alt -ls <provider>")
+			}
+			return listAlternativesForProvider(db, args[1])
+		}
+	}
+
 	// Interactive switch
 	targetPkg := args[0]
 	return handleAlternativeSwitch(hRoot, db, targetPkg)
+}
+
+func printAlternativesHelp() {
+	fmt.Println("Usage: hokuto alt [subcommand] [arguments]")
+	fmt.Println()
+	fmt.Println("Subcommands:")
+	fmt.Println("  (no args)             List all alternatives grouped by conflict set")
+	fmt.Println("  <package>             Interactively switch alternatives for a package")
+	fmt.Println("  discard-unmanaged     Cleanup unmanaged alternatives (requires root)")
+	fmt.Println("  -ls, --list <owner>   List files provided by a specific owner (e.g. 'unmanaged')")
+	fmt.Println()
+}
+
+func listAlternativesForProvider(db *GlobalAlternativesDB, provider string) error {
+	colInfo.Printf("Listing files provided by '%s':\n", provider)
+	count := 0
+
+	// Sort by path for consistent output
+	var paths []string
+	for p := range db.Files {
+		paths = append(paths, p)
+	}
+	sort.Strings(paths)
+
+	for _, path := range paths {
+		entry := db.Files[path]
+		for _, alt := range entry.Alternatives {
+			isOwner := false
+			for _, o := range alt.Owners {
+				if o == provider {
+					isOwner = true
+					break
+				}
+			}
+
+			if isOwner {
+				stateMarker := ""
+				if alt.State == StateActive {
+					stateMarker = " (active)"
+				}
+				fmt.Printf(" - %s%s\n", path, stateMarker)
+				count++
+				// Don't break, a provider might theoretically have multiple alts for same file?
+				// Unlikely in current model but safe to show all.
+			}
+		}
+	}
+
+	if count == 0 {
+		fmt.Printf("No files found for provider '%s'.\n", provider)
+	} else {
+		fmt.Printf("\nTotal: %d files.\n", count)
+	}
+
+	return nil
+}
+
+// discardUnmanagedAlternatives removes "unmanaged" ownership from all files.
+// If an alternative becomes orphaned (no owners), it is removed.
+// If the active alternative becomes orphaned, we try to switch to another valid one.
+func discardUnmanagedAlternatives(hRoot string, db *GlobalAlternativesDB) error {
+	execCtx := RootExec // Use the global root executor
+
+	modified := false
+	removedCount := 0
+	switchedCount := 0
+
+	colInfo.Println("Scanning for unmanaged alternatives")
+
+	// Iterate over all files
+	// Note: We need to be careful modifying the map while iterating if we delete keys?
+	// Go maps allow deletion during iteration, but values are pointers so we modify contents safely.
+
+	for path, entry := range db.Files {
+		entryModified := false
+
+		var newAlts []*Alternative
+
+		// 1. First pass: Remove "unmanaged" from owners
+		for _, alt := range entry.Alternatives {
+			newOwners := []string{}
+			hasUnmanaged := false
+			for _, o := range alt.Owners {
+				if o == "unmanaged" {
+					hasUnmanaged = true
+				} else {
+					newOwners = append(newOwners, o)
+				}
+			}
+
+			if hasUnmanaged {
+				alt.Owners = newOwners
+				entryModified = true
+				modified = true
+			}
+		}
+
+		if !entryModified {
+			continue
+		}
+
+		// 2. Second pass: Handle orphaned alternatives
+		// We rebuild the alternatives list, dropping orphans unless they need special handling (Active)
+
+		for _, alt := range entry.Alternatives {
+			if len(alt.Owners) > 0 {
+				newAlts = append(newAlts, alt)
+				continue
+			}
+
+			// This alternative is now orphaned (0 owners)
+			if alt.State == StateStashed {
+				// Safe to delete
+				storePath := getStashedFilePath(hRoot, alt.B3Sum)
+				if err := removeFileAsRoot(storePath, execCtx); err != nil {
+					colWarn.Printf("Warning: failed to remove stashed file %s: %v\n", storePath, err)
+				}
+				removedCount++
+				continue // Do not add to newAlts
+			}
+
+			if alt.State == StateActive {
+				// Active alternative is orphaned!
+				// We must try to switch to another candidate.
+
+				var candidate *Alternative
+				for _, other := range entry.Alternatives {
+					if other != alt && len(other.Owners) > 0 {
+						candidate = other
+						break
+					}
+				}
+
+				if candidate != nil {
+					// Switch to candidate
+					colArrow.Printf("Switching %s to managed alternative (owners: %v)\n", path, candidate.Owners)
+
+					targetAbsPath := filepath.Join(hRoot, path)
+					storePath := getStashedFilePath(hRoot, candidate.B3Sum)
+
+					// Use os.Lstat for robust checking of store file
+					if _, err := os.Lstat(storePath); os.IsNotExist(err) {
+						colError.Printf("Error: managed alternative content missing from store: %s\n", candidate.B3Sum)
+						// Keep current active one as a fallback? better than breaking system.
+						// Even if unmanaged, it's better than nothing.
+						// Re-add "unmanaged" owner? Or leave it with 0 owners but keep in DB?
+						// Let's leave it with 0 owners but keep it active to avoid breakage.
+						newAlts = append(newAlts, alt)
+						continue
+					}
+
+					if err := copyFileAsRoot(storePath, targetAbsPath, execCtx); err != nil {
+						colError.Printf("Error restoring alternative for %s: %v\n", path, err)
+						newAlts = append(newAlts, alt) // Keep broken/orphaned active
+						continue
+					}
+
+					candidate.State = StateActive
+					// Old active (alt) is dropped (not added to newAlts)
+					// Verify we shouldn't stash it? It's unmanaged and orphaned, so we discard it.
+					switchedCount++
+					removedCount++
+					// candidate is already in list or will be handled if we iterate differently?
+					// Wait, we are iterating `entry.Alternatives`. `candidate` comes from that list.
+					// If `candidate` was already processed, it's in `newAlts`.
+					// If `candidate` is yet to be processed, it will be added.
+					// We just need to ensure `candidate.State` update sticks.
+					// Since `candidate` is a pointer to an element in `entry.Alternatives`, it checks out.
+
+					// CRITICAL: If candidate is 'orphaned' this same loop, it won't be a candidate.
+					// We checked `len(other.Owners) > 0`.
+				} else {
+					// No candidates available.
+					// The file is orphaned and unmanaged.
+					// We should probably stop tracking it in alternatives DB.
+					// It remains on disk as a regular file (now truly unmanaged by hokuto).
+					colWarn.Printf("Dropping unmanaged file from alternatives system: %s\n", path)
+					removedCount++
+					// Do not add to newAlts
+				}
+			}
+		}
+
+		entry.Alternatives = newAlts
+	}
+
+	// 3. Cleanup empty file entries OR entries with only one managed owner (no conflict)
+	prunedCount := 0
+	for path, entry := range db.Files {
+		if len(entry.Alternatives) == 0 {
+			delete(db.Files, path)
+			modified = true
+		} else {
+			// If only one owner remains, it's no longer an "alternative" conflict.
+			owners := getSortedOwners(entry)
+			if len(owners) <= 1 {
+				delete(db.Files, path)
+				modified = true
+				prunedCount++
+			}
+		}
+	}
+
+	if modified {
+		if err := saveAlternativesDB(hRoot, db, execCtx); err != nil {
+			return fmt.Errorf("failed to save DB: %w", err)
+		}
+		colSuccess.Printf("Cleanup complete. Removed %d unmanaged records, pruned %d redundant entries, switched %d active files.\n", removedCount, prunedCount, switchedCount)
+	} else {
+		colInfo.Println("No unmanaged alternatives found.")
+	}
+
+	return nil
 }
 
 func listAlternativesGrouped(db *GlobalAlternativesDB) error {
