@@ -17,50 +17,119 @@ type syncPackage struct {
 }
 
 func handleCrossSyncCommand(args []string, cfg *Config) error {
-	colArrow.Print("-> ")
-	colSuccess.Println("Scanning for cross-system toolchain packages (aarch64-*)")
-
-	// 1. Get installed packages
-	entries, err := os.ReadDir(Installed)
-	if err != nil {
-		return fmt.Errorf("failed to read installed database: %w", err)
+	nativeMode := false
+	for _, arg := range args {
+		if arg == "-native" {
+			nativeMode = true
+			break
+		}
 	}
 
-	var crossToolPkgs []syncPackage
-	for _, e := range entries {
-		if !e.IsDir() {
-			continue
+	// Fetch remote index early
+	colArrow.Print("-> ")
+	colSuccess.Println("Checking remote repository index")
+	remoteIndex, _ := FetchRemoteIndex(cfg)
+
+	var targetPkgs []syncPackage
+
+	if nativeMode {
+		colArrow.Print("-> ")
+		colSuccess.Println("Scanning repository for existing native aarch64 packages")
+
+		// Pre-filter: only care about packages that already have at least one aarch64 entry on the mirror
+		supportedOnMirror := make(map[string]bool)
+		for _, entry := range remoteIndex {
+			if entry.Arch == "aarch64" {
+				supportedOnMirror[entry.Name] = true
+			}
 		}
-		name := e.Name()
-		if strings.HasPrefix(name, "aarch64-") {
-			baseName := strings.TrimPrefix(name, "aarch64-")
-			version, revision, err := getInstalledVersionAndRevision(name)
+
+		paths := filepath.SplitList(repoPaths)
+		seen := make(map[string]bool)
+
+		for _, base := range paths {
+			entries, err := os.ReadDir(base)
 			if err != nil {
-				debugf("Warning: failed to get version for %s: %v\n", name, err)
 				continue
 			}
-			crossToolPkgs = append(crossToolPkgs, syncPackage{
-				Full:     name,
-				Base:     baseName,
-				Version:  version,
-				Revision: revision,
-			})
+			for _, e := range entries {
+				if !e.IsDir() || seen[e.Name()] {
+					continue
+				}
+				pkgName := e.Name()
+
+				// User said: only check for packages that already have a native aarch64 on the binary repo
+				if !supportedOnMirror[pkgName] {
+					continue
+				}
+
+				pkgDir := filepath.Join(base, pkgName)
+
+				// Read version
+				verPath := filepath.Join(pkgDir, "version")
+				verData, err := os.ReadFile(verPath)
+				if err != nil {
+					continue
+				}
+				fields := strings.Fields(string(verData))
+				if len(fields) == 0 {
+					continue
+				}
+				version := fields[0]
+				revision := "1"
+				if len(fields) >= 2 {
+					revision = fields[1]
+				}
+
+				targetPkgs = append(targetPkgs, syncPackage{
+					Full:     pkgName,
+					Base:     pkgName,
+					Version:  version,
+					Revision: revision,
+				})
+				seen[pkgName] = true
+			}
+		}
+	} else {
+		colArrow.Print("-> ")
+		colSuccess.Println("Scanning for cross-system toolchain packages (aarch64-*)")
+
+		// 1. Get installed packages
+		entries, err := os.ReadDir(Installed)
+		if err != nil {
+			return fmt.Errorf("failed to read installed database: %w", err)
+		}
+
+		for _, e := range entries {
+			if !e.IsDir() {
+				continue
+			}
+			name := e.Name()
+			if strings.HasPrefix(name, "aarch64-") {
+				baseName := strings.TrimPrefix(name, "aarch64-")
+				version, revision, err := getInstalledVersionAndRevision(name)
+				if err != nil {
+					debugf("Warning: failed to get version for %s: %v\n", name, err)
+					continue
+				}
+				targetPkgs = append(targetPkgs, syncPackage{
+					Full:     name,
+					Base:     baseName,
+					Version:  version,
+					Revision: revision,
+				})
+			}
 		}
 	}
 
-	if len(crossToolPkgs) == 0 {
+	if len(targetPkgs) == 0 {
 		colArrow.Print("-> ")
-		colSuccess.Println("No cross-system toolchain packages found.")
+		colSuccess.Println("No packages found to sync.")
 		return nil
 	}
 
-	// 2. Fetch remote index
-	colArrow.Print("-> ")
-	colSuccess.Println("Checking binary cache and remote repository")
-	remoteIndex, _ := FetchRemoteIndex(cfg) // We ignore error and proceed with local-only if remote fails
-
 	var missing []syncPackage
-	for _, pkg := range crossToolPkgs {
+	for _, pkg := range targetPkgs {
 		found := false
 
 		// 3a. Check Local Binary Cache
@@ -93,13 +162,21 @@ func handleCrossSyncCommand(args []string, cfg *Config) error {
 
 	if len(missing) == 0 {
 		colArrow.Print("-> ")
-		colSuccess.Println("All installed cross-tool packages have corresponding native cross binaries.")
+		if nativeMode {
+			colSuccess.Println("All tracked repository packages have corresponding native aarch64 binaries.")
+		} else {
+			colSuccess.Println("All installed cross-tool packages have corresponding native cross binaries.")
+		}
 		return nil
 	}
 
 	// 4. Print Missing List
 	fmt.Println()
-	colSuccess.Println("Missing native cross packages:")
+	if nativeMode {
+		colSuccess.Println("Missing or outdated native aarch64 packages:")
+	} else {
+		colSuccess.Println("Missing native cross packages:")
+	}
 	for i, pkg := range missing {
 		colArrow.Print("-> ")
 		fmt.Printf("%2d) ", i+1)
@@ -109,7 +186,8 @@ func handleCrossSyncCommand(args []string, cfg *Config) error {
 	fmt.Println()
 
 	// 5. User Interaction
-	indices, ok := AskForSelection("Build (a)ll or pick packages to build/ignore (numbers or -numbers):", len(missing))
+	promptMsg := "Build (a)ll or pick packages to build (numbers or -numbers):"
+	indices, ok := AskForSelection(promptMsg, len(missing))
 	if !ok {
 		colNote.Println("Operation canceled.")
 		return nil
@@ -126,7 +204,11 @@ func handleCrossSyncCommand(args []string, cfg *Config) error {
 	for _, pkg := range toBuild {
 		fmt.Println()
 		colArrow.Print("-> ")
-		color.Bold.Printf("Building native cross package: %s\n", pkg.Base)
+		if nativeMode {
+			color.Bold.Printf("Building native aarch64 package: %s\n", pkg.Base)
+		} else {
+			color.Bold.Printf("Building native cross package: %s\n", pkg.Base)
+		}
 
 		buildArgs := []string{"--cross=arm64", pkg.Base}
 		if err := handleBuildCommand(buildArgs, cfg); err != nil {

@@ -60,9 +60,34 @@ func getAntigravityString() (string, error) {
 	return string(matches[1]), nil
 }
 
+func getVSCodeString() (string, error) {
+	downloadURL := "https://code.visualstudio.com/sha/download?build=stable&os=linux-x64"
+	// Use HEAD request to follow redirects and get the final URL
+	resp, err := http.Head(downloadURL)
+	if err != nil {
+		return "", fmt.Errorf("failed to fetch VS Code download link: %v", err)
+	}
+	resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		return "", fmt.Errorf("VS Code download link returned status: %d", resp.StatusCode)
+	}
+
+	// The final URL after all redirects
+	return resp.Request.URL.String(), nil
+}
+
 func getExtraSubs(pkgName string) (map[string]string, error) {
-	if filepath.Base(pkgName) == "antigravity" {
+	base := filepath.Base(pkgName)
+	if base == "antigravity" {
 		s, err := getAntigravityString()
+		if err != nil {
+			return nil, err
+		}
+		return map[string]string{"${string}": s}, nil
+	}
+	if base == "vscode" || base == "vscode-bin" {
+		s, err := getVSCodeString()
 		if err != nil {
 			return nil, err
 		}
