@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"sort"
 	"strings"
 
@@ -322,100 +323,112 @@ func findOrphans() ([]string, error) {
 	return orphans, nil
 }
 
-// handleOrphanCleanup finds orphans and prompts the user to remove them individually.
+// getOrphanVersion returns the version string for an installed package.
+func getOrphanVersion(pkgName string) string {
+	versionFile := filepath.Join(Installed, pkgName, "version")
+	data, err := os.ReadFile(versionFile)
+	if err != nil {
+		return "unknown"
+	}
+	return strings.TrimSpace(string(data))
+}
 
-func handleOrphanCleanup(cfg *Config) {
-	// --- STAGE 1: Normal Orphans (Runtime) ---
+// handleOrphanCleanup finds orphans and prompts the user to remove them using a numbered list.
+func handleOrphanCleanup(cfg *Config, preSelect string) {
 	colArrow.Print("-> ")
-	colSuccess.Println("Checking for runtime orphan packages")
+	colSuccess.Println("Checking for orphan packages")
 
 	orphans, err := findOrphans()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Warning: failed to calculate orphans: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Warning: failed to calculate runtime orphans: %v\n", err)
 	}
-
-	if len(orphans) > 0 {
-		sort.Strings(orphans)
-		colArrow.Print("-> ")
-		colWarn.Printf("Found %d runtime orphan package(s):\n", len(orphans))
-		colArrow.Print("-> ")
-		fmt.Println(strings.Join(orphans, " "))
-
-		var toRemove []string
-		if askForConfirmation(colArrow, "Remove all?") {
-			toRemove = orphans
-		} else {
-			for _, pkg := range orphans {
-				if askForConfirmation(colArrow, "Remove %s?", pkg) {
-					toRemove = append(toRemove, pkg)
-				}
-			}
-		}
-
-		if len(toRemove) > 0 {
-			for i, pkg := range toRemove {
-				colArrow.Print("-> ")
-				colSuccess.Printf("Removing: ")
-				colNote.Printf("%s", pkg)
-				colSuccess.Printf(" [%d/%d]\n", i+1, len(toRemove))
-				if err := pkgUninstall(pkg, cfg, RootExec, true, true); err != nil {
-					color.Danger.Printf("Failed to remove %s: %v\n", pkg, err)
-				} else {
-					removeFromWorld(pkg)
-					removeFromWorldMake(pkg) // Remove from make world too if present
-				}
-			}
-		}
-	} else {
-		colArrow.Print("-> ")
-		colSuccess.Println("No runtime orphans found.")
-	}
-
-	// --- STAGE 2: Make Orphans (Build Dependencies) ---
-	colArrow.Print("\n-> ")
-	colSuccess.Println("Checking for unneeded build dependencies")
 
 	makeOrphans, err := findMakeOrphans()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: failed to calculate make orphans: %v\n", err)
+	}
+
+	// Combine and de-duplicate
+	allOrphansMap := make(map[string]string) // pkg -> reason
+	for _, p := range orphans {
+		allOrphansMap[p] = "Runtime Orphan"
+	}
+	for _, p := range makeOrphans {
+		if _, exists := allOrphansMap[p]; exists {
+			allOrphansMap[p] = "Runtime & Build Orphan"
+		} else {
+			allOrphansMap[p] = "Build Dependency"
+		}
+	}
+
+	if len(allOrphansMap) == 0 {
+		colArrow.Print("-> ")
+		colSuccess.Println("No orphans found.")
 		return
 	}
 
-	if len(makeOrphans) > 0 {
-		sort.Strings(makeOrphans)
-		colArrow.Print("-> ")
-		colWarn.Printf("Found %d unneeded build dependency package(s):\n", len(makeOrphans))
-		colArrow.Print("-> ")
-		fmt.Println(strings.Join(makeOrphans, " "))
+	var sortedPkgs []string
+	for p := range allOrphansMap {
+		sortedPkgs = append(sortedPkgs, p)
+	}
+	sort.Strings(sortedPkgs)
 
-		var toRemove []string
-		if askForConfirmation(colArrow, "Remove all?") {
-			toRemove = makeOrphans
+	fmt.Println()
+	colSuccess.Printf("--- %d Orphan Package(s) Found ---\n", len(sortedPkgs))
+	for i, pkg := range sortedPkgs {
+		colArrow.Print("-> ")
+		fmt.Printf("%2d) ", i+1)
+		color.Bold.Printf("%s", pkg)
+		fmt.Print(": ")
+
+		version := getOrphanVersion(pkg)
+		colNote.Printf("%-20s ", version)
+
+		// Style the reason
+		reason := allOrphansMap[pkg]
+		if strings.Contains(reason, "Runtime") {
+			color.Warn.Printf("[%s]\n", reason)
 		} else {
-			for _, pkg := range makeOrphans {
-				if askForConfirmation(colArrow, "Remove build dependency %s?", pkg) {
-					toRemove = append(toRemove, pkg)
-				}
-			}
+			color.Note.Printf("[%s]\n", reason)
 		}
+	}
 
-		if len(toRemove) > 0 {
-			for i, pkg := range toRemove {
-				colArrow.Print("-> ")
-				colSuccess.Printf("Removing: ")
-				colNote.Printf("%s", pkg)
-				colSuccess.Printf(" [%d/%d]\n", i+1, len(toRemove))
-				if err := pkgUninstall(pkg, cfg, RootExec, true, true); err != nil {
-					color.Danger.Printf("Failed to remove %s: %v\n", pkg, err)
-				} else {
-					removeFromWorldMake(pkg)
-					// Also try to remove from world just in case of state desync
-					removeFromWorld(pkg)
-				}
-			}
+	var indices []int
+	var ok bool
+	if preSelect != "" {
+		var err error
+		indices, _, err = ParseSelectionIndices(preSelect, len(sortedPkgs))
+		if err != nil {
+			colError.Printf("Error: %v\n", err)
+			return
 		}
+		ok = true
 	} else {
+		indices, ok = AskForSelection("Remove (a)ll or pick packages to remove (numbers or -numbers):", len(sortedPkgs))
+	}
+
+	if !ok {
+		colNote.Println("Cleanup canceled by user.")
+		return
+	}
+
+	if len(indices) == 0 {
 		colArrow.Print("-> ")
-		colSuccess.Println("No unneeded build dependencies found.")
+		colSuccess.Println("No packages selected for removal.")
+		return
+	}
+
+	for i, idx := range indices {
+		pkg := sortedPkgs[idx]
+		colArrow.Print("-> ")
+		colSuccess.Printf("Removing: ")
+		colNote.Printf("%s", pkg)
+		colSuccess.Printf(" [%d/%d]\n", i+1, len(indices))
+		if err := pkgUninstall(pkg, cfg, RootExec, true, true); err != nil {
+			color.Danger.Printf("Failed to remove %s: %v\n", pkg, err)
+		} else {
+			removeFromWorld(pkg)
+			removeFromWorldMake(pkg)
+		}
 	}
 }

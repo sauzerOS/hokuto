@@ -16,6 +16,7 @@ func handleCleanupCommand(args []string, cfg *Config) error {
 	cleanBins := cleanupCmd.Bool("bins", false, "Remove all built binary packages.")
 	cleanOrphans := cleanupCmd.Bool("orphans", false, "Check and remove orphaned packages.")
 	cleanAll := cleanupCmd.Bool("all", false, "sources, binaries and orphans.")
+	packageNumbers := cleanupCmd.String("number", "", "Pre-select packages by number (e.g. 1,2 or -3)")
 
 	if err := cleanupCmd.Parse(args); err != nil {
 		return err // Should not happen with flag.ExitOnError
@@ -82,7 +83,7 @@ func handleCleanupCommand(args []string, cfg *Config) error {
 	}
 
 	if *cleanOrphans {
-		handleOrphanCleanup(cfg)
+		handleOrphanCleanup(cfg, *packageNumbers)
 	}
 
 	return nil
