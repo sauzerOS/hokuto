@@ -173,46 +173,44 @@ func FetchRemoteIndex(cfg *Config) ([]RepoEntry, error) {
 	// The user request implies R2 is slowing things down when creds are missing, so we should be strict).
 	// Actually, looking at NewR2Client, it sets "dummy" creds if missing. We want to avoid that if the intention is to use the mirror.
 
-	if hasCreds {
+	var sigData []byte
+	// 1. Try public Binary Mirror first (high priority for most users)
+	if BinaryMirror != "" {
+		colArrow.Print("-> ")
+		colSuccess.Println("Fetching remote index via Binary Mirror")
+		url := fmt.Sprintf("%s/repo-index.json", BinaryMirror)
+		dest := filepath.Join(os.TempDir(), "hokuto-index.json")
+		if dlErr := downloadFileQuiet(url, url, dest); dlErr == nil {
+			data, err = os.ReadFile(dest)
+			os.Remove(dest)
+
+			// Also try to fetch sig from mirror
+			sigUrl := url + ".sig"
+			sigDest := dest + ".sig"
+			if dlErr := downloadFileQuiet(sigUrl, sigUrl, sigDest); dlErr == nil {
+				sigData, _ = os.ReadFile(sigDest)
+				os.Remove(sigDest)
+			}
+		} else {
+			debugf("Mirror fetch failed: %v, falling back to R2 if available\n", dlErr)
+			err = dlErr
+		}
+	}
+
+	// 2. Fallback to R2 if Mirror failed or not configured
+	if len(data) == 0 && hasCreds {
 		r2, r2Err := NewR2Client(cfg)
 		if r2Err == nil {
 			colArrow.Print("-> ")
-			colSuccess.Println("Fetching remote index from R2")
+			colSuccess.Printf("Fetching remote index from %s (R2 fallback)\n", getMirrorDisplayName(cfg))
 			data, err = r2.DownloadFile(ctx, "repo-index.json")
+			if err == nil {
+				sigData, _ = r2.DownloadFile(ctx, "repo-index.json.sig")
+			}
 		} else {
 			debugf("R2 client initialization skipped: %v\n", r2Err)
-			err = r2Err
-		}
-	} else {
-		// Explicitly set err to trigger fallback
-		err = fmt.Errorf("R2 credentials not configured, skipping R2")
-		debugf("R2 credentials missing, skipping R2 fetch\n")
-	}
-
-	var sigData []byte
-	if err == nil {
-		// If index was from R2, try to get sig from R2
-		if r2, r2Err := NewR2Client(cfg); r2Err == nil {
-			sigData, _ = r2.DownloadFile(ctx, "repo-index.json.sig")
-		}
-	} else {
-		// Fallback: try download via BinaryMirror URL
-		if BinaryMirror != "" {
-			colArrow.Print("-> ")
-			colSuccess.Println("Fetching remote index via Binary Mirror")
-			url := fmt.Sprintf("%s/repo-index.json", BinaryMirror)
-			dest := filepath.Join(os.TempDir(), "hokuto-index.json")
-			if dlErr := downloadFileQuiet(url, url, dest); dlErr == nil {
-				data, err = os.ReadFile(dest)
-				os.Remove(dest)
-
-				// Also try to fetch sig from mirror
-				sigUrl := url + ".sig"
-				sigDest := dest + ".sig"
-				if dlErr := downloadFileQuiet(sigUrl, sigUrl, sigDest); dlErr == nil {
-					sigData, _ = os.ReadFile(sigDest)
-					os.Remove(sigDest)
-				}
+			if err == nil {
+				err = r2Err
 			}
 		}
 	}

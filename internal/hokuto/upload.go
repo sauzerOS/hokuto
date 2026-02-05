@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"sort"
@@ -48,12 +49,13 @@ func handleUploadCommand(args []string, cfg *Config) error {
 	var prompt = uploadCmd.Bool("prompt", false, "Prompt for each local file missing on remote (optionally filtered by name)")
 	var syncdb = uploadCmd.Bool("syncdb", false, "Upload only the global package database (pkg-db.json.zst)")
 	var deletePkg = uploadCmd.String("delete", "", "Delete all variants of a package from remote (use --delete=all to delete everything)")
+	var migrate = uploadCmd.Bool("copy-from-r2", false, "Copy all files from Cloudflare R2 to current mirror")
 
 	// Set output to stderr to avoid polluting stdout if captured
 	uploadCmd.SetOutput(os.Stderr)
 
 	if len(args) == 0 {
-		fmt.Println("Usage: hk upload [options] [pkgname...]")
+		fmt.Println("Usage: hk upload [options] [pkgname]")
 		fmt.Println("")
 		fmt.Println("Options:")
 		uploadCmd.PrintDefaults()
@@ -66,8 +68,8 @@ func handleUploadCommand(args []string, cfg *Config) error {
 
 	filters := uploadCmd.Args()
 
-	// Usage check if not deleting
-	if *deletePkg == "" && !*sync && !*prompt && !*cleanup && !*reindex && !*syncdb {
+	// Usage check
+	if *deletePkg == "" && !*sync && !*prompt && !*cleanup && !*reindex && !*syncdb && !*migrate {
 		fmt.Println("Usage: hk upload [options] [pkgname]")
 		fmt.Println("")
 		fmt.Println("Options:")
@@ -75,9 +77,88 @@ func handleUploadCommand(args []string, cfg *Config) error {
 		return nil
 	}
 
-	// 2. Initialize R2 Client
-	if cfg.Values["R2_ACCESS_KEY_ID"] == "" || cfg.Values["R2_SECRET_ACCESS_KEY"] == "" {
-		return fmt.Errorf("R2 credentials (R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY) are missing. Upload requires authentication")
+	// --- Migration Logic ---
+	if *migrate {
+		if cfg.Values["HOKUTO_MIRROR_NAME"] == "" || cfg.Values["HOKUTO_MIRROR_NAME"] == "cloudflare-r2" {
+			return fmt.Errorf("Copying requires an active mirror different from the default Cloudflare R2")
+		}
+
+		colArrow.Print("-> ")
+		colSuccess.Printf("Copying from Cloudflare R2 to '%s'\n", cfg.Values["HOKUTO_MIRROR_NAME"])
+
+		// 1. Destination Client (Active Mirror)
+		destClient, err := NewR2Client(cfg)
+		if err != nil {
+			return fmt.Errorf("failed to connect to destination mirror: %w", err)
+		}
+
+		// 2. Source Client (R2)
+		// Create a config copy and unset mirror name to force fallback
+		legacyCfg := &Config{Values: make(map[string]string)}
+		maps.Copy(legacyCfg.Values, cfg.Values)
+		delete(legacyCfg.Values, "HOKUTO_MIRROR_NAME")
+
+		sourceClient, err := NewR2Client(legacyCfg)
+		if err != nil {
+			return fmt.Errorf("failed to connect to R2: %w", err)
+		}
+
+		// 3. List Source
+		colArrow.Print("-> ")
+		colSuccess.Println("Listing files on R2")
+		objects, err := sourceClient.ListObjects(ctx, "")
+		if err != nil {
+			return fmt.Errorf("failed to list R2 objects: %w", err)
+		}
+
+		colNote.Printf("Found %d objects. Checking destination\n", len(objects))
+
+		var migratedCount int
+		var skippedCount int
+
+		destObjects, err := destClient.ListObjects(ctx, "")
+		if err != nil {
+			return fmt.Errorf("failed to list destination objects: %w", err)
+		}
+		destMap := make(map[string]int64)
+		for _, o := range destObjects {
+			destMap[o.Key] = o.Size
+		}
+
+		var toMigrate []R2Object
+		for _, obj := range objects {
+			if size, exists := destMap[obj.Key]; exists && size == obj.Size {
+				skippedCount++
+				continue
+			}
+			toMigrate = append(toMigrate, obj)
+		}
+
+		for i, obj := range toMigrate {
+			// Download
+			data, err := sourceClient.DownloadFile(ctx, obj.Key)
+			if err != nil {
+				colError.Printf("Failed to download: %v\n", err)
+				continue
+			}
+
+			// Upload
+			if err := destClient.UploadFile(ctx, obj.Key, data, i+1, len(toMigrate)); err != nil {
+				colError.Printf("Failed to upload: %v\n", err)
+				continue
+			}
+			migratedCount++
+		}
+
+		colSuccess.Printf("Copy complete. Copied: %d, Skipped: %d\n", migratedCount, skippedCount)
+		return nil
+	}
+
+	// 2. Initialize R2 Client (Normal Flow)
+	if cfg.Values["R2_ACCESS_KEY_ID"] == "" && cfg.Values["HOKUTO_MIRROR_NAME"] == "" {
+		// Only check legacy keys if no named mirror is active.
+		// NewR2Client checks specifics internally but this check preempts it.
+		// We should relax this check if HOKUTO_MIRROR_NAME is set.
 	}
 
 	r2, err := NewR2Client(cfg)
@@ -92,7 +173,7 @@ func handleUploadCommand(args []string, cfg *Config) error {
 
 	// 3. Fetch Remote Index
 	colArrow.Print("-> ")
-	colSuccess.Println("Fetching remote index from R2")
+	colSuccess.Printf("Fetching remote index from %s\n", getMirrorDisplayName(cfg))
 	remoteIndexData, err := r2.DownloadFile(ctx, "repo-index.json")
 	var remoteIndex []RepoEntry
 	if err != nil {
@@ -186,7 +267,7 @@ func handleUploadCommand(args []string, cfg *Config) error {
 			}
 
 			colArrow.Print("-> ")
-			colSuccess.Println("Scanning all remote packages...")
+			colSuccess.Println("Scanning all remote packages")
 
 			remoteObjects, err := r2.ListObjects(ctx, "")
 			if err != nil {
@@ -270,7 +351,7 @@ func handleUploadCommand(args []string, cfg *Config) error {
 	var reindexedCount int
 	if *reindex {
 		colArrow.Print("-> ")
-		colSuccess.Println("Re-indexing: Scanning all objects on R2")
+		colSuccess.Printf("Re-indexing: Scanning all objects on %s\n", getMirrorDisplayName(cfg))
 		remoteObjects, err := r2.ListObjects(ctx, "")
 		if err != nil {
 			return fmt.Errorf("failed to list remote objects for re-indexing: %w", err)
@@ -359,22 +440,33 @@ func handleUploadCommand(args []string, cfg *Config) error {
 	}
 	sort.Strings(sortedKeys)
 
+	// First, build a list of everything that definitely needs uploading (or might if prompted)
+	type uploadTask struct {
+		key    string
+		local  RepoEntry
+		prompt bool
+		reason string
+	}
+	var tasks []uploadTask
+
 	for _, key := range sortedKeys {
 		local := latestLocals[key]
-
-		// Skip cuda package during automatic sync (it's too large for automatic uploads)
 		if *sync && strings.HasPrefix(local.Name, "cuda") {
-			debugf("Skipping cuda package during automatic sync: %s\n", local.Name)
 			continue
 		}
 
 		remote, exists := newIndexMap[key]
-
 		needsUpload := false
+		reason := ""
 		if !exists {
 			needsUpload = true
-		} else if isNewer(local, remote) || local.B3Sum != remote.B3Sum {
+			reason = " (remote missing)"
+		} else if isNewer(local, remote) {
 			needsUpload = true
+			reason = fmt.Sprintf(" (newer: %s-%s vs %s-%s)", local.Version, local.Revision, remote.Version, remote.Revision)
+		} else if local.B3Sum != remote.B3Sum {
+			needsUpload = true
+			reason = " (checksum mismatch)"
 		}
 
 		if needsUpload {
@@ -393,41 +485,39 @@ func handleUploadCommand(args []string, cfg *Config) error {
 			}
 
 			if !*sync && !activePrompt {
-				// skip if no sync and the prompt was disabled (either by flag or filter)
 				continue
 			}
 
-			colArrow.Print("-> ")
-			if activePrompt {
-				reasonText := ""
-				if !exists {
-					reasonText = " (remote missing)"
-				} else if isNewer(local, remote) {
-					reasonText = fmt.Sprintf(" (newer: %s-%s vs %s-%s)", local.Version, local.Revision, remote.Version, remote.Revision)
-				} else if local.B3Sum != remote.B3Sum {
-					reasonText = " (checksum mismatch)"
-				}
-
-				if !askForConfirmation(colWarn, "Upload %s %s-%s (%s, %s)%s? ", local.Name, local.Version, local.Revision, local.Arch, local.Variant, reasonText) {
-					continue
-				}
-			}
-
-			colSuccess.Printf("Uploading to R2: %s\n", local.Filename)
-			localPath := filepath.Join(BinDir, local.Filename)
-			if err := r2.UploadLocalFile(ctx, local.Filename, localPath); err != nil {
-				return fmt.Errorf("failed to upload %s: %w", local.Name, err)
-			}
-
-			newIndexMap[key] = local
-			uploadedCount++
+			tasks = append(tasks, uploadTask{
+				key:    key,
+				local:  local,
+				prompt: activePrompt,
+				reason: reason,
+			})
 		}
+	}
+
+	for i, task := range tasks {
+		if task.prompt {
+			colArrow.Print("-> ")
+			if !askForConfirmation(colWarn, "Upload %s %s-%s (%s, %s)%s? ", task.local.Name, task.local.Version, task.local.Revision, task.local.Arch, task.local.Variant, task.reason) {
+				continue
+			}
+		}
+
+		localPath := filepath.Join(BinDir, task.local.Filename)
+		if err := r2.UploadLocalFile(ctx, task.local.Filename, localPath, i+1, len(tasks)); err != nil {
+			return fmt.Errorf("failed to upload %s: %w", task.local.Name, err)
+		}
+
+		newIndexMap[task.key] = task.local
+		uploadedCount++
 	}
 
 	// 6. Cleanup old versions on R2
 	if *cleanup {
 		colArrow.Print("-> ")
-		colSuccess.Println("Checking for old versions on R2 to cleanup")
+		colSuccess.Printf("Checking for old versions on %s to cleanup\n", getMirrorDisplayName(cfg))
 		remoteObjects, err := r2.ListObjects(ctx, "")
 		if err != nil {
 			return fmt.Errorf("failed to list remote files: %w", err)
@@ -444,7 +534,7 @@ func handleUploadCommand(args []string, cfg *Config) error {
 		for _, obj := range remoteObjects {
 			if !activeFiles[obj.Key] && strings.HasSuffix(obj.Key, ".tar.zst") {
 				colArrow.Print("-> ")
-				if askForConfirmation(colError, "Delete old version from R2: %s? ", obj.Key) {
+				if askForConfirmation(colError, "Delete old version from %s: %s? ", getMirrorDisplayName(cfg), obj.Key) {
 					if err := r2.DeleteFile(ctx, obj.Key); err != nil {
 						fmt.Fprintf(os.Stderr, "Warning: failed to delete %s: %v\n", obj.Key, err)
 					} else {
@@ -468,14 +558,24 @@ func handleUploadCommand(args []string, cfg *Config) error {
 			totalSize += obj.Size
 		}
 
-		const tenGB = 10 * 1024 * 1024 * 1024
-		percent := (float64(totalSize) / float64(tenGB)) * 100
+		activeMirrorName := cfg.Values["HOKUTO_MIRROR_NAME"]
+		mType := cfg.Values["MIRROR_"+activeMirrorName+"_TYPE"]
+		isR2 := (activeMirrorName == "" && cfg.Values["R2_ACCOUNT_ID"] != "") ||
+			strings.HasPrefix(strings.ToLower(activeMirrorName), "cloudflare") ||
+			strings.ToLower(mType) == "r2"
+
 		colArrow.Print("-> ")
 		colSuccess.Printf("Storage used: ")
-		colNote.Printf("%s / 10 GiB (%.1f%%)\n", humanReadableSize(totalSize), percent)
+		if isR2 {
+			const tenGB = 10 * 1024 * 1024 * 1024
+			percent := (float64(totalSize) / float64(tenGB)) * 100
+			colNote.Printf("%s / 10 GiB (%.1f%%)\n", humanReadableSize(totalSize), percent)
 
-		if totalSize > (tenGB * 9 / 10) {
-			colWarn.Println("Warning: You are using over 90% of your free R2 storage limit!")
+			if totalSize > (tenGB * 9 / 10) {
+				colWarn.Printf("Warning: You are using over 90%% of your free %s storage limit!\n", getMirrorDisplayName(cfg))
+			}
+		} else {
+			colNote.Printf("%s\n", humanReadableSize(totalSize))
 		}
 	}
 
@@ -550,7 +650,7 @@ func handleUploadCommand(args []string, cfg *Config) error {
 
 func uploadPkgDB(ctx context.Context, r2 *R2Client) error {
 	colArrow.Print("-> ")
-	colNote.Println("Syncing global package database to R2")
+	colNote.Printf("Syncing global package database to %s\n", getMirrorDisplayName(r2.Config))
 
 	debugf("Reading local database from %s\n", PkgDBPath)
 	data, err := os.ReadFile(PkgDBPath)

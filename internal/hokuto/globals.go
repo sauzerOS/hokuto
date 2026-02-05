@@ -42,6 +42,7 @@ var (
 	gnuOriginalURL       = "https://ftp.gnu.org/gnu"
 	gnuMirrorMessageOnce sync.Once
 	BinaryMirror         string
+	PublicBinaryMirrors  []string
 	defaultBinaryMirror  string  // hardcoded at build time via -X
 	version              = "dev" //default version; overridden at build time
 	arch                 = runtime.GOARCH
@@ -60,6 +61,9 @@ var (
 	PkgsetFile       = "/etc/hokuto/hokuto.pkgset"
 	versionedPkgDirs = make(map[string]string) // pkgName@version -> tmpDir
 	PkgDBPath        = "/var/db/hokuto/pkg-db.json.zst"
+	//go:embed assets/MIRROR
+	embeddedMirrorList string
+
 	// Cache for remote index to avoid multiple fetches
 	GlobalRemoteIndex       []RepoEntry
 	GlobalRemoteIndexLoaded bool

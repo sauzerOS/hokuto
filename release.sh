@@ -1,7 +1,7 @@
 #!/bin/sh -e
 
 VERSION=$(cat VERSION)
-MIRROR=$(cat MIRROR)
+MIRROR=$(cat internal/hokuto/assets/MIRROR)
 TAG="v$VERSION"
 BUILD_DATE=$(date +"%Y-%m-%d %H:%M:%S %Z")
 

@@ -67,7 +67,7 @@ func getRebuildTriggers(triggerPkg string, rootDir string) []string {
 	return packagesToRebuild
 }
 
-func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes bool, logger io.Writer) error {
+func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes, fast bool, logger io.Writer) error {
 	if logger == nil {
 		logger = os.Stdout
 	}
@@ -131,6 +131,13 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 			color.Danger.Printf("post-install for %s returned error: %v\n", pkgName, err)
 		}
 
+		if !fast {
+			// Run global post-install tasks immediately if not in fast mode
+			if err := PostInstallTasks(execCtx, logger); err != nil {
+				fmt.Fprintf(logger, "Warning: %v\n", err)
+			}
+		}
+
 		return nil
 	}
 
@@ -168,7 +175,11 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 	}
 
 	// 1.5. Verify package signature
-	if err := VerifyPackageSignature(stagingDir, pkgName, cfg, execCtx, logger); err != nil {
+	sigLogger := logger
+	if fast {
+		sigLogger = io.Discard
+	}
+	if err := VerifyPackageSignature(stagingDir, pkgName, cfg, execCtx, sigLogger); err != nil {
 		return err
 	}
 
@@ -385,7 +396,7 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 				os.Stdout.Sync()
 
 				var input string
-				if !yes && !skipAllPrompts {
+				if !yes && !skipAllPrompts && !fast {
 					if isSymlink && symlinkTarget != "" {
 						// Existing file is a symlink
 						if stagingIsSymlink && stagingSymlinkTarget != "" {
@@ -409,7 +420,11 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 					input = strings.TrimSpace(response)
 				}
 				if input == "" {
-					input = "k" // Default to keep if user presses enter or if in --yes mode
+					if fast {
+						input = "u" // Use new in fast mode
+					} else {
+						input = "k" // Default to keep if user presses enter or if in --yes mode
+					}
 				}
 				switch strings.ToLower(input) {
 				case "k":
@@ -471,7 +486,7 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 			os.Stdout.Sync()
 
 			var input string
-			if !yes && !skipAllPrompts {
+			if (!yes && !skipAllPrompts) || fast {
 				cPrintf(colInfo, "File %s modified, %schoose action: [k]eep current, [U]se new, [e]dit, use new for [A]ll: ", file, ownerDisplay)
 				// Flush stdout to ensure prompt is visible
 				os.Stdout.Sync()
@@ -721,7 +736,7 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 	// This handles cases where files exist on disk but are not tracked by any package
 	// (e.g., user chose to "keep existing" during a previous install)
 	debugf("Checking for conflicts with existing files\n")
-	if err := checkStagingConflicts(pkgName, stagingDir, rootDir, stagingManifest, execCtx, yes, filesRemovedFromStaging, nil); err != nil {
+	if err := checkStagingConflicts(pkgName, stagingDir, rootDir, stagingManifest, execCtx, yes, fast, filesRemovedFromStaging, nil); err != nil {
 		return err
 	}
 
@@ -893,8 +908,10 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 		logger = os.Stdout
 	}
 
-	fmt.Fprint(logger, colArrow.Sprint("-> "))
-	fmt.Fprintln(logger, colSuccess.Sprint("Executing package post-install script"))
+	if !fast {
+		fmt.Fprint(logger, colArrow.Sprint("-> "))
+		fmt.Fprintln(logger, colSuccess.Sprint("Executing package post-install script"))
+	}
 	if err := executePostInstall(pkgName, rootDir, execCtx, cfg, logger); err != nil {
 		fmt.Printf("warning: post-install for %s returned error: %v\n", pkgName, err)
 	}
@@ -1075,8 +1092,10 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 	}
 
 	// 11. Run global post-install tasks
-	if err := PostInstallTasks(RootExec, logger); err != nil {
-		fmt.Fprintf(os.Stderr, "post-remove tasks completed with warnings: %v\n", err)
+	if !fast {
+		if err := PostInstallTasks(RootExec, logger); err != nil {
+			fmt.Fprintf(os.Stderr, "post-install tasks completed with warnings: %v\n", err)
+		}
 	}
 	return nil
 }
@@ -1084,7 +1103,7 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 // checkStagingConflicts checks for conflicts between files in staging and existing files in the target.
 // This handles fresh installs where the package is not installed but files may already exist.
 // filesHandledInConflict is optional and only used for tracking (can be nil for fresh installs).
-func checkStagingConflicts(pkgName, stagingDir, rootDir, stagingManifest string, execCtx *Executor, yes bool, filesRemovedFromStaging map[string]bool, filesHandledInConflict map[string]bool) error {
+func checkStagingConflicts(pkgName, stagingDir, rootDir, stagingManifest string, execCtx *Executor, yes, fast bool, filesRemovedFromStaging map[string]bool, filesHandledInConflict map[string]bool) error {
 	// Read the staging manifest
 	stagingData, err := os.ReadFile(stagingManifest)
 	if err != nil {
@@ -1160,12 +1179,15 @@ func checkStagingConflicts(pkgName, stagingDir, rootDir, stagingManifest string,
 	skipAllPrompts := yes
 	useOriginalForAll := false // Flag to use original for all remaining alternatives (unmanaged)
 	useNewForAll := false      // Flag to use new for all remaining alternatives (unmanaged)
-	// If auto-confirming, set flags to default to "new"
-	if yes {
+	// If auto-confirming or fast mode, set flags to default to "new"
+	if yes || fast {
 		useNewForAll = true
 	}
 	keepAllConflicts := false   // Flag to keep all conflicting files items (package conflicts)
 	useNewAllConflicts := false // Flag to use new file for all conflicting items (package conflicts)
+	if fast {
+		useNewAllConflicts = true
+	}
 
 	// Data structure to collect conflicts grouped by conflicting package
 	type conflictInfo struct {
@@ -1279,7 +1301,7 @@ func checkStagingConflicts(pkgName, stagingDir, rootDir, stagingManifest string,
 			input = "k"
 		} else if useNewAllConflicts {
 			input = "n"
-		} else if !skipAllPrompts {
+		} else if !skipAllPrompts && !fast {
 			// Display all conflicting files
 			cPrintf(colWarn, "Conflicting file(s) detected from %s package:\n", conflictPkg)
 			for _, c := range conflicts {
@@ -1384,7 +1406,7 @@ func checkStagingConflicts(pkgName, stagingDir, rootDir, stagingManifest string,
 			input = "k"
 		} else if useNewForAll {
 			input = "n"
-		} else if !skipAllPrompts {
+		} else if !skipAllPrompts && !fast {
 			cPrintf(colWarn, "Conflicting file(s) detected (unmanaged):\n")
 			for _, c := range unmanagedConflicts {
 				colArrow.Print("-> ")

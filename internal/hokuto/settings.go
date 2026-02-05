@@ -61,6 +61,12 @@ func handleSettingsCommand(cfg *Config) error {
 		// 8. Detect Hardware
 		fmt.Println("8) Detect Hardware & Suggest Optimizations")
 
+		// 9. Manage Upload Mirrors
+		fmt.Printf("9) Manage Upload Mirrors [Active: %s]\n", color.Note.Sprint(getMirrorDisplayName(cfg)))
+
+		// 10. Public Download Mirror
+		fmt.Printf("10) Select Public Download Mirror: [%s]\n", color.Note.Sprint(BinaryMirror))
+
 		fmt.Println("q) Quit")
 		fmt.Println("--------------------------------")
 		fmt.Print("Choice: ")
@@ -252,8 +258,176 @@ func handleSettingsCommand(cfg *Config) error {
 				colSuccess.Println("Configuration updated successfully.")
 			}
 
-		default:
-			colWarn.Println("Invalid choice.")
+		case "9":
+			for {
+				fmt.Println()
+				colArrow.Print("-> ")
+				colSuccess.Println("Manage Upload Mirrors")
+				fmt.Println("--------------------------------")
+				fmt.Println("a) List Mirrors")
+				fmt.Println("b) Switch Active Mirror")
+				fmt.Println("c) Add New Mirror")
+				fmt.Println("d) Back to Main Settings")
+				fmt.Println("--------------------------------")
+				fmt.Print("Choice: ")
+
+				mChoice, _ := reader.ReadString('\n')
+				mChoice = strings.TrimSpace(mChoice)
+
+				if mChoice == "d" {
+					break // break inner loop, go back to main menu
+				}
+
+				switch mChoice {
+				case "a":
+					if err := listMirrors(cfg); err != nil {
+						colError.Printf("Error: %v\n", err)
+					}
+				case "b":
+					mirrors := loadMirrors(cfg)
+					if len(mirrors) == 0 {
+						colWarn.Println("No mirrors configured.")
+						continue
+					}
+
+					fmt.Println("\nAvailable Mirrors:")
+					for i, m := range mirrors {
+						status := ""
+						if cfg.Values["HOKUTO_MIRROR_NAME"] == m.Name {
+							status = " [ACTIVE]"
+						}
+						fmt.Printf("%d) %s (%s)%s\n", i+1, m.Name, m.URL, color.Note.Sprint(status))
+					}
+					fmt.Print("Choice (number or name, q to cancel): ")
+					choice, _ := reader.ReadString('\n')
+					choice = strings.TrimSpace(choice)
+
+					if choice == "" || choice == "q" {
+						continue
+					}
+
+					var selectedName string
+					// Check if choice is a number
+					var idx int
+					if _, err := fmt.Sscanf(choice, "%d", &idx); err == nil {
+						if idx >= 1 && idx <= len(mirrors) {
+							selectedName = mirrors[idx-1].Name
+						}
+					} else {
+						// Assume it's a name
+						selectedName = choice
+					}
+
+					if selectedName != "" {
+						if err := setMirror(cfg, selectedName); err != nil {
+							colError.Printf("Error: %v\n", err)
+						}
+					} else {
+						colWarn.Println("Invalid selection.")
+					}
+				case "c":
+					fmt.Print("Enter new mirror name: ")
+					name, _ := reader.ReadString('\n')
+					name = strings.TrimSpace(name)
+					if name == "" {
+						colWarn.Println("Invalid name.")
+						continue
+					}
+
+					fmt.Print("Enter mirror URL: ")
+					url, _ := reader.ReadString('\n')
+					url = strings.TrimSpace(url)
+					if url == "" {
+						colWarn.Println("Invalid URL.")
+						continue
+					}
+
+					fmt.Print("Enter type (http, s3, r2, minio) [default: http]: ")
+					mType, _ := reader.ReadString('\n')
+					mType = strings.TrimSpace(mType)
+					if mType == "" {
+						mType = "http"
+					}
+
+					var accessKey, secretKey, bucket, region string
+					if mType == "s3" || mType == "r2" || mType == "minio" {
+						fmt.Print("Enter Access Key ID: ")
+						accessKey, _ = reader.ReadString('\n')
+						accessKey = strings.TrimSpace(accessKey)
+
+						fmt.Print("Enter Secret Access Key: ")
+						secretKey, _ = reader.ReadString('\n')
+						secretKey = strings.TrimSpace(secretKey)
+
+						fmt.Print("Enter Bucket Name (optional, defaults to 'sauzeros'): ")
+						bucket, _ = reader.ReadString('\n')
+						bucket = strings.TrimSpace(bucket)
+
+						fmt.Print("Enter Region (default: auto): ")
+						region, _ = reader.ReadString('\n')
+						region = strings.TrimSpace(region)
+						if region == "" {
+							region = "auto"
+						}
+					}
+
+					if err := addMirror(cfg, name, url, mType); err != nil {
+						colError.Printf("Error: %v\n", err)
+					} else {
+						// Save extra fields if present
+						if accessKey != "" {
+							setConfigValue(cfg, "MIRROR_"+name+"_ACCESS_KEY", accessKey)
+						}
+						if secretKey != "" {
+							setConfigValue(cfg, "MIRROR_"+name+"_SECRET_KEY", secretKey)
+						}
+						if bucket != "" {
+							setConfigValue(cfg, "MIRROR_"+name+"_BUCKET", bucket)
+						}
+						if region != "" {
+							setConfigValue(cfg, "MIRROR_"+name+"_REGION", region)
+						}
+					}
+				default:
+					colWarn.Println("Invalid choice.")
+				}
+			}
+
+		case "10":
+			fmt.Println("\nAvailable Public Download Mirrors:")
+			for i, m := range PublicBinaryMirrors {
+				status := ""
+				if BinaryMirror == m {
+					status = " [ACTIVE]"
+				}
+				fmt.Printf("%d) %s%s\n", i+1, m, color.Note.Sprint(status))
+			}
+			fmt.Print("Choice (number, q to cancel): ")
+			mChoice, _ := reader.ReadString('\n')
+			mChoice = strings.TrimSpace(mChoice)
+			if mChoice == "q" || mChoice == "" {
+				continue
+			}
+
+			var newMirror string
+			idx := 0
+			if _, err := fmt.Sscanf(mChoice, "%d", &idx); err == nil {
+				if idx >= 1 && idx <= len(PublicBinaryMirrors) {
+					newMirror = PublicBinaryMirrors[idx-1]
+				}
+			}
+
+			if newMirror != "" {
+				if err := setConfigValue(cfg, "HOKUTO_MIRROR", newMirror); err != nil {
+					colError.Printf("Error: %v\n", err)
+				} else {
+					BinaryMirror = newMirror // Update global
+					GlobalRemoteIndexLoaded = false
+					colSuccess.Println("Download mirror updated successfully.")
+				}
+			} else {
+				colWarn.Println("Invalid choice.")
+			}
 		}
 	}
 

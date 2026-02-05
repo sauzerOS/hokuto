@@ -93,7 +93,9 @@ func extractBashArray(content string, arrayName string) []string {
 	var result []string
 
 	// Match array declaration (single or multi-line)
-	pattern := fmt.Sprintf(`(?s)%s=\((.*?)\)`, arrayName)
+	// Use ^\s* to ensure we match the variable definition at the start of a line
+	// preventing 'depends' from matching 'makedepends'.
+	pattern := fmt.Sprintf(`(?ms)^\s*%s=\((.*?)\)`, arrayName)
 	re := regexp.MustCompile(pattern)
 	match := re.FindStringSubmatch(content)
 

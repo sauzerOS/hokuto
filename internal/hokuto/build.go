@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"maps"
 	"net/http"
 	"os"
 	"os/exec"
@@ -278,6 +279,17 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, opts BuildOptions)
 	const setTitleFormat = "\033]0;%s\a"
 	debugf("INFO RUNNING pkgBuild function")
 
+	// CLONE CONFIG to avoid race conditions in parallel builds.
+	// pkgBuild modifies cfg.Values (e.g. for cross-compilation settings), so we need an isolated copy.
+	// Without this, parallel updates/builds will leak environment settings (like HOKUTO_CROSS) between packages.
+	cfgCopy := &Config{
+		Values:       make(map[string]string, len(cfg.Values)),
+		DefaultStrip: cfg.DefaultStrip,
+		DefaultLTO:   cfg.DefaultLTO,
+	}
+	maps.Copy(cfgCopy.Values, cfg.Values)
+	cfg = cfgCopy // Use the copy for the rest of this function
+
 	// Helper function to set the title in the TTY.
 	setTerminalTitle := func(title string) {
 		//	// Outputting directly to os.Stdout sets the title in the terminal session.
@@ -365,7 +377,9 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, opts BuildOptions)
 	}
 
 	// set tmpdirs for build
-	pkgTmpDir := filepath.Join(currentTmpDir, pkgName)
+	// Append random two-digit number to pkgTmpDir to avoid conflicts
+	randNum := time.Now().UnixNano() % 100
+	pkgTmpDir := filepath.Join(currentTmpDir, fmt.Sprintf("%s-%02d", pkgName, randNum))
 	logDir := filepath.Join(pkgTmpDir, "log")
 	buildDir := filepath.Join(pkgTmpDir, "build")
 	outputDir := filepath.Join(pkgTmpDir, "output")
@@ -435,8 +449,13 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, opts BuildOptions)
 
 	if options["nostrip"] {
 		if shouldStrip { // Only print if it wasn't already disabled
-			colArrow.Print("-> ")
-			colSuccess.Printf("Disabling stripping.\n")
+			if !opts.Quiet {
+				colArrow.Print("-> ")
+				colSuccess.Printf("Disabling stripping.\n")
+			}
+			if opts.LogWriter != nil {
+				fmt.Fprintf(opts.LogWriter, "Disabling stripping.\n")
+			}
 		}
 		shouldStrip = false // Override the global setting for this package only
 	}
@@ -1450,6 +1469,16 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 	if logger == nil {
 		logger = os.Stdout
 	}
+
+	// CLONE CONFIG to avoid race conditions.
+	// pkgBuildRebuild modifies cfg.Values (e.g. for cross-compilation settings), so we need an isolated copy.
+	cfgCopy := &Config{
+		Values:       make(map[string]string, len(cfg.Values)),
+		DefaultStrip: cfg.DefaultStrip,
+		DefaultLTO:   cfg.DefaultLTO,
+	}
+	maps.Copy(cfgCopy.Values, cfg.Values)
+	cfg = cfgCopy // Use the copy for the rest of this function
 
 	// Define the ANSI escape code format for setting the terminal title.
 	// \033]0; sets the title, and \a (bell character) terminates the sequence.
@@ -2652,12 +2681,12 @@ func handleBuildCommand(args []string, cfg *Config) error {
 			}
 			// Use output package name for tarball and installation (may be renamed for cross-system)
 			outputPkgName := getOutputPackageName(pkgName, cfg)
-			arch := GetSystemArch(cfg)
+			arch := GetSystemArchForPackage(cfg, pkgName)
 			variant := GetSystemVariantForPackage(cfg, pkgName)
 			tarballPath := filepath.Join(BinDir, StandardizeRemoteName(outputPkgName, version, revision, arch, variant))
 			isCriticalAtomic.Store(1)
 			handlePreInstallUninstall(outputPkgName, cfg, RootExec, false)
-			if installErr := pkgInstall(tarballPath, outputPkgName, cfg, RootExec, true, nil); installErr != nil {
+			if installErr := pkgInstall(tarballPath, outputPkgName, cfg, RootExec, true, false, nil); installErr != nil {
 				isCriticalAtomic.Store(0)
 				colArrow.Print("-> ")
 				color.Danger.Printf("Installation failed for %s: %v\n", outputPkgName, installErr)
@@ -2715,14 +2744,14 @@ func handleBuildCommand(args []string, cfg *Config) error {
 				}
 				// Use output package name for dependencies too (may be renamed for cross-system)
 				outputDepPkg := getOutputPackageName(depPkg, cfg)
-				arch := GetSystemArch(cfg)
+				arch := GetSystemArchForPackage(cfg, depPkg)
 				variant := GetSystemVariantForPackage(cfg, depPkg)
 				tarballPath := filepath.Join(BinDir, StandardizeRemoteName(outputDepPkg, version, revision, arch, variant))
 				if _, err := os.Stat(tarballPath); err == nil {
 					if askForConfirmation(colInfo, "Dependency '%s' is missing. Use available binary package?", depPkg) {
 						isCriticalAtomic.Store(1)
 						handlePreInstallUninstall(outputDepPkg, cfg, RootExec, false)
-						if err := pkgInstall(tarballPath, outputDepPkg, cfg, RootExec, false, nil); err != nil {
+						if err := pkgInstall(tarballPath, outputDepPkg, cfg, RootExec, false, false, nil); err != nil {
 							isCriticalAtomic.Store(0)
 							return fmt.Errorf("fatal error installing binary %s: %v", depPkg, err)
 						}
@@ -2737,22 +2766,35 @@ func handleBuildCommand(args []string, cfg *Config) error {
 						// Optimization: Check remote index first
 						index, err := GetCachedRemoteIndex(cfg)
 						shouldTryDownload := true
+						var expectedSum string
+
 						if err == nil {
-							if !IsPackageInIndex(index, depPkg, version, revision, cfg) {
-								shouldTryDownload = false
-								debugf("Message: Skipping download for %s (not found in remote index)\n", depPkg)
+							shouldTryDownload = false
+							targetArch := GetSystemArchForPackage(cfg, depPkg)
+							targetVariant := GetSystemVariantForPackage(cfg, depPkg)
+							for _, entry := range index {
+								if entry.Name == depPkg && entry.Version == version &&
+									entry.Revision == revision && entry.Arch == targetArch &&
+									entry.Variant == targetVariant {
+									shouldTryDownload = true
+									expectedSum = entry.B3Sum
+									break
+								}
+							}
+							if !shouldTryDownload {
+								debugf("Message: Skipping download for %s (not found in remote index details)\n", depPkg)
 							}
 						}
 
 						if shouldTryDownload {
-							if err := fetchBinaryPackage(depPkg, version, revision, cfg, true); err == nil {
+							if err := fetchBinaryPackage(depPkg, version, revision, cfg, true, expectedSum); err == nil {
 								// Successfully fetched! Check stat again to be sure.
 								if _, err := os.Stat(tarballPath); err == nil {
 									foundRemote = true
 									if askForConfirmation(colInfo, "Dependency '%s' found on remote mirror. Use binary?", depPkg) {
 										isCriticalAtomic.Store(1)
 										handlePreInstallUninstall(outputDepPkg, cfg, RootExec, false)
-										if err := pkgInstall(tarballPath, outputDepPkg, cfg, RootExec, false, nil); err != nil {
+										if err := pkgInstall(tarballPath, outputDepPkg, cfg, RootExec, false, false, nil); err != nil {
 											isCriticalAtomic.Store(0)
 											return fmt.Errorf("fatal error installing downloaded binary %s: %v", depPkg, err)
 										}
@@ -2853,6 +2895,7 @@ func handleBuildCommand(args []string, cfg *Config) error {
 					RebuildPackages:   make(map[string]bool),
 					PostRebuilds:      make(map[string][]string),
 					PostBuildRebuilds: make(map[string][]string),
+					NoDeps:            true,
 				}
 				initialPlan.Order = MovePackageToFront(initialPlan.Order, "sauzeros-base")
 				err = nil
@@ -2928,7 +2971,18 @@ func handleBuildCommand(args []string, cfg *Config) error {
 						}
 
 						if shouldTryDownload {
-							_ = fetchBinaryPackage(pkgName, version, revision, cfg, true)
+							var expectedSum string
+							targetArch := GetSystemArchForPackage(cfg, pkgName)
+							targetVariant := GetSystemVariantForPackage(cfg, pkgName)
+							for _, entry := range index {
+								if entry.Name == pkgName && entry.Version == version &&
+									entry.Revision == revision && entry.Arch == targetArch &&
+									entry.Variant == targetVariant {
+									expectedSum = entry.B3Sum
+									break
+								}
+							}
+							_ = fetchBinaryPackage(pkgName, version, revision, cfg, true, expectedSum)
 						}
 					}
 
@@ -2984,12 +3038,12 @@ func handleBuildCommand(args []string, cfg *Config) error {
 						}
 						version, revision, _ := getRepoVersion2(finalPkg)
 						outputFinalPkg := getOutputPackageName(finalPkg, cfg)
-						arch := GetSystemArch(cfg)
+						arch := GetSystemArchForPackage(cfg, finalPkg)
 						variant := GetSystemVariantForPackage(cfg, finalPkg)
 						tarballPath := filepath.Join(BinDir, StandardizeRemoteName(outputFinalPkg, version, revision, arch, variant))
 						isCriticalAtomic.Store(1)
 						handlePreInstallUninstall(outputFinalPkg, cfg, RootExec, false)
-						if err := pkgInstall(tarballPath, outputFinalPkg, cfg, RootExec, false, nil); err != nil {
+						if err := pkgInstall(tarballPath, outputFinalPkg, cfg, RootExec, false, false, nil); err != nil {
 							isCriticalAtomic.Store(0)
 							colArrow.Print("-> ")
 							color.Danger.Printf("Installation failed for %s: %v\n", outputFinalPkg, err)
@@ -3051,78 +3105,80 @@ func executeBuildPass(plan *BuildPlan, _ string, installAllTargets bool, cfg *Co
 				continue
 			}
 			canBuild := true
-			pkgDir, _ := findPackageDir(pkgName)
-			deps, _ := parseDependsFile(pkgDir)
-			for _, dep := range deps {
-				if dep.Optional {
-					continue
-				}
-
-				// FILTER: Ignore cross dependencies if not cross-compiling
-				if dep.Cross && cfg.Values["HOKUTO_CROSS_ARCH"] == "" {
-					continue
-				}
-
-				// FILTER: Ignore 32-bit dependencies if multilib is disabled
-				if !EnableMultilib && strings.HasSuffix(dep.Name, "-32") {
-					continue
-				}
-
-				isSatisfied := false
-
-				// Helper to check if a package is available (installed or just built)
-				isDepAvailable := func(name string, op string, ver string) bool {
-					// 1. Check if it was built this pass (using exact name)
-					if builtThisPass[name] {
-						return true
+			if !plan.NoDeps { // Dependency checks are skipped if plan.NoDeps is true
+				pkgDir, _ := findPackageDir(pkgName)
+				deps, _ := parseDependsFile(pkgDir)
+				for _, dep := range deps {
+					if dep.Optional {
+						continue
 					}
 
-					// 2. Check if any satisfying package is installed (including renamed ones)
-					if sat := findInstalledSatisfying(name, op, ver); sat != "" {
-						return true
+					// FILTER: Ignore cross dependencies if not cross-compiling
+					if dep.Cross && cfg.Values["HOKUTO_CROSS_ARCH"] == "" {
+						continue
 					}
 
-					// 3. Fallback: if it was built this pass under a renamed name,
-					// we need to check if that renamed name satisfies the constraint.
-					// This is complex, but for now we can check if any key in builtThisPass
-					// matches name-MAJOR if we can derive MAJOR from the constraint.
-					// However, if it was built this pass, it was also INSTALLED,
-					// so findInstalledSatisfying should have caught it.
-					// The only edge case is if it's built but not yet installed (not possible in current sequential flow).
+					// FILTER: Ignore 32-bit dependencies if multilib is disabled
+					if !EnableMultilib && strings.HasSuffix(dep.Name, "-32") {
+						continue
+					}
 
-					return false
-				}
+					isSatisfied := false
 
-				if len(dep.Alternatives) > 0 {
-					for _, alt := range dep.Alternatives {
-						if isDepAvailable(alt, "", "") {
-							isSatisfied = true
-							break
+					// Helper to check if a package is available (installed or just built)
+					isDepAvailable := func(name string, op string, ver string) bool {
+						// 1. Check if it was built this pass (using exact name)
+						if builtThisPass[name] {
+							return true
 						}
-					}
-				} else {
-					if isDepAvailable(dep.Name, dep.Op, dep.Version) {
-						isSatisfied = true
-					}
-				}
 
-				if !isSatisfied {
-					// Check if we are blocked by a SPECIFIC failure in the alternatives
+						// 2. Check if any satisfying package is installed (including renamed ones)
+						if sat := findInstalledSatisfying(name, op, ver); sat != "" {
+							return true
+						}
+
+						// 3. Fallback: if it was built this pass under a renamed name,
+						// we need to check if that renamed name satisfies the constraint.
+						// This is complex, but for now we can check if any key in builtThisPass
+						// matches name-MAJOR if we can derive MAJOR from the constraint.
+						// However, if it was built this pass, it was also INSTALLED,
+						// so findInstalledSatisfying should have caught it.
+						// The only edge case is if it's built but not yet installed (not possible in current sequential flow).
+
+						return false
+					}
+
 					if len(dep.Alternatives) > 0 {
 						for _, alt := range dep.Alternatives {
-							if _, hasFailed := failed[alt]; hasFailed {
-								failed[pkgName] = fmt.Errorf("blocked by failed dependency '%s'", alt)
+							if isDepAvailable(alt, "", "") {
+								isSatisfied = true
 								break
 							}
 						}
 					} else {
-						if _, hasFailed := failed[dep.Name]; hasFailed {
-							failed[pkgName] = fmt.Errorf("blocked by failed dependency '%s'", dep.Name)
+						if isDepAvailable(dep.Name, dep.Op, dep.Version) {
+							isSatisfied = true
 						}
 					}
 
-					canBuild = false
-					break
+					if !isSatisfied {
+						// Check if we are blocked by a SPECIFIC failure in the alternatives
+						if len(dep.Alternatives) > 0 {
+							for _, alt := range dep.Alternatives {
+								if _, hasFailed := failed[alt]; hasFailed {
+									failed[pkgName] = fmt.Errorf("blocked by failed dependency '%s'", alt)
+									break
+								}
+							}
+						} else {
+							if _, hasFailed := failed[dep.Name]; hasFailed {
+								failed[pkgName] = fmt.Errorf("blocked by failed dependency '%s'", dep.Name)
+							}
+						}
+
+						canBuild = false
+						break
+					}
 				}
 			}
 			if !canBuild {
@@ -3192,12 +3248,12 @@ func executeBuildPass(plan *BuildPlan, _ string, installAllTargets bool, cfg *Co
 					// Install the package immediately.
 					version, revision, _ := getRepoVersion2(pkgName)
 					outputPkgName := getOutputPackageName(pkgName, cfg)
-					arch := GetSystemArch(cfg)
+					arch := GetSystemArchForPackage(cfg, pkgName)
 					variant := GetSystemVariantForPackage(cfg, pkgName)
 					tarballPath := filepath.Join(BinDir, StandardizeRemoteName(outputPkgName, version, revision, arch, variant))
 					isCriticalAtomic.Store(1)
 					handlePreInstallUninstall(outputPkgName, cfg, RootExec, false)
-					if installErr := pkgInstall(tarballPath, outputPkgName, cfg, RootExec, true, nil); installErr != nil {
+					if installErr := pkgInstall(tarballPath, outputPkgName, cfg, RootExec, true, false, nil); installErr != nil {
 						isCriticalAtomic.Store(0)
 						colArrow.Print("-> ")
 						color.Danger.Printf("Installation failed for %s: %v\n", outputPkgName, installErr)
@@ -3301,12 +3357,12 @@ func executeBuildPass(plan *BuildPlan, _ string, installAllTargets bool, cfg *Co
 						// Install the newly rebuilt parent
 						version, revision, _ := getRepoVersion2(parent)
 						outputParent := getOutputPackageName(parent, cfg)
-						arch := GetSystemArch(cfg)
+						arch := GetSystemArchForPackage(cfg, parent)
 						variant := GetSystemVariantForPackage(cfg, parent)
 						tarballPath := filepath.Join(BinDir, StandardizeRemoteName(outputParent, version, revision, arch, variant))
 						isCriticalAtomic.Store(1)
 						handlePreInstallUninstall(outputParent, cfg, RootExec, false)
-						if installErr := pkgInstall(tarballPath, outputParent, cfg, RootExec, true, nil); installErr != nil {
+						if installErr := pkgInstall(tarballPath, outputParent, cfg, RootExec, true, false, nil); installErr != nil {
 							isCriticalAtomic.Store(0)
 							colArrow.Print("-> ")
 							color.Danger.Printf("Installation failed for rebuilt %s: %v\n", outputParent, installErr)
@@ -3349,13 +3405,13 @@ func executeBuildPass(plan *BuildPlan, _ string, installAllTargets bool, cfg *Co
 					// B. Install the newly rebuilt package automatically
 					version, revision, _ := getRepoVersion2(rebuildPkg)
 					outputRebuildPkg := getOutputPackageName(rebuildPkg, cfg)
-					arch := GetSystemArch(cfg)
+					arch := GetSystemArchForPackage(cfg, rebuildPkg)
 					variant := GetSystemVariantForPackage(cfg, rebuildPkg)
 					tarballPath := filepath.Join(BinDir, StandardizeRemoteName(outputRebuildPkg, version, revision, arch, variant))
 					isCriticalAtomic.Store(1)
 					handlePreInstallUninstall(outputRebuildPkg, cfg, RootExec, false)
 					// Always run this non-interactively
-					if installErr := pkgInstall(tarballPath, outputRebuildPkg, cfg, RootExec, true, nil); installErr != nil {
+					if installErr := pkgInstall(tarballPath, outputRebuildPkg, cfg, RootExec, true, false, nil); installErr != nil {
 						isCriticalAtomic.Store(0)
 						colArrow.Print("-> ")
 						color.Danger.Printf("Installation failed for post-build %s: %v\n", outputRebuildPkg, installErr)
@@ -3370,45 +3426,47 @@ func executeBuildPass(plan *BuildPlan, _ string, installAllTargets bool, cfg *Co
 		toBuild = remainingAfterPass
 		passInProgress = progressThisPass
 	}
-	for _, pkg := range toBuild {
-		if _, exists := failed[pkg]; !exists {
-			// Find which dependency is missing to provide a better error message
-			pkgDir, _ := findPackageDir(pkg)
-			deps, _ := parseDependsFile(pkgDir)
-			missingDep := "unknown"
-			for _, dep := range deps {
-				if dep.Optional {
-					continue
-				}
+	if !plan.NoDeps {
+		for _, pkg := range toBuild {
+			if _, exists := failed[pkg]; !exists {
+				// Find which dependency is missing to provide a better error message
+				pkgDir, _ := findPackageDir(pkg)
+				deps, _ := parseDependsFile(pkgDir)
+				missingDep := "unknown"
+				for _, dep := range deps {
+					if dep.Optional {
+						continue
+					}
 
-				// FILTER: Ignore 32-bit dependencies if multilib is disabled
-				if !EnableMultilib && strings.HasSuffix(dep.Name, "-32") {
-					continue
-				}
+					// FILTER: Ignore 32-bit dependencies if multilib is disabled
+					if !EnableMultilib && strings.HasSuffix(dep.Name, "-32") {
+						continue
+					}
 
-				isSatisfied := false
-				if len(dep.Alternatives) > 0 {
-					for _, alt := range dep.Alternatives {
-						if builtThisPass[alt] || findInstalledSatisfying(alt, "", "") != "" {
+					isSatisfied := false
+					if len(dep.Alternatives) > 0 {
+						for _, alt := range dep.Alternatives {
+							if builtThisPass[alt] || findInstalledSatisfying(alt, "", "") != "" {
+								isSatisfied = true
+								break
+							}
+						}
+					} else {
+						if builtThisPass[dep.Name] || findInstalledSatisfying(dep.Name, dep.Op, dep.Version) != "" {
 							isSatisfied = true
-							break
 						}
 					}
-				} else {
-					if builtThisPass[dep.Name] || findInstalledSatisfying(dep.Name, dep.Op, dep.Version) != "" {
-						isSatisfied = true
-					}
-				}
 
-				if !isSatisfied {
-					missingDep = dep.Name
-					if dep.Op != "" {
-						missingDep = fmt.Sprintf("%s%s%s", dep.Name, dep.Op, dep.Version)
+					if !isSatisfied {
+						missingDep = dep.Name
+						if dep.Op != "" {
+							missingDep = fmt.Sprintf("%s%s%s", dep.Name, dep.Op, dep.Version)
+						}
+						break
 					}
-					break
 				}
+				failed[pkg] = fmt.Errorf("dependency not satisfied: %s", missingDep)
 			}
-			failed[pkg] = fmt.Errorf("dependency not satisfied: %s", missingDep)
 		}
 	}
 	return failed, successfullyBuiltTargets, totalElapsedTime

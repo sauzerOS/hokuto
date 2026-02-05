@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/gookit/color"
+	"github.com/schollz/progressbar/v3"
 	"github.com/ulikunitz/xz"
 )
 
@@ -57,7 +58,7 @@ func printHelp() {
 		{"alt", "<pkg>", "List packages with alternatives or show/switch alternatives for a package"},
 		{"settings", "", "Manage hokuto configuration interactively"},
 		{"init-repos", "", "Initialize repositories"},
-		{"upload", "[options] [pkgname...]", "Upload local binaries to R2 and update index"},
+		{"upload", "[options] [pkgname...]", "Upload local binaries to remote mirror and update index"},
 		{"depends", "[--reverse] <pkg>", "Show package dependencies or reverse dependencies"},
 		{"meta", "pkgname [-e] [-db]", "Show/edit package metadata or generate global DB"},
 		{"search", "[query | -tag <tag>]", "Search global package database"},
@@ -554,6 +555,7 @@ func Main() {
 		var x86_64Flag = installCmd.Bool("x86_64", false, "Install x86_64 version of the package.")
 		var multiFlag = installCmd.Bool("multi", false, "Install multilib variants of packages that support them.")
 		var remote = installCmd.Bool("remote", false, "Install from remote mirror even if not in HOKUTO_PATH.")
+		var fast = installCmd.Bool("fast", false, "Enable fast install mode (progress bar, deferred tasks).")
 
 		if err := installCmd.Parse(os.Args[2:]); err != nil {
 			fmt.Fprintf(os.Stderr, "Error parsing install flags: %v\n", err)
@@ -605,6 +607,7 @@ func Main() {
 		}
 
 		effectiveYes := *yes || *yesLong
+		effectiveFast := *fast
 
 		// We build a list of ALL packages to install (explicit + dependencies).
 		var installPlan []string
@@ -708,6 +711,11 @@ func Main() {
 		allSucceeded := true
 
 		// Iterate through the calculated plan
+		var bar *progressbar.ProgressBar
+		if effectiveFast && len(installPlan) > 0 {
+			bar = progressbar.Default(int64(len(installPlan)), "Installing Packages")
+		}
+
 		for i, arg := range installPlan {
 			var tarballPath, pkgName string
 
@@ -864,19 +872,21 @@ func Main() {
 							targetVariant := GetSystemVariantForPackage(cfg, pkgName)
 
 							inIndex := false
+							var expectedSum string
 							if len(remoteIndex) > 0 {
 								for _, entry := range remoteIndex {
 									if entry.Name == pkgName && entry.Version == version &&
 										entry.Revision == revision && entry.Arch == targetArch &&
 										entry.Variant == targetVariant {
 										inIndex = true
+										expectedSum = entry.B3Sum
 										break
 									}
 								}
 							}
 
 							if inIndex {
-								if err := fetchBinaryPackage(pkgName, version, revision, cfg, false); err == nil {
+								if err := fetchBinaryPackage(pkgName, version, revision, cfg, effectiveFast, expectedSum); err == nil {
 									foundOnMirror = true
 								} else {
 									debugf("Mirror fetch failed for %s: %v\n", pkgName, err)
@@ -903,12 +913,14 @@ func Main() {
 									cfg.Values["HOKUTO_GENERIC"] = oldGeneric
 
 									inIndexGeneric := false
+									expectedSumGeneric := ""
 									if len(remoteIndex) > 0 {
 										for _, entry := range remoteIndex {
 											if entry.Name == pkgName && entry.Version == version &&
 												entry.Revision == revision && entry.Arch == targetArch &&
 												entry.Variant == targetVariantGeneric {
 												inIndexGeneric = true
+												expectedSumGeneric = entry.B3Sum
 												break
 											}
 										}
@@ -919,7 +931,7 @@ func Main() {
 										cPrintf(colInfo, "Optimized binary not found, trying fallback: %s\n", fallbackVariant)
 
 										cfg.Values["HOKUTO_GENERIC"] = "1"
-										if err := fetchBinaryPackage(pkgName, version, revision, cfg, false); err == nil {
+										if err := fetchBinaryPackage(pkgName, version, revision, cfg, effectiveFast, expectedSumGeneric); err == nil {
 											foundOnMirror = true
 											// Update tarballPath for installation
 											arch := GetSystemArchForPackage(cfg, pkgName)
@@ -939,19 +951,21 @@ func Main() {
 									// Try multi-optimized
 									targetVariantMulti := GetSystemVariantForPackage(cfg, pkgName)
 									inIndexMulti := false
+									expectedSumMulti := ""
 									if len(remoteIndex) > 0 {
 										for _, entry := range remoteIndex {
 											if entry.Name == pkgName && entry.Version == version &&
 												entry.Revision == revision && entry.Arch == targetArch &&
 												entry.Variant == targetVariantMulti {
 												inIndexMulti = true
+												expectedSumMulti = entry.B3Sum
 												break
 											}
 										}
 									}
 
 									if inIndexMulti {
-										if err := fetchBinaryPackage(pkgName, version, revision, cfg, false); err == nil {
+										if err := fetchBinaryPackage(pkgName, version, revision, cfg, effectiveFast, expectedSumMulti); err == nil {
 											foundOnMirror = true
 											arch := GetSystemArchForPackage(cfg, pkgName)
 											variant := GetSystemVariantForPackage(cfg, pkgName)
@@ -967,12 +981,14 @@ func Main() {
 										cfg.Values["HOKUTO_GENERIC"] = oldGeneric // reset for now
 
 										inIndexMultiGeneric := false
+										expectedSumMultiGeneric := ""
 										if len(remoteIndex) > 0 {
 											for _, entry := range remoteIndex {
 												if entry.Name == pkgName && entry.Version == version &&
 													entry.Revision == revision && entry.Arch == targetArch &&
 													entry.Variant == targetVariantMultiGeneric {
 													inIndexMultiGeneric = true
+													expectedSumMultiGeneric = entry.B3Sum
 													break
 												}
 											}
@@ -982,7 +998,7 @@ func Main() {
 											oldGeneric := cfg.Values["HOKUTO_GENERIC"]
 											if oldGeneric != "1" {
 												cfg.Values["HOKUTO_GENERIC"] = "1"
-												if err := fetchBinaryPackage(pkgName, version, revision, cfg, false); err == nil {
+												if err := fetchBinaryPackage(pkgName, version, revision, cfg, effectiveFast, expectedSumMultiGeneric); err == nil {
 													foundOnMirror = true
 													arch := GetSystemArchForPackage(cfg, pkgName)
 													variant := GetSystemVariantForPackage(cfg, pkgName)
@@ -1014,11 +1030,15 @@ func Main() {
 
 			handlePreInstallUninstall(pkgName, cfg, RootExec, false)
 
-			colArrow.Print("-> ")
-			colSuccess.Printf("Installing:")
-			colNote.Printf(" %s (%d/%d)\n", pkgName, i+1, len(installPlan))
+			if effectiveFast && bar != nil {
+				bar.Describe(fmt.Sprintf("Installing %s", pkgName))
+			} else {
+				colArrow.Print("-> ")
+				colSuccess.Printf("Installing:")
+				colNote.Printf(" %s (%d/%d)\n", pkgName, i+1, len(installPlan))
+			}
 
-			if err := pkgInstall(tarballPath, pkgName, cfg, RootExec, effectiveYes, nil); err != nil {
+			if err := pkgInstall(tarballPath, pkgName, cfg, RootExec, effectiveYes, effectiveFast, nil); err != nil {
 				fmt.Fprintln(os.Stderr,
 					colArrow.Sprint("->"),
 					colSuccess.Sprintf("Error installing package"),
@@ -1037,10 +1057,27 @@ func Main() {
 				}
 			}
 
+			if effectiveFast && bar != nil {
+				bar.Add(1)
+			} else {
+				colArrow.Print("-> ")
+				colSuccess.Printf("Package ")
+				colNote.Printf("%s", pkgName)
+				colSuccess.Printf(" installed successfully.\n")
+			}
+		}
+
+		if effectiveFast && allSucceeded {
+			if bar != nil {
+				bar.Finish()
+				fmt.Println()
+			}
 			colArrow.Print("-> ")
-			colSuccess.Printf("Package ")
-			colNote.Printf("%s", pkgName)
-			colSuccess.Printf(" installed successfully.\n")
+			colSuccess.Println("Running post-install tasks")
+			if err := PostInstallTasks(RootExec, os.Stdout); err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: Post-install tasks failed: %v\n", err)
+				// We don't mark allSucceeded as false here because packages ARE installed
+			}
 		}
 
 		if !allSucceeded {
@@ -1335,12 +1372,19 @@ func Main() {
 				os.Exit(1)
 			}
 		} else {
-			// Mode: Single Bump (hokuto bump <pkg> <new>)
-			if len(args) < 2 {
-				fmt.Println("Usage: hokuto bump <pkgname> <newversion>")
+			// Mode: Single Bump (hokuto bump <pkg> [newversion])
+			if len(args) < 1 {
+				fmt.Println("Usage: hokuto bump <pkgname> [newversion]")
 				os.Exit(1)
 			}
-			if err := handleSingleBumpCommand(args[0], args[1]); err != nil {
+
+			pkgName := args[0]
+			newVersion := ""
+			if len(args) >= 2 {
+				newVersion = args[1]
+			}
+
+			if err := handleSingleBumpCommand(pkgName, newVersion); err != nil {
 				fmt.Fprintf(os.Stderr, "Bump failed: %v\n", err)
 				os.Exit(1)
 			}

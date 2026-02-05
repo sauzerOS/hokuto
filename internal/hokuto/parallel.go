@@ -283,7 +283,7 @@ func (pm *ParallelManager) installPackage(pkgName string, userRequestedMap map[s
 	}
 
 	outputPkgName := getOutputPackageName(pkgName, pm.Config)
-	arch := GetSystemArch(pm.Config)
+	arch := GetSystemArchForPackage(pm.Config, pkgName)
 	variant := GetSystemVariantForPackage(pm.Config, pkgName)
 	tarballPath := filepath.Join(BinDir, StandardizeRemoteName(outputPkgName, version, revision, arch, variant))
 
@@ -309,8 +309,8 @@ func (pm *ParallelManager) installPackage(pkgName string, userRequestedMap map[s
 	}
 
 	// Check for conflicts before install
-	handlePreInstallUninstall(outputPkgName, pm.Config, RootExec, pm.AutoYes)             // Pass AutoYes
-	err = pkgInstall(tarballPath, outputPkgName, pm.Config, RootExec, pm.AutoYes, logger) // Pass AutoYes
+	handlePreInstallUninstall(outputPkgName, pm.Config, RootExec, pm.AutoYes)                    // Pass AutoYes
+	err = pkgInstall(tarballPath, outputPkgName, pm.Config, RootExec, pm.AutoYes, false, logger) // Pass AutoYes
 	isCriticalAtomic.Store(0)
 
 	if err == nil {
@@ -324,6 +324,9 @@ func (pm *ParallelManager) installPackage(pkgName string, userRequestedMap map[s
 
 func (pm *ParallelManager) canBuild(pkgName string) bool {
 	// Simplified dependency check reusing logic similar to executeBuildPass
+	if pm.BuildPlan.NoDeps {
+		return true
+	}
 
 	pkgDir, err := findPackageDir(pkgName)
 	if err != nil {
@@ -342,20 +345,28 @@ func (pm *ParallelManager) canBuild(pkgName string) bool {
 			continue
 		}
 
-		if !EnableMultilib && strings.HasSuffix(dep.Name, "-32") {
-			continue
+		// Determine candidates: either the alternatives or just the single name
+		candidates := []string{dep.Name}
+		if len(dep.Alternatives) > 0 {
+			candidates = dep.Alternatives
 		}
 
-		// Check if satisfied
+		// Check if satisfied by ANY candidate
 		satisfied := false
+		for _, cand := range candidates {
+			if !EnableMultilib && strings.HasSuffix(cand, "-32") {
+				continue
+			}
 
-		// 1. Check if completed in this run
-		if pm.Completed[dep.Name] {
-			satisfied = true
-		} else {
-			// 2. Check if installed in system
-			if isPackageInstalled(dep.Name) { // Simplified check
+			// 1. Check if completed in this run
+			if pm.Completed[cand] {
 				satisfied = true
+				break
+			}
+			// 2. Check if installed in system
+			if isPackageInstalled(cand) {
+				satisfied = true
+				break
 			}
 		}
 

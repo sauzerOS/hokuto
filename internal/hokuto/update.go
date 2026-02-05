@@ -502,6 +502,15 @@ func checkForUpgrades(_ context.Context, cfg *Config, maxJobs int) error {
 
 	// 4.5. Pre-check for available binaries to avoid pulling in build dependencies
 	binaryAvailable := make(map[string]bool)
+
+	// Fetch remote index once for all checks (pre-check, sequential, parallel)
+	var remoteIndex []RepoEntry
+	if BinaryMirror != "" {
+		if idx, err := FetchRemoteIndex(cfg); err == nil {
+			remoteIndex = idx
+		}
+	}
+
 	if len(pkgNames) > 0 {
 		colArrow.Print("-> ")
 		colSuccess.Printf("Checking for binary availability\n")
@@ -513,7 +522,7 @@ func checkForUpgrades(_ context.Context, cfg *Config, maxJobs int) error {
 			}
 
 			outputPkgName := getOutputPackageName(pkgName, cfg)
-			arch := GetSystemArch(cfg)
+			arch := GetSystemArchForPackage(cfg, pkgName)
 			variant := GetSystemVariantForPackage(cfg, pkgName)
 			tarballName := StandardizeRemoteName(outputPkgName, version, revision, arch, variant)
 			tarballPath := filepath.Join(BinDir, tarballName)
@@ -526,8 +535,23 @@ func checkForUpgrades(_ context.Context, cfg *Config, maxJobs int) error {
 
 			// 2. Check remote mirror (prefetch)
 			if BinaryMirror != "" {
+				// Lookup checksum
+				var expectedSum string
+				if len(remoteIndex) > 0 {
+					targetArch := GetSystemArchForPackage(cfg, pkgName)
+					targetVariant := GetSystemVariantForPackage(cfg, pkgName)
+					for _, entry := range remoteIndex {
+						if entry.Name == pkgName && entry.Version == version &&
+							entry.Revision == revision && entry.Arch == targetArch &&
+							entry.Variant == targetVariant {
+							expectedSum = entry.B3Sum
+							break
+						}
+					}
+				}
+
 				// Use quiet mode for check
-				if err := fetchBinaryPackage(pkgName, version, revision, cfg, true); err == nil {
+				if err := fetchBinaryPackage(pkgName, version, revision, cfg, true, expectedSum); err == nil {
 					binaryAvailable[pkgName] = true
 				}
 			}
@@ -572,13 +596,28 @@ func checkForUpgrades(_ context.Context, cfg *Config, maxJobs int) error {
 
 			// Try to fetch binary if configured (mirror check logic reused logic from sequential)
 			if BinaryMirror != "" {
+				// Lookup checksum
+				var expectedSum string
+				if len(remoteIndex) > 0 {
+					targetArch := GetSystemArchForPackage(cfg, pkgName)
+					targetVariant := GetSystemVariantForPackage(cfg, pkgName)
+					for _, entry := range remoteIndex {
+						if entry.Name == pkgName && entry.Version == version &&
+							entry.Revision == revision && entry.Arch == targetArch &&
+							entry.Variant == targetVariant {
+							expectedSum = entry.B3Sum
+							break
+						}
+					}
+				}
+
 				// Errors here are ignored, we just fail to find binary and proceed to build
 				// Parallel mode: pass quiet=true
-				_ = fetchBinaryPackage(pkgName, version, revision, cfg, true)
+				_ = fetchBinaryPackage(pkgName, version, revision, cfg, true, expectedSum)
 			}
 
 			outputPkgName := getOutputPackageName(pkgName, cfg)
-			arch := GetSystemArch(cfg)
+			arch := GetSystemArchForPackage(cfg, pkgName)
 			variant := GetSystemVariantForPackage(cfg, pkgName)
 			tarballPath := filepath.Join(BinDir, StandardizeRemoteName(outputPkgName, version, revision, arch, variant))
 
@@ -631,7 +670,7 @@ func checkForUpgrades(_ context.Context, cfg *Config, maxJobs int) error {
 		}
 
 		outputPkgName := getOutputPackageName(pkgName, cfg)
-		arch := GetSystemArch(cfg)
+		arch := GetSystemArchForPackage(cfg, pkgName)
 		variant := GetSystemVariantForPackage(cfg, pkgName)
 		tarballName := StandardizeRemoteName(outputPkgName, version, revision, arch, variant)
 		tarballPath := filepath.Join(BinDir, tarballName)
@@ -642,8 +681,23 @@ func checkForUpgrades(_ context.Context, cfg *Config, maxJobs int) error {
 			colSuccess.Printf("Using cached binary package: %s\n", tarballName)
 			foundBinary = true
 		} else if BinaryMirror != "" {
+			// Lookup checksum
+			var expectedSum string
+			if len(remoteIndex) > 0 {
+				targetArch := GetSystemArchForPackage(cfg, pkgName)
+				targetVariant := GetSystemVariantForPackage(cfg, pkgName)
+				for _, entry := range remoteIndex {
+					if entry.Name == pkgName && entry.Version == version &&
+						entry.Revision == revision && entry.Arch == targetArch &&
+						entry.Variant == targetVariant {
+						expectedSum = entry.B3Sum
+						break
+					}
+				}
+			}
+
 			// Sequential mode: output is fine (quiet=false)
-			if err := fetchBinaryPackage(pkgName, version, revision, cfg, false); err == nil {
+			if err := fetchBinaryPackage(pkgName, version, revision, cfg, false, expectedSum); err == nil {
 				foundBinary = true
 			} else {
 				colArrow.Print("-> ")
@@ -657,7 +711,7 @@ func checkForUpgrades(_ context.Context, cfg *Config, maxJobs int) error {
 			colArrow.Print("-> ")
 			colSuccess.Printf("Installing")
 			colNote.Printf(" %s\n", outputPkgName)
-			if err := pkgInstall(tarballPath, outputPkgName, cfg, RootExec, false, nil); err != nil {
+			if err := pkgInstall(tarballPath, outputPkgName, cfg, RootExec, false, false, nil); err != nil {
 				isCriticalAtomic.Store(0)
 				color.Danger.Printf("Binary installation failed for %s: %v. Falling back to build.\n", outputPkgName, err)
 			} else {
@@ -699,7 +753,7 @@ func checkForUpgrades(_ context.Context, cfg *Config, maxJobs int) error {
 		colArrow.Print("-> ")
 		colSuccess.Printf("Installing")
 		colNote.Printf(" %s\n", outputPkgName)
-		if err := pkgInstall(tarballPath, outputPkgName, cfg, RootExec, false, nil); err != nil {
+		if err := pkgInstall(tarballPath, outputPkgName, cfg, RootExec, false, false, nil); err != nil {
 			isCriticalAtomic.Store(0)
 			color.Danger.Printf("Installation failed for %s: %v\n", outputPkgName, err)
 			failedPackages = append(failedPackages, pkgName)

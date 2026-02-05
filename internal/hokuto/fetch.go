@@ -210,8 +210,11 @@ func downloadFileWithOptions(originalURL, finalURL, destFile string, opt downloa
 			nativeErr = fmt.Errorf("failed to create http request: %w", err)
 			break
 		}
-		// Set User-Agent to mimic wget to avoid bot checks/HTML redirects (e.g. SourceForge)
-		req.Header.Set("User-Agent", "Wget/1.21.4")
+		// Use a realistic browser User-Agent to avoid being flagged as a bot (e.g. by GitHub or SourceForge)
+		req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36")
+		req.Header.Set("Accept", "*/*")
+		req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+		req.Header.Set("Connection", "keep-alive")
 
 		resp, err = client.Do(req)
 		if err != nil {
@@ -236,7 +239,7 @@ func downloadFileWithOptions(originalURL, finalURL, destFile string, opt downloa
 			ct := resp.Header.Get("Content-Type")
 			isBinary := strings.HasSuffix(finalURL, ".gz") || strings.HasSuffix(finalURL, ".bz2") ||
 				strings.HasSuffix(finalURL, ".xz") || strings.HasSuffix(finalURL, ".zip") ||
-				strings.HasSuffix(finalURL, ".tgz")
+				strings.HasSuffix(finalURL, ".tgz") || strings.HasSuffix(finalURL, ".zst")
 
 			if strings.HasPrefix(ct, "text/html") && isBinary {
 				resp.Body.Close()
@@ -256,11 +259,29 @@ func downloadFileWithOptions(originalURL, finalURL, destFile string, opt downloa
 			var writer io.Writer = out
 			var bar *progressbar.ProgressBar
 			if !opt.Quiet {
-				// Use colored description for progress bar
-				desc := colArrow.Sprint("-> ") + colSuccess.Sprint("Downloading")
-				bar = progressbar.DefaultBytes(
+				displayFilename := filepath.Base(finalURL)
+				sizeStr := humanReadableSize(resp.ContentLength)
+				colArrow.Print("-> ")
+				colSuccess.Printf("Downloading %s (%s)\n", displayFilename, sizeStr)
+
+				bar = progressbar.NewOptions64(
 					resp.ContentLength,
-					desc,
+					progressbar.OptionSetDescription("   "),
+					progressbar.OptionSetWriter(os.Stderr),
+					progressbar.OptionShowBytes(true),
+					progressbar.OptionSetWidth(30),
+					progressbar.OptionThrottle(10*time.Millisecond),
+					progressbar.OptionShowCount(),
+					progressbar.OptionOnCompletion(func() {
+						fmt.Fprint(os.Stderr, "\n")
+					}),
+					progressbar.OptionSetTheme(progressbar.Theme{
+						Saucer:        "▓",
+						SaucerHead:    "▓",
+						SaucerPadding: "░",
+						BarStart:      "┃",
+						BarEnd:        "┃",
+					}),
 				)
 				writer = io.MultiWriter(out, bar)
 			}
@@ -276,7 +297,6 @@ func downloadFileWithOptions(originalURL, finalURL, destFile string, opt downloa
 			wrappedBody.Close() // Close response body and stop timer
 			if bar != nil {
 				bar.Finish()
-				// fmt.Println() // Removed extra newline per user request
 			}
 			if err != nil {
 				// Write failed
@@ -284,10 +304,7 @@ func downloadFileWithOptions(originalURL, finalURL, destFile string, opt downloa
 			}
 
 			if !opt.Quiet {
-				colArrow.Print("-> ")
-				// Show the base name of the URL for cleaner output
-				displayFilename := filepath.Base(finalURL)
-				colSuccess.Printf("Download successful: %s\n", displayFilename)
+				debugf("Download successful: %s\n", filepath.Base(finalURL))
 			}
 			debugf("\nDownload successful with native Go HTTP client.\n")
 			return nil
@@ -392,32 +409,46 @@ func downloadViaBrowser(url, destPath string, quiet bool) error {
 
 			if !quiet {
 				if bar == nil && e.TotalBytes > 0 {
-					desc := colArrow.Sprint("-> ") + colSuccess.Sprint("Downloading (browser)")
-					bar = progressbar.DefaultBytes(
+					displayFilename := filepath.Base(url)
+					sizeStr := humanReadableSize(int64(e.TotalBytes))
+					colArrow.Print("-> ")
+					colSuccess.Printf("Downloading %s (%s) (browser)\n", displayFilename, sizeStr)
+
+					bar = progressbar.NewOptions64(
 						int64(e.TotalBytes),
-						desc,
+						progressbar.OptionSetDescription("   "),
+						progressbar.OptionSetWriter(os.Stderr),
+						progressbar.OptionShowBytes(true),
+						progressbar.OptionSetWidth(30),
+						progressbar.OptionThrottle(10*time.Millisecond),
+						progressbar.OptionShowCount(),
+						progressbar.OptionOnCompletion(func() {
+							fmt.Fprint(os.Stderr, "\n")
+						}),
+						progressbar.OptionSetTheme(progressbar.Theme{
+							Saucer:        "▓",
+							SaucerHead:    "▓",
+							SaucerPadding: "░",
+							BarStart:      "┃",
+							BarEnd:        "┃",
+						}),
 					)
 				}
 				if bar != nil {
 					bar.Set(int(e.ReceivedBytes))
 					if e.State == browser.DownloadProgressStateCompleted {
 						bar.Finish()
-						// fmt.Println() // Newline after bar
 					}
 				}
 			}
 
 		case *network.EventResponseReceived:
-			// Check for 404 on the main document or any relevant resource if it might be the download
-			// Note: For downloads, the response might not be "Document" but "Other" if headers trigger download.
-			// But if we get a 404, it's usually a Document/HTML error page.
-			if e.Response.Status == http.StatusNotFound {
-				// We can be strict: if we see a 404, we likely failed.
-				// But to be safe, maybe only for Document type?
-				// A 404 on a favicon should not kill the download.
+			// Check for fatal status codes (404, 403, 429) on the main document
+			status := e.Response.Status
+			if status == http.StatusNotFound || status == http.StatusForbidden || status == http.StatusTooManyRequests {
 				if e.Type == network.ResourceTypeDocument {
 					select {
-					case chromeErrCh <- fmt.Errorf("browser received 404 Not Found"):
+					case chromeErrCh <- fmt.Errorf("browser received status %d %s", status, http.StatusText(int(status))):
 					default:
 					}
 				}
@@ -533,7 +564,8 @@ func downloadViaBrowser(url, destPath string, quiet bool) error {
 
 // fetchBinaryPackage attempts to download a binary package from the configured mirror.
 
-func fetchBinaryPackage(pkgName, version, revision string, cfg *Config, quiet bool) error {
+// fetchBinaryPackage attempts to download a binary package from the configured mirror.
+func fetchBinaryPackage(pkgName, version, revision string, cfg *Config, quiet bool, expectedSum string) error {
 	lookupName := pkgName
 	if idx := strings.Index(pkgName, "@"); idx != -1 {
 		lookupName = pkgName[:idx]
@@ -549,17 +581,30 @@ func fetchBinaryPackage(pkgName, version, revision string, cfg *Config, quiet bo
 	url := fmt.Sprintf("%s/%s", BinaryMirror, filename)
 	destPath := filepath.Join(BinDir, filename)
 
-	if !quiet {
-		colArrow.Print("-> ")
-		colSuccess.Printf("Checking mirror for binary: %s\n", filename)
-	}
-
-	// Use downloadFileQuiet so we don't see curl errors (e.g. 404) during update loop
-	if err := downloadFileQuiet(url, url, destPath); err != nil {
+	// Use downloadFileWithOptions to show progress if not quiet
+	if err := downloadFileWithOptions(url, url, destPath, downloadOptions{Quiet: quiet}); err != nil {
 		// Clean up partial file on failure to prevent corrupt cache
 		os.Remove(destPath)
 		return err
 	}
+
+	// Check checksum if provided
+	if expectedSum != "" {
+		computedSum, err := ComputeChecksum(destPath, nil)
+		if err != nil {
+			os.Remove(destPath)
+			return fmt.Errorf("failed to compute checksum for %s: %w", filename, err)
+		}
+		if computedSum != expectedSum {
+			os.Remove(destPath)
+			return fmt.Errorf("checksum mismatch for %s: expected %s, got %s", filename, expectedSum, computedSum)
+		}
+		if !quiet {
+			colArrow.Print("-> ")
+			colSuccess.Printf("Checksum verified: %s\n", expectedSum)
+		}
+	}
+
 	return nil
 }
 
@@ -800,10 +845,6 @@ func fetchSourcesWithOptions(pkgName, pkgDir string, processGit bool, quiet bool
 		}
 
 		if _, err := os.Stat(cachePath); os.IsNotExist(err) {
-			if !quiet {
-				colArrow.Print("-> ")
-				colSuccess.Printf("Fetching source: %s\n", origFilename)
-			}
 			downloader := downloadFile
 			if quiet {
 				downloader = downloadFileQuiet

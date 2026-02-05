@@ -166,12 +166,45 @@ func initConfig(cfg *Config) {
 		debugf("=> No GNU mirror configured, using default: %s\n", gnuMirrorURL)
 	}
 
+	// Load Public Binary Mirrors
+	PublicBinaryMirrors = nil
+	// 1. From embedded file
+	if embeddedMirrorList != "" {
+		lines := strings.Split(embeddedMirrorList, "\n")
+		for _, line := range lines {
+			line = strings.TrimSpace(line)
+			if line != "" {
+				PublicBinaryMirrors = append(PublicBinaryMirrors, line)
+			}
+		}
+	}
+	// 2. From build-time -X flag (handle potential multiple lines)
+	if defaultBinaryMirror != "" {
+		lines := strings.Split(defaultBinaryMirror, "\n")
+		for _, line := range lines {
+			line = strings.TrimSpace(line)
+			if line == "" {
+				continue
+			}
+			found := false
+			for _, m := range PublicBinaryMirrors {
+				if m == line {
+					found = true
+					break
+				}
+			}
+			if !found {
+				PublicBinaryMirrors = append(PublicBinaryMirrors, line)
+			}
+		}
+	}
+
 	if mirror, exists := cfg.Values["HOKUTO_MIRROR"]; exists && mirror != "" {
 		BinaryMirror = strings.TrimRight(mirror, "/")
 		debugf("=> Using Binary Mirror from config: %s\n", BinaryMirror)
-	} else if defaultBinaryMirror != "" {
-		BinaryMirror = strings.TrimRight(defaultBinaryMirror, "/")
-		debugf("=> Using hardcoded default Binary Mirror: %s\n", BinaryMirror)
+	} else if len(PublicBinaryMirrors) > 0 {
+		BinaryMirror = strings.TrimRight(PublicBinaryMirrors[0], "/")
+		debugf("=> Using first available public mirror: %s\n", BinaryMirror)
 	}
 
 	SourcesDir = CacheDir + "/sources"

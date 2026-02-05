@@ -7,56 +7,72 @@ import (
 	"io"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/schollz/progressbar/v3"
 )
 
 // R2Client wraps the S3 client for Cloudflare R2.
 type R2Client struct {
 	Client     *s3.Client
 	BucketName string
+	Config     *Config
 }
 
-// NewR2Client initializes a new R2 client using configuration values.
+// NewR2Client initializes a new S3/R2 client using configuration values.
 func NewR2Client(cfg *Config) (*R2Client, error) {
-	accountID := cfg.Values["R2_ACCOUNT_ID"]
-	accessKey := cfg.Values["R2_ACCESS_KEY_ID"]
-	secretKey := cfg.Values["R2_SECRET_ACCESS_KEY"]
-	bucketName := cfg.Values["R2_BUCKET_NAME"]
+	// 1. Try to load from Active Mirror configuration first
+	activeMirrorName := cfg.Values["HOKUTO_MIRROR_NAME"]
+	var endpoint, accessKey, secretKey, bucketName, region string
+	var usePathStyle bool
 
+	if activeMirrorName != "" {
+		// Load from mirror config
+		endpoint = cfg.Values["MIRROR_"+activeMirrorName+"_URL"]
+		accessKey = cfg.Values["MIRROR_"+activeMirrorName+"_ACCESS_KEY"]
+		secretKey = cfg.Values["MIRROR_"+activeMirrorName+"_SECRET_KEY"]
+		bucketName = cfg.Values["MIRROR_"+activeMirrorName+"_BUCKET"]
+		region = cfg.Values["MIRROR_"+activeMirrorName+"_REGION"]
+		mType := cfg.Values["MIRROR_"+activeMirrorName+"_TYPE"]
+
+		if mType == "s3" || mType == "minio" {
+			usePathStyle = true
+		}
+	}
+
+	// 2. Fallback to Legacy R2 Environment Variables if keys missing
+	// (This preserves backward compatibility for the existing R2 setup)
+	if accessKey == "" || secretKey == "" {
+		accountID := cfg.Values["R2_ACCOUNT_ID"]
+		accessKey = cfg.Values["R2_ACCESS_KEY_ID"]
+		secretKey = cfg.Values["R2_SECRET_ACCESS_KEY"]
+		bucketName = cfg.Values["R2_BUCKET_NAME"]
+
+		if accountID != "" {
+			endpoint = fmt.Sprintf("https://%s.r2.cloudflarestorage.com", accountID)
+		}
+	}
+
+	// Defaults
 	if bucketName == "" {
 		bucketName = "sauzeros"
 	}
-
-	// Use binary mirror account ID if missing
-	if accountID == "" && BinaryMirror != "" {
-		// Try to extract account ID from mirror URL if possible, or just use a sensible default
-		// Actually, let's just use "sauzeros" or similar if we can't find it
-		accountID = "617154563a6a127a69bc9262804b4d66" // Sauzeros public account ID?
+	if region == "" {
+		region = "auto"
 	}
 
-	if accountID == "" || accessKey == "" || secretKey == "" {
-		if bucketName != "sauzeros" {
-			return nil, fmt.Errorf("R2 credentials missing in configuration (R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY)")
-		}
-		// Public access if credentials missing? We still need an account ID for the endpoint.
-		if accountID == "" {
-			accountID = "617154563a6a127a69bc9262804b4d66"
-		}
-		if accessKey == "" {
-			accessKey = "dummy"
-		}
-		if secretKey == "" {
-			secretKey = "dummy"
-		}
+	if accessKey == "" || secretKey == "" {
+		return nil, fmt.Errorf("S3/R2 credentials missing (checked active mirror '%s' and legacy R2_* vars)", activeMirrorName)
 	}
 
 	options := []func(*config.LoadOptions) error{
 		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(accessKey, secretKey, "")),
-		config.WithRegion("auto"),
+		config.WithRegion(region),
 	}
 
 	if Debug {
@@ -65,18 +81,37 @@ func NewR2Client(cfg *Config) (*R2Client, error) {
 
 	awsCfg, err := config.LoadDefaultConfig(context.TODO(), options...)
 	if err != nil {
-		return nil, fmt.Errorf("failed to load R2 config: %w", err)
+		return nil, fmt.Errorf("failed to load AWS/S3 config: %w", err)
 	}
 
 	client := s3.NewFromConfig(awsCfg, func(o *s3.Options) {
-		o.BaseEndpoint = aws.String(fmt.Sprintf("https://%s.r2.cloudflarestorage.com", accountID))
-		o.UsePathStyle = true
+		if endpoint != "" {
+			o.BaseEndpoint = aws.String(endpoint)
+		}
+		o.UsePathStyle = usePathStyle
 	})
 
 	return &R2Client{
 		Client:     client,
 		BucketName: bucketName,
+		Config:     cfg,
 	}, nil
+}
+
+// progressReadSeeker wraps an io.ReadSeeker to track progress smoothly.
+type progressReadSeeker struct {
+	inner io.ReadSeeker
+	bar   *progressbar.ProgressBar
+}
+
+func (p *progressReadSeeker) Read(b []byte) (int, error) {
+	n, err := p.inner.Read(b)
+	p.bar.Add(n)
+	return n, err
+}
+
+func (p *progressReadSeeker) Seek(offset int64, whence int) (int64, error) {
+	return p.inner.Seek(offset, whence)
 }
 
 // DownloadFile fetches a file from R2.
@@ -94,7 +129,7 @@ func (r *R2Client) DownloadFile(ctx context.Context, key string) ([]byte, error)
 }
 
 // UploadFile uploads a file to R2.
-func (r *R2Client) UploadFile(ctx context.Context, key string, body []byte) error {
+func (r *R2Client) UploadFile(ctx context.Context, key string, body []byte, progress ...int) error {
 	contentType := "application/octet-stream"
 	if strings.HasSuffix(key, ".json") {
 		contentType = "application/json"
@@ -102,18 +137,54 @@ func (r *R2Client) UploadFile(ctx context.Context, key string, body []byte) erro
 		contentType = "application/zstd"
 	}
 
-	_, err := r.Client.PutObject(ctx, &s3.PutObjectInput{
-		Bucket:        aws.String(r.BucketName),
-		Key:           aws.String(key),
-		Body:          bytes.NewReader(body),
-		ContentLength: aws.Int64(int64(len(body))),
-		ContentType:   aws.String(contentType),
+	uploader := manager.NewUploader(r.Client, func(u *manager.Uploader) {
+		u.PartSize = 10 * 1024 * 1024 // 10MiB (must be <= 16MiB for some mirrors)
+		u.Concurrency = 1             // Disable concurrency for smooth, linear progress bar updates
 	})
+
+	// Print status line first
+	sizeStr := humanReadableSize(int64(len(body)))
+	colArrow.Print("-> ")
+	if len(progress) >= 2 {
+		colNote.Printf("[%d/%d] ", progress[0], progress[1])
+	}
+	colSuccess.Printf("Uploading %s (%s)\n", key, sizeStr)
+
+	// Initialize progress bar on the next line
+	bar := progressbar.NewOptions64(
+		int64(len(body)),
+		progressbar.OptionSetDescription("   "),
+		progressbar.OptionSetWriter(os.Stderr),
+		progressbar.OptionShowBytes(true),
+		progressbar.OptionSetWidth(30),
+		progressbar.OptionThrottle(10*time.Millisecond), // Fast update throttled at 100fps
+		progressbar.OptionShowCount(),
+		progressbar.OptionOnCompletion(func() {
+			fmt.Fprint(os.Stderr, "\n")
+		}),
+		progressbar.OptionSetTheme(progressbar.Theme{
+			Saucer:        "▓",
+			SaucerHead:    "▓",
+			SaucerPadding: "░",
+			BarStart:      "┃",
+			BarEnd:        "┃",
+		}),
+	)
+
+	_, err := uploader.Upload(ctx, &s3.PutObjectInput{
+		Bucket:      aws.String(r.BucketName),
+		Key:         aws.String(key),
+		Body:        &progressReadSeeker{inner: bytes.NewReader(body), bar: bar},
+		ContentType: aws.String(contentType),
+	})
+	if err == nil {
+		bar.Finish()
+	}
 	return err
 }
 
 // UploadLocalFile uploads a file from disk to R2.
-func (r *R2Client) UploadLocalFile(ctx context.Context, key, filePath string) error {
+func (r *R2Client) UploadLocalFile(ctx context.Context, key, filePath string, progress ...int) error {
 	file, err := os.Open(filePath)
 	if err != nil {
 		return err
@@ -130,13 +201,49 @@ func (r *R2Client) UploadLocalFile(ctx context.Context, key, filePath string) er
 		contentType = "application/zstd"
 	}
 
-	_, err = r.Client.PutObject(ctx, &s3.PutObjectInput{
-		Bucket:        aws.String(r.BucketName),
-		Key:           aws.String(key),
-		Body:          file,
-		ContentLength: aws.Int64(stat.Size()),
-		ContentType:   aws.String(contentType),
+	uploader := manager.NewUploader(r.Client, func(u *manager.Uploader) {
+		u.PartSize = 10 * 1024 * 1024 // 10MiB
+		u.Concurrency = 1             // Sequential for better progress visualization
 	})
+
+	// Print status line first
+	sizeStr := humanReadableSize(stat.Size())
+	colArrow.Print("-> ")
+	if len(progress) >= 2 {
+		colNote.Printf("[%d/%d] ", progress[0], progress[1])
+	}
+	colSuccess.Printf("Uploading %s (%s)\n", key, sizeStr)
+
+	// Initialize progress bar on the next line
+	bar := progressbar.NewOptions64(
+		stat.Size(),
+		progressbar.OptionSetDescription("   "),
+		progressbar.OptionSetWriter(os.Stderr),
+		progressbar.OptionShowBytes(true),
+		progressbar.OptionSetWidth(30),
+		progressbar.OptionThrottle(10*time.Millisecond),
+		progressbar.OptionShowCount(),
+		progressbar.OptionOnCompletion(func() {
+			fmt.Fprint(os.Stderr, "\n")
+		}),
+		progressbar.OptionSetTheme(progressbar.Theme{
+			Saucer:        "▓",
+			SaucerHead:    "▓",
+			SaucerPadding: "░",
+			BarStart:      "┃",
+			BarEnd:        "┃",
+		}),
+	)
+
+	_, err = uploader.Upload(ctx, &s3.PutObjectInput{
+		Bucket:      aws.String(r.BucketName),
+		Key:         aws.String(key),
+		Body:        &progressReadSeeker{inner: file, bar: bar},
+		ContentType: aws.String(contentType),
+	})
+	if err == nil {
+		bar.Finish()
+	}
 	return err
 }
 

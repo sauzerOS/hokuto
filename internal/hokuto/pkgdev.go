@@ -453,6 +453,26 @@ func bumpPackage(pkgName, expectedOldVersion, newVersion string) (string, error)
 }
 
 func handleSingleBumpCommand(pkgName, newVersion string) error {
+	// If newVersion is empty, we infer it means "keep version, bump revision"
+	// So we need to look up the current version first.
+	if newVersion == "" {
+		pkgDir, err := findPackageDir(pkgName)
+		if err != nil {
+			return fmt.Errorf("%s: package not found", pkgName)
+		}
+		versionPath := filepath.Join(pkgDir, "version")
+		versionData, err := os.ReadFile(versionPath)
+		if err != nil {
+			return fmt.Errorf("%s: could not read version file", pkgName)
+		}
+		fields := strings.Fields(string(versionData))
+		if len(fields) == 0 {
+			return fmt.Errorf("%s: version file empty", pkgName)
+		}
+		// The current version is the first field (e.g. "1.2.3")
+		newVersion = fields[0]
+	}
+
 	pkgDir, err := bumpPackage(pkgName, "", newVersion)
 	if err != nil {
 		return err
