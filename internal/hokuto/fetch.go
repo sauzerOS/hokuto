@@ -741,7 +741,6 @@ func fetchSourcesWithOptions(pkgName, pkgDir string, processGit bool, quiet bool
 				debugf("Skipping git repository for this operation: %s\n", rawSourceURL)
 				continue
 			}
-			// ... (rest of the existing, correct git logic) ...
 			gitURL := strings.TrimPrefix(rawSourceURL, "git+")
 			ref := ""
 			if strings.Contains(gitURL, "#") {
@@ -751,12 +750,66 @@ func fetchSourcesWithOptions(pkgName, pkgDir string, processGit bool, quiet bool
 			}
 			parts = strings.Split(strings.TrimSuffix(gitURL, ".git"), "/")
 			repoName := parts[len(parts)-1]
+
+			// --- SHARED GIT CACHE LOGIC WITH LOCKING ---
+			gitCacheDir := filepath.Join(CacheStore, "git")
+			os.MkdirAll(gitCacheDir, 0o755)
+
+			urlHash := hashString(gitURL)[:12]
+			cacheRepoPath := filepath.Join(gitCacheDir, repoName+"-"+urlHash)
+
+			// Use a sub-function to handle locking and defer
+			err := func() error {
+				lockPath := cacheRepoPath + ".lock"
+				lFile, err := os.Create(lockPath)
+				if err != nil {
+					return fmt.Errorf("failed to create lock file for git cache: %v", err)
+				}
+				defer os.Remove(lockPath)
+				defer lFile.Close()
+
+				if err := unix.Flock(int(lFile.Fd()), unix.LOCK_EX); err != nil {
+					return fmt.Errorf("failed to lock git cache: %v", err)
+				}
+				defer unix.Flock(int(lFile.Fd()), unix.LOCK_UN)
+
+				if _, err := os.Stat(cacheRepoPath); os.IsNotExist(err) {
+					if !quiet {
+						cPrintf(colInfo, "Initializing shared git cache for %s\n", gitURL)
+					}
+					// Use --mirror for a complete copy of all refs in a bare repository
+					cmd := exec.Command("git", "clone", "--mirror", gitURL, cacheRepoPath)
+					if quiet && !Debug {
+						cmd.Stdout = io.Discard
+						cmd.Stderr = io.Discard
+					} else {
+						cmd.Stdout = os.Stdout
+						cmd.Stderr = os.Stderr
+					}
+					if err := cmd.Run(); err != nil {
+						return fmt.Errorf("failed to clone git cache: %v", err)
+					}
+				} else {
+					// Update existing cache
+					debugf("Updating shared git cache for %s\n", gitURL)
+					cmd := exec.Command("git", "-C", cacheRepoPath, "remote", "update", "--prune")
+					if err := cmd.Run(); err != nil {
+						debugf("Warning: failed to update git cache: %v\n", err)
+					}
+				}
+				return nil
+			}()
+			if err != nil {
+				return err
+			}
+
 			destPath := filepath.Join(pkgLinkDir, repoName)
 			if _, err := os.Stat(destPath); os.IsNotExist(err) {
 				if !quiet {
-					cPrintf(colInfo, "Cloning git repository %s into %s\n", gitURL, destPath)
+					cPrintf(colInfo, "Cloning %s into %s (cached)\n", gitURL, destPath)
 				}
-				cmd := exec.Command("git", "clone", gitURL, destPath)
+				// Use --shared to save space (links to cache objects)
+				cmd := exec.Command("git", "clone", "--shared", cacheRepoPath, destPath)
 				if quiet && !Debug {
 					cmd.Stdout = io.Discard
 					cmd.Stderr = io.Discard
@@ -765,9 +818,13 @@ func fetchSourcesWithOptions(pkgName, pkgDir string, processGit bool, quiet bool
 					cmd.Stderr = os.Stderr
 				}
 				if err := cmd.Run(); err != nil {
-					return fmt.Errorf("git clone failed: %v", err)
+					return fmt.Errorf("failed to clone from cache: %v", err)
 				}
+				// Reset the origin URL to the real one so users can still pull manually if they want
+				exec.Command("git", "-C", destPath, "remote", "set-url", "origin", gitURL).Run()
 			} else if ref == "" {
+				// If no ref, we try to update
+				debugf("Updating %s from cache\n", repoName)
 				cmd := exec.Command("git", "-C", destPath, "pull")
 				if quiet && !Debug {
 					cmd.Stdout = io.Discard
@@ -778,8 +835,11 @@ func fetchSourcesWithOptions(pkgName, pkgDir string, processGit bool, quiet bool
 				}
 				cmd.Run()
 			}
+
+			// Configure advice and checkout the requested ref if provided
 			exec.Command("git", "-C", destPath, "config", "advice.detachedHead", "false").Run()
 			if ref != "" {
+				// Try to see if it's a branch first
 				checkBranch := exec.Command("git", "-C", destPath, "rev-parse", "--verify", "refs/heads/"+ref)
 				if err := checkBranch.Run(); err == nil {
 					cmd := exec.Command("git", "-C", destPath, "checkout", ref)
@@ -801,6 +861,7 @@ func fetchSourcesWithOptions(pkgName, pkgDir string, processGit bool, quiet bool
 					}
 					cmd.Run()
 				} else {
+					// Fallback: checkout as a tag or commit hash
 					cmd := exec.Command("git", "-C", destPath, "checkout", ref)
 					if quiet && !Debug {
 						cmd.Stdout = io.Discard
