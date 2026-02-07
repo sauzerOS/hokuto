@@ -67,7 +67,11 @@ func getRebuildTriggers(triggerPkg string, rootDir string) []string {
 	return packagesToRebuild
 }
 
-func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes, fast bool, logger io.Writer) error {
+// pkgInstall installs a compiled hokuto package from a tarball.
+// If yes is true, it assumes 'yes' to all prompts.
+// If fast is true, it optimizes for speed (e.g., skip some UI/status updates).
+// If managed is true, it skips internal rebuild triggers (e.g. DKMS) assuming the caller handles them.
+func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes, fast, managed bool, logger io.Writer) error {
 	if logger == nil {
 		logger = os.Stdout
 	}
@@ -919,24 +923,12 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 	// 7.5. Check for rebuild triggers from /etc/hokuto/hokuto.rebuild
 	rebuildTriggerPkgs := getRebuildTriggers(pkgName, rootDir)
 	if len(rebuildTriggerPkgs) > 0 {
-		colArrow.Print("-> ")
-		colSuccess.Print("DKMS trigger: ")
+		fmt.Fprint(logger, colArrow.Sprint("-> "))
+		fmt.Fprint(logger, colSuccess.Sprint("DKMS trigger: "))
 		fmt.Fprintf(logger, "%s", colNote.Sprintf("%s\n", strings.Join(rebuildTriggerPkgs, " ")))
 		shouldRebuild := yes // Default to true if --yes flag is set
 		if !yes {
-			// Use custom prompt to match requested format
-			WithPrompt(func() {
-				colArrow.Print("-> ")
-				colWarn.Printf("Rebuild the packages? [Y/n]")
-				os.Stdout.Sync()
-				response, err := stdinReader.ReadString('\n')
-				if err != nil {
-					shouldRebuild = false // Default to no on read error
-				} else {
-					response = strings.ToLower(strings.TrimSpace(response))
-					shouldRebuild = response == "y" || response == "yes" || response == ""
-				}
-			})
+			shouldRebuild = askForConfirmation(colWarn, "%sRebuild the packages?", colArrow.Sprint("-> "))
 		}
 
 		if shouldRebuild {

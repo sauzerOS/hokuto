@@ -99,6 +99,16 @@ func RunParallelBuilds(plan *BuildPlan, cfg *Config, maxJobs int, userRequestedM
 	uiDone := make(chan struct{})
 	go pm.uiLoop(uiDone)
 
+	// Disable interactive mode for executors in parallel mode
+	oldUserInt := UserExec.Interactive
+	oldRootInt := RootExec.Interactive
+	UserExec.Interactive = false
+	RootExec.Interactive = false
+	defer func() {
+		UserExec.Interactive = oldUserInt
+		RootExec.Interactive = oldRootInt
+	}()
+
 	// Execute
 	err := pm.Run()
 
@@ -182,6 +192,15 @@ func RunParallelBuilds(plan *BuildPlan, cfg *Config, maxJobs int, userRequestedM
 	return nil
 }
 
+func (pm *ParallelManager) isInteractive(pkgName string) bool {
+	pkgDir, err := findPackageDir(pkgName)
+	if err != nil {
+		return false
+	}
+	options := loadBuildOptions(pkgDir)
+	return options["interactive"]
+}
+
 // Run executes the parallel build loop
 func (pm *ParallelManager) Run() error {
 	failed := false
@@ -189,25 +208,53 @@ func (pm *ParallelManager) Run() error {
 		// 1. Check if we can start new jobs
 		pm.mu.Lock()
 		if !failed { // Stop starting new jobs if a failure occurred
-			// Identify candidates
-			var nextPending []string
-
-			for _, pkgName := range pm.Pending {
-				// Stop if we hit max jobs
-				if len(pm.Running) >= pm.MaxJobs {
-					nextPending = append(nextPending, pkgName)
-					continue
-				}
-
-				// Check dependencies
-				if pm.canBuild(pkgName) {
-					// Start Build
-					pm.startBuild(pkgName, len(pm.Completed)+len(pm.Running)+1, len(pm.BuildPlan.Order))
-				} else {
-					nextPending = append(nextPending, pkgName)
+			// Check if any interactive job is currently running
+			anyInteractiveRunning := false
+			for rPkg := range pm.Running {
+				if pm.isInteractive(rPkg) {
+					anyInteractiveRunning = true
+					break
 				}
 			}
-			pm.Pending = nextPending
+
+			if !anyInteractiveRunning {
+				// Identify candidates
+				var nextPending []string
+				canStartMore := true
+
+				for _, pkgName := range pm.Pending {
+					// Stop if we hit max jobs or just started/found an interactive job
+					if !canStartMore || len(pm.Running) >= pm.MaxJobs {
+						nextPending = append(nextPending, pkgName)
+						continue
+					}
+
+					if pm.isInteractive(pkgName) {
+						// Interactive packages must run ALONE
+						if len(pm.Running) == 0 {
+							if pm.canBuild(pkgName) {
+								pm.startBuild(pkgName, len(pm.Completed)+len(pm.Running)+1, len(pm.BuildPlan.Order))
+								canStartMore = false // Don't start anything else after starting an interactive job
+							} else {
+								nextPending = append(nextPending, pkgName)
+							}
+						} else {
+							// Other jobs are running, wait for them to finish before starting this interactive one
+							nextPending = append(nextPending, pkgName)
+							canStartMore = false // Optimization: don't look ahead if we're waiting to isolate a job
+						}
+						continue
+					}
+
+					// Non-interactive package
+					if pm.canBuild(pkgName) {
+						pm.startBuild(pkgName, len(pm.Completed)+len(pm.Running)+1, len(pm.BuildPlan.Order))
+					} else {
+						nextPending = append(nextPending, pkgName)
+					}
+				}
+				pm.Pending = nextPending
+			}
 		}
 		pm.mu.Unlock()
 
@@ -232,7 +279,18 @@ func (pm *ParallelManager) Run() error {
 				// Release lock during installation to allow UI loop (which needs lock) to run
 				// and process prompts (which call back to UI loop).
 				pm.mu.Unlock()
-				installErr := pm.Installer(res.pkgName, logger)
+				var installErr error
+				if pm.isInteractive(res.pkgName) {
+					WithPrompt(func() {
+						UserExec.Interactive = true
+						RootExec.Interactive = true
+						installErr = pm.Installer(res.pkgName, logger)
+						UserExec.Interactive = false
+						RootExec.Interactive = false
+					})
+				} else {
+					installErr = pm.Installer(res.pkgName, logger)
+				}
 				pm.mu.Lock()
 
 				if installErr != nil {
@@ -241,11 +299,35 @@ func (pm *ParallelManager) Run() error {
 				} else {
 					pm.Completed[res.pkgName] = true
 
-					// 3. Dynamic Task Addition (Post-Build Rebuilds)
-					if rebuilds, ok := pm.BuildPlan.PostBuildRebuilds[res.pkgName]; ok {
+					// 3. Dynamic Task Addition (Post-Build Rebuilds & Triggers)
+					var rebuilds []string
+					if rbs, ok := pm.BuildPlan.PostBuildRebuilds[res.pkgName]; ok {
+						rebuilds = append(rebuilds, rbs...)
+					}
+					// Check for filesystem triggers (e.g. DKMS) in parallel mode
+					targetRoot := pm.Config.Values["HOKUTO_ROOT"]
+					if targetRoot == "" {
+						targetRoot = "/"
+					}
+					triggers := getRebuildTriggers(res.pkgName, targetRoot)
+					if len(triggers) > 0 {
+						rebuilds = append(rebuilds, triggers...)
+					}
+
+					if len(rebuilds) > 0 {
 						for _, rPkg := range rebuilds {
-							// Simple append for now. canBuild will gate it.
-							if !pm.Completed[rPkg] {
+							if pm.Completed[rPkg] {
+								continue
+							}
+							// Add to pending if not already there
+							isPending := false
+							for _, p := range pm.Pending {
+								if p == rPkg {
+									isPending = true
+									break
+								}
+							}
+							if !isPending {
 								pm.Pending = append(pm.Pending, rPkg)
 							}
 						}
@@ -309,8 +391,8 @@ func (pm *ParallelManager) installPackage(pkgName string, userRequestedMap map[s
 	}
 
 	// Check for conflicts before install
-	handlePreInstallUninstall(outputPkgName, pm.Config, RootExec, pm.AutoYes)                    // Pass AutoYes
-	err = pkgInstall(tarballPath, outputPkgName, pm.Config, RootExec, pm.AutoYes, false, logger) // Pass AutoYes
+	handlePreInstallUninstall(outputPkgName, pm.Config, RootExec, pm.AutoYes)                          // Pass AutoYes
+	err = pkgInstall(tarballPath, outputPkgName, pm.Config, RootExec, pm.AutoYes, false, true, logger) // Pass AutoYes, managed=true
 	isCriticalAtomic.Store(0)
 
 	if err == nil {
@@ -379,34 +461,47 @@ func (pm *ParallelManager) canBuild(pkgName string) bool {
 
 func (pm *ParallelManager) startBuild(pkgName string, idx, total int) {
 	pm.Running[pkgName] = time.Now()
+	interactive := pm.isInteractive(pkgName)
 
 	// Create log file
-	if err := os.MkdirAll(HokutoTmpDir, 0755); err != nil {
-		// fallback if we can't create the dir? or just let CreateTemp fail?
-		// We can log a debug warning.
-	}
-	logFile, err := os.CreateTemp(HokutoTmpDir, fmt.Sprintf("hokuto-build-%s-*.log", pkgName))
+	var logFile *os.File
 	var logWriter io.Writer
-	if err == nil {
-		pm.LogFiles[pkgName] = logFile
-		logWriter = logFile // Write to file
-	} else {
+	if !interactive {
+		if err := os.MkdirAll(HokutoTmpDir, 0755); err == nil {
+			if f, err := os.CreateTemp(HokutoTmpDir, fmt.Sprintf("hokuto-build-%s-*.log", pkgName)); err == nil {
+				logFile = f
+				pm.LogFiles[pkgName] = logFile
+				logWriter = logFile // Write to file
+			}
+		}
+	}
+
+	if logWriter == nil && !interactive {
 		logWriter = io.Discard
 	}
 
 	go func() {
-		// Call pkgBuild with Quiet=true and LogWriter
+		// Call pkgBuild with Quiet flag and LogWriter
 		opts := BuildOptions{
 			Bootstrap:    false, // TODO: Propagate from global?
 			CurrentIndex: idx,
 			TotalCount:   total,
-			Quiet:        true,
+			Quiet:        !interactive,
 			LogWriter:    logWriter,
 		}
 
-		start := time.Now()
-		// Use injected Builder
-		dur, err := pm.Builder(pkgName, pm.Config, UserExec, opts)
+		var dur time.Duration
+		var err error
+
+		if interactive {
+			WithPrompt(func() {
+				UserExec.Interactive = true
+				dur, err = pm.Builder(pkgName, pm.Config, UserExec, opts)
+				UserExec.Interactive = false
+			})
+		} else {
+			dur, err = pm.Builder(pkgName, pm.Config, UserExec, opts)
+		}
 
 		pm.resultChan <- buildResult{
 			pkgName:  pkgName,
@@ -418,7 +513,7 @@ func (pm *ParallelManager) startBuild(pkgName string, idx, total int) {
 		if logFile != nil {
 			if err != nil {
 				// Print tail of log file to stdout?
-				fmt.Fprintf(pm.LogFiles[pkgName], "\nBuild failed in %s\n", time.Since(start))
+				fmt.Fprintf(pm.LogFiles[pkgName], "\nBuild failed\n")
 			}
 		}
 	}()

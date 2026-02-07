@@ -265,10 +265,12 @@ func Main() {
 	UserExec = &Executor{
 		Context:         ctx,
 		ShouldRunAsRoot: false,
+		Interactive:     true,
 	}
 	RootExec = &Executor{
 		Context:         ctx,
 		ShouldRunAsRoot: true,
+		Interactive:     true,
 	}
 
 	// 7. MAIN LOGIC
@@ -1038,7 +1040,7 @@ func Main() {
 				colNote.Printf(" %s (%d/%d)\n", pkgName, i+1, len(installPlan))
 			}
 
-			if err := pkgInstall(tarballPath, pkgName, cfg, RootExec, effectiveYes, effectiveFast, nil); err != nil {
+			if err := pkgInstall(tarballPath, pkgName, cfg, RootExec, effectiveYes, effectiveFast, false, nil); err != nil {
 				fmt.Fprintln(os.Stderr,
 					colArrow.Sprint("->"),
 					colSuccess.Sprintf("Error installing package"),

@@ -630,8 +630,12 @@ func checkForUpgrades(_ context.Context, cfg *Config, maxJobs int) error {
 			return pkgBuild(pkgName, cfg, exec, opts)
 		}
 
-		if err := RunParallelBuilds(updatePlan, cfg, maxJobs, userRequestedMap, false, smartBuilder); err != nil {
+		if err := RunParallelBuilds(updatePlan, cfg, maxJobs, userRequestedMap, true, smartBuilder); err != nil {
 			return err
+		}
+
+		if err := PostInstallTasks(RootExec, os.Stdout); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: Global post-install tasks failed: %v\n", err)
 		}
 
 		// Recheck specific condition: Hokuto itself updated?
@@ -711,7 +715,7 @@ func checkForUpgrades(_ context.Context, cfg *Config, maxJobs int) error {
 			colArrow.Print("-> ")
 			colSuccess.Printf("Installing")
 			colNote.Printf(" %s\n", outputPkgName)
-			if err := pkgInstall(tarballPath, outputPkgName, cfg, RootExec, false, false, nil); err != nil {
+			if err := pkgInstall(tarballPath, outputPkgName, cfg, RootExec, false, false, false, nil); err != nil {
 				isCriticalAtomic.Store(0)
 				color.Danger.Printf("Binary installation failed for %s: %v. Falling back to build.\n", outputPkgName, err)
 			} else {
@@ -753,7 +757,7 @@ func checkForUpgrades(_ context.Context, cfg *Config, maxJobs int) error {
 		colArrow.Print("-> ")
 		colSuccess.Printf("Installing")
 		colNote.Printf(" %s\n", outputPkgName)
-		if err := pkgInstall(tarballPath, outputPkgName, cfg, RootExec, false, false, nil); err != nil {
+		if err := pkgInstall(tarballPath, outputPkgName, cfg, RootExec, false, false, false, nil); err != nil {
 			isCriticalAtomic.Store(0)
 			color.Danger.Printf("Installation failed for %s: %v\n", outputPkgName, err)
 			failedPackages = append(failedPackages, pkgName)

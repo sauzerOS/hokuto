@@ -598,9 +598,19 @@ func executePostInstall(pkgName, rootDir string, execCtx *Executor, cfg *Config,
 	}
 	cmd.Env = append(os.Environ(), fmt.Sprintf("HOKUTO_REAL_USER=%s", realUser))
 
-	cmd.Stdin = os.Stdin
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+	if logger != nil {
+		cmd.Stdout = logger
+		cmd.Stderr = logger
+	} else {
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+	}
+
+	if execCtx.Interactive {
+		cmd.Stdin = os.Stdin
+	} else {
+		cmd.Stdin = nil
+	}
 
 	// If chroot is used, we must mount communicating filesystems (/dev, /proc, /sys)
 	// to ensure scripts like make-ca (which interacts with /dev/stdin) work correctly.
