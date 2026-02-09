@@ -855,7 +855,7 @@ func Main() {
 
 				// 1. Check Local Cache (skip if we already found the tarball directly)
 				if !tarballFoundDirectly {
-					if _, err := os.Stat(tarballPath); err != nil {
+					if _, err := os.Stat(tarballPath); err != nil || *remote {
 						foundOnMirror := false
 
 						// 2. Not in local cache? Try Mirror.
@@ -888,7 +888,7 @@ func Main() {
 							}
 
 							if inIndex {
-								if err := fetchBinaryPackage(pkgName, version, revision, cfg, effectiveFast, expectedSum); err == nil {
+								if err := fetchBinaryPackage(pkgName, version, revision, cfg, effectiveFast, expectedSum, *remote); err == nil {
 									foundOnMirror = true
 								} else {
 									debugf("Mirror fetch failed for %s: %v\n", pkgName, err)
@@ -933,7 +933,7 @@ func Main() {
 										cPrintf(colInfo, "Optimized binary not found, trying fallback: %s\n", fallbackVariant)
 
 										cfg.Values["HOKUTO_GENERIC"] = "1"
-										if err := fetchBinaryPackage(pkgName, version, revision, cfg, effectiveFast, expectedSumGeneric); err == nil {
+										if err := fetchBinaryPackage(pkgName, version, revision, cfg, effectiveFast, expectedSumGeneric, *remote); err == nil {
 											foundOnMirror = true
 											// Update tarballPath for installation
 											arch := GetSystemArchForPackage(cfg, pkgName)
@@ -967,7 +967,7 @@ func Main() {
 									}
 
 									if inIndexMulti {
-										if err := fetchBinaryPackage(pkgName, version, revision, cfg, effectiveFast, expectedSumMulti); err == nil {
+										if err := fetchBinaryPackage(pkgName, version, revision, cfg, effectiveFast, expectedSumMulti, *remote); err == nil {
 											foundOnMirror = true
 											arch := GetSystemArchForPackage(cfg, pkgName)
 											variant := GetSystemVariantForPackage(cfg, pkgName)
@@ -1000,7 +1000,7 @@ func Main() {
 											oldGeneric := cfg.Values["HOKUTO_GENERIC"]
 											if oldGeneric != "1" {
 												cfg.Values["HOKUTO_GENERIC"] = "1"
-												if err := fetchBinaryPackage(pkgName, version, revision, cfg, effectiveFast, expectedSumMultiGeneric); err == nil {
+												if err := fetchBinaryPackage(pkgName, version, revision, cfg, effectiveFast, expectedSumMultiGeneric, *remote); err == nil {
 													foundOnMirror = true
 													arch := GetSystemArchForPackage(cfg, pkgName)
 													variant := GetSystemVariantForPackage(cfg, pkgName)

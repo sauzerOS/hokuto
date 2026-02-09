@@ -294,7 +294,7 @@ func installRemotePackage(pkgName string, cfg *Config, remoteIndex []RepoEntry) 
 	tarballPath := filepath.Join(BinDir, tarballName)
 
 	if _, err := os.Stat(tarballPath); err != nil {
-		if err := fetchBinaryPackage(pkgName, version, revision, cfg, false, entry.B3Sum); err != nil {
+		if err := fetchBinaryPackage(pkgName, version, revision, cfg, false, entry.B3Sum, false); err != nil {
 			return fmt.Errorf("download failed: %w", err)
 		}
 	}

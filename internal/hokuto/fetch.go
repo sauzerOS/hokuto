@@ -75,6 +75,7 @@ func newHttpClient() (*http.Client, error) {
 
 type downloadOptions struct {
 	Quiet bool // Quiet suppresses all stdout/stderr/progress output
+	Force bool // Force re-download even if file exists
 }
 
 type IdleTimeoutReader struct {
@@ -170,7 +171,7 @@ func downloadFileWithOptions(originalURL, finalURL, destFile string, opt downloa
 
 	// DOUBLE CHECK: Now that we have the lock, check if the file exists again.
 	// The background worker might have finished it while we were waiting for the lock.
-	if _, err := os.Stat(absPath); err == nil {
+	if _, err := os.Stat(absPath); err == nil && !opt.Force {
 		debugf("File %s appeared after acquiring lock, skipping download.\n", absPath)
 		// Remove lock file since we're not downloading
 		_ = os.Remove(lockPath)
@@ -567,7 +568,7 @@ func downloadViaBrowser(url, destPath string, quiet bool) error {
 // fetchBinaryPackage attempts to download a binary package from the configured mirror.
 
 // fetchBinaryPackage attempts to download a binary package from the configured mirror.
-func fetchBinaryPackage(pkgName, version, revision string, cfg *Config, quiet bool, expectedSum string) error {
+func fetchBinaryPackage(pkgName, version, revision string, cfg *Config, quiet bool, expectedSum string, force bool) error {
 	lookupName := pkgName
 	if idx := strings.Index(pkgName, "@"); idx != -1 {
 		lookupName = pkgName[:idx]
@@ -584,7 +585,7 @@ func fetchBinaryPackage(pkgName, version, revision string, cfg *Config, quiet bo
 	destPath := filepath.Join(BinDir, filename)
 
 	// Use downloadFileWithOptions to show progress if not quiet
-	if err := downloadFileWithOptions(url, url, destPath, downloadOptions{Quiet: quiet}); err != nil {
+	if err := downloadFileWithOptions(url, url, destPath, downloadOptions{Quiet: quiet, Force: force}); err != nil {
 		// Clean up partial file on failure to prevent corrupt cache
 		os.Remove(destPath)
 		return err

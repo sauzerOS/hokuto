@@ -551,7 +551,7 @@ func checkForUpgrades(_ context.Context, cfg *Config, maxJobs int) error {
 				}
 
 				// Use quiet mode for check
-				if err := fetchBinaryPackage(pkgName, version, revision, cfg, true, expectedSum); err == nil {
+				if err := fetchBinaryPackage(pkgName, version, revision, cfg, true, expectedSum, false); err == nil {
 					binaryAvailable[pkgName] = true
 				}
 			}
@@ -613,7 +613,7 @@ func checkForUpgrades(_ context.Context, cfg *Config, maxJobs int) error {
 
 				// Errors here are ignored, we just fail to find binary and proceed to build
 				// Parallel mode: pass quiet=true
-				_ = fetchBinaryPackage(pkgName, version, revision, cfg, true, expectedSum)
+				_ = fetchBinaryPackage(pkgName, version, revision, cfg, true, expectedSum, false)
 			}
 
 			outputPkgName := getOutputPackageName(pkgName, cfg)
@@ -701,7 +701,7 @@ func checkForUpgrades(_ context.Context, cfg *Config, maxJobs int) error {
 			}
 
 			// Sequential mode: output is fine (quiet=false)
-			if err := fetchBinaryPackage(pkgName, version, revision, cfg, false, expectedSum); err == nil {
+			if err := fetchBinaryPackage(pkgName, version, revision, cfg, false, expectedSum, false); err == nil {
 				foundBinary = true
 			} else {
 				colArrow.Print("-> ")

@@ -2787,7 +2787,7 @@ func handleBuildCommand(args []string, cfg *Config) error {
 						}
 
 						if shouldTryDownload {
-							if err := fetchBinaryPackage(depPkg, version, revision, cfg, true, expectedSum); err == nil {
+							if err := fetchBinaryPackage(depPkg, version, revision, cfg, true, expectedSum, false); err == nil {
 								// Successfully fetched! Check stat again to be sure.
 								if _, err := os.Stat(tarballPath); err == nil {
 									foundRemote = true
@@ -2982,7 +2982,7 @@ func handleBuildCommand(args []string, cfg *Config) error {
 									break
 								}
 							}
-							_ = fetchBinaryPackage(pkgName, version, revision, cfg, true, expectedSum)
+							_ = fetchBinaryPackage(pkgName, version, revision, cfg, true, expectedSum, false)
 						}
 					}
 
