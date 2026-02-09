@@ -239,12 +239,15 @@ func downloadFileWithOptions(originalURL, finalURL, destFile string, opt downloa
 			ct := resp.Header.Get("Content-Type")
 			isBinary := strings.HasSuffix(finalURL, ".gz") || strings.HasSuffix(finalURL, ".bz2") ||
 				strings.HasSuffix(finalURL, ".xz") || strings.HasSuffix(finalURL, ".zip") ||
-				strings.HasSuffix(finalURL, ".tgz") || strings.HasSuffix(finalURL, ".zst")
+				strings.HasSuffix(finalURL, ".tgz") || strings.HasSuffix(finalURL, ".zst") ||
+				strings.HasSuffix(finalURL, ".tar") || strings.HasSuffix(finalURL, ".rpm") ||
+				strings.HasSuffix(finalURL, ".deb") || strings.HasSuffix(finalURL, ".pkg.tar.xz") ||
+				strings.HasSuffix(finalURL, ".pkg.tar.zst")
 
 			if strings.HasPrefix(ct, "text/html") && isBinary {
 				resp.Body.Close()
 				nativeErr = fmt.Errorf("server returned text/html content for binary file (likely bot check or redirect page)")
-				debugf("Native download got text/html for binary, falling back to browser...\n")
+				debugf("Native download got text/html for binary, falling back to browser\n")
 				break
 			}
 
@@ -438,6 +441,11 @@ func downloadViaBrowser(url, destPath string, quiet bool) error {
 					bar.Set(int(e.ReceivedBytes))
 					if e.State == browser.DownloadProgressStateCompleted {
 						bar.Finish()
+						// Signal completion through foundCh
+						select {
+						case foundCh <- "completed":
+						default:
+						}
 					}
 				}
 			}
@@ -456,34 +464,7 @@ func downloadViaBrowser(url, destPath string, quiet bool) error {
 		}
 	})
 
-	// 1. Start polling the directory in a separate goroutine.
-	// We do this BEFORE running chromedp so we are ready to catch the file if it downloads instantly.
-	go func() {
-		ticker := time.NewTicker(1 * time.Second)
-		defer ticker.Stop()
-
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				entries, err := os.ReadDir(tmpDir)
-				if err != nil {
-					continue
-				}
-				for _, entry := range entries {
-					name := entry.Name()
-					// Check for completed file (not crdownload or tmp)
-					if !strings.HasSuffix(name, ".crdownload") && !strings.HasSuffix(name, ".tmp") {
-						foundCh <- filepath.Join(tmpDir, name)
-						return
-					}
-				}
-			}
-		}
-	}()
-
-	// 2. Run chromedp in a separate goroutine.
+	// 1. Run chromedp in a separate goroutine.
 	// We use an indefinite ActionFunc at the end so this goroutine BLOCKS until ctx is done.
 	// This prevents "browser finished" errors when a bot check page loads properly.
 	go func() {
@@ -502,36 +483,57 @@ func downloadViaBrowser(url, destPath string, quiet bool) error {
 		chromeErrCh <- err
 	}()
 
-	// 3. Wait for either the file to be found, or a chrome error/timeout.
+	// 2. Wait for completion or error.
 	var downloadedFile string
 
+	// Helper to find the completed file in tmpDir
+	findFile := func() string {
+		entries, err := os.ReadDir(tmpDir)
+		if err != nil {
+			return ""
+		}
+		for _, entry := range entries {
+			name := entry.Name()
+			// Check for completed file (not crdownload or tmp)
+			if !strings.HasSuffix(name, ".crdownload") && !strings.HasSuffix(name, ".tmp") {
+				return filepath.Join(tmpDir, name)
+			}
+		}
+		return ""
+	}
+
 	select {
-	case file := <-foundCh:
-		downloadedFile = file
-		// Success! The defer cancel() at end of function will kill chrome.
+	case <-foundCh:
+		// Chromium says it's done. Now find the file.
+		downloadedFile = findFile()
+		if downloadedFile == "" {
+			return fmt.Errorf("browser reported download complete but no file found in %s", tmpDir)
+		}
 
 	case err := <-chromeErrCh:
 		// If Chrome exits, check error.
 		if err != nil && !errors.Is(err, context.Canceled) {
 			// Special handling for net::ERR_ABORTED
 			if strings.Contains(err.Error(), "net::ERR_ABORTED") {
-				debugf("Browser navigation aborted (likely download started), waiting for file...\n")
+				debugf("Browser navigation aborted (likely download started), waiting for completion...\n")
 				select {
-				case file := <-foundCh:
-					downloadedFile = file
-				case <-time.After(10 * time.Second):
+				case <-foundCh:
+					downloadedFile = findFile()
+				case <-time.After(30 * time.Second): // Give it some time to finish if it was already progressing
+					// Check if it finished anyway
+					downloadedFile = findFile()
+				}
+				if downloadedFile == "" {
 					return fmt.Errorf("browser download failed (aborted and no file found): %w", err)
 				}
 			} else {
 				return fmt.Errorf("browser download failed: %w", err)
 			}
 		} else {
-			// If Chrome exited cleanly (nil error), check for file one last time.
-			select {
-			case file := <-foundCh:
-				downloadedFile = file
-			case <-time.After(5 * time.Second):
-				return fmt.Errorf("browser finished but file was not found")
+			// If Chrome exited cleanly (nil error), check for file.
+			downloadedFile = findFile()
+			if downloadedFile == "" {
+				return fmt.Errorf("browser finished but no file was found")
 			}
 		}
 
