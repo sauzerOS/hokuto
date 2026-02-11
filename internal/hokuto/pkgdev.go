@@ -120,6 +120,12 @@ func applySubstitutions(content, version, pkgName string, extraSubs map[string]s
 		versionLastOnly = version[lastDot+1:]
 	}
 
+	// Logic for ${version-kernel}: 6.19.0 -> 6.19, 6.19.1 -> 6.19.1
+	versionKernel := version
+	if strings.HasSuffix(version, ".0") {
+		versionKernel = strings.TrimSuffix(version, ".0")
+	}
+
 	// SQLite version format: Mmmppee (Major, Minor, Patch, Extra)
 	// Example: 3.51.1 -> 3510100
 	sqliteVer := ""
@@ -142,6 +148,7 @@ func applySubstitutions(content, version, pkgName string, extraSubs map[string]s
 		"${version-glued}", strings.ReplaceAll(version, ".", ""),
 		"${version-glued-last}", versionGluedLast,
 		"${version-last-only}", versionLastOnly,
+		"${version-kernel}", versionKernel,
 		"${pkgname}", pkgName,
 	}
 
