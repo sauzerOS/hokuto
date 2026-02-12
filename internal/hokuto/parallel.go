@@ -1,6 +1,7 @@
 package hokuto
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"io"
@@ -31,7 +32,7 @@ type ParallelManager struct {
 
 	// Dep injection for testing
 	Builder   func(string, *Config, *Executor, BuildOptions) (time.Duration, error)
-	Installer func(string, io.Writer) error
+	Installer func(string, io.Writer) ([]string, error)
 
 	// Channels
 	resultChan  chan buildResult
@@ -73,7 +74,7 @@ func RunParallelBuilds(plan *BuildPlan, cfg *Config, maxJobs int, userRequestedM
 		pm.Builder = customBuilder
 	}
 
-	pm.Installer = func(pkg string, logger io.Writer) error {
+	pm.Installer = func(pkg string, logger io.Writer) ([]string, error) {
 		return pm.installPackage(pkg, userRequestedMap, logger)
 	}
 	copy(pm.Pending, plan.Order)
@@ -280,16 +281,17 @@ func (pm *ParallelManager) Run() error {
 				// and process prompts (which call back to UI loop).
 				pm.mu.Unlock()
 				var installErr error
+				var derivedRebuilds []string
 				if pm.isInteractive(res.pkgName) {
 					WithPrompt(func() {
 						UserExec.Interactive = true
 						RootExec.Interactive = true
-						installErr = pm.Installer(res.pkgName, logger)
+						derivedRebuilds, installErr = pm.Installer(res.pkgName, logger)
 						UserExec.Interactive = false
 						RootExec.Interactive = false
 					})
 				} else {
-					installErr = pm.Installer(res.pkgName, logger)
+					derivedRebuilds, installErr = pm.Installer(res.pkgName, logger)
 				}
 				pm.mu.Lock()
 
@@ -304,6 +306,10 @@ func (pm *ParallelManager) Run() error {
 					if rbs, ok := pm.BuildPlan.PostBuildRebuilds[res.pkgName]; ok {
 						rebuilds = append(rebuilds, rbs...)
 					}
+					// Add triggers returned by installer (e.g. library updates)
+					if len(derivedRebuilds) > 0 {
+						rebuilds = append(rebuilds, derivedRebuilds...)
+					}
 					// Check for filesystem triggers (e.g. DKMS) in parallel mode
 					targetRoot := pm.Config.Values["HOKUTO_ROOT"]
 					if targetRoot == "" {
@@ -315,11 +321,17 @@ func (pm *ParallelManager) Run() error {
 					}
 
 					if len(rebuilds) > 0 {
+						var uniqueRebuilds []string
+						seen := make(map[string]bool)
+
+						// First pass: filter already completed/pending/duplicate packages
 						for _, rPkg := range rebuilds {
 							if pm.Completed[rPkg] {
 								continue
 							}
-							// Add to pending if not already there
+							if seen[rPkg] {
+								continue
+							}
 							isPending := false
 							for _, p := range pm.Pending {
 								if p == rPkg {
@@ -327,8 +339,48 @@ func (pm *ParallelManager) Run() error {
 									break
 								}
 							}
-							if !isPending {
-								pm.Pending = append(pm.Pending, rPkg)
+							if isPending {
+								continue
+							}
+							uniqueRebuilds = append(uniqueRebuilds, rPkg)
+							seen[rPkg] = true
+						}
+
+						if len(uniqueRebuilds) > 0 {
+							shouldRebuild := pm.AutoYes
+							if !shouldRebuild {
+								// Unlock mutex to allow UI to pause
+								pm.mu.Unlock()
+
+								// Prompt user
+								WithPrompt(func() {
+									// Pause UI updates handled by WithPrompt hook
+									fmt.Print("\r\033[K")
+									cPrintf(colWarn, "\nThe following packages need to be rebuilt:\n")
+									for _, p := range uniqueRebuilds {
+										colArrow.Print("-> ")
+										colInfo.Println(p)
+									}
+									cPrintf(colInfo, "Proceed with rebuild? [Y/n] ")
+
+									reader := bufio.NewReader(os.Stdin)
+									input, _ := reader.ReadString('\n')
+									input = strings.TrimSpace(strings.ToLower(input))
+									if input == "" || input == "y" || input == "yes" {
+										shouldRebuild = true
+									}
+								})
+
+								// Lock again
+								pm.mu.Lock()
+							}
+
+							if shouldRebuild {
+								pm.Pending = append(pm.Pending, uniqueRebuilds...)
+							} else {
+								// If declined, we mark them as "skipped" effectively, or just don't add them.
+								// They won't run.
+								fmt.Printf("Skipping rebuilds.\n")
 							}
 						}
 					}
@@ -358,10 +410,10 @@ func (pm *ParallelManager) Run() error {
 	return nil
 }
 
-func (pm *ParallelManager) installPackage(pkgName string, userRequestedMap map[string]bool, logger io.Writer) error {
+func (pm *ParallelManager) installPackage(pkgName string, userRequestedMap map[string]bool, logger io.Writer) ([]string, error) {
 	version, revision, err := getRepoVersion2(pkgName)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	outputPkgName := getOutputPackageName(pkgName, pm.Config)
@@ -386,13 +438,13 @@ func (pm *ParallelManager) installPackage(pkgName string, userRequestedMap map[s
 			if userRequestedMap[pkgName] {
 				addToWorld(pkgName)
 			}
-			return nil
+			return nil, nil
 		}
 	}
 
 	// Check for conflicts before install
-	handlePreInstallUninstall(outputPkgName, pm.Config, RootExec, pm.AutoYes)                          // Pass AutoYes
-	err = pkgInstall(tarballPath, outputPkgName, pm.Config, RootExec, pm.AutoYes, false, true, logger) // Pass AutoYes, managed=true
+	handlePreInstallUninstall(outputPkgName, pm.Config, RootExec, pm.AutoYes)                                     // Pass AutoYes
+	rebuilds, err := pkgInstall(tarballPath, outputPkgName, pm.Config, RootExec, pm.AutoYes, false, true, logger) // Pass AutoYes, managed=true
 	isCriticalAtomic.Store(0)
 
 	if err == nil {
@@ -401,7 +453,7 @@ func (pm *ParallelManager) installPackage(pkgName string, userRequestedMap map[s
 		}
 	}
 
-	return err
+	return rebuilds, err
 }
 
 func (pm *ParallelManager) canBuild(pkgName string) bool {

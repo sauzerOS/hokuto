@@ -71,7 +71,9 @@ func getRebuildTriggers(triggerPkg string, rootDir string) []string {
 // If yes is true, it assumes 'yes' to all prompts.
 // If fast is true, it optimizes for speed (e.g., skip some UI/status updates).
 // If managed is true, it skips internal rebuild triggers (e.g. DKMS) assuming the caller handles them.
-func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes, fast, managed bool, logger io.Writer) error {
+// pkgInstall installs a package from a tarball.
+// It returns a list of packages that need to be rebuilt if managed is true, or nil otherwise.
+func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes, fast, managed bool, logger io.Writer) ([]string, error) {
 	if logger == nil {
 		logger = os.Stdout
 	}
@@ -89,7 +91,7 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 			if err := checkLock(pkgName, version); err != nil {
 				colArrow.Print("-> ")
 				colError.Println(err)
-				return err
+				return nil, err
 			}
 		}
 
@@ -126,7 +128,7 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 		}
 
 		if extractErr != nil {
-			return fmt.Errorf("failed to extract glibc tarball: %v", extractErr)
+			return nil, fmt.Errorf("failed to extract glibc tarball: %v", extractErr)
 		}
 
 		// Always run post-install hook for glibc
@@ -142,7 +144,7 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 			}
 		}
 
-		return nil
+		return nil, nil
 	}
 
 	stagingDir := filepath.Join(tmpDir, pkgName, "staging")
@@ -154,7 +156,7 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 	// Clean staging dir
 	os.RemoveAll(stagingDir)
 	if err := os.MkdirAll(stagingDir, 0o755); err != nil {
-		return fmt.Errorf("failed to create staging dir: %v", err)
+		return nil, fmt.Errorf("failed to create staging dir: %v", err)
 	}
 
 	// 1. Unpack tarball into staging
@@ -171,10 +173,10 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 	if !tarSuccess {
 		if os.Geteuid() == 0 || execCtx.ShouldRunAsRoot {
 			if err := unpackTarballFallback(tarballPath, stagingDir); err != nil {
-				return fmt.Errorf("failed to unpack tarball (native): %v", err)
+				return nil, fmt.Errorf("failed to unpack tarball (native): %v", err)
 			}
 		} else {
-			return fmt.Errorf("System tar missing or broken, run hokuto as root!")
+			return nil, fmt.Errorf("System tar missing or broken, run hokuto as root!")
 		}
 	}
 
@@ -184,7 +186,7 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 		sigLogger = io.Discard
 	}
 	if err := VerifyPackageSignature(stagingDir, pkgName, cfg, execCtx, sigLogger); err != nil {
-		return err
+		return nil, err
 	}
 
 	// Helper function to run diff with root executor fallback if permission denied
@@ -314,7 +316,7 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 			if err := checkLock(pkgName, version); err != nil {
 				colArrow.Print("-> ")
 				colError.Println(err)
-				return err
+				return nil, err
 			}
 		}
 	}
@@ -339,10 +341,10 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 			debugf("optimized user modified files detection failed, falling back to root executor: %v\n", err)
 			modifiedFiles, err = getModifiedFiles(pkgName, rootDir, execCtx) // execCtx is original (likely root)
 			if err != nil {
-				return err
+				return nil, err
 			}
 		} else {
-			return err
+			return nil, err
 		}
 	}
 
@@ -435,12 +437,12 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 					// Keep the file from the other package - delete from staging
 					if os.Geteuid() == 0 {
 						if err := os.Remove(stagingFile); err != nil {
-							return fmt.Errorf("failed to remove file from staging %s natively: %v", stagingFile, err)
+							return nil, fmt.Errorf("failed to remove file from staging %s natively: %v", stagingFile, err)
 						}
 					} else {
 						rmCmd := exec.Command("rm", "-f", stagingFile)
 						if err := execCtx.Run(rmCmd); err != nil {
-							return fmt.Errorf("failed to remove file from staging %s: %v", stagingFile, err)
+							return nil, fmt.Errorf("failed to remove file from staging %s: %v", stagingFile, err)
 						}
 					}
 					// Track this file for manifest removal
@@ -460,12 +462,12 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 					// Invalid input, default to keep
 					if os.Geteuid() == 0 {
 						if err := os.Remove(stagingFile); err != nil {
-							return fmt.Errorf("failed to remove file from staging %s natively: %v", stagingFile, err)
+							return nil, fmt.Errorf("failed to remove file from staging %s natively: %v", stagingFile, err)
 						}
 					} else {
 						rmCmd := exec.Command("rm", "-f", stagingFile)
 						if err := execCtx.Run(rmCmd); err != nil {
-							return fmt.Errorf("failed to remove file from staging %s: %v", stagingFile, err)
+							return nil, fmt.Errorf("failed to remove file from staging %s: %v", stagingFile, err)
 						}
 					}
 					// Track this file for manifest removal
@@ -513,35 +515,35 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 					// It's a symlink - preserve it by reading the target and recreating the symlink
 					linkTarget, err := os.Readlink(currentFile)
 					if err != nil {
-						return fmt.Errorf("failed to read symlink %s: %v", currentFile, err)
+						return nil, fmt.Errorf("failed to read symlink %s: %v", currentFile, err)
 					}
 					// Remove existing file/symlink in staging if it exists (use executor or native if root)
 					if os.Geteuid() == 0 {
 						os.Remove(stagingFile)
 						if err := os.Symlink(linkTarget, stagingFile); err != nil {
-							return fmt.Errorf("failed to recreate symlink %s -> %s natively: %v", stagingFile, linkTarget, err)
+							return nil, fmt.Errorf("failed to recreate symlink %s -> %s natively: %v", stagingFile, linkTarget, err)
 						}
 					} else {
 						rmCmd := exec.Command("rm", "-f", stagingFile)
 						if err := execCtx.Run(rmCmd); err != nil {
-							return fmt.Errorf("failed to remove existing file %s: %v", stagingFile, err)
+							return nil, fmt.Errorf("failed to remove existing file %s: %v", stagingFile, err)
 						}
 						// Recreate the symlink in staging using executor for proper permissions
 						lnCmd := exec.Command("ln", "-s", linkTarget, stagingFile)
 						if err := execCtx.Run(lnCmd); err != nil {
-							return fmt.Errorf("failed to recreate symlink %s -> %s: %v", stagingFile, linkTarget, err)
+							return nil, fmt.Errorf("failed to recreate symlink %s -> %s: %v", stagingFile, linkTarget, err)
 						}
 					}
 				} else {
 					// It's a regular file - copy it normally
 					if os.Geteuid() == 0 {
 						if err := copyFile(currentFile, stagingFile); err != nil {
-							return fmt.Errorf("failed to overwrite %s natively: %v", stagingFile, err)
+							return nil, fmt.Errorf("failed to overwrite %s natively: %v", stagingFile, err)
 						}
 					} else {
 						cpCmd := exec.Command("cp", "--remove-destination", currentFile, stagingFile)
 						if err := execCtx.Run(cpCmd); err != nil {
-							return fmt.Errorf("failed to overwrite %s: %v", stagingFile, err)
+							return nil, fmt.Errorf("failed to overwrite %s: %v", stagingFile, err)
 						}
 					}
 				}
@@ -555,13 +557,13 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 				// --- NEW: Get original staging file permissions ---
 				stagingInfo, err := os.Stat(stagingFile)
 				if err != nil {
-					return fmt.Errorf("failed to stat staging file %s: %v", stagingFile, err)
+					return nil, fmt.Errorf("failed to stat staging file %s: %v", stagingFile, err)
 				}
 				originalMode := stagingInfo.Mode()
 				// read staging content
 				stContent, err := os.ReadFile(stagingFile)
 				if err != nil {
-					return fmt.Errorf("failed to read staging file %s: %v", stagingFile, err)
+					return nil, fmt.Errorf("failed to read staging file %s: %v", stagingFile, err)
 				}
 
 				// produce unified diff (currentFile vs stagingFile); ignore diff errors (non-zero exit means differences)
@@ -571,7 +573,7 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 				// create temp file prefilled with staging content + marked diff
 				tmp, err := os.CreateTemp("", "hokuto-edit-")
 				if err != nil {
-					return fmt.Errorf("failed to create temp file for editing: %v", err)
+					return nil, fmt.Errorf("failed to create temp file for editing: %v", err)
 				}
 				tmpPath := tmp.Name()
 				defer func() {
@@ -580,22 +582,22 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 				}()
 
 				if _, err := tmp.Write(stContent); err != nil {
-					return fmt.Errorf("failed to write staging content to temp file: %v", err)
+					return nil, fmt.Errorf("failed to write staging content to temp file: %v", err)
 				}
 
 				// append a separator and diff output for reference
 				if len(diffOut) > 0 {
 					if _, err := tmp.WriteString("\n\n--- diff (installed -> staging) ---\n"); err != nil {
-						return fmt.Errorf("failed to write diff header to temp file: %v", err)
+						return nil, fmt.Errorf("failed to write diff header to temp file: %v", err)
 					}
 					if _, err := tmp.Write(diffOut); err != nil {
-						return fmt.Errorf("failed to write diff to temp file: %v", err)
+						return nil, fmt.Errorf("failed to write diff to temp file: %v", err)
 					}
 				}
 
 				// close before launching editor
 				if err := tmp.Close(); err != nil {
-					return fmt.Errorf("failed to close temp file before editing: %v", err)
+					return nil, fmt.Errorf("failed to close temp file before editing: %v", err)
 				}
 
 				editor := os.Getenv("EDITOR")
@@ -607,22 +609,22 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 				editCmd := exec.Command(editor, tmpPath)
 				editCmd.Stdin, editCmd.Stdout, editCmd.Stderr = os.Stdin, os.Stdout, os.Stderr
 				if err := editCmd.Run(); err != nil {
-					return fmt.Errorf("editor failed: %v", err)
+					return nil, fmt.Errorf("editor failed: %v", err)
 				}
 
 				// After editing, copy temp back to staging
 				if os.Geteuid() == 0 {
 					if err := copyFile(tmpPath, stagingFile); err != nil {
-						return fmt.Errorf("failed to copy edited file back to staging %s natively: %v", stagingFile, err)
+						return nil, fmt.Errorf("failed to copy edited file back to staging %s natively: %v", stagingFile, err)
 					}
 					// restore mode
 					if err := os.Chmod(stagingFile, originalMode.Perm()); err != nil {
-						return fmt.Errorf("failed to restore permissions on %s natively: %v", stagingFile, err)
+						return nil, fmt.Errorf("failed to restore permissions on %s natively: %v", stagingFile, err)
 					}
 				} else {
 					cpCmd := exec.Command("cp", "--preserve=mode,ownership,timestamps", tmpPath, stagingFile)
 					if err := execCtx.Run(cpCmd); err != nil {
-						return fmt.Errorf("failed to copy edited file back to staging %s: %v", stagingFile, err)
+						return nil, fmt.Errorf("failed to copy edited file back to staging %s: %v", stagingFile, err)
 					}
 					// --- NEW: Explicitly restore permissions ---
 					// The `cp --preserve=mode` relies on the temp file's mode, which is wrong.
@@ -632,7 +634,7 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 
 					chmodCmd := exec.Command("chmod", modeStr, stagingFile)
 					if err := execCtx.Run(chmodCmd); err != nil {
-						return fmt.Errorf("failed to restore permissions on %s to %s: %v", stagingFile, modeStr, err)
+						return nil, fmt.Errorf("failed to restore permissions on %s to %s: %v", stagingFile, modeStr, err)
 					}
 				}
 			}
@@ -651,21 +653,21 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 				stagingFileDir := filepath.Dir(stagingFile)
 				if os.Geteuid() == 0 {
 					if err := os.MkdirAll(stagingFileDir, 0755); err != nil {
-						return fmt.Errorf("failed to create directory %s natively: %v", stagingFileDir, err)
+						return nil, fmt.Errorf("failed to create directory %s natively: %v", stagingFileDir, err)
 					}
 					if err := copyFile(currentFile, stagingFile); err != nil {
-						return fmt.Errorf("failed to copy %s to staging natively: %v", file, err)
+						return nil, fmt.Errorf("failed to copy %s to staging natively: %v", file, err)
 					}
 				} else {
 					// ensure staging directory exists (run as root)
 					mkdirCmd := exec.Command("mkdir", "-p", stagingFileDir)
 					if err := execCtx.Run(mkdirCmd); err != nil {
-						return fmt.Errorf("failed to create directory %s: %v", stagingFileDir, err)
+						return nil, fmt.Errorf("failed to create directory %s: %v", stagingFileDir, err)
 					}
 					// copy current file into staging preserving attributes
 					cpCmd := exec.Command("cp", "--preserve=mode,ownership,timestamps", currentFile, stagingFile)
 					if err := execCtx.Run(cpCmd); err != nil {
-						return fmt.Errorf("failed to copy %s to staging: %v", file, err)
+						return nil, fmt.Errorf("failed to copy %s to staging: %v", file, err)
 					}
 				}
 				debugf("Kept modified file by copying %s into staging\n", file)
@@ -715,10 +717,10 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 		if !manifestExec.ShouldRunAsRoot {
 			debugf("optimized user manifest generation failed, falling back to root executor: %v\n", err)
 			if err := generateManifest(stagingDir, stagingManifest2dir, RootExec); err != nil {
-				return fmt.Errorf("failed to generate manifest: %v", err)
+				return nil, fmt.Errorf("failed to generate manifest: %v", err)
 			}
 		} else {
-			return fmt.Errorf("failed to generate manifest: %v", err)
+			return nil, fmt.Errorf("failed to generate manifest: %v", err)
 		}
 	}
 	debugf("Generate update manifest\n")
@@ -741,14 +743,14 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 	// (e.g., user chose to "keep existing" during a previous install)
 	debugf("Checking for conflicts with existing files\n")
 	if err := checkStagingConflicts(pkgName, stagingDir, rootDir, stagingManifest, execCtx, yes, fast, filesRemovedFromStaging, nil); err != nil {
-		return err
+		return nil, err
 	}
 
 	// 4. Determine obsolete files (compare manifests)
 	debugf("Find obsolete files\n")
 	filesToDelete, err := removeObsoleteFiles(pkgName, stagingDir, rootDir)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	// --- NEW: Dependency Check and Backup (Before deletion) ---
@@ -759,7 +761,7 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 	libFilesToDelete := make(map[string]struct{})
 	tempLibBackupDir, err := os.MkdirTemp(tmpDir, "hokuto-lib-backup-")
 	if err != nil {
-		return fmt.Errorf("failed to create temporary backup directory: %v", err)
+		return nil, fmt.Errorf("failed to create temporary backup directory: %v", err)
 	}
 	// CLEANUP: Ensure the backup directory is removed on exit
 	defer func() {
@@ -774,82 +776,89 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 	}()
 
 	// 4a. Check filesToDelete against all libdeps
+	// Skip this check entirely if the package being installed is a -bin package.
+	// These packages often bundle libraries that are removed/upgraded during an update,
+	// but since they are self-contained (or should be treated as such for this purpose),
+	// this shouldn't trigger rebuilds of other packages.
+	if strings.HasSuffix(pkgName, "-bin") {
+		debugf("Skipping reverse dependency check for -bin package: %s\n", pkgName)
+	} else {
+		// Optimization: Pre-compute lookups
+		filesToDeleteMap := make(map[string]struct{}, len(filesToDelete))
+		filesToDeleteBasenameMap := make(map[string]string, len(filesToDelete))
+		for _, f := range filesToDelete {
+			filesToDeleteMap[f] = struct{}{}
+			filesToDeleteBasenameMap[filepath.Base(f)] = f
+		}
 
-	// Optimization: Pre-compute lookups
-	filesToDeleteMap := make(map[string]struct{}, len(filesToDelete))
-	filesToDeleteBasenameMap := make(map[string]string, len(filesToDelete))
-	for _, f := range filesToDelete {
-		filesToDeleteMap[f] = struct{}{}
-		filesToDeleteBasenameMap[filepath.Base(f)] = f
-	}
-
-	allInstalledEntries, err := os.ReadDir(Installed)
-	if err == nil {
-		for _, entry := range allInstalledEntries {
-			if !entry.IsDir() || entry.Name() == pkgName {
-				continue // Skip files or the package currently being installed
-			}
-
-			otherPkgName := entry.Name()
-			libdepsPath := filepath.Join(Installed, otherPkgName, "libdeps")
-
-			// Optimization: Try fast read first
-			var libdepsContent []byte
-			var err error
-			if data, lerr := os.ReadFile(libdepsPath); lerr == nil {
-				libdepsContent = data
-			} else {
-				libdepsContent, err = readFileAsRoot(libdepsPath)
-				if err != nil {
-					continue // Skip if libdeps file is unreadable
-				}
-			}
-
-			// Check if any file in filesToDelete is a libdep of otherPkgName
-			lines := strings.SplitSeq(string(libdepsContent), "\n")
-			for line := range lines {
-				libPath := strings.TrimSpace(line)
-				if libPath == "" {
-					continue
+		allInstalledEntries, err := os.ReadDir(Installed)
+		if err == nil {
+			for _, entry := range allInstalledEntries {
+				if !entry.IsDir() || entry.Name() == pkgName {
+					continue // Skip: files or package being installed
 				}
 
-				var matchFile string
-				if strings.HasPrefix(libPath, "/") {
-					// Old format: absolute path
-					absLibPath := libPath
-					if rootDir != "/" {
-						absLibPath = filepath.Join(rootDir, libPath[1:])
-					}
-					if _, ok := filesToDeleteMap[absLibPath]; ok {
-						matchFile = absLibPath
-					}
+				otherPkgName := entry.Name()
+				libdepsPath := filepath.Join(Installed, otherPkgName, "libdeps")
+
+				// Optimization: Try fast read first
+				var libdepsContent []byte
+				var err error
+				if data, lerr := os.ReadFile(libdepsPath); lerr == nil {
+					libdepsContent = data
 				} else {
-					// New format: basename only
-					if fullPath, ok := filesToDeleteBasenameMap[libPath]; ok {
-						matchFile = fullPath
+					libdepsContent, err = readFileAsRoot(libdepsPath)
+					if err != nil {
+						continue // Skip if libdeps file is unreadable
 					}
 				}
 
-				if matchFile != "" {
-					// Store just the basename for display
-					libName := filepath.Base(matchFile)
-					// Avoid duplicates
-					exists := false
-					for _, l := range affectedPackages[otherPkgName] {
-						if l == libName {
-							exists = true
-							break
+				// Check if any file in filesToDelete is a libdep of otherPkgName
+				lines := strings.SplitSeq(string(libdepsContent), "\n")
+				for line := range lines {
+					libPath := strings.TrimSpace(line)
+					if libPath == "" {
+						continue
+					}
+
+					var matchFile string
+					if strings.HasPrefix(libPath, "/") {
+						// Old format: absolute path
+						absLibPath := libPath
+						if rootDir != "/" {
+							absLibPath = filepath.Join(rootDir, libPath[1:])
+						}
+						if _, ok := filesToDeleteMap[absLibPath]; ok {
+							matchFile = absLibPath
+						}
+					} else {
+						// New format: basename only
+						if fullPath, ok := filesToDeleteBasenameMap[libPath]; ok {
+							matchFile = fullPath
 						}
 					}
-					if !exists {
-						affectedPackages[otherPkgName] = append(affectedPackages[otherPkgName], libName)
+
+					if matchFile != "" {
+						// Store just the basename for display
+						libName := filepath.Base(matchFile)
+						// Avoid duplicates
+						exists := false
+						for _, l := range affectedPackages[otherPkgName] {
+							if l == libName {
+								exists = true
+								break
+							}
+						}
+						if !exists {
+							affectedPackages[otherPkgName] = append(affectedPackages[otherPkgName], libName)
+						}
+						libFilesToDelete[matchFile] = struct{}{}
 					}
-					libFilesToDelete[matchFile] = struct{}{}
 				}
 			}
 		}
 	}
-
+	// 4b. Backup all affected library files
 	// 4b. Backup all affected library files
 	for libPath := range libFilesToDelete {
 		// libPath is the HOKUTO_ROOT-prefixed path (e.g., /tmp/hokuto/usr/lib/libfoo.so)
@@ -868,7 +877,7 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 		// Create the directory structure in the backup location
 		if os.Geteuid() == 0 {
 			if err := os.MkdirAll(backupDir, 0755); err != nil {
-				return fmt.Errorf("failed to create backup dir %s natively: %v", backupDir, err)
+				return nil, fmt.Errorf("failed to create backup dir %s natively: %v", backupDir, err)
 			}
 			if err := copyFile(libPath, backupPath); err != nil {
 				fmt.Fprintf(os.Stderr, "warning: failed to backup library %s natively: %v\n", libPath, err)
@@ -878,7 +887,7 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 		} else {
 			mkdirCmd := exec.Command("mkdir", "-p", backupDir)
 			if err := execCtx.Run(mkdirCmd); err != nil {
-				return fmt.Errorf("failed to create backup dir %s: %v", backupDir, err)
+				return nil, fmt.Errorf("failed to create backup dir %s: %v", backupDir, err)
 			}
 
 			// Copy the library file to the backup location
@@ -894,7 +903,7 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 	// 5. Rsync staging into root
 	debugf("Rsync staging into root")
 	if err := rsyncStaging(stagingDir, rootDir, execCtx); err != nil {
-		return fmt.Errorf("failed to sync staging to %s: %v", rootDir, err)
+		return nil, fmt.Errorf("failed to sync staging to %s: %v", rootDir, err)
 	}
 
 	// 6. Remove files that were scheduled for deletion
@@ -973,6 +982,17 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 		}
 		sort.Strings(affectedList)
 
+		// If managed (parallel mode), we return the list of affected packages so the caller
+		// can handle them (queue them for parallel execution). We do NOT prompt or rebuild here.
+		if managed {
+			// Log informational message only if we found something
+			if len(affectedList) > 0 {
+				// silence explicit output to avoid interleaving, caller handles queuing
+			}
+			return affectedList, nil
+		}
+
+		// --- Sequential Handling (managed=false) ---
 		// 8a. Prompt for rebuild (Hokuto is guaranteed to be run in a terminal)
 		var sb strings.Builder
 		sb.WriteString("\nWARNING: The following packages depend on libraries that were removed/upgraded:\n")
@@ -984,7 +1004,11 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 		var packagesToRebuild []string
 		rebuildAll := false // Flag to track if 'a' (all) was selected
 
-		if !yes {
+		// Check if 'yes' was passed explicitly by the user (CLI flag)
+		// If not (e.g. implied by parallel mode), we should still prompt for rebuilds.
+		userExplicitYes := isExplicitYes()
+
+		if !yes || (yes && !userExplicitYes) {
 			// Use the same robust reader we defined earlier
 			shouldQuit := false
 			WithPrompt(func() {
@@ -1034,7 +1058,7 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 				}
 			})
 		} else {
-			// If --yes is passed, just rebuild all affected packages (original behavior)
+			// If --yes is passed explicitly, just rebuild all affected packages
 			fmt.Fprintf(logger, "%s", colInfo.Sprint("Rebuilding all affected packages due to --yes flag.\n"))
 			packagesToRebuild = affectedList
 		}
@@ -1043,10 +1067,27 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 		if len(packagesToRebuild) > 0 {
 			colArrow.Print("-> ")
 			colSuccess.Println("Starting rebuild of affected packages")
-			for _, pkg := range packagesToRebuild {
-				fmt.Fprintf(logger, "%s", colInfo.Sprintf("\n--- Rebuilding %s ---\n", pkg))
 
-				if err := pkgBuildRebuild(pkg, cfg, execCtx, tempLibBackupDir, nil); err != nil {
+			// Check if we should silence output (parallel mode without explicit user interaction for this step)
+			// In parallel mode, 'yes' is true, but we might want to hide the verbose rebuild logs
+			// because they interfere with the parallel status line.
+			var rebuildLogger io.Writer
+			rebuildLogger = logger
+			if yes && !isExplicitYes() {
+				// Implicit yes (parallel mode) -> silence output
+				rebuildLogger = io.Discard
+			}
+
+			for _, pkg := range packagesToRebuild {
+				if rebuildLogger != io.Discard {
+					fmt.Fprintf(logger, "%s", colInfo.Sprintf("\n--- Rebuilding %s ---\n", pkg))
+				} else {
+					// In silent mode, just print a one-line status to the main log/stdout if needed,
+					// or rely on the final success message.
+					// Actually, with io.Discard, we print NOTHING from the build process.
+				}
+
+				if err := pkgBuildRebuild(pkg, cfg, execCtx, tempLibBackupDir, rebuildLogger); err != nil {
 					failed = append(failed, fmt.Sprintf("rebuild of %s failed: %v", pkg, err))
 					fmt.Fprintf(logger, "%s", colWarn.Sprintf("WARNING: Rebuild of %s failed: %v\n", pkg, err))
 					continue // Skip to next package on failure, same as hokuto update
@@ -1080,7 +1121,7 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 
 	// 10. Report failures if any
 	if len(failed) > 0 { // 'failed' slice is correctly declared at the start of pkgInstall
-		return fmt.Errorf("some file actions failed:\n%s", strings.Join(failed, "\n"))
+		return nil, fmt.Errorf("some file actions failed:\n%s", strings.Join(failed, "\n"))
 	}
 
 	// 11. Run global post-install tasks
@@ -1089,7 +1130,7 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 			fmt.Fprintf(os.Stderr, "post-install tasks completed with warnings: %v\n", err)
 		}
 	}
-	return nil
+	return nil, nil
 }
 
 // checkStagingConflicts checks for conflicts between files in staging and existing files in the target.
@@ -1517,4 +1558,14 @@ func checkStagingConflicts(pkgName, stagingDir, rootDir, stagingManifest string,
 	}
 
 	return nil
+}
+
+// isExplicitYes checks if the user passed -y/--yes/--force-yes on the command line
+func isExplicitYes() bool {
+	for _, arg := range os.Args {
+		if arg == "-y" || arg == "--yes" || arg == "-yes" || arg == "--force-yes" {
+			return true
+		}
+	}
+	return false
 }

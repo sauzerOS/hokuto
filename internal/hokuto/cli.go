@@ -1040,7 +1040,7 @@ func Main() {
 				colNote.Printf(" %s (%d/%d)\n", pkgName, i+1, len(installPlan))
 			}
 
-			if err := pkgInstall(tarballPath, pkgName, cfg, RootExec, effectiveYes, effectiveFast, false, nil); err != nil {
+			if _, err := pkgInstall(tarballPath, pkgName, cfg, RootExec, effectiveYes, effectiveFast, false, nil); err != nil {
 				fmt.Fprintln(os.Stderr,
 					colArrow.Sprint("->"),
 					colSuccess.Sprintf("Error installing package"),
@@ -1156,6 +1156,8 @@ func Main() {
 
 		var verboseLong = updateCmd.Bool("verbose", false, "Enable verbose output.")
 		var remote = updateCmd.Bool("remote", false, "Check for updates from remote binary mirror only.")
+		var yes = updateCmd.Bool("y", false, "Assume 'yes' to all prompts.")
+		var yesLong = updateCmd.Bool("yes", false, "Assume 'yes' to all prompts.")
 
 		if err := updateCmd.Parse(args); err != nil {
 			fmt.Fprintf(os.Stderr, "Error parsing update flags: %v\n", err)
@@ -1192,7 +1194,8 @@ func Main() {
 			maxJobs = *parallelLong
 		}
 
-		if err := checkForUpgrades(ctx, cfg, maxJobs); err != nil {
+		effectiveYes := *yes || *yesLong
+		if err := checkForUpgrades(ctx, cfg, maxJobs, effectiveYes); err != nil {
 			fmt.Fprintf(os.Stderr, "Upgrade process failed: %v\n", err)
 			os.Exit(1)
 		}

@@ -1553,15 +1553,19 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 		Context:         execCtx.Context,
 		ShouldRunAsRoot: needsRootBuild,
 		Interactive:     needsInteractiveBuild,
+		Stdout:          logger,
+		Stderr:          logger,
 	}
 
 	// Fetch all sources for the build, including git repositories.
-	if err := fetchSources(pkgName, pkgDir, true); err != nil {
+	// Silence output if logger is not stdout (e.g. io.Discard)
+	quietFetch := (logger != os.Stdout)
+	if err := fetchSourcesWithOptions(pkgName, pkgDir, true, quietFetch); err != nil {
 		return fmt.Errorf("failed to fetch sources: %v", err)
 	}
 
 	// Perform a strict, non-interactive checksum verification.
-	if err := verifyOrCreateChecksums(pkgName, pkgDir, false, nil); err != nil {
+	if err := verifyOrCreateChecksums(pkgName, pkgDir, false, logger); err != nil {
 		return fmt.Errorf("source verification failed: %w", err)
 	}
 	// Prepare sources
@@ -2003,14 +2007,17 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 					elapsed := time.Since(startTime).Truncate(time.Second)
 					title := fmt.Sprintf("Rebuild %s elapsed: %s", pkgName, elapsed)
 					setTerminalTitle(title)
-					// Only print elapsed time to console if not in verbose mode
+					// Only print elapsed time to console if not in verbose mode AND logger is stdout (not silent)
 					// In verbose mode, the build output is already visible, so we only update the title
-					if !Verbose {
+					// In silent mode (parallel rebuild), we don't want to spam the console
+					if !Verbose && logger == os.Stdout {
 						colArrow.Print("-> ")
 						colSuccess.Printf("Building %s elapsed: %s\r", pkgName, elapsed)
 					}
 				case <-doneCh:
-					fmt.Print("\r")
+					if !Verbose && logger == os.Stdout {
+						fmt.Print("\r")
+					}
 					return
 				case <-buildExec.Context.Done():
 					return
@@ -2686,7 +2693,7 @@ func handleBuildCommand(args []string, cfg *Config) error {
 			tarballPath := filepath.Join(BinDir, StandardizeRemoteName(outputPkgName, version, revision, arch, variant))
 			isCriticalAtomic.Store(1)
 			handlePreInstallUninstall(outputPkgName, cfg, RootExec, false)
-			if installErr := pkgInstall(tarballPath, outputPkgName, cfg, RootExec, true, false, false, nil); installErr != nil {
+			if _, installErr := pkgInstall(tarballPath, outputPkgName, cfg, RootExec, true, false, false, nil); installErr != nil {
 				isCriticalAtomic.Store(0)
 				colArrow.Print("-> ")
 				color.Danger.Printf("Installation failed for %s: %v\n", outputPkgName, installErr)
@@ -2751,7 +2758,7 @@ func handleBuildCommand(args []string, cfg *Config) error {
 					if askForConfirmation(colInfo, "Dependency '%s' is missing. Use available binary package?", depPkg) {
 						isCriticalAtomic.Store(1)
 						handlePreInstallUninstall(outputDepPkg, cfg, RootExec, false)
-						if err := pkgInstall(tarballPath, outputDepPkg, cfg, RootExec, false, false, false, nil); err != nil {
+						if _, err := pkgInstall(tarballPath, outputDepPkg, cfg, RootExec, false, false, false, nil); err != nil {
 							isCriticalAtomic.Store(0)
 							return fmt.Errorf("fatal error installing binary %s: %v", depPkg, err)
 						}
@@ -2794,7 +2801,7 @@ func handleBuildCommand(args []string, cfg *Config) error {
 									if askForConfirmation(colInfo, "Dependency '%s' found on remote mirror. Use binary?", depPkg) {
 										isCriticalAtomic.Store(1)
 										handlePreInstallUninstall(outputDepPkg, cfg, RootExec, false)
-										if err := pkgInstall(tarballPath, outputDepPkg, cfg, RootExec, false, false, false, nil); err != nil {
+										if _, err := pkgInstall(tarballPath, outputDepPkg, cfg, RootExec, false, false, false, nil); err != nil {
 											isCriticalAtomic.Store(0)
 											return fmt.Errorf("fatal error installing downloaded binary %s: %v", depPkg, err)
 										}
@@ -3047,7 +3054,7 @@ func handleBuildCommand(args []string, cfg *Config) error {
 						tarballPath := filepath.Join(BinDir, StandardizeRemoteName(outputFinalPkg, version, revision, arch, variant))
 						isCriticalAtomic.Store(1)
 						handlePreInstallUninstall(outputFinalPkg, cfg, RootExec, false)
-						if err := pkgInstall(tarballPath, outputFinalPkg, cfg, RootExec, false, false, false, nil); err != nil {
+						if _, err := pkgInstall(tarballPath, outputFinalPkg, cfg, RootExec, false, false, false, nil); err != nil {
 							isCriticalAtomic.Store(0)
 							colArrow.Print("-> ")
 							color.Danger.Printf("Installation failed for %s: %v\n", outputFinalPkg, err)
@@ -3257,7 +3264,7 @@ func executeBuildPass(plan *BuildPlan, _ string, installAllTargets bool, cfg *Co
 					tarballPath := filepath.Join(BinDir, StandardizeRemoteName(outputPkgName, version, revision, arch, variant))
 					isCriticalAtomic.Store(1)
 					handlePreInstallUninstall(outputPkgName, cfg, RootExec, false)
-					if installErr := pkgInstall(tarballPath, outputPkgName, cfg, RootExec, true, false, false, nil); installErr != nil {
+					if _, installErr := pkgInstall(tarballPath, outputPkgName, cfg, RootExec, true, false, false, nil); installErr != nil {
 						isCriticalAtomic.Store(0)
 						colArrow.Print("-> ")
 						color.Danger.Printf("Installation failed for %s: %v\n", outputPkgName, installErr)
@@ -3366,7 +3373,7 @@ func executeBuildPass(plan *BuildPlan, _ string, installAllTargets bool, cfg *Co
 						tarballPath := filepath.Join(BinDir, StandardizeRemoteName(outputParent, version, revision, arch, variant))
 						isCriticalAtomic.Store(1)
 						handlePreInstallUninstall(outputParent, cfg, RootExec, false)
-						if installErr := pkgInstall(tarballPath, outputParent, cfg, RootExec, true, false, false, nil); installErr != nil {
+						if _, installErr := pkgInstall(tarballPath, outputParent, cfg, RootExec, true, false, false, nil); installErr != nil {
 							isCriticalAtomic.Store(0)
 							colArrow.Print("-> ")
 							color.Danger.Printf("Installation failed for rebuilt %s: %v\n", outputParent, installErr)
@@ -3415,7 +3422,7 @@ func executeBuildPass(plan *BuildPlan, _ string, installAllTargets bool, cfg *Co
 					isCriticalAtomic.Store(1)
 					handlePreInstallUninstall(outputRebuildPkg, cfg, RootExec, false)
 					// Always run this non-interactively
-					if installErr := pkgInstall(tarballPath, outputRebuildPkg, cfg, RootExec, true, false, false, nil); installErr != nil {
+					if _, installErr := pkgInstall(tarballPath, outputRebuildPkg, cfg, RootExec, true, false, false, nil); installErr != nil {
 						isCriticalAtomic.Store(0)
 						colArrow.Print("-> ")
 						color.Danger.Printf("Installation failed for post-build %s: %v\n", outputRebuildPkg, installErr)

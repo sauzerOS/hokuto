@@ -207,7 +207,7 @@ func verifyOrCreateChecksums(pkgName, pkgDir string, force bool, logger io.Write
 				// Case B: Force mode is enabled. Always redownload.
 				actionSummary = "Updated (forced)"
 				WithPrompt(func() {
-					performRedownload(fname, originalURL, substitutedURL, pkgVersion, pkgSrcDir)
+					performRedownload(fname, originalURL, substitutedURL, pkgVersion, pkgSrcDir, (logger != os.Stdout), logger)
 				})
 			}
 
@@ -219,7 +219,7 @@ func verifyOrCreateChecksums(pkgName, pkgDir string, force bool, logger io.Write
 				}
 				actionSummary = "Updated (missing)"
 				WithPrompt(func() {
-					performRedownload(fname, originalURL, substitutedURL, pkgVersion, pkgSrcDir)
+					performRedownload(fname, originalURL, substitutedURL, pkgVersion, pkgSrcDir, (logger != os.Stdout), logger)
 				})
 			} else {
 				WithPrompt(func() {
@@ -259,7 +259,7 @@ func verifyOrCreateChecksums(pkgName, pkgDir string, force bool, logger io.Write
 						} else {
 							actionSummary = "Redownloaded"
 							// PERFORM REDOWNLOAD INSIDE PROMPT LOCK
-							performRedownload(fname, originalURL, substitutedURL, pkgVersion, pkgSrcDir)
+							performRedownload(fname, originalURL, substitutedURL, pkgVersion, pkgSrcDir, (logger != os.Stdout), logger)
 						}
 					} else {
 						actionSummary = "Kept (mismatch)"
@@ -553,9 +553,15 @@ func computeSingleGoHash(path string, execCtx *Executor, buf []byte) (string, er
 }
 
 // Helper to perform redownload with logging
-func performRedownload(fname, originalURL, substitutedURL, pkgVersion, pkgSrcDir string) {
-	colArrow.Print("-> ")
-	colSuccess.Printf("Downloading %s\n", fname)
+func performRedownload(fname, originalURL, substitutedURL, pkgVersion, pkgSrcDir string, quiet bool, logger io.Writer) {
+	if !quiet {
+		if logger != nil && logger != os.Stdout && logger != os.Stderr {
+			fmt.Fprintf(logger, "Downloading %s\n", fname)
+		} else {
+			colArrow.Print("-> ")
+			colSuccess.Printf("Downloading %s\n", fname)
+		}
+	}
 
 	//Use version-aware hash and cleanup
 	hashInput := originalURL + pkgVersion
@@ -576,11 +582,15 @@ func performRedownload(fname, originalURL, substitutedURL, pkgVersion, pkgSrcDir
 	_ = os.Remove(cachePath)
 	_ = os.Remove(filePath)
 
-	if dErr := downloadFile(originalURL, substitutedURL, cachePath); dErr != nil {
-		fmt.Printf("Msg: failed to redownload %s: %v\n", fname, dErr)
+	if dErr := downloadFileWithOptions(originalURL, substitutedURL, cachePath, downloadOptions{Quiet: quiet, Force: true}); dErr != nil {
+		if !quiet {
+			fmt.Printf("Msg: failed to redownload %s: %v\n", fname, dErr)
+		}
 	} else {
 		if sErr := os.Symlink(cachePath, filepath.Join(pkgSrcDir, fname)); sErr != nil {
-			fmt.Printf("Msg: failed to symlink %s -> %s: %v\n", cachePath, filepath.Join(pkgSrcDir, fname), sErr)
+			if !quiet {
+				fmt.Printf("Msg: failed to symlink %s -> %s: %v\n", cachePath, filepath.Join(pkgSrcDir, fname), sErr)
+			}
 		}
 	}
 }

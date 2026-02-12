@@ -384,8 +384,8 @@ func generateDepends(pkgName, pkgDir, outputDir, rootDir string, execCtx *Execut
 					continue
 				}
 				otherPkg := e.Name()
-				if otherPkg == pkgName {
-					continue
+				if otherPkg == pkgName || strings.HasSuffix(otherPkg, "-bin") {
+					continue // Skip self and -bin packages (prevent false dependencies)
 				}
 
 				manifestFile := filepath.Join(dbRoot, otherPkg, "manifest")
