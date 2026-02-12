@@ -79,7 +79,7 @@ func getVSCodeString() (string, error) {
 
 func getExtraSubs(pkgName string) (map[string]string, error) {
 	base := filepath.Base(pkgName)
-	if base == "antigravity" {
+	if base == "antigravity-bin" {
 		s, err := getAntigravityString()
 		if err != nil {
 			return nil, err
