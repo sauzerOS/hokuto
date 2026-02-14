@@ -725,7 +725,10 @@ func getPackageDependenciesToUninstall(name string) []string {
 // before a new package can be installed. It now verifies packages are installed
 // before attempting removal.
 // forceYes: if true, skips the confirmation prompt.
-func handlePreInstallUninstall(pkgName string, cfg *Config, execCtx *Executor, forceYes bool) {
+func handlePreInstallUninstall(pkgName string, cfg *Config, execCtx *Executor, forceYes bool, logger io.Writer) {
+	if logger == nil {
+		logger = os.Stdout
+	}
 	// 1. Check if a -bin version of this package is already installed
 	// (e.g., if we are installing 'make', check for 'make-bin')
 	binPkgName := pkgName + "-bin"
@@ -739,11 +742,11 @@ func handlePreInstallUninstall(pkgName string, cfg *Config, execCtx *Executor, f
 			// In parallel mode (forceYes=true), we might not want to print interactive prompts,
 			// but we still print status.
 			// If forceYes implies skipping prompt, we proceed.
-			if err := pkgUninstall(binPkgName, cfg, execCtx, true, true); err != nil {
+			if err := pkgUninstall(binPkgName, cfg, execCtx, true, true, logger); err != nil {
 				cPrintf(colWarn, "Warning: failed to uninstall conflicting package %s: %v\n", binPkgName, err)
 			} else {
-				colArrow.Print("-> ")
-				colSuccess.Printf("Uninstalled conflicting package %s successfully.\n", binPkgName)
+				fcPrintf(logger, colArrow, "-> ")
+				fcPrintf(logger, colSuccess, "Uninstalled conflicting package %s successfully.\n", binPkgName)
 				removeFromWorld(binPkgName)
 			}
 		}
@@ -764,15 +767,18 @@ func handlePreInstallUninstall(pkgName string, cfg *Config, execCtx *Executor, f
 
 	// --- Now, only proceed if there are real packages to uninstall ---
 	if len(depsToActuallyUninstall) > 0 {
-		colArrow.Print("-> ")
-		// The message is now more accurate, as it only lists packages we KNOW are installed.
-		colSuccess.Printf("Uninstalling")
-		colNote.Printf(" %v", strings.Join(depsToActuallyUninstall, ", "))
-		colSuccess.Printf(" to avoid install conflicts\n")
+		// Only print if not in parallel/force mode to avoid terminal clutter
+		if !forceYes || logger == os.Stdout {
+			fcPrintf(logger, colArrow, "-> ")
+			// The message is now more accurate, as it only lists packages we KNOW are installed.
+			fcPrintf(logger, colSuccess, "Uninstalling")
+			fcPrintf(logger, colNote, " %v", strings.Join(depsToActuallyUninstall, ", "))
+			fcPrintf(logger, colSuccess, " to avoid install conflicts\n")
+		}
 
 		for _, dep := range depsToActuallyUninstall {
 			// Use force and yes flags to ensure silent, non-interactive uninstallation.
-			if err := pkgUninstall(dep, cfg, execCtx, true, true); err != nil {
+			if err := pkgUninstall(dep, cfg, execCtx, true, true, logger); err != nil {
 				// This is a non-fatal warning. The installation should proceed.
 				debugf("Warning: failed to uninstall conflicting package %s: %v\n", dep, err)
 			} else {

@@ -424,7 +424,7 @@ func handleOrphanCleanup(cfg *Config, preSelect string) {
 		colSuccess.Printf("Removing: ")
 		colNote.Printf("%s", pkg)
 		colSuccess.Printf(" [%d/%d]\n", i+1, len(indices))
-		if err := pkgUninstall(pkg, cfg, RootExec, true, true); err != nil {
+		if err := pkgUninstall(pkg, cfg, RootExec, true, true, nil); err != nil {
 			color.Danger.Printf("Failed to remove %s: %v\n", pkg, err)
 		} else {
 			removeFromWorld(pkg)

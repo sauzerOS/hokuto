@@ -300,7 +300,7 @@ func installRemotePackage(pkgName string, cfg *Config, remoteIndex []RepoEntry) 
 	}
 
 	// Install
-	handlePreInstallUninstall(pkgName, cfg, RootExec, false)
+	handlePreInstallUninstall(pkgName, cfg, RootExec, false, nil)
 	// We use 'true' for force/yes usually for updates? or pass explicit 'yes' flag?
 	// Implicit 'yes' for updates usually.
 	if _, err := pkgInstall(tarballPath, pkgName, cfg, RootExec, true, false, false, nil); err != nil {

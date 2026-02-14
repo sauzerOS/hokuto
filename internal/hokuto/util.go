@@ -2,6 +2,8 @@ package hokuto
 
 import (
 	"fmt"
+	"io"
+	"os"
 	"strings"
 )
 
@@ -13,20 +15,49 @@ type colorPrinter interface {
 
 // cPrintf prints with a colored style or falls back to fmt.Printf when nil
 func cPrintf(p colorPrinter, format string, a ...any) {
-	if p == nil {
-		fmt.Printf(format, a...)
-		return
-	}
-	p.Printf(format, a...)
+	fcPrintf(os.Stdout, p, format, a...)
 }
 
 // cPrintln prints a line with the given style or falls back to fmt.Println when nil
 func cPrintln(p colorPrinter, a ...any) {
+	fcPrintln(os.Stdout, p, a...)
+}
+
+// fcPrintf prints with a colored style to a specific writer
+func fcPrintf(w io.Writer, p any, format string, a ...any) {
 	if p == nil {
-		fmt.Println(a...)
+		fmt.Fprintf(w, format, a...)
 		return
 	}
-	p.Println(a...)
+
+	// Handle different color types from gookit/color
+	type printer interface {
+		Sprint(a ...any) string
+	}
+
+	if pr, ok := p.(printer); ok {
+		fmt.Fprint(w, pr.Sprint(fmt.Sprintf(format, a...)))
+	} else {
+		fmt.Fprintf(w, format, a...)
+	}
+}
+
+// fcPrintln prints a line with a colored style to a specific writer
+func fcPrintln(w io.Writer, p any, a ...any) {
+	if p == nil {
+		fmt.Fprintln(w, a...)
+		return
+	}
+
+	type printer interface {
+		Sprint(a ...any) string
+	}
+
+	if pr, ok := p.(printer); ok {
+		fmt.Fprintln(w, pr.Sprint(fmt.Sprint(a...)))
+	} else {
+		fmt.Fprintln(w, a...)
+	}
 }
 
 // debugf prints debug messages when Debug is true

@@ -652,6 +652,7 @@ type BuildPlan struct {
 	RebuildPackages   map[string]bool     // Packages marked for rebuild
 	PostRebuilds      map[string][]string // Packages needing a rebuild for optional deps
 	PostBuildRebuilds map[string][]string // Stores post-build actions
+	ManualPrereqs     map[string][]string // pkgs that MUST be completed before this one (from /etc/hokuto/hokuto.update)
 	NoDeps            bool                // Skip dependency checking during execution
 }
 
@@ -667,6 +668,7 @@ func resolveBuildPlan(targetPackages []string, userRequestedPackages map[string]
 		RebuildPackages:   make(map[string]bool),
 		PostRebuilds:      make(map[string][]string),
 		PostBuildRebuilds: make(map[string][]string),
+		ManualPrereqs:     make(map[string][]string),
 	}
 
 	processed := make(map[string]bool)

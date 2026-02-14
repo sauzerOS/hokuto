@@ -576,7 +576,8 @@ func checkForUpgrades(_ context.Context, cfg *Config, maxJobs int, yes bool) err
 	pkgNames = plan.Order
 
 	// Apply user-specified update order from /etc/hokuto/hokuto.update
-	pkgNames = applyUpdateOrder(pkgNames)
+	var manualPrereqs map[string][]string
+	pkgNames, manualPrereqs = applyUpdateOrder(pkgNames)
 
 	// Launch background prefetcher for SUBSEQUENT packages.
 	if len(pkgNames) > 1 {
@@ -594,6 +595,7 @@ func checkForUpgrades(_ context.Context, cfg *Config, maxJobs int, yes bool) err
 			// PostBuildRebuilds isn't typically used in updates, and we don't calculate them here.
 			// The update logic is simpler than a full world rebuild.
 			PostBuildRebuilds: make(map[string][]string),
+			ManualPrereqs:     manualPrereqs,
 		}
 
 		// Use a custom builder that incorporates binary checks
@@ -721,7 +723,7 @@ func checkForUpgrades(_ context.Context, cfg *Config, maxJobs int, yes bool) err
 
 		if foundBinary {
 			isCriticalAtomic.Store(1)
-			handlePreInstallUninstall(outputPkgName, cfg, RootExec, false)
+			handlePreInstallUninstall(outputPkgName, cfg, RootExec, false, nil)
 			colArrow.Print("-> ")
 			colSuccess.Printf("Installing")
 			colNote.Printf(" %s\n", outputPkgName)
@@ -763,7 +765,7 @@ func checkForUpgrades(_ context.Context, cfg *Config, maxJobs int, yes bool) err
 
 		// B. If build is successful, install the package
 		isCriticalAtomic.Store(1)
-		handlePreInstallUninstall(outputPkgName, cfg, RootExec, false)
+		handlePreInstallUninstall(outputPkgName, cfg, RootExec, false, nil)
 		colArrow.Print("-> ")
 		colSuccess.Printf("Installing")
 		colNote.Printf(" %s\n", outputPkgName)
@@ -808,12 +810,12 @@ func checkForUpgrades(_ context.Context, cfg *Config, maxJobs int, yes bool) err
 }
 
 // applyUpdateOrder reorders the package list based on /etc/hokuto/hokuto.update
-func applyUpdateOrder(pkgNames []string) []string {
+func applyUpdateOrder(pkgNames []string) ([]string, map[string][]string) {
 	updateOrderFile := filepath.Join(rootDir, "etc", "hokuto", "hokuto.update")
 	data, err := os.ReadFile(updateOrderFile)
 	if err != nil {
-		// If file doesn't exist or can't be read, return original order
-		return pkgNames
+		// If file doesn't exist or can't be read, return original order and nil prereqs
+		return pkgNames, nil
 	}
 
 	// Map to store the priority of packages.
@@ -839,11 +841,10 @@ func applyUpdateOrder(pkgNames []string) []string {
 	}
 
 	if len(priority) == 0 {
-		return pkgNames
+		return pkgNames, nil
 	}
 
-	// Create a copy to avoid modifying the input slice if that's preferred,
-	// but here we are re-assigning it anyway.
+	// Create a copy to avoid modifying the input slice
 	result := make([]string, len(pkgNames))
 	copy(result, pkgNames)
 
@@ -864,7 +865,36 @@ func applyUpdateOrder(pkgNames []string) []string {
 		return false
 	})
 
-	return result
+	// Generate manual prerequisites for parallel builds
+	manualPrereqs := make(map[string][]string)
+
+	// Create a map for quick lookup of packages in the current update list
+	inUpdateList := make(map[string]bool)
+	for _, p := range pkgNames {
+		inUpdateList[p] = true
+	}
+
+	// Re-scan to generate prerequisites based on per-line ordering
+	scanner = bufio.NewScanner(strings.NewReader(string(data)))
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		pkgs := strings.Fields(line)
+		var lastPkgInUpdate string
+		for _, p := range pkgs {
+			if inUpdateList[p] {
+				if lastPkgInUpdate != "" {
+					manualPrereqs[p] = append(manualPrereqs[p], lastPkgInUpdate)
+				}
+				lastPkgInUpdate = p
+			}
+		}
+	}
+
+	return result, manualPrereqs
 }
 
 // resolveMissingDeps recursively finds all missing dependencies for a package.

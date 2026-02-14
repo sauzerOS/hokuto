@@ -2692,7 +2692,7 @@ func handleBuildCommand(args []string, cfg *Config) error {
 			variant := GetSystemVariantForPackage(cfg, pkgName)
 			tarballPath := filepath.Join(BinDir, StandardizeRemoteName(outputPkgName, version, revision, arch, variant))
 			isCriticalAtomic.Store(1)
-			handlePreInstallUninstall(outputPkgName, cfg, RootExec, false)
+			handlePreInstallUninstall(outputPkgName, cfg, RootExec, false, nil)
 			if _, installErr := pkgInstall(tarballPath, outputPkgName, cfg, RootExec, true, false, false, nil); installErr != nil {
 				isCriticalAtomic.Store(0)
 				colArrow.Print("-> ")
@@ -2757,7 +2757,7 @@ func handleBuildCommand(args []string, cfg *Config) error {
 				if _, err := os.Stat(tarballPath); err == nil {
 					if askForConfirmation(colInfo, "Dependency '%s' is missing. Use available binary package?", depPkg) {
 						isCriticalAtomic.Store(1)
-						handlePreInstallUninstall(outputDepPkg, cfg, RootExec, false)
+						handlePreInstallUninstall(outputDepPkg, cfg, RootExec, false, nil)
 						if _, err := pkgInstall(tarballPath, outputDepPkg, cfg, RootExec, false, false, false, nil); err != nil {
 							isCriticalAtomic.Store(0)
 							return fmt.Errorf("fatal error installing binary %s: %v", depPkg, err)
@@ -2800,7 +2800,7 @@ func handleBuildCommand(args []string, cfg *Config) error {
 									foundRemote = true
 									if askForConfirmation(colInfo, "Dependency '%s' found on remote mirror. Use binary?", depPkg) {
 										isCriticalAtomic.Store(1)
-										handlePreInstallUninstall(outputDepPkg, cfg, RootExec, false)
+										handlePreInstallUninstall(outputDepPkg, cfg, RootExec, false, nil)
 										if _, err := pkgInstall(tarballPath, outputDepPkg, cfg, RootExec, false, false, false, nil); err != nil {
 											isCriticalAtomic.Store(0)
 											return fmt.Errorf("fatal error installing downloaded binary %s: %v", depPkg, err)
@@ -3053,7 +3053,7 @@ func handleBuildCommand(args []string, cfg *Config) error {
 						variant := GetSystemVariantForPackage(cfg, finalPkg)
 						tarballPath := filepath.Join(BinDir, StandardizeRemoteName(outputFinalPkg, version, revision, arch, variant))
 						isCriticalAtomic.Store(1)
-						handlePreInstallUninstall(outputFinalPkg, cfg, RootExec, false)
+						handlePreInstallUninstall(outputFinalPkg, cfg, RootExec, false, nil)
 						if _, err := pkgInstall(tarballPath, outputFinalPkg, cfg, RootExec, false, false, false, nil); err != nil {
 							isCriticalAtomic.Store(0)
 							colArrow.Print("-> ")
@@ -3263,7 +3263,7 @@ func executeBuildPass(plan *BuildPlan, _ string, installAllTargets bool, cfg *Co
 					variant := GetSystemVariantForPackage(cfg, pkgName)
 					tarballPath := filepath.Join(BinDir, StandardizeRemoteName(outputPkgName, version, revision, arch, variant))
 					isCriticalAtomic.Store(1)
-					handlePreInstallUninstall(outputPkgName, cfg, RootExec, false)
+					handlePreInstallUninstall(outputPkgName, cfg, RootExec, false, nil)
 					if _, installErr := pkgInstall(tarballPath, outputPkgName, cfg, RootExec, true, false, false, nil); installErr != nil {
 						isCriticalAtomic.Store(0)
 						colArrow.Print("-> ")
@@ -3372,7 +3372,7 @@ func executeBuildPass(plan *BuildPlan, _ string, installAllTargets bool, cfg *Co
 						variant := GetSystemVariantForPackage(cfg, parent)
 						tarballPath := filepath.Join(BinDir, StandardizeRemoteName(outputParent, version, revision, arch, variant))
 						isCriticalAtomic.Store(1)
-						handlePreInstallUninstall(outputParent, cfg, RootExec, false)
+						handlePreInstallUninstall(outputParent, cfg, RootExec, false, nil)
 						if _, installErr := pkgInstall(tarballPath, outputParent, cfg, RootExec, true, false, false, nil); installErr != nil {
 							isCriticalAtomic.Store(0)
 							colArrow.Print("-> ")
@@ -3420,7 +3420,7 @@ func executeBuildPass(plan *BuildPlan, _ string, installAllTargets bool, cfg *Co
 					variant := GetSystemVariantForPackage(cfg, rebuildPkg)
 					tarballPath := filepath.Join(BinDir, StandardizeRemoteName(outputRebuildPkg, version, revision, arch, variant))
 					isCriticalAtomic.Store(1)
-					handlePreInstallUninstall(outputRebuildPkg, cfg, RootExec, false)
+					handlePreInstallUninstall(outputRebuildPkg, cfg, RootExec, false, nil)
 					// Always run this non-interactively
 					if _, installErr := pkgInstall(tarballPath, outputRebuildPkg, cfg, RootExec, true, false, false, nil); installErr != nil {
 						isCriticalAtomic.Store(0)

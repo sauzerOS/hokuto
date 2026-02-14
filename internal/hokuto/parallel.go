@@ -443,7 +443,7 @@ func (pm *ParallelManager) installPackage(pkgName string, userRequestedMap map[s
 	}
 
 	// Check for conflicts before install
-	handlePreInstallUninstall(outputPkgName, pm.Config, RootExec, pm.AutoYes)                                     // Pass AutoYes
+	handlePreInstallUninstall(outputPkgName, pm.Config, RootExec, pm.AutoYes, logger)                             // Pass AutoYes and logger
 	rebuilds, err := pkgInstall(tarballPath, outputPkgName, pm.Config, RootExec, pm.AutoYes, false, true, logger) // Pass AutoYes, managed=true
 	isCriticalAtomic.Store(0)
 
@@ -460,6 +460,15 @@ func (pm *ParallelManager) canBuild(pkgName string) bool {
 	// Simplified dependency check reusing logic similar to executeBuildPass
 	if pm.BuildPlan.NoDeps {
 		return true
+	}
+
+	// Check manual prerequisites from hokuto.update
+	if prereqs, ok := pm.BuildPlan.ManualPrereqs[pkgName]; ok {
+		for _, prereq := range prereqs {
+			if !pm.Completed[prereq] {
+				return false
+			}
+		}
 	}
 
 	pkgDir, err := findPackageDir(pkgName)

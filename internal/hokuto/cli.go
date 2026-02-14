@@ -1030,7 +1030,7 @@ func Main() {
 				}
 			}
 
-			handlePreInstallUninstall(pkgName, cfg, RootExec, false)
+			handlePreInstallUninstall(pkgName, cfg, RootExec, effectiveYes, nil)
 
 			if effectiveFast && bar != nil {
 				bar.Describe(fmt.Sprintf("Installing %s", pkgName))
@@ -1121,7 +1121,7 @@ func Main() {
 			colArrow.Print("-> ")
 			colSuccess.Printf("Attempting to uninstall package: %s\n", pkgName)
 
-			if err := pkgUninstall(pkgName, cfg, RootExec, effectiveForce, effectiveYes); err != nil {
+			if err := pkgUninstall(pkgName, cfg, RootExec, effectiveForce, effectiveYes, nil); err != nil {
 				colArrow.Print("-> ")
 				color.Light.Printf("Error uninstalling %s: %v\n", pkgName, err)
 				allSucceeded = false

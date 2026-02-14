@@ -74,7 +74,7 @@ func handlePythonRebuildCommand(cfg *Config) error {
 		colArrow.Print("-> ")
 		colSuccess.Printf("Uninstalling %s\n", pkg)
 		// Force uninstall (force=true, yes=true)
-		if err := pkgUninstall(pkg, cfg, RootExec, true, true); err != nil {
+		if err := pkgUninstall(pkg, cfg, RootExec, true, true, nil); err != nil {
 			return fmt.Errorf("failed to uninstall package %s: %w", pkg, err)
 		}
 	}

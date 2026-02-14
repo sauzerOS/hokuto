@@ -16,7 +16,10 @@ import (
 	"github.com/gookit/color"
 )
 
-func pkgUninstall(pkgName string, cfg *Config, execCtx *Executor, force, yes bool) error {
+func pkgUninstall(pkgName string, cfg *Config, execCtx *Executor, force, yes bool, logger io.Writer) error {
+	if logger == nil {
+		logger = os.Stdout
+	}
 	// Resolve HOKUTO_ROOT (fall back to "/")
 	hRoot := cfg.Values["HOKUTO_ROOT"]
 	if hRoot == "" {
@@ -156,8 +159,8 @@ func pkgUninstall(pkgName string, cfg *Config, execCtx *Executor, force, yes boo
 
 	// 5. Confirm with user unless 'yes' is set
 	if !yes {
-		colArrow.Print("-> ")
-		color.Danger.Printf("About to remove package %s and %d file(s). Continue? [Y/n]: ", pkgName, fileCount)
+		fcPrintf(logger, colArrow, "-> ")
+		fcPrintf(logger, color.Danger, "About to remove package %s and %d file(s). Continue? [Y/n]: ", pkgName, fileCount)
 		var answer string
 		fmt.Scanln(&answer)
 		answer = strings.ToLower(strings.TrimSpace(answer))
@@ -267,11 +270,11 @@ func pkgUninstall(pkgName string, cfg *Config, execCtx *Executor, force, yes boo
 
 		// Skip modification warning for files with 000000 checksum
 		if currentSum != meta.B3Sum && meta.B3Sum != "000000" {
-			cPrintf(colWarn, "\nWARNING: File %s has been modified (expected %s, found %s).\n", p, meta.B3Sum, currentSum)
+			fcPrintf(logger, colWarn, "\nWARNING: File %s has been modified (expected %s, found %s).\n", p, meta.B3Sum, currentSum)
 
 			// Prompt user unless 'yes' is set
 			if !yes {
-				fmt.Printf("File content mismatch. Remove anyway? [Y/n]: ")
+				fmt.Fprintf(logger, "File content mismatch. Remove anyway? [Y/n]: ")
 				var answer string
 				fmt.Scanln(&answer)
 				answer = strings.ToLower(strings.TrimSpace(answer))
@@ -302,8 +305,8 @@ func pkgUninstall(pkgName string, cfg *Config, execCtx *Executor, force, yes boo
 					}
 				}
 			}
-			colArrow.Print("-> ")
-			colSuccess.Printf("Removed %d files natively\n", removedCount)
+			fcPrintf(logger, colArrow, "-> ")
+			fcPrintf(logger, colSuccess, "Removed %d files natively\n", removedCount)
 		} else {
 			// Use rm with multiple files for better performance
 			rmCmd := exec.Command("rm", "-f")
@@ -322,8 +325,8 @@ func pkgUninstall(pkgName string, cfg *Config, execCtx *Executor, force, yes boo
 					}
 				}
 			} else {
-				colArrow.Print("-> ")
-				colSuccess.Printf("Removed %d files\n", len(filesToRemove))
+				fcPrintf(logger, colArrow, "-> ")
+				fcPrintf(logger, colSuccess, "Removed %d files\n", len(filesToRemove))
 			}
 		}
 	}
