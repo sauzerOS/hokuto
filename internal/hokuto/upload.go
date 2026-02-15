@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -231,8 +232,10 @@ func handleUploadCommand(args []string, cfg *Config) error {
 			cacheUpdated = true
 		}
 
-		key := fmt.Sprintf("%s-%s-%s", entry.Name, entry.Arch, entry.Variant)
+		key := fmt.Sprintf("%s-%s-%s-%s-%s", entry.Name, entry.Version, entry.Revision, entry.Arch, entry.Variant)
 		if existing, ok := latestLocals[key]; ok {
+			// This case should only happen if we have duplicates of the exact same version/revision/arch/variant
+			// which shouldn't happen with unique filenames, but good to be safe.
 			if isNewer(entry, existing) {
 				latestLocals[key] = entry
 			}
@@ -250,7 +253,7 @@ func handleUploadCommand(args []string, cfg *Config) error {
 	// 5. Compare with Remote and Upload
 	newIndexMap := make(map[string]RepoEntry)
 	for _, entry := range remoteIndex {
-		key := fmt.Sprintf("%s-%s-%s", entry.Name, entry.Arch, entry.Variant)
+		key := fmt.Sprintf("%s-%s-%s-%s-%s", entry.Name, entry.Version, entry.Revision, entry.Arch, entry.Variant)
 		newIndexMap[key] = entry
 	}
 
@@ -380,14 +383,14 @@ func handleUploadCommand(args []string, cfg *Config) error {
 			// AND it has dependency info (Depends field is not empty if it should have some)
 			// Actually, just check if it's missing Depends and force re-scan if so.
 			if existing, ok := oldByFilename[obj.Key]; ok && existing.Size == obj.Size && len(existing.Depends) > 0 {
-				key := fmt.Sprintf("%s-%s-%s", existing.Name, existing.Arch, existing.Variant)
+				key := fmt.Sprintf("%s-%s-%s-%s-%s", existing.Name, existing.Version, existing.Revision, existing.Arch, existing.Variant)
 				reconciledMap[key] = existing
 				continue
 			}
 
 			// 2. Check if we have it locally
 			if local, ok := localByFilename[obj.Key]; ok && local.Size == obj.Size {
-				key := fmt.Sprintf("%s-%s-%s", local.Name, local.Arch, local.Variant)
+				key := fmt.Sprintf("%s-%s-%s-%s-%s", local.Name, local.Version, local.Revision, local.Arch, local.Variant)
 				reconciledMap[key] = local
 				reindexedCount++
 				continue
@@ -420,7 +423,7 @@ func handleUploadCommand(args []string, cfg *Config) error {
 				continue
 			}
 
-			key := fmt.Sprintf("%s-%s-%s", entry.Name, entry.Arch, entry.Variant)
+			key := fmt.Sprintf("%s-%s-%s-%s-%s", entry.Name, entry.Version, entry.Revision, entry.Arch, entry.Variant)
 			reconciledMap[key] = entry
 			reindexedCount++
 		}
@@ -461,9 +464,9 @@ func handleUploadCommand(args []string, cfg *Config) error {
 		if !exists {
 			needsUpload = true
 			reason = " (remote missing)"
-		} else if isNewer(local, remote) {
-			needsUpload = true
-			reason = fmt.Sprintf(" (newer: %s-%s vs %s-%s)", local.Version, local.Revision, remote.Version, remote.Revision)
+			// Since we now include version in the key, "newer" logic in the map is less relevant
+			// because existing remote versions are separate keys.
+			// But if we are overwriting an EXACT match (same version/rev/arch/variant), check checksum.
 		} else if local.B3Sum != remote.B3Sum {
 			needsUpload = true
 			reason = " (checksum mismatch)"
@@ -612,7 +615,19 @@ func handleUploadCommand(args []string, cfg *Config) error {
 			if a.Arch != b.Arch {
 				return a.Arch < b.Arch
 			}
-			return a.Variant < b.Variant
+			if a.Variant != b.Variant {
+				return a.Variant < b.Variant
+			}
+			// Sort by version (descending preferred? No, usually ls lists ascending, but let's stick to standard sort order)
+			// Actually, for "ls", seeing versions in order is good.
+			// Let's sort ascending by version, then revision.
+			cmp := compareVersions(a.Version, b.Version)
+			if cmp != 0 {
+				return cmp < 0
+			}
+			ar, _ := strconv.Atoi(a.Revision)
+			br, _ := strconv.Atoi(b.Revision)
+			return ar < br
 		})
 
 		indexBytes, err := json.MarshalIndent(finalizedIndex, "", "  ")

@@ -343,74 +343,105 @@ func listRemotePackages(searchTerm string, cfg *Config) error {
 	return RunPager("Remote Packages", output)
 }
 
-// GetRemotePackageVersion searches the remote index for a package matching system criteria.
-func GetRemotePackageVersion(pkgName string, cfg *Config, remoteIndex []RepoEntry) (version, revision string, err error) {
+// GetRemotePackageEntry searches the remote index for a package matching system criteria.
+// It returns the full RepoEntry or an error if not found.
+func GetRemotePackageEntry(pkgName string, cfg *Config, remoteIndex []RepoEntry) (*RepoEntry, error) {
 	targetVersion := ""
+	targetRevision := ""
 	lookupName := pkgName
 	if idx := strings.Index(pkgName, "@"); idx != -1 {
 		lookupName = pkgName[:idx]
-		targetVersion = pkgName[idx+1:]
+		verStr := pkgName[idx+1:]
+		// Check for revision (format: version-revision)
+		// Only treat it as revision if the part after the last dash is numeric
+		if lastDash := strings.LastIndex(verStr, "-"); lastDash != -1 {
+			possibleRev := verStr[lastDash+1:]
+			if _, err := strconv.Atoi(possibleRev); err == nil {
+				targetVersion = verStr[:lastDash]
+				targetRevision = possibleRev
+			} else {
+				targetVersion = verStr
+			}
+		} else {
+			targetVersion = verStr
+		}
 	}
 
 	arch := GetSystemArch(cfg)
 	variant := GetSystemVariantForPackage(cfg, lookupName)
 
-	var bestMatch *RepoEntry
-	for i := range remoteIndex {
-		entry := &remoteIndex[i]
-		if entry.Name == lookupName && entry.Arch == arch && entry.Variant == variant {
-			// If targetVersion is specified, only match that exact version
-			if targetVersion != "" {
-				if entry.Version == targetVersion {
-					// Found the exact version
-					return entry.Version, entry.Revision, nil
+	// Helper to search in a specific variant
+	searchInVariant := func(searchVariant string) *RepoEntry {
+		var localBest *RepoEntry
+		for i := range remoteIndex {
+			entry := &remoteIndex[i]
+			if entry.Name == lookupName && entry.Arch == arch && entry.Variant == searchVariant {
+				if targetVersion != "" {
+					if entry.Version == targetVersion {
+						if targetRevision != "" && entry.Revision != targetRevision {
+							continue
+						}
+						return entry
+					}
+					continue
 				}
-				continue
-			}
-
-			if bestMatch == nil || isNewer(*entry, *bestMatch) {
-				bestMatch = entry
+				if localBest == nil || isNewer(*entry, *localBest) {
+					localBest = entry
+				}
 			}
 		}
+		return localBest
 	}
 
-	if bestMatch != nil {
-		return bestMatch.Version, bestMatch.Revision, nil
+	// 1. Preferred Variant
+	if match := searchInVariant(variant); match != nil {
+		return match, nil
 	}
 
-	// FALLBACK: If preferred variant not found, try 'generic'
+	// 2. Generic Variant (if preferred was not generic)
 	if !strings.Contains(variant, "generic") {
-		// multi-optimized -> multi-generic, optimized -> generic
 		fallbackVariant := "generic"
 		if strings.HasPrefix(variant, "multi-") {
 			fallbackVariant = "multi-generic"
 		}
-
-		for i := range remoteIndex {
-			entry := &remoteIndex[i]
-			if entry.Name == lookupName && entry.Arch == arch && entry.Variant == fallbackVariant {
-				if targetVersion != "" {
-					if entry.Version == targetVersion {
-						return entry.Version, entry.Revision, nil
-					}
-					continue
-				}
-				if bestMatch == nil || isNewer(*entry, *bestMatch) {
-					bestMatch = entry
-				}
-			}
+		if match := searchInVariant(fallbackVariant); match != nil {
+			return match, nil
 		}
 	}
 
-	if bestMatch != nil {
-		return bestMatch.Version, bestMatch.Revision, nil
+	// 3. Multi variants fallback
+	// If we are looking for non-multi (e.g. optimized) but only multi- exists, try that.
+	if !strings.HasPrefix(variant, "multi-") {
+		// Try multi- + variant (e.g. "optimized" -> "multi-optimized")
+		fallbackVariant := "multi-" + variant
+		if match := searchInVariant(fallbackVariant); match != nil {
+			return match, nil
+		}
+
+		// Try multi-generic
+		if match := searchInVariant("multi-generic"); match != nil {
+			return match, nil
+		}
 	}
 
 	if targetVersion != "" {
-		return "", "", fmt.Errorf("package %s@%s not found in remote index for %s (%s)", lookupName, targetVersion, arch, variant)
+		verStr := targetVersion
+		if targetRevision != "" {
+			verStr += "-" + targetRevision
+		}
+		return nil, fmt.Errorf("package %s@%s not found in remote index for %s (%s)", lookupName, verStr, arch, variant)
 	}
 
-	return "", "", fmt.Errorf("package %s not found in remote index for %s (%s)", pkgName, arch, variant)
+	return nil, fmt.Errorf("package %s not found in remote index for %s (%s)", pkgName, arch, variant)
+}
+
+// GetRemotePackageVersion searches the remote index for a package matching system criteria.
+func GetRemotePackageVersion(pkgName string, cfg *Config, remoteIndex []RepoEntry) (version, revision string, err error) {
+	entry, err := GetRemotePackageEntry(pkgName, cfg, remoteIndex)
+	if err != nil {
+		return "", "", err
+	}
+	return entry.Version, entry.Revision, nil
 }
 
 // showManifest prints the file list for a package manifest, skipping directories,
