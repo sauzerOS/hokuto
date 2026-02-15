@@ -1258,6 +1258,17 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, opts BuildOptions)
 		return 0, fmt.Errorf("failed to copy build file: %v", err)
 	}
 
+	// Copy options file from pkgDir if it exists
+	optionsSrc := filepath.Join(pkgDir, "options")
+	optionsDst := filepath.Join(installedDir, "options")
+
+	if fi, err := os.Stat(optionsSrc); err == nil && !fi.IsDir() {
+		cpCmd := exec.Command("cp", "--remove-destination", optionsSrc, optionsDst)
+		if err := buildExec.Run(cpCmd); err != nil {
+			return 0, fmt.Errorf("failed to copy options file: %v", err)
+		}
+	}
+
 	// Copy post-install file from pkgDir if it exists
 	postinstallSrc := filepath.Join(pkgDir, "post-install")
 	postinstallDst := filepath.Join(installedDir, "post-install")

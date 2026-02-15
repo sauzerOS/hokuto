@@ -780,8 +780,12 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 	// These packages often bundle libraries that are removed/upgraded during an update,
 	// but since they are self-contained (or should be treated as such for this purpose),
 	// this shouldn't trigger rebuilds of other packages.
-	if strings.HasSuffix(pkgName, "-bin") {
-		debugf("Skipping reverse dependency check for -bin package: %s\n", pkgName)
+	// Check package options for 'binary' flag
+	pkgMetaDir := filepath.Join(stagingDir, "var", "db", "hokuto", "installed", pkgName)
+	pkgOpts := loadBuildOptions(pkgMetaDir)
+
+	if pkgOpts["binary"] {
+		debugf("Skipping reverse dependency check for binary package: %s\n", pkgName)
 	} else {
 		// Optimization: Pre-compute lookups
 		filesToDeleteMap := make(map[string]struct{}, len(filesToDelete))

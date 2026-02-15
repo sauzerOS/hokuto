@@ -384,8 +384,15 @@ func generateDepends(pkgName, pkgDir, outputDir, rootDir string, execCtx *Execut
 					continue
 				}
 				otherPkg := e.Name()
-				if otherPkg == pkgName || strings.HasSuffix(otherPkg, "-bin") {
-					continue // Skip self and -bin packages (prevent false dependencies)
+				if otherPkg == pkgName {
+					continue
+				}
+
+				// Check if package is marked as binary in options
+				otherPkgDir := filepath.Join(dbRoot, otherPkg)
+				otherOpts := loadBuildOptions(otherPkgDir)
+				if otherOpts["binary"] {
+					continue // Skip binary packages (prevent false dependencies)
 				}
 
 				manifestFile := filepath.Join(dbRoot, otherPkg, "manifest")
