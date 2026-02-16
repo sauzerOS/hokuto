@@ -426,7 +426,7 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, opts BuildOptions)
 		Stderr:          opts.LogWriter,
 	}
 	// Fetch all sources for the build, including git repositories.
-	if err := fetchSources(pkgName, pkgDir, true); err != nil {
+	if err := fetchSourcesWithOptions(pkgName, pkgDir, true, opts.Quiet); err != nil {
 		return 0, fmt.Errorf("failed to fetch sources: %v", err)
 	}
 

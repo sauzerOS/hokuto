@@ -290,6 +290,13 @@ func (pm *ParallelManager) Run() error {
 						UserExec.Interactive = false
 						RootExec.Interactive = false
 					})
+				} else if !pm.AutoYes {
+					// Non-interactive package but prompts may appear (no -y flag).
+					// Wrap in WithPrompt to pause the UI status line so modified-file
+					// prompts are visible and the user can respond.
+					WithPrompt(func() {
+						derivedRebuilds, installErr = pm.Installer(res.pkgName, logger)
+					})
 				} else {
 					derivedRebuilds, installErr = pm.Installer(res.pkgName, logger)
 				}
