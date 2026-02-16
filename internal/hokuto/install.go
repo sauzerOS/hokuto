@@ -933,48 +933,55 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 		fmt.Printf("warning: post-install for %s returned error: %v\n", pkgName, err)
 	}
 
+	// Collected rebuilds to return in managed mode
+	var parallelRebuilds []string
+
 	// 7.5. Check for rebuild triggers from /etc/hokuto/hokuto.rebuild
 	rebuildTriggerPkgs := getRebuildTriggers(pkgName, rootDir)
 	if len(rebuildTriggerPkgs) > 0 {
 		fmt.Fprint(logger, colArrow.Sprint("-> "))
 		fmt.Fprint(logger, colSuccess.Sprint("DKMS trigger: "))
 		fmt.Fprintf(logger, "%s", colNote.Sprintf("%s\n", strings.Join(rebuildTriggerPkgs, " ")))
-		shouldRebuild := yes // Default to true if --yes flag is set
-		if !yes {
-			shouldRebuild = askForConfirmation(colWarn, "%sRebuild the packages?", colArrow.Sprint("-> "))
-		}
-
-		if shouldRebuild {
-			for _, rebuildPkg := range rebuildTriggerPkgs {
-				debugf("\n--- Rebuilding %s (triggered by %s) ---\n", rebuildPkg, pkgName)
-
-				// Pass empty string for oldLibsDir since this is a trigger-based rebuild, not a library dependency rebuild
-				if err := pkgBuildRebuild(rebuildPkg, cfg, execCtx, "", nil); err != nil {
-					failed = append(failed, fmt.Sprintf("rebuild of %s (triggered by %s) failed: %v", rebuildPkg, pkgName, err))
-					fmt.Fprintf(logger, "%s", colWarn.Sprintf("WARNING: Rebuild of %s failed: %v\n", rebuildPkg, err))
-					continue
-				}
-
-				rebuildOutputDir := filepath.Join(tmpDir, rebuildPkg, "output")
-
-				if err := rsyncStaging(rebuildOutputDir, rootDir, execCtx); err != nil {
-					failed = append(failed, fmt.Sprintf("failed to sync rebuilt package %s to root: %v", rebuildPkg, err))
-					fmt.Fprintf(logger, "%s", colWarn.Sprintf("WARNING: Failed to sync rebuilt package %s to root: %v\n", rebuildPkg, err))
-					continue
-				}
-
-				rmCmd := exec.Command("rm", "-rf", filepath.Join(tmpDir, rebuildPkg))
-				if err := execCtx.Run(rmCmd); err != nil {
-					fmt.Fprintf(os.Stderr, "failed to cleanup rebuild tmpdirs for %s: %v\n", rebuildPkg, err)
-				}
-				colArrow.Print("-> ")
-				fmt.Fprintf(logger, "%s", colSuccess.Sprint("Rebuild of "))
-				colNote.Printf("%s ", rebuildPkg)
-				colSuccess.Printf("finished and installed.\n")
-			}
+		if managed {
+			parallelRebuilds = append(parallelRebuilds, rebuildTriggerPkgs...)
 		} else {
-			colArrow.Print("-> ")
-			fmt.Fprintf(logger, "%s", colInfo.Sprintf("Skipping rebuild of %s\n", strings.Join(rebuildTriggerPkgs, ", ")))
+			shouldRebuild := yes // Default to true if --yes flag is set
+			if !yes {
+				shouldRebuild = askForConfirmation(colWarn, "%sRebuild the packages?", colArrow.Sprint("-> "))
+			}
+
+			if shouldRebuild {
+				for _, rebuildPkg := range rebuildTriggerPkgs {
+					debugf("\n--- Rebuilding %s (triggered by %s) ---\n", rebuildPkg, pkgName)
+
+					// Pass empty string for oldLibsDir since this is a trigger-based rebuild, not a library dependency rebuild
+					if err := pkgBuildRebuild(rebuildPkg, cfg, execCtx, "", nil); err != nil {
+						failed = append(failed, fmt.Sprintf("rebuild of %s (triggered by %s) failed: %v", rebuildPkg, pkgName, err))
+						fmt.Fprintf(logger, "%s", colWarn.Sprintf("WARNING: Rebuild of %s failed: %v\n", rebuildPkg, err))
+						continue
+					}
+
+					rebuildOutputDir := filepath.Join(tmpDir, rebuildPkg, "output")
+
+					if err := rsyncStaging(rebuildOutputDir, rootDir, execCtx); err != nil {
+						failed = append(failed, fmt.Sprintf("failed to sync rebuilt package %s to root: %v", rebuildPkg, err))
+						fmt.Fprintf(logger, "%s", colWarn.Sprintf("WARNING: Failed to sync rebuilt package %s to root: %v\n", rebuildPkg, err))
+						continue
+					}
+
+					rmCmd := exec.Command("rm", "-rf", filepath.Join(tmpDir, rebuildPkg))
+					if err := execCtx.Run(rmCmd); err != nil {
+						fmt.Fprintf(os.Stderr, "failed to cleanup rebuild tmpdirs for %s: %v\n", rebuildPkg, err)
+					}
+					colArrow.Print("-> ")
+					fmt.Fprintf(logger, "%s", colSuccess.Sprint("Rebuild of "))
+					colNote.Printf("%s ", rebuildPkg)
+					colSuccess.Printf("finished and installed.\n")
+				}
+			} else {
+				colArrow.Print("-> ")
+				fmt.Fprintf(logger, "%s", colInfo.Sprintf("Skipping rebuild of %s\n", strings.Join(rebuildTriggerPkgs, ", ")))
+			}
 		}
 	}
 
@@ -989,15 +996,10 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 		// If managed (parallel mode), we return the list of affected packages so the caller
 		// can handle them (queue them for parallel execution). We do NOT prompt or rebuild here.
 		if managed {
-			// Log informational message only if we found something
-			if len(affectedList) > 0 {
-				// silence explicit output to avoid interleaving, caller handles queuing
-			}
-			return affectedList, nil
-		}
-
-		// --- Sequential Handling (managed=false) ---
-		// 8a. Prompt for rebuild (Hokuto is guaranteed to be run in a terminal)
+			parallelRebuilds = append(parallelRebuilds, affectedList...)
+		} else {
+			// --- Sequential Handling (managed=false) ---
+			// 8a. Prompt for rebuild (Hokuto is guaranteed to be run in a terminal)
 		var sb strings.Builder
 		sb.WriteString("\nWARNING: The following packages depend on libraries that were removed/upgraded:\n")
 		for _, pkg := range affectedList {
@@ -1116,6 +1118,7 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 			}
 		}
 	}
+	}
 
 	// 9. Cleanup
 	rmCmd2 := exec.Command("rm", "-rf", pkgTmpDir)
@@ -1134,7 +1137,7 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 			fmt.Fprintf(os.Stderr, "post-install tasks completed with warnings: %v\n", err)
 		}
 	}
-	return nil, nil
+	return parallelRebuilds, nil
 }
 
 // checkStagingConflicts checks for conflicts between files in staging and existing files in the target.
