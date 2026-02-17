@@ -131,7 +131,7 @@ func RunParallelBuilds(plan *BuildPlan, cfg *Config, maxJobs int, userRequestedM
 		// 2. Blocked
 		for _, pkg := range pm.Pending {
 			// Determine reason
-			reason := "dependency not satisfied"
+			reason := "build cancelled"
 			pkgDir, err := findPackageDir(pkg)
 			if err == nil {
 				if deps, err := parseDependsFile(pkgDir); err == nil {
@@ -147,16 +147,33 @@ func RunParallelBuilds(plan *BuildPlan, cfg *Config, maxJobs int, userRequestedM
 							continue
 						}
 
-						// Check status
-						if _, failed := pm.Failed[dep.Name]; failed {
-							reason = fmt.Sprintf("dependency failed: %s", dep.Name)
-							break
+						// Check status involving alternatives
+						candidates := []string{dep.Name}
+						if len(dep.Alternatives) > 0 {
+							candidates = dep.Alternatives
 						}
-						// Check if installed or built
-						isBuilt := pm.Completed[dep.Name]
-						isInstalled := isPackageInstalled(dep.Name)
-						if !isBuilt && !isInstalled {
-							reason = fmt.Sprintf("dependency not satisfied: %s", dep.Name)
+
+						satisfied := false
+						failedDep := ""
+						for _, cand := range candidates {
+							if !EnableMultilib && strings.HasSuffix(cand, "-32") {
+								continue
+							}
+							if _, f := pm.Failed[cand]; f {
+								failedDep = cand
+							}
+							if pm.Completed[cand] || isPackageInstalled(cand) {
+								satisfied = true
+								break
+							}
+						}
+
+						if !satisfied {
+							if failedDep != "" {
+								reason = fmt.Sprintf("dependency failed: %s", failedDep)
+							} else {
+								reason = fmt.Sprintf("dependency not satisfied: %s", dep.Name)
+							}
 							break
 						}
 					}
@@ -204,58 +221,55 @@ func (pm *ParallelManager) isInteractive(pkgName string) bool {
 
 // Run executes the parallel build loop
 func (pm *ParallelManager) Run() error {
-	failed := false
 	for len(pm.Pending) > 0 || len(pm.Running) > 0 {
 		// 1. Check if we can start new jobs
 		pm.mu.Lock()
-		if !failed { // Stop starting new jobs if a failure occurred
-			// Check if any interactive job is currently running
-			anyInteractiveRunning := false
-			for rPkg := range pm.Running {
-				if pm.isInteractive(rPkg) {
-					anyInteractiveRunning = true
-					break
-				}
+		// Check if any interactive job is currently running
+		anyInteractiveRunning := false
+		for rPkg := range pm.Running {
+			if pm.isInteractive(rPkg) {
+				anyInteractiveRunning = true
+				break
 			}
+		}
 
-			if !anyInteractiveRunning {
-				// Identify candidates
-				var nextPending []string
-				canStartMore := true
+		if !anyInteractiveRunning {
+			// Identify candidates
+			var nextPending []string
+			canStartMore := true
 
-				for _, pkgName := range pm.Pending {
-					// Stop if we hit max jobs or just started/found an interactive job
-					if !canStartMore || len(pm.Running) >= pm.MaxJobs {
-						nextPending = append(nextPending, pkgName)
-						continue
-					}
+			for _, pkgName := range pm.Pending {
+				// Stop if we hit max jobs or just started/found an interactive job
+				if !canStartMore || len(pm.Running) >= pm.MaxJobs {
+					nextPending = append(nextPending, pkgName)
+					continue
+				}
 
-					if pm.isInteractive(pkgName) {
-						// Interactive packages must run ALONE
-						if len(pm.Running) == 0 {
-							if pm.canBuild(pkgName) {
-								pm.startBuild(pkgName, len(pm.Completed)+len(pm.Running)+1, len(pm.BuildPlan.Order))
-								canStartMore = false // Don't start anything else after starting an interactive job
-							} else {
-								nextPending = append(nextPending, pkgName)
-							}
+				if pm.isInteractive(pkgName) {
+					// Interactive packages must run ALONE
+					if len(pm.Running) == 0 {
+						if pm.canBuild(pkgName) {
+							pm.startBuild(pkgName, len(pm.Completed)+len(pm.Running)+1, len(pm.BuildPlan.Order))
+							canStartMore = false // Don't start anything else after starting an interactive job
 						} else {
-							// Other jobs are running, wait for them to finish before starting this interactive one
 							nextPending = append(nextPending, pkgName)
-							canStartMore = false // Optimization: don't look ahead if we're waiting to isolate a job
 						}
-						continue
-					}
-
-					// Non-interactive package
-					if pm.canBuild(pkgName) {
-						pm.startBuild(pkgName, len(pm.Completed)+len(pm.Running)+1, len(pm.BuildPlan.Order))
 					} else {
+						// Other jobs are running, wait for them to finish before starting this interactive one
 						nextPending = append(nextPending, pkgName)
+						canStartMore = false // Optimization: don't look ahead if we're waiting to isolate a job
 					}
+					continue
 				}
-				pm.Pending = nextPending
+
+				// Non-interactive package
+				if pm.canBuild(pkgName) {
+					pm.startBuild(pkgName, len(pm.Completed)+len(pm.Running)+1, len(pm.BuildPlan.Order))
+				} else {
+					nextPending = append(nextPending, pkgName)
+				}
 			}
+			pm.Pending = nextPending
 		}
 		pm.mu.Unlock()
 
@@ -273,7 +287,7 @@ func (pm *ParallelManager) Run() error {
 
 			if res.err != nil {
 				pm.Failed[res.pkgName] = res.err
-				failed = true
+				// failed = true // We track failures but don't stop the world
 			} else {
 				// INSTALLATION (Sequential for safety)
 				// We must install the package so that subsequent builds can find headers/libs.
@@ -304,7 +318,7 @@ func (pm *ParallelManager) Run() error {
 
 				if installErr != nil {
 					pm.Failed[res.pkgName] = fmt.Errorf("install failed: %w", installErr)
-					failed = true
+					// failed = true
 				} else {
 					pm.Completed[res.pkgName] = true
 
@@ -406,8 +420,12 @@ func (pm *ParallelManager) Run() error {
 			}
 			delete(pm.Running, res.pkgName)
 			pm.mu.Unlock()
-		} else if len(pm.Pending) > 0 && !failed {
-			// No running jobs but pending jobs exist, and we couldn't start any?
+		} else if len(pm.Pending) > 0 {
+			// No running jobs but pending jobs exist.
+			// If we have failures, assume pending jobs are blocked by them and exit gracefully.
+			if len(pm.Failed) > 0 {
+				break
+			}
 			return fmt.Errorf("parallel build deadlock: pending packages %v cannot be satisfied", pm.Pending)
 		} else {
 			// No running, no pending (or failed). Done.
