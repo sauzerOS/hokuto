@@ -526,22 +526,49 @@ func handleUploadCommand(args []string, cfg *Config) error {
 			return fmt.Errorf("failed to list remote files: %w", err)
 		}
 
-		// Build a set of filenames currently in the index
-		activeFiles := make(map[string]bool)
-		for _, entry := range newIndexMap {
-			activeFiles[entry.Filename] = true
+		// Identify the LATEST version for each package
+		type pkgGroupKey struct {
+			Name    string
+			Arch    string
+			Variant string
 		}
+		groupedPkgs := make(map[pkgGroupKey][]RepoEntry)
+		for _, entry := range newIndexMap {
+			k := pkgGroupKey{Name: entry.Name, Arch: entry.Arch, Variant: entry.Variant}
+			groupedPkgs[k] = append(groupedPkgs[k], entry)
+		}
+
+		activeFiles := make(map[string]bool)
 		activeFiles["repo-index.json"] = true
+		activeFiles["repo-index.json.sig"] = true
+
+		for _, entries := range groupedPkgs {
+			// Sort so the first element is the newest
+			sort.Slice(entries, func(i, j int) bool {
+				return isNewer(entries[i], entries[j])
+			})
+			// Keep only the newest version as "active"
+			if len(entries) > 0 {
+				activeFiles[entries[0].Filename] = true
+			}
+		}
 
 		var deletedCount int
 		for _, obj := range remoteObjects {
 			if !activeFiles[obj.Key] && strings.HasSuffix(obj.Key, ".tar.zst") {
 				colArrow.Print("-> ")
-				if askForConfirmation(colError, "Delete old version from %s: %s? ", getMirrorDisplayName(cfg), obj.Key) {
+				if askForConfirmation(colError, "Delete old version/orphan from %s: %s? ", getMirrorDisplayName(cfg), obj.Key) {
 					if err := r2.DeleteFile(ctx, obj.Key); err != nil {
 						fmt.Fprintf(os.Stderr, "Warning: failed to delete %s: %v\n", obj.Key, err)
 					} else {
 						deletedCount++
+						deletionsOccurred = true
+						// IMPORTANT: Remove from the index map so we don't re-upload a broken link
+						for k, v := range newIndexMap {
+							if v.Filename == obj.Key {
+								delete(newIndexMap, k)
+							}
+						}
 					}
 				}
 			}

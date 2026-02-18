@@ -211,7 +211,7 @@ export HOKUTO_GENERIC="$HOKUTO_GENERIC"
 export HOKUTO_MULTILIB="$HOKUTO_MULTILIB"
 
 # Run install
-"$BIN" install --remote $PKG_LIST
+"$BIN" install --remote --fast $PKG_LIST
 
 # 8. Update Configuration
 CONF_DIR="$HOKUTO_ROOT/etc/hokuto"
