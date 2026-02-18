@@ -119,8 +119,8 @@ func verifyOrCreateChecksums(pkgName, pkgDir string, force bool, logger io.Write
 	urlMap := make(map[string]string) // map[filename] -> url
 	for _, line := range strings.Split(string(sourceData), "\n") {
 		line = strings.TrimSpace(line)
-		// git+ sources are checked out, not checksummed as files here usually.
-		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, "git+") {
+		// git+ and svn+ sources are checked out, not checksummed as files.
+		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, "git+") || strings.HasPrefix(line, "svn+") {
 			continue
 		}
 		parts := strings.Fields(line)

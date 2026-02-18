@@ -882,6 +882,98 @@ func fetchSourcesWithOptions(pkgName, pkgDir string, processGit bool, quiet bool
 			continue // End git block
 		}
 
+		// --- SVN Source Logic ---
+		if strings.HasPrefix(rawSourceURL, "svn+") {
+			// If we are not supposed to process VCS repos (e.g., in 'checksum' command), skip.
+			if !processGit {
+				debugf("Skipping SVN repository for this operation: %s\n", rawSourceURL)
+				continue
+			}
+
+			baseURL, repoPath, revision, err := parseSVNSourceURL(rawSourceURL)
+			if err != nil {
+				return fmt.Errorf("failed to parse SVN source URL: %v", err)
+			}
+
+			dirName := svnDirName(rawSourceURL)
+			destPath := filepath.Join(pkgLinkDir, dirName)
+
+			// Use file locking to prevent parallel download races
+			svnCacheDir := filepath.Join(CacheStore, "svn")
+			os.MkdirAll(svnCacheDir, 0o755)
+
+			urlHash := hashString(rawSourceURL)[:12]
+			lockPath := filepath.Join(svnCacheDir, dirName+"-"+urlHash+".lock")
+
+			err = func() error {
+				lFile, err := os.Create(lockPath)
+				if err != nil {
+					return fmt.Errorf("failed to create lock file for SVN: %v", err)
+				}
+				defer os.Remove(lockPath)
+				defer lFile.Close()
+
+				if err := unix.Flock(int(lFile.Fd()), unix.LOCK_EX); err != nil {
+					return fmt.Errorf("failed to lock SVN cache: %v", err)
+				}
+				defer unix.Flock(int(lFile.Fd()), unix.LOCK_UN)
+
+				// If the destination already exists, check if revision matches
+				if _, err := os.Stat(destPath); err == nil {
+					// Check the stored revision marker
+					markerPath := filepath.Join(destPath, ".hokuto_svn_revision")
+					storedRev, readErr := os.ReadFile(markerPath)
+					storedRevStr := strings.TrimSpace(string(storedRev))
+
+					if readErr == nil && storedRevStr == revision {
+						// Same revision — nothing to do
+						debugf("SVN checkout already at revision %s: %s\n", revision, destPath)
+						return nil
+					}
+
+					// Revision changed or marker missing — remove and re-checkout
+					if !quiet {
+						if readErr != nil {
+							cPrintf(colInfo, "SVN checkout exists but has no revision marker, re-checking out\n")
+						} else {
+							cPrintf(colInfo, "SVN revision changed (%s -> %s), re-checking out\n", storedRevStr, revision)
+						}
+					}
+					os.RemoveAll(destPath)
+				}
+
+				if !quiet {
+					revStr := ""
+					if revision != "" {
+						revStr = fmt.Sprintf(" (revision %s)", revision)
+					}
+					cPrintf(colInfo, "Checking out SVN: %s%s%s\n", baseURL, repoPath, revStr)
+				}
+
+				if err := svnCheckout(baseURL, repoPath, revision, destPath, quiet); err != nil {
+					// Clean up partial checkout on failure
+					os.RemoveAll(destPath)
+					return fmt.Errorf("SVN checkout failed: %v", err)
+				}
+
+				// Write revision marker for future cache validation
+				if revision != "" {
+					markerPath := filepath.Join(destPath, ".hokuto_svn_revision")
+					os.WriteFile(markerPath, []byte(revision+"\n"), 0o644)
+				}
+
+				return nil
+			}()
+			if err != nil {
+				return err
+			}
+
+			if !quiet {
+				cPrintf(colInfo, "SVN checkout ready: %s\n", destPath)
+			}
+			continue // End SVN block
+		}
+
 		// --- HTTP/FTP Source Logic ---
 		originalSourceURL := rawSourceURL
 		substitutedURL := applyGnuMirror(originalSourceURL)
