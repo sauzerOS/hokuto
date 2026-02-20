@@ -398,6 +398,12 @@ func (pm *ParallelManager) Run() error {
 
 							if shouldRebuild {
 								pm.Pending = append(pm.Pending, uniqueRebuilds...)
+								if pm.BuildPlan.RebuildPackages == nil {
+									pm.BuildPlan.RebuildPackages = make(map[string]bool)
+								}
+								for _, p := range uniqueRebuilds {
+									pm.BuildPlan.RebuildPackages[p] = true
+								}
 							} else {
 								// If declined, we mark them as "skipped" effectively, or just don't add them.
 								// They won't run.

@@ -348,7 +348,8 @@ func downloadFileWithOptions(originalURL, finalURL, destFile string, opt downloa
 
 	// --- Fallback: Browser Download (chromedp) ---
 	debugf("Falling back to browser download (chromedp)\n")
-	if err := downloadViaBrowser(finalURL, absPath, opt.Quiet); err == nil {
+	browserErr := downloadViaBrowser(finalURL, absPath, opt.Quiet)
+	if browserErr == nil {
 		if !opt.Quiet {
 			colArrow.Print("-> ")
 			displayFilename := filepath.Base(finalURL)
@@ -356,13 +357,52 @@ func downloadFileWithOptions(originalURL, finalURL, destFile string, opt downloa
 		}
 		debugf("Download successful with browser (chromedp).")
 		return nil
-	} else {
-		// If browser also failed, combine errors
-		if nativeErr != nil {
-			return fmt.Errorf("all download methods failed. Native error: %w; Browser error: %w", nativeErr, err)
-		}
-		return fmt.Errorf("all download methods failed. Browser error: %w", err)
 	}
+
+	// --- Fallback: Wget ---
+	debugf("Browser download failed: %v. Falling back to wget...\n", browserErr)
+	if err := downloadViaWget(finalURL, absPath, opt.Quiet); err == nil {
+		if !opt.Quiet {
+			colArrow.Print("-> ")
+			displayFilename := filepath.Base(finalURL)
+			colSuccess.Printf("Download successful (wget): %s\n", displayFilename)
+		}
+		debugf("Download successful with wget.\n")
+		return nil
+	} else {
+		return fmt.Errorf("all download methods failed. Native error: %v; Browser error: %v; Wget error: %v", nativeErr, browserErr, err)
+	}
+}
+
+func downloadViaWget(url, destPath string, quiet bool) error {
+	// check if wget is available
+	if _, err := exec.LookPath("wget"); err != nil {
+		return fmt.Errorf("wget not found in PATH")
+	}
+
+	args := []string{"-O", destPath, url}
+	if quiet {
+		args = append(args, "-q")
+	} else {
+		args = append(args, "--show-progress")
+	}
+
+	// Set user agent - REMOVED to match user's successful manual test with default wget
+	// args = append(args, "--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36")
+
+	cmd := exec.Command("wget", args...)
+	if quiet {
+		cmd.Stdout = io.Discard
+		cmd.Stderr = io.Discard
+	} else {
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+	}
+
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("wget execution failed: %w", err)
+	}
+	return nil
 }
 
 // downloadViaBrowser uses a headless browser to download the file, bypassing simple bot checks.

@@ -2963,7 +2963,7 @@ func handleBuildCommand(args []string, cfg *Config) error {
 				smartBuildBuilder := func(pkgName string, cfg *Config, exec *Executor, opts BuildOptions) (time.Duration, error) {
 					// 1. If user specifically requested this package, we usually force build
 					// unless -a logic implies otherwise. But generally build command means build.
-					if userRequestedMap[pkgName] {
+					if userRequestedMap[pkgName] || initialPlan.RebuildPackages[pkgName] {
 						return pkgBuild(pkgName, cfg, exec, opts)
 					}
 
