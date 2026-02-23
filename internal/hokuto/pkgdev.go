@@ -4,6 +4,7 @@ package hokuto
 // No behavior changes intended.
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -519,6 +520,8 @@ func handleSingleBumpCommand(pkgName, newVersion string) error {
 		return fmt.Errorf("git push failed: %v", err)
 	}
 
+	printGithubReleaseNotes(pkgDir)
+
 	return nil
 }
 
@@ -566,4 +569,64 @@ func handleSetBumpCommand(pkgsetName, oldVersion, newVersion string) error {
 	}
 
 	return nil
+}
+
+func printGithubReleaseNotes(pkgDir string) {
+	sourcesPath := filepath.Join(pkgDir, "sources")
+	content, err := os.ReadFile(sourcesPath)
+	if err != nil {
+		return
+	}
+
+	urls := strings.Fields(string(content))
+	for _, u := range urls {
+		if strings.Contains(u, "github.com") {
+			u = strings.TrimSpace(u)
+			parts := strings.Split(u, "/")
+			var owner, repo, tag string
+			for i, p := range parts {
+				if p == "github.com" && i+2 < len(parts) {
+					owner = parts[i+1]
+					repo = strings.TrimSuffix(parts[i+2], ".git")
+				}
+				if p == "download" && i > 0 && parts[i-1] == "releases" {
+					if i+1 < len(parts) {
+						tag = parts[i+1]
+					}
+				}
+				if p == "tags" && i > 1 && parts[i-1] == "refs" && parts[i-2] == "archive" {
+					if i+1 < len(parts) {
+						tag = strings.TrimSuffix(parts[i+1], ".tar.gz")
+						tag = strings.TrimSuffix(tag, ".zip")
+						tag = strings.TrimSuffix(tag, ".tar.bz2")
+					}
+				}
+				if p == "archive" && i+1 < len(parts) && parts[i+1] != "refs" {
+					tag = parts[i+1]
+					tag = strings.TrimSuffix(tag, ".tar.gz")
+					tag = strings.TrimSuffix(tag, ".zip")
+					tag = strings.TrimSuffix(tag, ".tar.bz2")
+				}
+			}
+
+			if owner != "" && repo != "" && tag != "" {
+				apiURL := fmt.Sprintf("https://api.github.com/repos/%s/%s/releases/tags/%s", owner, repo, tag)
+				resp, err := http.Get(apiURL)
+				if err == nil && resp.StatusCode == 200 {
+					defer resp.Body.Close()
+					var result struct {
+						Body string `json:"body"`
+					}
+					if err := json.NewDecoder(resp.Body).Decode(&result); err == nil {
+						if result.Body != "" {
+							colArrow.Print("-> ")
+							colSuccess.Println("Release notes:")
+							fmt.Println(result.Body)
+						}
+					}
+				}
+				return // only process the first github link
+			}
+		}
+	}
 }
