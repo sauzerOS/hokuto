@@ -23,12 +23,13 @@ type ParallelManager struct {
 	AutoYes   bool
 
 	// State
-	mu        sync.Mutex
-	Pending   []string
-	Running   map[string]time.Time // Package name -> Start time
-	Completed map[string]bool      // Package name -> true
-	Failed    map[string]error
-	LogFiles  map[string]*os.File
+	mu              sync.Mutex
+	Pending         []string
+	pendingRebuilds []string
+	Running         map[string]time.Time // Package name -> Start time
+	Completed       map[string]bool      // Package name -> true
+	Failed          map[string]error
+	LogFiles        map[string]*os.File
 
 	// Dep injection for testing
 	Builder   func(string, *Config, *Executor, BuildOptions) (time.Duration, error)
@@ -368,47 +369,7 @@ func (pm *ParallelManager) Run() error {
 						}
 
 						if len(uniqueRebuilds) > 0 {
-							shouldRebuild := pm.AutoYes
-							if !shouldRebuild {
-								// Unlock mutex to allow UI to pause
-								pm.mu.Unlock()
-
-								// Prompt user
-								WithPrompt(func() {
-									// Pause UI updates handled by WithPrompt hook
-									fmt.Print("\r\033[K")
-									cPrintf(colWarn, "\nThe following packages need to be rebuilt:\n")
-									for _, p := range uniqueRebuilds {
-										colArrow.Print("-> ")
-										colInfo.Println(p)
-									}
-									cPrintf(colInfo, "Proceed with rebuild? [Y/n] ")
-
-									reader := bufio.NewReader(os.Stdin)
-									input, _ := reader.ReadString('\n')
-									input = strings.TrimSpace(strings.ToLower(input))
-									if input == "" || input == "y" || input == "yes" {
-										shouldRebuild = true
-									}
-								})
-
-								// Lock again
-								pm.mu.Lock()
-							}
-
-							if shouldRebuild {
-								pm.Pending = append(pm.Pending, uniqueRebuilds...)
-								if pm.BuildPlan.RebuildPackages == nil {
-									pm.BuildPlan.RebuildPackages = make(map[string]bool)
-								}
-								for _, p := range uniqueRebuilds {
-									pm.BuildPlan.RebuildPackages[p] = true
-								}
-							} else {
-								// If declined, we mark them as "skipped" effectively, or just don't add them.
-								// They won't run.
-								fmt.Printf("Skipping rebuilds.\n")
-							}
+							pm.pendingRebuilds = append(pm.pendingRebuilds, uniqueRebuilds...)
 						}
 					}
 				}
@@ -426,8 +387,51 @@ func (pm *ParallelManager) Run() error {
 			}
 			delete(pm.Running, res.pkgName)
 			pm.mu.Unlock()
-		} else if len(pm.Pending) > 0 {
+		} else if len(pm.Pending) > 0 || len(pm.pendingRebuilds) > 0 {
 			// No running jobs but pending jobs exist.
+
+			// 3. Batch Process Rebuild Prompts
+			pm.mu.Lock()
+			if len(pm.pendingRebuilds) > 0 {
+				shouldRebuild := pm.AutoYes
+				if !shouldRebuild {
+					pm.mu.Unlock()
+					WithPrompt(func() {
+						fmt.Print("\r\033[K")
+						cPrintf(colWarn, "\nThe following packages need to be rebuilt:\n")
+						for _, p := range pm.pendingRebuilds {
+							colArrow.Print("-> ")
+							colInfo.Println(p)
+						}
+						cPrintf(colInfo, "Proceed with rebuild? [Y/n] ")
+						reader := bufio.NewReader(os.Stdin)
+						input, _ := reader.ReadString('\n')
+						input = strings.TrimSpace(strings.ToLower(input))
+						if input == "" || input == "y" || input == "yes" {
+							shouldRebuild = true
+						}
+					})
+					pm.mu.Lock()
+				}
+
+				if shouldRebuild {
+					pm.Pending = append(pm.Pending, pm.pendingRebuilds...)
+					if pm.BuildPlan.RebuildPackages == nil {
+						pm.BuildPlan.RebuildPackages = make(map[string]bool)
+					}
+					for _, p := range pm.pendingRebuilds {
+						pm.BuildPlan.RebuildPackages[p] = true
+					}
+				} else {
+					fmt.Printf("Skipping rebuilds.\n")
+				}
+				// Clear pending rebuilds list since we've processed them
+				pm.pendingRebuilds = nil
+				pm.mu.Unlock()
+				continue // Restart loop to immediately process the newly active pending jobs
+			}
+			pm.mu.Unlock()
+
 			// If we have failures, assume pending jobs are blocked by them and exit gracefully.
 			if len(pm.Failed) > 0 {
 				break
@@ -532,13 +536,43 @@ func (pm *ParallelManager) canBuild(pkgName string) bool {
 				continue
 			}
 
+			// If it failed in this run, we definitely can't be satisfied by it
+			if pm.Failed[cand] != nil {
+				continue
+			}
+
+			// Is it pending or running or in rebuild queue?
+			isBuilding := false
+			for _, p := range pm.Pending {
+				if p == cand {
+					isBuilding = true
+					break
+				}
+			}
+			if !isBuilding {
+				for r := range pm.Running {
+					if r == cand {
+						isBuilding = true
+						break
+					}
+				}
+			}
+			if !isBuilding {
+				for _, r := range pm.pendingRebuilds {
+					if r == cand {
+						isBuilding = true
+						break
+					}
+				}
+			}
+
 			// 1. Check if completed in this run
 			if pm.Completed[cand] {
 				satisfied = true
 				break
 			}
-			// 2. Check if installed in system
-			if isPackageInstalled(cand) {
+			// 2. Check if installed in system (only if we're not planning to update/rebuild it!)
+			if !isBuilding && isPackageInstalled(cand) {
 				satisfied = true
 				break
 			}
