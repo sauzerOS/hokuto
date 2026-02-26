@@ -543,26 +543,29 @@ func checkForUpgrades(_ context.Context, cfg *Config, maxJobs int, yes bool) err
 				continue
 			}
 
-			// 2. Check remote mirror (prefetch)
-			if BinaryMirror != "" {
-				// Lookup checksum
+			// 2. Check remote mirror (prefetch) — only if the package is in the remote index
+			if BinaryMirror != "" && len(remoteIndex) > 0 {
+				// Lookup checksum and verify the package exists in the index
 				var expectedSum string
-				if len(remoteIndex) > 0 {
-					targetArch := GetSystemArchForPackage(cfg, pkgName)
-					targetVariant := GetSystemVariantForPackage(cfg, pkgName)
-					for _, entry := range remoteIndex {
-						if entry.Name == pkgName && entry.Version == version &&
-							entry.Revision == revision && entry.Arch == targetArch &&
-							entry.Variant == targetVariant {
-							expectedSum = entry.B3Sum
-							break
-						}
+				foundInIndex := false
+				targetArch := GetSystemArchForPackage(cfg, pkgName)
+				targetVariant := GetSystemVariantForPackage(cfg, pkgName)
+				for _, entry := range remoteIndex {
+					if entry.Name == pkgName && entry.Version == version &&
+						entry.Revision == revision && entry.Arch == targetArch &&
+						entry.Variant == targetVariant {
+						expectedSum = entry.B3Sum
+						foundInIndex = true
+						break
 					}
 				}
 
-				// Use quiet mode for check
-				if err := fetchBinaryPackage(pkgName, version, revision, cfg, true, expectedSum, false); err == nil {
-					binaryAvailable[pkgName] = true
+				// Only attempt download if the package was found in the remote index
+				if foundInIndex {
+					// Use quiet mode for check
+					if err := fetchBinaryPackage(pkgName, version, revision, cfg, true, expectedSum, false); err == nil {
+						binaryAvailable[pkgName] = true
+					}
 				}
 			}
 		}
@@ -607,25 +610,28 @@ func checkForUpgrades(_ context.Context, cfg *Config, maxJobs int, yes bool) err
 			}
 
 			// Try to fetch binary if configured (mirror check logic reused logic from sequential)
-			if BinaryMirror != "" {
-				// Lookup checksum
+			if BinaryMirror != "" && len(remoteIndex) > 0 {
+				// Lookup checksum and verify the package exists in the index
 				var expectedSum string
-				if len(remoteIndex) > 0 {
-					targetArch := GetSystemArchForPackage(cfg, pkgName)
-					targetVariant := GetSystemVariantForPackage(cfg, pkgName)
-					for _, entry := range remoteIndex {
-						if entry.Name == pkgName && entry.Version == version &&
-							entry.Revision == revision && entry.Arch == targetArch &&
-							entry.Variant == targetVariant {
-							expectedSum = entry.B3Sum
-							break
-						}
+				foundInIndex := false
+				targetArch := GetSystemArchForPackage(cfg, pkgName)
+				targetVariant := GetSystemVariantForPackage(cfg, pkgName)
+				for _, entry := range remoteIndex {
+					if entry.Name == pkgName && entry.Version == version &&
+						entry.Revision == revision && entry.Arch == targetArch &&
+						entry.Variant == targetVariant {
+						expectedSum = entry.B3Sum
+						foundInIndex = true
+						break
 					}
 				}
 
-				// Errors here are ignored, we just fail to find binary and proceed to build
-				// Parallel mode: pass quiet=true
-				_ = fetchBinaryPackage(pkgName, version, revision, cfg, true, expectedSum, false)
+				// Only attempt download if the package was found in the remote index
+				if foundInIndex {
+					// Errors here are ignored, we just fail to find binary and proceed to build
+					// Parallel mode: pass quiet=true
+					_ = fetchBinaryPackage(pkgName, version, revision, cfg, true, expectedSum, false)
+				}
 			}
 
 			outputPkgName := getOutputPackageName(pkgName, cfg)
@@ -696,28 +702,30 @@ func checkForUpgrades(_ context.Context, cfg *Config, maxJobs int, yes bool) err
 			colArrow.Print("-> ")
 			colSuccess.Printf("Using cached binary package: %s\n", tarballName)
 			foundBinary = true
-		} else if BinaryMirror != "" {
-			// Lookup checksum
+		} else if BinaryMirror != "" && len(remoteIndex) > 0 {
+			// Lookup checksum and verify the package exists in the index
 			var expectedSum string
-			if len(remoteIndex) > 0 {
-				targetArch := GetSystemArchForPackage(cfg, pkgName)
-				targetVariant := GetSystemVariantForPackage(cfg, pkgName)
-				for _, entry := range remoteIndex {
-					if entry.Name == pkgName && entry.Version == version &&
-						entry.Revision == revision && entry.Arch == targetArch &&
-						entry.Variant == targetVariant {
-						expectedSum = entry.B3Sum
-						break
-					}
+			foundInIndex := false
+			targetArch := GetSystemArchForPackage(cfg, pkgName)
+			targetVariant := GetSystemVariantForPackage(cfg, pkgName)
+			for _, entry := range remoteIndex {
+				if entry.Name == pkgName && entry.Version == version &&
+					entry.Revision == revision && entry.Arch == targetArch &&
+					entry.Variant == targetVariant {
+					expectedSum = entry.B3Sum
+					foundInIndex = true
+					break
 				}
 			}
 
-			// Sequential mode: output is fine (quiet=false)
-			if err := fetchBinaryPackage(pkgName, version, revision, cfg, false, expectedSum, false); err == nil {
-				foundBinary = true
-			} else {
-				colArrow.Print("-> ")
-				colSuccess.Println("Binary not found on mirror, building package locally")
+			if foundInIndex {
+				// Sequential mode: output is fine (quiet=false)
+				if err := fetchBinaryPackage(pkgName, version, revision, cfg, false, expectedSum, false); err == nil {
+					foundBinary = true
+				} else {
+					colArrow.Print("-> ")
+					colSuccess.Println("Binary not found on mirror, building package locally")
+				}
 			}
 		}
 
