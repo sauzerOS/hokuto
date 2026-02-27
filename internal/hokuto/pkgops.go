@@ -937,6 +937,12 @@ func prepareVersionedPackage(arg string) (string, error) {
 		return arg, fmt.Errorf("failed to list files in git history for %s: %w", relPath, err)
 	}
 
+	// Check if git-lfs is available for resolving LFS pointers
+	hasGitLFS := false
+	if _, lfsErr := exec.LookPath("git-lfs"); lfsErr == nil {
+		hasGitLFS = true
+	}
+
 	scanner := bufio.NewScanner(bytes.NewReader(lsOut))
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -970,6 +976,16 @@ func prepareVersionedPackage(arg string) (string, error) {
 		}
 		outF.Close()
 
+		// Check if the extracted file is a Git LFS pointer and resolve it
+		if hasGitLFS {
+			if isLFSPointer(targetFilePath) {
+				debugf("Resolving LFS pointer for %s\n", fileName)
+				if err := smudgeLFSFile(targetFilePath, gitRoot); err != nil {
+					colWarn.Printf("Warning: failed to resolve LFS file %s: %v\n", fileName, err)
+				}
+			}
+		}
+
 		// Set execution bits if the file was executable in Git
 		// Git file modes: 100644 (normal), 100755 (executable)
 		if modeStr == "100755" {
@@ -988,4 +1004,55 @@ func prepareVersionedPackage(arg string) (string, error) {
 	colSuccess.Printf("Extracted %s@%s (as %s) from commit %s into temporary directory\n", pkgName, foundVersion, renamedPkgName, foundCommit[:8])
 
 	return renamedPkgName, nil
+}
+
+// isLFSPointer checks if a file is a Git LFS pointer by reading its first line.
+// LFS pointers start with "version https://git-lfs.github.com/spec/v1".
+func isLFSPointer(filePath string) bool {
+	f, err := os.Open(filePath)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+
+	// LFS pointers are small text files (typically ~130 bytes).
+	// Read just enough to check the header.
+	buf := make([]byte, 512)
+	n, err := f.Read(buf)
+	if err != nil || n == 0 {
+		return false
+	}
+	return strings.HasPrefix(string(buf[:n]), "version https://git-lfs.github.com/spec/v1")
+}
+
+// smudgeLFSFile resolves a Git LFS pointer file to its actual content.
+// It reads the pointer, pipes it through "git lfs smudge", and overwrites
+// the file with the real content.
+func smudgeLFSFile(filePath, gitRoot string) error {
+	// Read the LFS pointer content
+	pointerData, err := os.ReadFile(filePath)
+	if err != nil {
+		return fmt.Errorf("failed to read LFS pointer: %w", err)
+	}
+
+	// Run git lfs smudge with the pointer as stdin
+	smudgeCmd := exec.Command("git", "lfs", "smudge")
+	smudgeCmd.Dir = gitRoot
+	smudgeCmd.Stdin = bytes.NewReader(pointerData)
+
+	var out bytes.Buffer
+	var errBuf bytes.Buffer
+	smudgeCmd.Stdout = &out
+	smudgeCmd.Stderr = &errBuf
+
+	if err := smudgeCmd.Run(); err != nil {
+		return fmt.Errorf("git lfs smudge failed: %w (%s)", err, errBuf.String())
+	}
+
+	// Overwrite the pointer file with the actual content
+	if err := os.WriteFile(filePath, out.Bytes(), 0o644); err != nil {
+		return fmt.Errorf("failed to write resolved LFS content: %w", err)
+	}
+
+	return nil
 }
