@@ -609,6 +609,14 @@ func checkForUpgrades(_ context.Context, cfg *Config, maxJobs int, yes bool) err
 				return 0, fmt.Errorf("failed to get version: %w", err)
 			}
 
+			// Skip binary check for rebuild packages (e.g. DKMS triggers).
+			// These must be built from source against the current system state
+			// (e.g. new kernel headers), so a cached binary would be stale.
+			isRebuild := updatePlan.RebuildPackages != nil && updatePlan.RebuildPackages[pkgName]
+			if isRebuild {
+				return pkgBuild(pkgName, cfg, exec, opts)
+			}
+
 			// Try to fetch binary if configured (mirror check logic reused logic from sequential)
 			if BinaryMirror != "" && len(remoteIndex) > 0 {
 				// Lookup checksum and verify the package exists in the index

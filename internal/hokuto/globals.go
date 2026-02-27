@@ -197,6 +197,7 @@ var MultilibPackages = []string{
 	"spirv-tools",
 	"sqlite",
 	"systemd",
+        "twolame",
 	"util-linux",
 	"vkd3d-proton",
 	"vulkan-loader",
