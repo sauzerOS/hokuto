@@ -766,9 +766,19 @@ func fetchSourcesWithOptions(pkgName, pkgDir string, processGit bool, quiet bool
 
 		// Declare all loop-scoped variables here.
 		var parts []string
-		var origFilename, hashName, cachePath, linkPath string
+		var origFilename, hashName, cachePath, linkPath, rawSourceURL string
 
-		rawSourceURL := strings.Fields(line)[0]
+		parts = strings.Fields(line)
+		if len(parts) == 0 {
+			continue
+		}
+		rawSourceURL = parts[0]
+		origFilename = filepath.Base(rawSourceURL)
+
+		// --- NEW: Support "URL -> filename" syntax ---
+		if len(parts) >= 3 && parts[1] == "->" {
+			origFilename = parts[2]
+		}
 
 		// --- FIX START: Skip local files defined with the 'files/' prefix ---
 		if strings.HasPrefix(rawSourceURL, "files/") {
@@ -1018,9 +1028,6 @@ func fetchSourcesWithOptions(pkgName, pkgDir string, processGit bool, quiet bool
 		originalSourceURL := rawSourceURL
 		substitutedURL := applyGnuMirror(originalSourceURL)
 
-		parts = strings.Split(originalSourceURL, "/")
-		origFilename = parts[len(parts)-1]
-
 		// Create a version-aware hash key by combining the URL and the package version.
 		// This busts the cache for static URLs (like .../stable.deb) when the package version file is updated.
 		hashInput := originalSourceURL + pkgVersion
@@ -1041,12 +1048,28 @@ func fetchSourcesWithOptions(pkgName, pkgDir string, processGit bool, quiet bool
 		}
 
 		if _, err := os.Stat(cachePath); os.IsNotExist(err) {
-			downloader := downloadFile
-			if quiet {
-				downloader = downloadFileQuiet
-			}
-			if err := downloader(originalSourceURL, substitutedURL, cachePath); err != nil {
-				return fmt.Errorf("failed to download %s: %v", substitutedURL, err)
+			// --- NEW: Check for custom downloader script ---
+			downloadScript := filepath.Join(pkgDir, "download")
+			if _, err := os.Stat(downloadScript); err == nil {
+				if !quiet {
+					colArrow.Print("-> ")
+					colSuccess.Printf("Using custom downloader for %s\n", origFilename)
+				}
+				cmd := exec.Command(downloadScript, originalSourceURL, cachePath)
+				cmd.Env = os.Environ()
+				cmd.Stdout = os.Stdout
+				cmd.Stderr = os.Stderr
+				if err := cmd.Run(); err != nil {
+					return fmt.Errorf("custom downloader failed for %s: %v", origFilename, err)
+				}
+			} else {
+				downloader := downloadFile
+				if quiet {
+					downloader = downloadFileQuiet
+				}
+				if err := downloader(originalSourceURL, substitutedURL, cachePath); err != nil {
+					return fmt.Errorf("failed to download %s: %v", substitutedURL, err)
+				}
 			}
 		} else {
 			debugf("Already in cache: %s\n", cachePath)

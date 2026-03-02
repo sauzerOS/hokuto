@@ -42,6 +42,13 @@ func prepareSources(pkgName, pkgDir, buildDir string, execCtx *Executor) error {
 		}
 		relPath := tokens[0]
 
+		filenameOverride := ""
+		if len(tokens) >= 3 && tokens[1] == "->" {
+			filenameOverride = tokens[2]
+			// Shift tokens so the rest of the logic (subdir, noextract) works
+			tokens = append([]string{tokens[0]}, tokens[3:]...)
+		}
+
 		targetSubdir := ""
 		noExtract := false
 		for _, tok := range tokens[1:] {
@@ -136,6 +143,9 @@ func prepareSources(pkgName, pkgDir, buildDir string, execCtx *Executor) error {
 				return fmt.Errorf("invalid URL in sources file: %v", err)
 			}
 			filenameOnDisk := filepath.Base(urlPath.Path)
+			if filenameOverride != "" {
+				filenameOnDisk = filenameOverride
+			}
 			// srcDir is SourcesDir/pkgName. Files are symlinked here by fetchSources.
 			srcPath = filepath.Join(srcDir, filenameOnDisk)
 

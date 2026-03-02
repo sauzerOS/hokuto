@@ -77,11 +77,21 @@ func parsePKGBUILD(content string, pkgName string) (*PKGBUILDInfo, error) {
 	info.PackageFunc = extractBashFunction(content, "package")
 
 	// Replace variable references in sources
+	// Replace variable references in sources
 	for i, src := range info.Sources {
 		src = strings.ReplaceAll(src, "${pkgname}", pkgName)
 		src = strings.ReplaceAll(src, "$pkgname", pkgName)
 		src = strings.ReplaceAll(src, "${pkgver}", "${version}")
 		src = strings.ReplaceAll(src, "$pkgver", "${version}")
+
+		// Convert Arch-style renaming "filename::URL" to Hokuto-style "URL -> filename"
+		if strings.Contains(src, "::") {
+			parts := strings.SplitN(src, "::", 2)
+			if len(parts) == 2 {
+				src = fmt.Sprintf("%s -> %s", parts[1], parts[0])
+			}
+		}
+
 		info.Sources[i] = src
 	}
 

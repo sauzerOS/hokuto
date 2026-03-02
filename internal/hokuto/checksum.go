@@ -127,6 +127,9 @@ func verifyOrCreateChecksums(pkgName, pkgDir string, force bool, logger io.Write
 		if len(parts) > 0 {
 			src := parts[0]
 			fname := filepath.Base(src)
+			if len(parts) >= 3 && parts[1] == "->" {
+				fname = parts[2]
+			}
 			expectedFiles = append(expectedFiles, fname)
 			urlMap[fname] = src
 		}
