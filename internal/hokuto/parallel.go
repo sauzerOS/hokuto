@@ -222,7 +222,7 @@ func (pm *ParallelManager) isInteractive(pkgName string) bool {
 
 // Run executes the parallel build loop
 func (pm *ParallelManager) Run() error {
-	for len(pm.Pending) > 0 || len(pm.Running) > 0 {
+	for len(pm.Pending) > 0 || len(pm.Running) > 0 || len(pm.pendingRebuilds) > 0 {
 		// 1. Check if we can start new jobs
 		pm.mu.Lock()
 		// Check if any interactive job is currently running
@@ -338,8 +338,13 @@ func (pm *ParallelManager) Run() error {
 						targetRoot = "/"
 					}
 					triggers := getRebuildTriggers(res.pkgName, targetRoot)
+					// Build a set of trigger packages for special handling below
+					triggerSet := make(map[string]bool, len(triggers))
 					if len(triggers) > 0 {
 						rebuilds = append(rebuilds, triggers...)
+						for _, t := range triggers {
+							triggerSet[t] = true
+						}
 					}
 
 					if len(rebuilds) > 0 {
@@ -348,8 +353,20 @@ func (pm *ParallelManager) Run() error {
 
 						// First pass: filter already completed/pending/duplicate packages
 						for _, rPkg := range rebuilds {
+							// Filesystem triggers (e.g. DKMS) must override the completed
+							// status. If nvidia-modules was already installed from binary
+							// earlier in this update, but a kernel update now triggers a
+							// rebuild, the old binary is stale (wrong kernel modules).
+							// Remove from Completed so it gets rebuilt from source.
+							isTrigger := triggerSet[rPkg]
 							if pm.Completed[rPkg] {
-								continue
+								if isTrigger {
+									// Force re-queue: the previously installed binary is
+									// stale (e.g. built against old kernel headers).
+									delete(pm.Completed, rPkg)
+								} else {
+									continue
+								}
 							}
 							if seen[rPkg] {
 								continue
