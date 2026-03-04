@@ -325,26 +325,30 @@ func (pm *ParallelManager) Run() error {
 
 					// 3. Dynamic Task Addition (Post-Build Rebuilds & Triggers)
 					var rebuilds []string
+					triggerSet := make(map[string]bool)
+
+					// Add post-build rebuilds which are essentially triggers (force rebuild)
 					if rbs, ok := pm.BuildPlan.PostBuildRebuilds[res.pkgName]; ok {
 						rebuilds = append(rebuilds, rbs...)
+						for _, t := range rbs {
+							triggerSet[t] = true
+						}
 					}
-					// Add triggers returned by installer (e.g. library updates)
+					// Add triggers returned by installer (e.g. library updates, filesystem triggers)
 					if len(derivedRebuilds) > 0 {
 						rebuilds = append(rebuilds, derivedRebuilds...)
 					}
-					// Check for filesystem triggers (e.g. DKMS) in parallel mode
+
+					// Identify which ones are filesystem triggers (e.g. DKMS) to ensure force-rebuild
 					targetRoot := pm.Config.Values["HOKUTO_ROOT"]
 					if targetRoot == "" {
 						targetRoot = "/"
 					}
 					triggers := getRebuildTriggers(res.pkgName, targetRoot)
-					// Build a set of trigger packages for special handling below
-					triggerSet := make(map[string]bool, len(triggers))
-					if len(triggers) > 0 {
-						rebuilds = append(rebuilds, triggers...)
-						for _, t := range triggers {
-							triggerSet[t] = true
-						}
+					for _, t := range triggers {
+						triggerSet[t] = true
+						// We don't append triggers to rebuilds again because they are already
+						// included in derivedRebuilds from pm.Installer
 					}
 
 					if len(rebuilds) > 0 {
@@ -373,6 +377,15 @@ func (pm *ParallelManager) Run() error {
 							}
 							isPending := false
 							for _, p := range pm.Pending {
+								if p == rPkg {
+									isPending = true
+									break
+								}
+							}
+							if isPending {
+								continue
+							}
+							for _, p := range pm.pendingRebuilds {
 								if p == rPkg {
 									isPending = true
 									break

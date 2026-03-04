@@ -1000,124 +1000,124 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 		} else {
 			// --- Sequential Handling (managed=false) ---
 			// 8a. Prompt for rebuild (Hokuto is guaranteed to be run in a terminal)
-		var sb strings.Builder
-		sb.WriteString("\nWARNING: The following packages depend on libraries that were removed/upgraded:\n")
-		for _, pkg := range affectedList {
-			libs := affectedPackages[pkg]
-			sb.WriteString(fmt.Sprintf("  %s (needs: %s)\n", pkg, strings.Join(libs, ", ")))
-		}
-		// Interactive rebuild selection
-		var packagesToRebuild []string
-		rebuildAll := false // Flag to track if 'a' (all) was selected
+			var sb strings.Builder
+			sb.WriteString("\nWARNING: The following packages depend on libraries that were removed/upgraded:\n")
+			for _, pkg := range affectedList {
+				libs := affectedPackages[pkg]
+				sb.WriteString(fmt.Sprintf("  %s (needs: %s)\n", pkg, strings.Join(libs, ", ")))
+			}
+			// Interactive rebuild selection
+			var packagesToRebuild []string
+			rebuildAll := false // Flag to track if 'a' (all) was selected
 
-		// Check if 'yes' was passed explicitly by the user (CLI flag)
-		// If not (e.g. implied by parallel mode), we should still prompt for rebuilds.
-		userExplicitYes := isExplicitYes()
+			// Check if 'yes' was passed explicitly by the user (CLI flag)
+			// If not (e.g. implied by parallel mode), we should still prompt for rebuilds.
+			userExplicitYes := isExplicitYes()
 
-		if !yes || (yes && !userExplicitYes) {
-			// Use the same robust reader we defined earlier
-			shouldQuit := false
-			WithPrompt(func() {
-				// Print warning inside the prompt block to ensure it's not overwritten
-				cPrintf(colWarn, "%s", sb.String())
+			if !yes || (yes && !userExplicitYes) {
+				// Use the same robust reader we defined earlier
+				shouldQuit := false
+				WithPrompt(func() {
+					// Print warning inside the prompt block to ensure it's not overwritten
+					cPrintf(colWarn, "%s", sb.String())
 
-				for _, pkg := range affectedList {
-					if shouldQuit {
-						break
+					for _, pkg := range affectedList {
+						if shouldQuit {
+							break
+						}
+
+						if rebuildAll {
+							// 'all' was selected, just add and continue
+							packagesToRebuild = append(packagesToRebuild, pkg)
+							cPrintf(colInfo, "Rebuilding %s (auto-selected by 'all')\n", pkg)
+							// continue // continue doesn't render well here since we are inside closure inside loop?
+							// actually we are inside closure.
+							// Wait, if we wrap the WHOLE loop in WithPrompt, then we can use continue naturally?
+							// No, WithPrompt accepts a func().
+							continue
+						}
+
+						// Prompt for this specific package
+						cPrintf(colInfo, "Rebuild %s? [Y/n/a(ll)/q(uit)]: ", pkg)
+						os.Stdout.Sync()
+						response, err := stdinReader.ReadString('\n')
+						if err != nil {
+							response = "q" // Treat error (like Ctrl+D) as 'quit'
+						}
+						response = strings.ToLower(strings.TrimSpace(response))
+
+						switch response {
+						case "y", "": // Default is Yes
+							packagesToRebuild = append(packagesToRebuild, pkg)
+						case "n": // No
+							cPrintf(colInfo, "Skipping rebuild for %s\n", pkg)
+						case "a": // All
+							cPrintf(colInfo, "Rebuilding %s and all subsequent packages\n", pkg)
+							rebuildAll = true
+							packagesToRebuild = append(packagesToRebuild, pkg)
+						case "q": // Quit
+							cPrintf(colInfo, "Quitting rebuild selection. No more packages will be rebuilt.\n")
+							shouldQuit = true // Signal to break loop
+						default: // Invalid, treat as 'No' for safety
+							cPrintf(colInfo, "Invalid input. Skipping rebuild for %s\n", pkg)
+						}
 					}
-
-					if rebuildAll {
-						// 'all' was selected, just add and continue
-						packagesToRebuild = append(packagesToRebuild, pkg)
-						cPrintf(colInfo, "Rebuilding %s (auto-selected by 'all')\n", pkg)
-						// continue // continue doesn't render well here since we are inside closure inside loop?
-						// actually we are inside closure.
-						// Wait, if we wrap the WHOLE loop in WithPrompt, then we can use continue naturally?
-						// No, WithPrompt accepts a func().
-						continue
-					}
-
-					// Prompt for this specific package
-					cPrintf(colInfo, "Rebuild %s? [Y/n/a(ll)/q(uit)]: ", pkg)
-					os.Stdout.Sync()
-					response, err := stdinReader.ReadString('\n')
-					if err != nil {
-						response = "q" // Treat error (like Ctrl+D) as 'quit'
-					}
-					response = strings.ToLower(strings.TrimSpace(response))
-
-					switch response {
-					case "y", "": // Default is Yes
-						packagesToRebuild = append(packagesToRebuild, pkg)
-					case "n": // No
-						cPrintf(colInfo, "Skipping rebuild for %s\n", pkg)
-					case "a": // All
-						cPrintf(colInfo, "Rebuilding %s and all subsequent packages\n", pkg)
-						rebuildAll = true
-						packagesToRebuild = append(packagesToRebuild, pkg)
-					case "q": // Quit
-						cPrintf(colInfo, "Quitting rebuild selection. No more packages will be rebuilt.\n")
-						shouldQuit = true // Signal to break loop
-					default: // Invalid, treat as 'No' for safety
-						cPrintf(colInfo, "Invalid input. Skipping rebuild for %s\n", pkg)
-					}
-				}
-			})
-		} else {
-			// If --yes is passed explicitly, just rebuild all affected packages
-			fmt.Fprintf(logger, "%s", colInfo.Sprint("Rebuilding all affected packages due to --yes flag.\n"))
-			packagesToRebuild = affectedList
-		}
-
-		// 8b. Perform rebuild
-		if len(packagesToRebuild) > 0 {
-			colArrow.Print("-> ")
-			colSuccess.Println("Starting rebuild of affected packages")
-
-			// Check if we should silence output (parallel mode without explicit user interaction for this step)
-			// In parallel mode, 'yes' is true, but we might want to hide the verbose rebuild logs
-			// because they interfere with the parallel status line.
-			var rebuildLogger io.Writer
-			rebuildLogger = logger
-			if yes && !isExplicitYes() {
-				// Implicit yes (parallel mode) -> silence output
-				rebuildLogger = io.Discard
+				})
+			} else {
+				// If --yes is passed explicitly, just rebuild all affected packages
+				fmt.Fprintf(logger, "%s", colInfo.Sprint("Rebuilding all affected packages due to --yes flag.\n"))
+				packagesToRebuild = affectedList
 			}
 
-			for _, pkg := range packagesToRebuild {
-				if rebuildLogger != io.Discard {
-					fmt.Fprintf(logger, "%s", colInfo.Sprintf("\n--- Rebuilding %s ---\n", pkg))
-				} else {
-					// In silent mode, just print a one-line status to the main log/stdout if needed,
-					// or rely on the final success message.
-					// Actually, with io.Discard, we print NOTHING from the build process.
-				}
-
-				if err := pkgBuildRebuild(pkg, cfg, execCtx, tempLibBackupDir, rebuildLogger); err != nil {
-					failed = append(failed, fmt.Sprintf("rebuild of %s failed: %v", pkg, err))
-					fmt.Fprintf(logger, "%s", colWarn.Sprintf("WARNING: Rebuild of %s failed: %v\n", pkg, err))
-					continue // Skip to next package on failure, same as hokuto update
-				}
-
-				rebuildOutputDir := filepath.Join(tmpDir, pkg, "output")
-
-				if err := rsyncStaging(rebuildOutputDir, rootDir, execCtx); err != nil {
-					failed = append(failed, fmt.Sprintf("failed to sync rebuilt package %s to root: %v", pkg, err))
-					fmt.Fprintf(logger, "%s", colWarn.Sprintf("WARNING: Failed to sync rebuilt package %s to root: %v\n", pkg, err))
-					continue // Skip cleanup on sync failure
-				}
-
-				rmCmd := exec.Command("rm", "-rf", filepath.Join(tmpDir, pkg))
-				if err := execCtx.Run(rmCmd); err != nil {
-					fmt.Fprintf(os.Stderr, "failed to cleanup rebuild tmpdirs for %s: %v\n", pkg, err)
-				}
+			// 8b. Perform rebuild
+			if len(packagesToRebuild) > 0 {
 				colArrow.Print("-> ")
-				colSuccess.Printf("Rebuild of ")
-				colNote.Printf("%s ", pkg)
-				colSuccess.Printf("finished and installed.\n")
+				colSuccess.Println("Starting rebuild of affected packages")
+
+				// Check if we should silence output (parallel mode without explicit user interaction for this step)
+				// In parallel mode, 'yes' is true, but we might want to hide the verbose rebuild logs
+				// because they interfere with the parallel status line.
+				var rebuildLogger io.Writer
+				rebuildLogger = logger
+				if yes && !isExplicitYes() {
+					// Implicit yes (parallel mode) -> silence output
+					rebuildLogger = io.Discard
+				}
+
+				for _, pkg := range packagesToRebuild {
+					if rebuildLogger != io.Discard {
+						fmt.Fprintf(logger, "%s", colInfo.Sprintf("\n--- Rebuilding %s ---\n", pkg))
+					} else {
+						// In silent mode, just print a one-line status to the main log/stdout if needed,
+						// or rely on the final success message.
+						// Actually, with io.Discard, we print NOTHING from the build process.
+					}
+
+					if err := pkgBuildRebuild(pkg, cfg, execCtx, tempLibBackupDir, rebuildLogger); err != nil {
+						failed = append(failed, fmt.Sprintf("rebuild of %s failed: %v", pkg, err))
+						fmt.Fprintf(logger, "%s", colWarn.Sprintf("WARNING: Rebuild of %s failed: %v\n", pkg, err))
+						continue // Skip to next package on failure, same as hokuto update
+					}
+
+					rebuildOutputDir := filepath.Join(tmpDir, pkg, "output")
+
+					if err := rsyncStaging(rebuildOutputDir, rootDir, execCtx); err != nil {
+						failed = append(failed, fmt.Sprintf("failed to sync rebuilt package %s to root: %v", pkg, err))
+						fmt.Fprintf(logger, "%s", colWarn.Sprintf("WARNING: Failed to sync rebuilt package %s to root: %v\n", pkg, err))
+						continue // Skip cleanup on sync failure
+					}
+
+					rmCmd := exec.Command("rm", "-rf", filepath.Join(tmpDir, pkg))
+					if err := execCtx.Run(rmCmd); err != nil {
+						fmt.Fprintf(os.Stderr, "failed to cleanup rebuild tmpdirs for %s: %v\n", pkg, err)
+					}
+					colArrow.Print("-> ")
+					colSuccess.Printf("Rebuild of ")
+					colNote.Printf("%s ", pkg)
+					colSuccess.Printf("finished and installed.\n")
+				}
 			}
 		}
-	}
 	}
 
 	// 9. Cleanup
@@ -1392,7 +1392,6 @@ func checkStagingConflicts(pkgName, stagingDir, rootDir, stagingManifest string,
 					IncomingFile: c.stagingFile,
 					KeepOriginal: true,
 				}
-				batchRequests = append(batchRequests, req)
 				batchRequests = append(batchRequests, req)
 				stagingFilesToRemove[c.filePath] = true
 				// Do NOT add to manifestEntriesToRemove. We want the package to "own" the file
