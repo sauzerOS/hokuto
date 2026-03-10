@@ -804,14 +804,14 @@ func fetchSourcesWithOptions(pkgName, pkgDir string, processGit bool, quiet bool
 			parts = strings.Split(strings.TrimSuffix(gitURL, ".git"), "/")
 			repoName := parts[len(parts)-1]
 
-			// --- SHARED GIT CACHE LOGIC WITH LOCKING ---
+			// --- 1. SHARED BARE CACHE (objects only) ---
 			gitCacheDir := filepath.Join(CacheStore, "git")
 			os.MkdirAll(gitCacheDir, 0o755)
 
 			urlHash := hashString(gitURL)[:12]
 			cacheRepoPath := filepath.Join(gitCacheDir, repoName+"-"+urlHash)
 
-			// Use a sub-function to handle locking and defer
+			// Update/Clone bare cache
 			err := func() error {
 				lockPath := cacheRepoPath + ".lock"
 				lFile, err := os.Create(lockPath)
@@ -856,78 +856,89 @@ func fetchSourcesWithOptions(pkgName, pkgDir string, processGit bool, quiet bool
 				return err
 			}
 
-			destPath := filepath.Join(pkgLinkDir, repoName)
-			if _, err := os.Stat(destPath); os.IsNotExist(err) {
-				if !quiet {
-					cPrintf(colInfo, "Cloning %s into %s (cached)\n", gitURL, destPath)
+			// --- 2. SHARED CHECKOUT (Working Tree) ---
+			// We share the checkout between packages if they use the same URL and ref.
+			checkoutsDir := filepath.Join(CacheStore, "checkouts")
+			os.MkdirAll(checkoutsDir, 0o755)
+
+			checkoutHashInput := gitURL
+			if ref != "" {
+				checkoutHashInput += "#" + ref
+			}
+			checkoutHash := hashString(checkoutHashInput)[:12]
+			sharedPath := filepath.Join(checkoutsDir, repoName+"-"+checkoutHash)
+
+			err = func() error {
+				lockPath := sharedPath + ".lock"
+				lFile, err := os.Create(lockPath)
+				if err != nil {
+					return fmt.Errorf("failed to create lock file for shared checkout: %v", err)
 				}
-				// Use --shared to save space (links to cache objects)
-				cmd := exec.Command("git", "clone", "--shared", cacheRepoPath, destPath)
-				if quiet && !Debug {
-					cmd.Stdout = io.Discard
-					cmd.Stderr = io.Discard
+				defer os.Remove(lockPath)
+				defer lFile.Close()
+
+				if err := unix.Flock(int(lFile.Fd()), unix.LOCK_EX); err != nil {
+					return fmt.Errorf("failed to lock shared checkout: %v", err)
+				}
+				defer unix.Flock(int(lFile.Fd()), unix.LOCK_UN)
+
+				if _, err := os.Stat(sharedPath); os.IsNotExist(err) {
+					if !quiet {
+						cPrintf(colInfo, "Creating shared git checkout for %s@%s\n", gitURL, ref)
+					}
+					// Use --shared to save space (links to cache objects)
+					cmd := exec.Command("git", "clone", "--shared", cacheRepoPath, sharedPath)
+					if quiet && !Debug {
+						cmd.Stdout = io.Discard
+						cmd.Stderr = io.Discard
+					} else {
+						cmd.Stdout = os.Stdout
+						cmd.Stderr = os.Stderr
+					}
+					if err := cmd.Run(); err != nil {
+						return fmt.Errorf("failed to create shared checkout from cache: %v", err)
+					}
+					// Reset the origin URL to the real one
+					exec.Command("git", "-C", sharedPath, "remote", "set-url", "origin", gitURL).Run()
+				}
+
+				// Finalize checkout state (ref and updates)
+				exec.Command("git", "-C", sharedPath, "config", "advice.detachedHead", "false").Run()
+				if ref != "" {
+					// Try to see if it's a branch first
+					checkBranch := exec.Command("git", "-C", sharedPath, "rev-parse", "--verify", "refs/heads/"+ref)
+					if err := checkBranch.Run(); err == nil {
+						exec.Command("git", "-C", sharedPath, "checkout", ref).Run()
+						// If it's a branch, we try to update
+						debugf("Updating shared branch %s from cache\n", ref)
+						exec.Command("git", "-C", sharedPath, "pull").Run()
+					} else {
+						// Fallback: checkout as a tag or commit hash
+						exec.Command("git", "-C", sharedPath, "checkout", ref).Run()
+					}
 				} else {
-					cmd.Stdout = os.Stdout
-					cmd.Stderr = os.Stderr
+					// If no ref, we try to update the default branch
+					debugf("Updating shared default branch for %s from cache\n", gitURL)
+					exec.Command("git", "-C", sharedPath, "pull").Run()
 				}
-				if err := cmd.Run(); err != nil {
-					return fmt.Errorf("failed to clone from cache: %v", err)
-				}
-				// Reset the origin URL to the real one so users can still pull manually if they want
-				exec.Command("git", "-C", destPath, "remote", "set-url", "origin", gitURL).Run()
-			} else if ref == "" {
-				// If no ref, we try to update
-				debugf("Updating %s from cache\n", repoName)
-				cmd := exec.Command("git", "-C", destPath, "pull")
-				if quiet && !Debug {
-					cmd.Stdout = io.Discard
-					cmd.Stderr = io.Discard
-				} else {
-					cmd.Stdout = os.Stdout
-					cmd.Stderr = os.Stderr
-				}
-				cmd.Run()
+				return nil
+			}()
+			if err != nil {
+				return err
 			}
 
-			// Configure advice and checkout the requested ref if provided
-			exec.Command("git", "-C", destPath, "config", "advice.detachedHead", "false").Run()
-			if ref != "" {
-				// Try to see if it's a branch first
-				checkBranch := exec.Command("git", "-C", destPath, "rev-parse", "--verify", "refs/heads/"+ref)
-				if err := checkBranch.Run(); err == nil {
-					cmd := exec.Command("git", "-C", destPath, "checkout", ref)
-					if quiet && !Debug {
-						cmd.Stdout = io.Discard
-						cmd.Stderr = io.Discard
-					} else {
-						cmd.Stdout = os.Stdout
-						cmd.Stderr = os.Stderr
-					}
-					cmd.Run()
-					cmd = exec.Command("git", "-C", destPath, "pull")
-					if quiet && !Debug {
-						cmd.Stdout = io.Discard
-						cmd.Stderr = io.Discard
-					} else {
-						cmd.Stdout = os.Stdout
-						cmd.Stderr = os.Stderr
-					}
-					cmd.Run()
-				} else {
-					// Fallback: checkout as a tag or commit hash
-					cmd := exec.Command("git", "-C", destPath, "checkout", ref)
-					if quiet && !Debug {
-						cmd.Stdout = io.Discard
-						cmd.Stderr = io.Discard
-					} else {
-						cmd.Stdout = os.Stdout
-						cmd.Stderr = os.Stderr
-					}
-					cmd.Run()
-				}
+			// --- 3. LINK PACKAGE TO SHARED CHECKOUT ---
+			destPath := filepath.Join(pkgLinkDir, repoName)
+			// Remove anything that's currently there (old directory or legacy checkout)
+			if _, err := os.Lstat(destPath); err == nil {
+				os.RemoveAll(destPath)
 			}
+			if err := os.Symlink(sharedPath, destPath); err != nil {
+				return fmt.Errorf("failed to link shared checkout for %s: %v", pkgName, err)
+			}
+
 			if !quiet {
-				cPrintf(colInfo, "Git repository ready: %s\n", destPath)
+				cPrintf(colInfo, "Git repository ready (shared): %s\n", destPath)
 			}
 			continue // End git block
 		}
@@ -946,16 +957,16 @@ func fetchSourcesWithOptions(pkgName, pkgDir string, processGit bool, quiet bool
 			}
 
 			dirName := svnDirName(rawSourceURL)
-			destPath := filepath.Join(pkgLinkDir, dirName)
 
-			// Use file locking to prevent parallel download races
-			svnCacheDir := filepath.Join(CacheStore, "svn")
-			os.MkdirAll(svnCacheDir, 0o755)
+			// --- SHARED SVN CHECKOUT LOGIC ---
+			checkoutsDir := filepath.Join(CacheStore, "checkouts")
+			os.MkdirAll(checkoutsDir, 0o755)
 
-			urlHash := hashString(rawSourceURL)[:12]
-			lockPath := filepath.Join(svnCacheDir, dirName+"-"+urlHash+".lock")
+			checkoutHash := hashString(rawSourceURL)[:12]
+			sharedPath := filepath.Join(checkoutsDir, dirName+"-"+checkoutHash)
 
 			err = func() error {
+				lockPath := sharedPath + ".lock"
 				lFile, err := os.Create(lockPath)
 				if err != nil {
 					return fmt.Errorf("failed to create lock file for SVN: %v", err)
@@ -968,16 +979,16 @@ func fetchSourcesWithOptions(pkgName, pkgDir string, processGit bool, quiet bool
 				}
 				defer unix.Flock(int(lFile.Fd()), unix.LOCK_UN)
 
-				// If the destination already exists, check if revision matches
-				if _, err := os.Stat(destPath); err == nil {
+				// If the shared checkout already exists, check if revision matches
+				if _, err := os.Stat(sharedPath); err == nil {
 					// Check the stored revision marker
-					markerPath := filepath.Join(destPath, ".hokuto_svn_revision")
+					markerPath := filepath.Join(sharedPath, ".hokuto_svn_revision")
 					storedRev, readErr := os.ReadFile(markerPath)
 					storedRevStr := strings.TrimSpace(string(storedRev))
 
 					if readErr == nil && storedRevStr == revision {
 						// Same revision — nothing to do
-						debugf("SVN checkout already at revision %s: %s\n", revision, destPath)
+						debugf("SVN checkout already at revision %s: %s\n", revision, sharedPath)
 						return nil
 					}
 
@@ -989,7 +1000,7 @@ func fetchSourcesWithOptions(pkgName, pkgDir string, processGit bool, quiet bool
 							cPrintf(colInfo, "SVN revision changed (%s -> %s), re-checking out\n", storedRevStr, revision)
 						}
 					}
-					os.RemoveAll(destPath)
+					os.RemoveAll(sharedPath)
 				}
 
 				if !quiet {
@@ -997,18 +1008,18 @@ func fetchSourcesWithOptions(pkgName, pkgDir string, processGit bool, quiet bool
 					if revision != "" {
 						revStr = fmt.Sprintf(" (revision %s)", revision)
 					}
-					cPrintf(colInfo, "Checking out SVN: %s%s%s\n", baseURL, repoPath, revStr)
+					cPrintf(colInfo, "Checking out shared SVN: %s%s%s\n", baseURL, repoPath, revStr)
 				}
 
-				if err := svnCheckout(baseURL, repoPath, revision, destPath, quiet); err != nil {
+				if err := svnCheckout(baseURL, repoPath, revision, sharedPath, quiet); err != nil {
 					// Clean up partial checkout on failure
-					os.RemoveAll(destPath)
+					os.RemoveAll(sharedPath)
 					return fmt.Errorf("SVN checkout failed: %v", err)
 				}
 
 				// Write revision marker for future cache validation
 				if revision != "" {
-					markerPath := filepath.Join(destPath, ".hokuto_svn_revision")
+					markerPath := filepath.Join(sharedPath, ".hokuto_svn_revision")
 					os.WriteFile(markerPath, []byte(revision+"\n"), 0o644)
 				}
 
@@ -1018,8 +1029,17 @@ func fetchSourcesWithOptions(pkgName, pkgDir string, processGit bool, quiet bool
 				return err
 			}
 
+			// --- LINK PACKAGE TO SHARED CHECKOUT ---
+			destPath := filepath.Join(pkgLinkDir, dirName)
+			if _, err := os.Lstat(destPath); err == nil {
+				os.RemoveAll(destPath)
+			}
+			if err := os.Symlink(sharedPath, destPath); err != nil {
+				return fmt.Errorf("failed to link shared SVN checkout for %s: %v", pkgName, err)
+			}
+
 			if !quiet {
-				cPrintf(colInfo, "SVN checkout ready: %s\n", destPath)
+				cPrintf(colInfo, "SVN checkout ready (shared): %s\n", destPath)
 			}
 			continue // End SVN block
 		}
