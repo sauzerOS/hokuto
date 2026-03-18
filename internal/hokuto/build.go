@@ -917,6 +917,13 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, opts BuildOptions)
 		defaults["QEMU_LD_PREFIX"] = sysroot
 	}
 
+	// Inject HOKUTO_REAL_USER
+	realUser := os.Getenv("SUDO_USER")
+	if realUser == "" {
+		realUser = os.Getenv("USER")
+	}
+	defaults["HOKUTO_REAL_USER"] = realUser
+
 	// Sort keys for deterministic order
 	keys := make([]string, 0, len(defaults))
 	for k := range defaults {
@@ -1918,6 +1925,13 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 		defaults["QEMU_LD_PREFIX"] = sysroot
 	}
 	// --- END REFACTORED FLAG LOGIC ---
+
+	// Inject HOKUTO_REAL_USER
+	realUser := os.Getenv("SUDO_USER")
+	if realUser == "" {
+		realUser = os.Getenv("USER")
+	}
+	defaults["HOKUTO_REAL_USER"] = realUser
 
 	// Prepare Environment Array
 	// Start with environment, but filter out CFLAGS/CXXFLAGS/LDFLAGS to avoid conflicts
