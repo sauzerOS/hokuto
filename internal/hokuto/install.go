@@ -426,11 +426,7 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 					input = strings.TrimSpace(response)
 				}
 				if input == "" {
-					if fast {
-						input = "u" // Use new in fast mode
-					} else {
-						input = "k" // Default to keep if user presses enter or if in --yes mode
-					}
+					input = "k" // Default to keep if user presses enter, even in fast mode
 				}
 				switch strings.ToLower(input) {
 				case "k":
@@ -493,19 +489,19 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 
 			var input string
 			if (!yes && !skipAllPrompts) || fast {
-				cPrintf(colInfo, "File %s modified, %schoose action: [k]eep current, [U]se new, [e]dit, use new for [A]ll: ", file, ownerDisplay)
+				cPrintf(colInfo, "File %s modified, %schoose action: [K]eep current, [u]se new, [e]dit, use new for [A]ll: ", file, ownerDisplay)
 				// Flush stdout to ensure prompt is visible
 				os.Stdout.Sync()
 				// Use the shared, robust bufio.Reader
 				response, err := stdinReader.ReadString('\n')
 				if err != nil {
-					// Default to 'u' on read error (e.g., Ctrl+D)
-					response = "u"
+					// Default to 'k' on read error (e.g., Ctrl+D)
+					response = "k"
 				}
 				input = strings.TrimSpace(response)
 			}
 			if input == "" {
-				input = "u" // Default to 'use new' if user presses enter or if in --yes mode
+				input = "k" // Default to 'keep' if user presses enter, even in fast mode
 			}
 			switch strings.ToLower(input) {
 			case "k":

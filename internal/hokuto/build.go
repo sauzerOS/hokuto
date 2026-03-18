@@ -1517,7 +1517,35 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 		}
 	}
 	if !found {
-		return fmt.Errorf("package %s not found in HOKUTO_PATH", pkgName)
+		// Attempt to derive the original versioned package request (e.g., vmware-modules@17.6.4).
+		installedVersionFile := filepath.Join(rootDir, "var/db/hokuto/installed", pkgName, "version")
+		if data, err := os.ReadFile(installedVersionFile); err == nil {
+			fields := strings.Fields(string(data))
+			if len(fields) > 0 {
+				ver := fields[0]
+				major := strings.Split(ver, ".")[0]
+				if major != "" && strings.HasSuffix(pkgName, "-"+major) {
+					baseName := strings.TrimSuffix(pkgName, "-"+major)
+					req := fmt.Sprintf("%s@%s", baseName, ver)
+					debugf("Package %s not found in HOKUTO_PATH, attempting derived request %s\n", pkgName, req)
+
+					// Use prepareVersionedPackage to get the temp dir
+					newPkgName, err := prepareVersionedPackage(req)
+					if err == nil {
+						// update pkgName and search again
+						pkgName = newPkgName
+						pkgDir = versionedPkgDirs[pkgName]
+						found = true
+					} else {
+						debugf("Failed to prepare derived request %s: %v\n", req, err)
+					}
+				}
+			}
+		}
+
+		if !found {
+			return fmt.Errorf("package %s not found in HOKUTO_PATH", pkgName)
+		}
 	}
 
 	// NEW: Load build options (consolidated from 'options' file or individual files)
