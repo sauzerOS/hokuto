@@ -297,6 +297,12 @@ func findPackageDir(pkgName string) (string, error) {
 		}
 	}
 
+	// If not found in repos, try to derive from installed package sources
+	// This handles rebuilds of versioned packages (pkg-MAJOR)
+	if dir, ok := deriveVersionedPackageDir(pkgName); ok {
+		return dir, nil
+	}
+
 	// FALLBACK: Check if it's already installed.
 	// This is crucial for resolving dependencies of renamed packages (pkg-MAJOR)
 	// which only exist in the installed database and have no source in repositories.

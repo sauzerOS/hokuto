@@ -1016,6 +1016,39 @@ func prepareVersionedPackage(arg string) (string, error) {
 	return renamedPkgName, nil
 }
 
+// deriveVersionedPackageDir attempts to find the sources for an installed package
+// by deriving its original versioned request (e.g., pkg@1.2.3 from pkg-1).
+// Returns the directory path if successful, and a boolean indicating success.
+func deriveVersionedPackageDir(pkgName string) (string, bool) {
+	installedVersionFile := filepath.Join(Installed, pkgName, "version")
+	data, err := os.ReadFile(installedVersionFile)
+	if err != nil {
+		return "", false
+	}
+	fields := strings.Fields(string(data))
+	if len(fields) == 0 {
+		return "", false
+	}
+	ver := fields[0]
+	major := strings.Split(ver, ".")[0]
+	if major != "" && strings.HasSuffix(pkgName, "-"+major) {
+		baseName := strings.TrimSuffix(pkgName, "-"+major)
+		req := fmt.Sprintf("%s@%s", baseName, ver)
+		debugf("Attempting to derive sources for %s using request %s\n", pkgName, req)
+
+		// Use prepareVersionedPackage to get the temp dir
+		newPkgName, err := prepareVersionedPackage(req)
+		if err == nil {
+			if dir, ok := versionedPkgDirs[newPkgName]; ok {
+				return dir, true
+			}
+		} else {
+			debugf("Failed to prepare derived request %s: %v\n", req, err)
+		}
+	}
+	return "", false
+}
+
 // isLFSPointer checks if a file is a Git LFS pointer by reading its first line.
 // LFS pointers start with "version https://git-lfs.github.com/spec/v1".
 func isLFSPointer(filePath string) bool {

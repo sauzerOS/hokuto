@@ -1511,51 +1511,13 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 	// Track build time
 	startTime := time.Now()
 
-	// Determine package source directory (Same as pkgBuild)
-	paths := strings.Split(repoPaths, ":")
-	var pkgDir string
-	found := false
-	for _, repo := range paths {
-		tryPath := filepath.Join(repo, pkgName)
-		if info, err := os.Stat(tryPath); err == nil && info.IsDir() {
-			pkgDir = tryPath
-			found = true
-			break
-		}
+	// Determine package source directory
+	pkgDir, err := findPackageDir(pkgName)
+	if err != nil {
+		return fmt.Errorf("package %s not found in HOKUTO_PATH: %w", pkgName, err)
 	}
-	if !found {
-		// Attempt to derive the original versioned package request (e.g., vmware-modules@17.6.4).
-		installedVersionFile := filepath.Join(rootDir, "var/db/hokuto/installed", pkgName, "version")
-		if data, err := os.ReadFile(installedVersionFile); err == nil {
-			fields := strings.Fields(string(data))
-			if len(fields) > 0 {
-				ver := fields[0]
-				major := strings.Split(ver, ".")[0]
-				if major != "" && strings.HasSuffix(pkgName, "-"+major) {
-					baseName := strings.TrimSuffix(pkgName, "-"+major)
-					req := fmt.Sprintf("%s@%s", baseName, ver)
-					debugf("Package %s not found in HOKUTO_PATH, attempting derived request %s\n", pkgName, req)
-
-					// Use prepareVersionedPackage to get the temp dir
-					newPkgName, err := prepareVersionedPackage(req)
-					if err == nil {
-						// update pkgName and search again
-						pkgName = newPkgName
-						pkgDir = versionedPkgDirs[pkgName]
-						found = true
-					} else {
-						debugf("Failed to prepare derived request %s: %v\n", req, err)
-					}
-				}
-			}
-		}
-
-		if !found {
-			return fmt.Errorf("package %s not found in HOKUTO_PATH", pkgName)
-		}
-	}
-
-	// NEW: Load build options (consolidated from 'options' file or individual files)
+ 
+ 	// NEW: Load build options (consolidated from 'options' file or individual files)
 	options := loadBuildOptions(pkgDir)
 
 	// 1. Initialize a LOCAL temporary directory variable with the global default.
