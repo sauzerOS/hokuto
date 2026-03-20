@@ -91,7 +91,7 @@ func resolveBinaryDependencies(pkgName string, visited map[string]bool, plan *[]
 	if idx := strings.Index(pkgName, "@"); idx != -1 {
 		lookupName = pkgName[:idx]
 	}
-	pkgDir, err := findPackageDir(lookupName)
+	pkgDir, err := findPackageMetadataDir(lookupName)
 	if err != nil {
 		return fmt.Errorf("cannot resolve dependencies for %s: source not found in HOKUTO_PATH", pkgName)
 	}
@@ -157,7 +157,7 @@ func resolveMissingDeps(pkgName string, processed map[string]bool, missing *[]st
 	processed[pkgName] = true
 
 	// --- 3. Find the Package Source Directory (pkgDir) ---
-	pkgDir, err := findPackageDir(pkgName)
+	pkgDir, err := findPackageMetadataDir(pkgName)
 	if err != nil {
 		return err
 	}
@@ -390,7 +390,7 @@ func resolveAlternativeDep(dep DepSpec, yes bool) (string, error) {
 			return cached, nil
 		}
 		// Check if can be found in repos
-		if _, err := findPackageDir(cached); err == nil {
+		if _, err := findPackageMetadataDir(cached); err == nil {
 			return cached, nil
 		}
 		// Cached choice is no longer available, remove from cache and continue
@@ -415,7 +415,7 @@ func resolveAlternativeDep(dep DepSpec, yes bool) (string, error) {
 			continue
 		}
 		// Check if can be found in repos
-		if _, err := findPackageDir(altName); err == nil {
+		if _, err := findPackageMetadataDir(altName); err == nil {
 			available = append(available, altName)
 		}
 	}
@@ -567,7 +567,7 @@ func resolveBuildPlan(targetPackages []string, userRequestedPackages map[string]
 		inProgress[pkgName] = true
 		defer func() { delete(inProgress, pkgName) }()
 
-		pkgDir, err := findPackageDir(pkgName)
+		pkgDir, err := findPackageMetadataDir(pkgName)
 		if err != nil {
 			return fmt.Errorf("package source not found for '%s': %w", pkgName, err)
 		}

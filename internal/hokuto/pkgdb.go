@@ -263,6 +263,52 @@ func checkPackageExactMatch(pkgName string) bool {
 	return info.IsDir()
 }
 
+// findPackageMetadataDir is a non-extracting version of findPackageDir.
+// It prioritizes repo paths and installed packages but skips the Git derivation
+// and extraction logic for versioned packages.
+func findPackageMetadataDir(pkgName string) (string, error) {
+	// 1. Memory check (already resolved)
+	if dir, ok := versionedPkgDirs[pkgName]; ok {
+		return dir, nil
+	}
+
+	searchNames := []string{pkgName}
+	prefixes := []string{"aarch64-", "x86_64-"}
+	for _, pref := range prefixes {
+		if strings.HasPrefix(pkgName, pref) {
+			baseName := strings.TrimPrefix(pkgName, pref)
+			searchNames = append(searchNames, baseName)
+			break
+		}
+	}
+
+	// 2. Repo check
+	paths := strings.Split(repoPaths, ":")
+	for _, name := range searchNames {
+		for _, repoPath := range paths {
+			repoPath = strings.TrimSpace(repoPath)
+			if repoPath == "" {
+				continue
+			}
+			pkgDir := filepath.Join(repoPath, name)
+			if info, err := os.Stat(pkgDir); err == nil && info.IsDir() {
+				return pkgDir, nil
+			}
+		}
+	}
+
+	// 3. Installed Check (Directly read from DB)
+	for _, name := range searchNames {
+		if checkPackageExactMatch(name) {
+			return filepath.Join(Installed, name), nil
+		}
+	}
+
+	// 4. If still not found, then it must be a versioned package not in cache.
+	// We call findPackageDir to allow the derivation/extraction if absolutely needed.
+	return findPackageDir(pkgName)
+}
+
 // findPackageDir locates the package source directory in repoPaths.
 func findPackageDir(pkgName string) (string, error) {
 	// Check for versioned package override (e.g., pkg@1.0.0)

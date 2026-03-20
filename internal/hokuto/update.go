@@ -23,7 +23,7 @@ import (
 // We only care about the first field (the version).
 
 func getRepoVersion(pkgName string) (string, error) {
-	pkgDir, err := findPackageDir(pkgName)
+	pkgDir, err := findPackageMetadataDir(pkgName)
 	if err != nil {
 		return "", fmt.Errorf("package %s not found in HOKUTO_PATH: %v", pkgName, err)
 	}
@@ -56,7 +56,7 @@ func getRepoVersion2(pkgName string) (version string, revision string, err error
 		lookupName = pkgName[:idx]
 	}
 
-	pkgDir, err := findPackageDir(lookupName)
+	pkgDir, err := findPackageMetadataDir(lookupName)
 	if err != nil {
 		return "", "", fmt.Errorf("package %s not found in HOKUTO_PATH: %v", lookupName, err)
 	}
@@ -323,9 +323,9 @@ func checkDependencyBlocks(pkgName string, newVersion string, installedPackages 
 			continue
 		}
 
-		// Use findPackageDir to locate the package metadata.
-		// This ensures we prioritize repository metadata (NEW depends) over installed metadata.
-		pkgDir, err := findPackageDir(installedPkgName)
+		// Use findPackageMetadataDir to locate the package metadata without re-extracting
+		// for versioned/renamed packages.
+		pkgDir, err := findPackageMetadataDir(installedPkgName)
 		if err != nil {
 			// If we can't find metadata, skip it.
 			continue
