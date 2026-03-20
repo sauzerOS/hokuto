@@ -1,9 +1,11 @@
 package hokuto
 
 import (
+	"flag"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/gookit/color"
@@ -17,13 +19,19 @@ type syncPackage struct {
 }
 
 func handleCrossSyncCommand(args []string, cfg *Config) error {
-	nativeMode := false
-	for _, arg := range args {
-		if arg == "-native" {
-			nativeMode = true
-			break
-		}
+	// use build-style arg preprocessing for -jN support
+	args = PreprocessBuildArgs(args)
+
+	syncCmd := flag.NewFlagSet("cross-sync", flag.ContinueOnError)
+	nativeModeFlag := syncCmd.Bool("native", false, "Identify and build missing native aarch64 packages")
+	idleFlag := syncCmd.Bool("i", false, "Use idle build priority")
+	parallelFlag := syncCmd.Int("j", 1, "Number of parallel build jobs")
+
+	if err := syncCmd.Parse(args); err != nil {
+		return err
 	}
+
+	nativeMode := *nativeModeFlag
 
 	// Fetch remote index early
 	colArrow.Print("-> ")
@@ -199,22 +207,30 @@ func handleCrossSyncCommand(args []string, cfg *Config) error {
 	}
 
 	// 6. Execute Build
+	if len(toBuild) == 0 {
+		return nil
+	}
+
 	colArrow.Print("-> ")
 	colSuccess.Printf("Starting build for %d packages\n", len(toBuild))
-	for _, pkg := range toBuild {
-		fmt.Println()
-		colArrow.Print("-> ")
-		if nativeMode {
-			color.Bold.Printf("Building native aarch64 package: %s\n", pkg.Base)
-		} else {
-			color.Bold.Printf("Building native cross package: %s\n", pkg.Base)
-		}
 
-		buildArgs := []string{"--cross=arm64", pkg.Base}
-		if err := handleBuildCommand(buildArgs, cfg); err != nil {
-			colError.Printf("Failed to build %s: %v\n", pkg.Base, err)
-			colWarn.Println("Continuing with remaining packages")
-		}
+	// Construct build arguments for handleBuildCommand
+	buildArgs := []string{"--cross=arm64"}
+	if *idleFlag {
+		buildArgs = append(buildArgs, "-i")
+	}
+	if *parallelFlag > 1 {
+		buildArgs = append(buildArgs, "-j"+strconv.Itoa(*parallelFlag))
+	}
+
+	// Add all packages to the build command
+	for _, pkg := range toBuild {
+		buildArgs = append(buildArgs, pkg.Base)
+	}
+
+	// Single call to handleBuildCommand allows it to manage parallel builds and order
+	if err := handleBuildCommand(buildArgs, cfg); err != nil {
+		return fmt.Errorf("build failed: %w", err)
 	}
 
 	return nil

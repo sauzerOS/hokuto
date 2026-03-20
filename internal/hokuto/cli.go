@@ -63,7 +63,7 @@ func printHelp() {
 		{"meta", "pkgname [-e] [-db]", "Show/edit package metadata or generate global DB"},
 		{"search", "[query | -tag <tag>]", "Search global package database"},
 		{"sync", "", "Manually sync global package database from mirror"},
-		{"cross-sync", "[-native]", "Identify and build missing native cross (or aarch64 native) packages"},
+		{"cross-sync", "[-native] [-jN] [-i]", "Identify and build missing native cross (or aarch64 native) packages"},
 	}
 
 	// --- Dynamic Padding Logic ---
