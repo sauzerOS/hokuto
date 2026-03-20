@@ -132,7 +132,7 @@ func checkForRemoteUpgrades(_ context.Context, cfg *Config) error {
 	}
 
 	// 4. Prompt User
-	indices, ok := AskForSelection("Update (a)ll or pick packages to update/ignore (numbers or -numbers):", len(upgradeList))
+	indices, ok := AskForSelection("Update (a)ll, (q)uit, or pick packages to update/ignore (numbers or -numbers):", len(upgradeList))
 	if !ok {
 		colNote.Println("Upgrade canceled by user.")
 		return nil

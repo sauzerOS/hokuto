@@ -479,7 +479,7 @@ func checkForUpgrades(_ context.Context, cfg *Config, maxJobs int, yes bool) err
 		}
 		ok = true
 	} else {
-		indices, ok = AskForSelection("Update (a)ll or pick packages to update/ignore (numbers or -numbers):", len(filteredUpgradeList))
+		indices, ok = AskForSelection("Update (a)ll, (q)uit, or pick packages to update/ignore (numbers or -numbers):", len(filteredUpgradeList))
 	}
 	if !ok {
 		colNote.Println("Upgrade canceled by user.")

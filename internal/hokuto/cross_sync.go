@@ -186,7 +186,7 @@ func handleCrossSyncCommand(args []string, cfg *Config) error {
 	fmt.Println()
 
 	// 5. User Interaction
-	promptMsg := "Build (a)ll or pick packages to build (numbers or -numbers):"
+	promptMsg := "Build (a)ll, (q)uit, or pick packages to build (numbers or -numbers):"
 	indices, ok := AskForSelection(promptMsg, len(missing))
 	if !ok {
 		colNote.Println("Operation canceled.")

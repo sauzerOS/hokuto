@@ -404,7 +404,7 @@ func handleOrphanCleanup(cfg *Config, preSelect string) {
 		}
 		ok = true
 	} else {
-		indices, ok = AskForSelection("Remove (a)ll or pick packages to remove (numbers or -numbers):", len(sortedPkgs))
+		indices, ok = AskForSelection("Remove (a)ll, (q)uit, or pick packages to remove (numbers or -numbers):", len(sortedPkgs))
 	}
 
 	if !ok {

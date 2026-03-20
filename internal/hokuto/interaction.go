@@ -90,9 +90,12 @@ func AskForSelection(prompt string, count int) ([]int, bool) {
 			return indices, true
 		}
 
-		// Cancel
+		// Cancel/Quit
 		if lower == "n" || lower == "no" || lower == "c" || lower == "cancel" {
 			return nil, false
+		}
+		if lower == "q" || lower == "quit" {
+			os.Exit(0)
 		}
 
 		// Selection
