@@ -78,6 +78,7 @@ func prepareSources(pkgName, pkgDir, buildDir string, execCtx *Executor) error {
 
 		isGitSource := strings.HasPrefix(relPath, "git+")
 		isSvnSource := strings.HasPrefix(relPath, "svn+")
+		isHgSource := strings.HasPrefix(relPath, "hg+")
 		isUrlSource := strings.HasPrefix(relPath, "http://") || strings.HasPrefix(relPath, "https://") || strings.HasPrefix(relPath, "ftp://")
 
 		switch {
@@ -134,6 +135,28 @@ func prepareSources(pkgName, pkgDir, buildDir string, execCtx *Executor) error {
 				return fmt.Errorf("failed to copy SVN source contents from %s to %s: %v", srcPath, targetDir, err)
 			}
 			// SVN source handled, move to the next line
+			continue
+
+		case isHgSource:
+			// HG sources: Source path is the cloned directory in the cache (SourcesDir/pkgName/dirName)
+			dirName := hgDirName(relPath)
+			srcPath = filepath.Join(srcDir, dirName)
+
+			// Check if source exists
+			info, err := os.Stat(srcPath)
+			if err != nil {
+				return fmt.Errorf("HG source %s listed but missing: stat %s: %v", relPath, srcPath, err)
+			}
+			if !info.IsDir() {
+				return fmt.Errorf("HG source %s exists but is not a directory: %s", relPath, srcPath)
+			}
+
+			// ACTION: Copy CONTENTS of srcPath into targetDir
+			rsyncCmd := exec.Command("rsync", "-a", srcPath+"/", targetDir)
+			if err := execCtx.Run(rsyncCmd); err != nil {
+				return fmt.Errorf("failed to copy HG source contents from %s to %s: %v", srcPath, targetDir, err)
+			}
+			// HG source handled, move to the next line
 			continue
 
 		case isUrlSource:

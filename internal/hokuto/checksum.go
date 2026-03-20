@@ -120,7 +120,7 @@ func verifyOrCreateChecksums(pkgName, pkgDir string, force bool, logger io.Write
 	for _, line := range strings.Split(string(sourceData), "\n") {
 		line = strings.TrimSpace(line)
 		// git+ and svn+ sources are checked out, not checksummed as files.
-		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, "git+") || strings.HasPrefix(line, "svn+") {
+		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, "git+") || strings.HasPrefix(line, "svn+") || strings.HasPrefix(line, "hg+") {
 			continue
 		}
 		parts := strings.Fields(line)

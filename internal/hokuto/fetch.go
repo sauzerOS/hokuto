@@ -1044,6 +1044,76 @@ func fetchSourcesWithOptions(pkgName, pkgDir string, processGit bool, quiet bool
 			continue // End SVN block
 		}
 
+		// --- Mercurial Source Logic ---
+		if strings.HasPrefix(rawSourceURL, "hg+") {
+			// If we are not supposed to process VCS repos (e.g., in 'checksum' command), skip.
+			if !processGit {
+				debugf("Skipping HG repository for this operation: %s\n", rawSourceURL)
+				continue
+			}
+
+			repoURL, revision, err := parseHGSourceURL(rawSourceURL)
+			if err != nil {
+				return fmt.Errorf("failed to parse HG source URL: %v", err)
+			}
+
+			dirName := hgDirName(rawSourceURL)
+
+			// --- SHARED HG CHECKOUT LOGIC ---
+			checkoutsDir := filepath.Join(CacheStore, "checkouts")
+			os.MkdirAll(checkoutsDir, 0o755)
+
+			checkoutHash := hashString(rawSourceURL)[:12]
+			sharedPath := filepath.Join(checkoutsDir, dirName+"-"+checkoutHash)
+
+			err = func() error {
+				lockPath := sharedPath + ".lock"
+				lFile, err := os.Create(lockPath)
+				if err != nil {
+					return fmt.Errorf("failed to create lock file for HG: %v", err)
+				}
+				defer os.Remove(lockPath)
+				defer lFile.Close()
+
+				if err := unix.Flock(int(lFile.Fd()), unix.LOCK_EX); err != nil {
+					return fmt.Errorf("failed to lock HG cache: %v", err)
+				}
+				defer unix.Flock(int(lFile.Fd()), unix.LOCK_UN)
+
+				if !quiet {
+					revStr := ""
+					if revision != "" {
+						revStr = fmt.Sprintf(" (revision %s)", revision)
+					}
+					cPrintf(colInfo, "Checking out shared HG: %s%s\n", repoURL, revStr)
+				}
+
+				if err := hgCheckout(repoURL, revision, sharedPath, quiet); err != nil {
+					// Clean up partial checkout on failure? Or let Mercurial handle it?
+					return fmt.Errorf("HG checkout failed: %v", err)
+				}
+
+				return nil
+			}()
+			if err != nil {
+				return err
+			}
+
+			// --- LINK PACKAGE TO SHARED CHECKOUT ---
+			destPath := filepath.Join(pkgLinkDir, dirName)
+			if _, err := os.Lstat(destPath); err == nil {
+				os.RemoveAll(destPath)
+			}
+			if err := os.Symlink(sharedPath, destPath); err != nil {
+				return fmt.Errorf("failed to link shared HG checkout for %s: %v", pkgName, err)
+			}
+
+			if !quiet {
+				cPrintf(colInfo, "HG checkout ready (shared): %s\n", destPath)
+			}
+			continue // End HG block
+		}
+
 		// --- HTTP/FTP Source Logic ---
 		originalSourceURL := rawSourceURL
 		substitutedURL := applyGnuMirror(originalSourceURL)
