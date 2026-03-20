@@ -311,13 +311,13 @@ func resolveRemoteDependencies(pkgName string, visited map[string]bool, plan *[]
 		}
 	} else {
 		// Fallback: Fetch binary package to read depends (older index or missing info)
-		if err := fetchBinaryPackage(pkgName, entry.Version, entry.Revision, cfg, false, entry.B3Sum, false); err != nil {
+		if err := fetchBinaryPackage(entry.Name, entry.Version, entry.Revision, cfg, false, entry.B3Sum, false); err != nil {
 			return fmt.Errorf("failed to fetch remote package for dependency resolution (%s): %v", pkgName, err)
 		}
 
 		arch := GetSystemArch(cfg)
-		variant := GetSystemVariantForPackage(cfg, pkgName)
-		tarballName := StandardizeRemoteName(pkgName, entry.Version, entry.Revision, arch, variant)
+		variant := GetSystemVariantForPackage(cfg, entry.Name)
+		tarballName := StandardizeRemoteName(entry.Name, entry.Version, entry.Revision, arch, variant)
 		tarballPath := filepath.Join(BinDir, tarballName)
 
 		// 5. Scan metadata (pkginfo and depends)
