@@ -752,6 +752,8 @@ func getPackageDependenciesToUninstall(name string) []string {
 		return []string{"18-sed"}
 	case "hokuto":
 		return []string{"21-hokuto"}
+        case "make-ca":
+		return []string{"ca-certificates"}
 	case "cython":
 		return []string{name}
 	case "dbus-python":
