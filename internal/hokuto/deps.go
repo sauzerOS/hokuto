@@ -561,7 +561,12 @@ func resolveBuildPlan(targetPackages []string, userRequestedPackages map[string]
 			return nil
 		}
 		if processed[pkgName] {
-			return nil
+			// If it's already in the order, we definitely don't need to process it again.
+			// If it's NOT in the order, but it's now marked for rebuild, we MUST process it
+			// to ensure it and its make-dependencies are added.
+			if !plan.RebuildPackages[pkgName] || alreadyInOrder[pkgName] {
+				return nil
+			}
 		}
 
 		inProgress[pkgName] = true
