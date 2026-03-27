@@ -46,6 +46,15 @@ func needsRootPrivileges(args []string) bool {
 		}
 	}
 
+	// Check if bump command has auto flag
+	if cmd == "bump" {
+		for _, arg := range args[1:] {
+			if arg == "--auto" || arg == "-auto" {
+				return true
+			}
+		}
+	}
+
 	return false
 }
 

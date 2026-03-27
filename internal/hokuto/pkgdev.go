@@ -645,16 +645,29 @@ func HandleAutoBumpCommand(cfg *Config, autoBuild bool) error {
 		return fmt.Errorf("REPOLOGY_URL is not configured in hokuto.conf")
 	}
 
-	// Ensure log directory exists
+	// Ensure log directory and file exist with correct permissions
 	logDir := filepath.Dir(BumpLogFile)
 	if _, err := os.Stat(logDir); os.IsNotExist(err) {
-		_ = os.MkdirAll(logDir, 0755)
+		if os.Geteuid() == 0 {
+			_ = os.MkdirAll(logDir, 0755)
+		} else {
+			_ = RootExec.Run(exec.Command("mkdir", "-p", logDir))
+		}
 	}
 
+	// Try to open first
 	logFile, err := os.OpenFile(BumpLogFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil && os.Geteuid() != 0 {
+		// If fails and not root, try to create/fix via sudo
+		_ = RootExec.Run(exec.Command("touch", BumpLogFile))
+		_ = RootExec.Run(exec.Command("chmod", "666", BumpLogFile)) // Make writable for now
+		logFile, err = os.OpenFile(BumpLogFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	}
+
 	if err != nil {
 		fmt.Printf("Warning: failed to open global log file %s: %v\n", BumpLogFile, err)
 	} else {
+		// Ensure it's closed on return
 		defer logFile.Close()
 	}
 
