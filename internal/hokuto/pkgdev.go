@@ -14,6 +14,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 )
 
 func getAntigravityString() (string, error) {
@@ -629,4 +630,177 @@ func printGithubReleaseNotes(pkgDir string) {
 			}
 		}
 	}
+}
+
+type RepologyEntry struct {
+	Repo    string `json:"repo"`
+	Version string `json:"version"`
+	Status  string `json:"status"`
+}
+
+// HandleAutoBumpCommand implements the logic of the automagic bump script.
+func HandleAutoBumpCommand(cfg *Config, autoBuild bool) error {
+	repoURL := cfg.Values["REPOLOGY_URL"]
+	if repoURL == "" {
+		return fmt.Errorf("REPOLOGY_URL is not configured in hokuto.conf")
+	}
+
+	// Ensure log directory exists
+	logDir := filepath.Dir(BumpLogFile)
+	if _, err := os.Stat(logDir); os.IsNotExist(err) {
+		_ = os.MkdirAll(logDir, 0755)
+	}
+
+	logFile, err := os.OpenFile(BumpLogFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		fmt.Printf("Warning: failed to open global log file %s: %v\n", BumpLogFile, err)
+	} else {
+		defer logFile.Close()
+	}
+
+	logMsg := func(format string, a ...interface{}) {
+		msg := fmt.Sprintf(format, a...)
+		fmt.Print(msg)
+		if logFile != nil {
+			fmt.Fprintf(logFile, "[%s] %s", time.Now().Format("2006-01-02 15:04:05"), msg)
+		}
+	}
+
+	colArrow.Print("-> ")
+	colNote.Printf("Fetching outdated packages from Repology\n")
+
+	resp, err := http.Get(repoURL)
+	if err != nil {
+		return fmt.Errorf("failed to fetch from Repology: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("Repology API returned status: %d", resp.StatusCode)
+	}
+
+	var projects map[string][]RepologyEntry
+	if err := json.NewDecoder(resp.Body).Decode(&projects); err != nil {
+		return fmt.Errorf("failed to decode Repology JSON: %v", err)
+	}
+
+	if len(projects) == 0 {
+		colSuccess.Println("No outdated packages found.")
+		return nil
+	}
+
+	var successfullyBumped []string
+	var failedBumps []string
+	var successfullyBuilt []string
+	var failedBuilds []string
+
+	for project, entries := range projects {
+		// Map name to repo convention (python:chardet -> python-chardet)
+		pkgName := strings.ReplaceAll(project, ":", "-")
+
+		var newVer string
+		var repologyCurrent string
+
+		for _, e := range entries {
+			if e.Status == "newest" {
+				newVer = e.Version
+			}
+			if e.Repo == "sauzeros" {
+				repologyCurrent = e.Version
+			}
+		}
+
+		if newVer == "" {
+			continue // Should not happen if it's outdated
+		}
+
+		// Double check actual local version
+		curVer, _, err := getRepoVersion2(pkgName)
+		if err != nil {
+			colWarn.Printf("Skipping %s: could not determine local version: %v\n", pkgName, err)
+			continue
+		}
+
+		fmt.Printf("Found: %s (Local: %s | Repology: %s | Target: %s)\n", pkgName, curVer, repologyCurrent, newVer)
+
+		if curVer == newVer {
+			colSuccess.Printf(">> [SKIP] %s is already at %s locally.\n", pkgName, newVer)
+			continue
+		}
+
+		colNote.Printf(">> [BUMPING] %s to %s\n", pkgName, newVer)
+		if err := handleSingleBumpCommand(pkgName, newVer); err != nil {
+			colError.Printf(">> [ERROR] bump failed for %s: %v\n", pkgName, err)
+			failedBumps = append(failedBumps, pkgName)
+			logMsg("BUMP_FAILED: %s to %s: %v\n", pkgName, newVer, err)
+		} else {
+			colSuccess.Printf(">> [SUCCESS] %s updated.\n", pkgName)
+			successfullyBumped = append(successfullyBumped, pkgName)
+			logMsg("BUMP_SUCCESS: %s: %s -> %s\n", pkgName, curVer, newVer)
+
+			if autoBuild {
+				colNote.Printf(">> [BUILDING] %s (idle mode)\n", pkgName)
+				// Set build priority to idle for this process
+				originalPriority := buildPriority
+				buildPriority = "idle"
+
+				// Create a non-interactive executor for the build
+				buildExec := *UserExec
+				buildExec.Interactive = false
+
+				// Execute build but skip installation (autoInstall = false)
+				_, buildErr := pkgBuild(pkgName, cfg, &buildExec, BuildOptions{
+					Quiet: true, // Be a bit quieter in logs?
+				})
+
+				// Restore original priority
+				buildPriority = originalPriority
+
+				if buildErr != nil {
+					colError.Printf(">> [ERROR] build failed for %s: %v\n", pkgName, buildErr)
+					failedBuilds = append(failedBuilds, pkgName)
+					logMsg("BUILD_FAILED: %s: %v\n", pkgName, buildErr)
+				} else {
+					colSuccess.Printf(">> [SUCCESS] %s built.\n", pkgName)
+					successfullyBuilt = append(successfullyBuilt, pkgName)
+					logMsg("BUILD_SUCCESS: %s\n", pkgName)
+				}
+			}
+		}
+		fmt.Println("------------------------------------------------")
+	}
+
+	// Update package database
+	if err := GeneratePkgDB(cfg); err != nil {
+		colError.Printf("Warning: failed to update package database: %v\n", err)
+	}
+
+	// If build was requested and some packages were built, run upload --sync
+	if autoBuild && len(successfullyBuilt) > 0 {
+		colArrow.Print("-> ")
+		colNote.Println("Builds complete. Running upload --sync")
+		if err := handleUploadCommand([]string{"--sync"}, cfg); err != nil {
+			colError.Printf("Warning: upload --sync failed: %v\n", err)
+			logMsg("UPLOAD_SYNC_FAILED: %v\n", err)
+		} else {
+			logMsg("UPLOAD_SYNC_SUCCESS\n")
+		}
+	}
+
+	// Final Summary to log
+	logMsg("=== Auto-Bump Work Complete ===\n")
+	logMsg("Successfully bumped: %v\n", successfullyBumped)
+	if len(failedBumps) > 0 {
+		logMsg("Failed bumps: %v\n", failedBumps)
+	}
+	if autoBuild {
+		logMsg("Successfully built: %v\n", successfullyBuilt)
+		if len(failedBuilds) > 0 {
+			logMsg("Failed builds: %v\n", failedBuilds)
+		}
+	}
+	logMsg("================================\n")
+
+	colSuccess.Println("=== Work Complete ===")
+	return nil
 }

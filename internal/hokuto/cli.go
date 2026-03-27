@@ -49,7 +49,7 @@ func printHelp() {
 		{"find, f", "<query>", "Find which package matches query string"},
 		{"new, n", "<pkg>", "Create a new package skeleton"},
 		{"edit, e", "<pkg>", "Edit a package's build files"},
-		{"bump", "<pkgset> <old> <new>", "Batch update a set of packages"},
+		{"bump", "[options] [pkg]", "Update package(s) or batch update sets"},
 		{"cd", "<pkg>", "Change directory to package repository directory"},
 		{"bootstrap", "<dir>", "Build a bootstrap rootfs in target directory"},
 		{"chroot", "<dir> [cmd]", "Enter chroot and run command (default: /bin/bash)"},
@@ -1360,10 +1360,21 @@ func Main() {
 	case "bump":
 		bumpCmd := flag.NewFlagSet("bump", flag.ExitOnError)
 		var isSet = bumpCmd.Bool("set", false, "Bump a package set")
+		var auto = bumpCmd.Bool("auto", false, "Automagically bump outdated packages using Repology")
+		var build = bumpCmd.Bool("build", false, "Automatically build bumped packages in --idle mode")
 		if err := bumpCmd.Parse(os.Args[2:]); err != nil {
 			fmt.Fprintf(os.Stderr, "Error parsing bump flags: %v\n", err)
 			os.Exit(1)
 		}
+
+		if *auto {
+			if err := HandleAutoBumpCommand(cfg, *build); err != nil {
+				fmt.Fprintf(os.Stderr, "Auto bump failed: %v\n", err)
+				os.Exit(1)
+			}
+			os.Exit(0)
+		}
+
 		args := bumpCmd.Args()
 
 		if *isSet {
@@ -1380,6 +1391,7 @@ func Main() {
 			// Mode: Single Bump (hokuto bump <pkg> [newversion])
 			if len(args) < 1 {
 				fmt.Println("Usage: hokuto bump <pkgname> [newversion]")
+				fmt.Println("       hokuto bump --auto")
 				os.Exit(1)
 			}
 

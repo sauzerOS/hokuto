@@ -494,16 +494,20 @@ func SearchPkgDB(args []string, cfg *Config) error {
 	}
 
 	tagMode := false
+	strictMode := false
 	query := ""
 
 	for i := 0; i < len(args); i++ {
-		if args[i] == "-tag" {
+		switch args[i] {
+		case "-tag":
 			tagMode = true
 			if i+1 < len(args) {
 				query = args[i+1]
 				i++
 			}
-		} else {
+		case "-strict":
+			strictMode = true
+		default:
 			query = args[i]
 		}
 	}
@@ -527,15 +531,28 @@ func SearchPkgDB(args []string, cfg *Config) error {
 	for _, pkg := range db.Packages {
 		if tagMode {
 			for _, t := range pkg.Metadata.Tags {
-				if strings.Contains(strings.ToLower(t), queryLower) {
-					results = append(results, pkg)
-					break
+				if strictMode {
+					if strings.EqualFold(t, query) {
+						results = append(results, pkg)
+						break
+					}
+				} else {
+					if strings.Contains(strings.ToLower(t), queryLower) {
+						results = append(results, pkg)
+						break
+					}
 				}
 			}
 		} else {
-			if strings.Contains(strings.ToLower(pkg.Name), queryLower) ||
-				strings.Contains(strings.ToLower(pkg.Metadata.Description), queryLower) {
-				results = append(results, pkg)
+			if strictMode {
+				if strings.EqualFold(pkg.Name, query) {
+					results = append(results, pkg)
+				}
+			} else {
+				if strings.Contains(strings.ToLower(pkg.Name), queryLower) ||
+					strings.Contains(strings.ToLower(pkg.Metadata.Description), queryLower) {
+					results = append(results, pkg)
+				}
 			}
 		}
 	}
@@ -566,6 +583,7 @@ func SearchPkgDB(args []string, cfg *Config) error {
 func printSearchHelp() {
 	colNote.Println("Usage: hokuto search <query>       Search by package name or description")
 	colNote.Println("       hokuto search -tag <tag>    Search by package tag")
+	colNote.Println("       hokuto search -strict <q>   Search for exact name matches")
 	fmt.Println()
 	colSuccess.Println("Available Tags:")
 	// Print tags in a grid
