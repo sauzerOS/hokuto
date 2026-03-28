@@ -53,7 +53,7 @@ var (
 	RootExec *Executor
 	//go:embed assets/*.png
 	embeddedImages embed.FS
-	//go:embed assets/ca-bundle.crt
+	//go:embed assets/ca-bundle.crt assets/git-hook-prepare-commit-msg
 	embeddedAssets   embed.FS
 	WorldFile        = "/var/db/hokuto/world"
 	WorldMakeFile    = "/var/db/hokuto/world_make"

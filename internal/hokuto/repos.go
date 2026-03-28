@@ -182,40 +182,6 @@ func handleInitReposCommand(cfg *Config) error {
 	return nil
 }
 
-const gitHookScript = `#!/bin/sh
-# Auto-generate commit message lines for any package version bump
-
-case "$2" in
-  merge|commit) exit 0 ;;
-esac
-
-packages=$(git diff --cached --name-only | grep '/version$')
-
-msg=""
-for pkg in $packages; do
-  name=$(basename "$(dirname "$pkg")")
-
-  diff_out=$(git diff --cached -U0 "$pkg")
-
-  # Extract old/new upstream versions (field 1 only)
-  old=$(echo "$diff_out" \
-    | grep '^-' | grep -v '^---' \
-    | cut -c2- | awk '{print $1}')
-
-  new=$(echo "$diff_out" \
-    | grep '^+' | grep -v '^+++' \
-    | cut -c2- | awk '{print $1}')
-
-  if [ -n "$old" ] && [ -n "$new" ] && [ "$old" != "$new" ]; then
-    msg="${msg}${name}: ${old} → ${new}\n"
-  fi
-done
-
-if [ -n "$msg" ]; then
-  existing_content=$(cat "$1")
-  printf "%b\n%s" "$msg" "$existing_content" > "$1"
-fi
-`
 
 func installGitHooks(repoPath string) error {
 	hooksDir := filepath.Join(repoPath, ".git", "hooks")
@@ -227,7 +193,11 @@ func installGitHooks(repoPath string) error {
 
 	// 1. Write the script file
 	scriptPath := filepath.Join(hooksDir, "git-hook-prepare-commit-msg")
-	if err := os.WriteFile(scriptPath, []byte(gitHookScript), 0755); err != nil {
+	data, err := embeddedAssets.ReadFile("assets/git-hook-prepare-commit-msg")
+	if err != nil {
+		return fmt.Errorf("failed to read embedded hook script: %w", err)
+	}
+	if err := os.WriteFile(scriptPath, data, 0755); err != nil {
 		return fmt.Errorf("failed to write hook script: %w", err)
 	}
 

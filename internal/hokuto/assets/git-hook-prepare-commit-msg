@@ -1,0 +1,40 @@
+#!/bin/sh
+# Auto-generate commit message lines for any package version bump
+
+case "$2" in
+  merge|commit) exit 0 ;;
+esac
+
+packages=$(git diff --cached --name-only | grep '/version$')
+
+msg=""
+for pkg in $packages; do
+  name=$(basename "$(dirname "$pkg")")
+
+  diff_out=$(git diff --cached -U0 "$pkg")
+
+  # Extract old/new versions and revisions
+  old_line=$(echo "$diff_out" | grep '^-' | grep -v '^---' | cut -c2-)
+  new_line=$(echo "$diff_out" | grep '^+' | grep -v '^+++' | cut -c2-)
+
+  old_v=$(echo "$old_line" | awk '{print $1}')
+  old_r=$(echo "$old_line" | awk '{print $2}')
+  [ -z "$old_r" ] && old_r="1"
+
+  new_v=$(echo "$new_line" | awk '{print $1}')
+  new_r=$(echo "$new_line" | awk '{print $2}')
+  [ -z "$new_r" ] && new_r="1"
+
+  if [ -n "$old_v" ] && [ -n "$new_v" ]; then
+    if [ "$old_v" != "$new_v" ]; then
+      msg="${msg}${name}: ${old_v} → ${new_v}\n"
+    elif [ "$old_r" != "$new_r" ]; then
+      msg="${msg}${name}: ${new_v}: ${old_r} → ${new_r}\n"
+    fi
+  fi
+done
+
+if [ -n "$msg" ]; then
+  existing_content=$(cat "$1")
+  printf "%b\n%s" "$msg" "$existing_content" > "$1"
+fi
