@@ -722,6 +722,13 @@ func HandleAutoBumpCommand(cfg *Config, autoBuild bool) error {
 				repologyCurrent = e.Version
 			}
 		}
+		
+		// Repology often reports openssh versions with an underscore (10.3_p1)
+		// while the actual version used by openssh and our repo is 10.3p1.
+		if pkgName == "openssh" {
+			newVer = strings.ReplaceAll(newVer, "_p", "p")
+			repologyCurrent = strings.ReplaceAll(repologyCurrent, "_p", "p")
+		}
 
 		if newVer == "" {
 			continue // Should not happen if it's outdated
