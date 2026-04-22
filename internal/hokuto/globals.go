@@ -32,6 +32,7 @@ var (
 	WantLTO              string
 	VerifySignature      bool
 	HokutoGeneric        bool
+	GlobalAssumeYes      bool
 	activeKeyID          string
 	newPackageDir        string
 	setIdlePriority      bool

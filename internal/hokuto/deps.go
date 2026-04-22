@@ -1098,3 +1098,125 @@ func containsDep(dependsPath, targetPkg string) bool {
 	}
 	return false
 }
+
+// installBuildDependencies identifies and installs all missing build-time dependencies for a package.
+// It returns a list of packages that were newly installed, which can later be uninstalled.
+func installBuildDependencies(pkgName string, cfg *Config) ([]string, error) {
+	var newlyInstalled []string
+
+	// Collect ALL missing dependencies (both runtime and build-time)
+	var missing []string
+	masterProcessed := make(map[string]bool)
+	userRequested := map[string]bool{pkgName: true}
+
+	if err := resolveMissingDeps(pkgName, masterProcessed, &missing, userRequested, cfg); err != nil {
+		return newlyInstalled, fmt.Errorf("failed to resolve dependencies for %s: %v", pkgName, err)
+	}
+
+	if len(missing) == 0 {
+		return nil, nil
+	}
+
+	// Ensure base is first
+	missing = MovePackageToFront(missing, "sauzeros-base")
+
+	for _, depPkg := range missing {
+		// Skip the target package itself
+		if depPkg == pkgName {
+			continue
+		}
+		if isPackageInstalled(depPkg) {
+			continue
+		}
+
+		// Try to install from binary or build
+		installed, err := ensurePackageInstalled(depPkg, cfg)
+		if err != nil {
+			return newlyInstalled, err
+		}
+		if installed {
+			newlyInstalled = append(newlyInstalled, depPkg)
+		}
+	}
+
+	return newlyInstalled, nil
+}
+
+// ensurePackageInstalled handles the "fetch binary OR build and then install" logic for a single package.
+func ensurePackageInstalled(pkgName string, cfg *Config) (bool, error) {
+	// 1. Get repo version
+	version, revision, err := getRepoVersion2(pkgName)
+	if err != nil {
+		return false, fmt.Errorf("failed to get version for %s: %v", pkgName, err)
+	}
+
+	outputPkgName := getOutputPackageName(pkgName, cfg)
+	arch := GetSystemArchForPackage(cfg, pkgName)
+	variant := GetSystemVariantForPackage(cfg, pkgName)
+	tarballName := StandardizeRemoteName(outputPkgName, version, revision, arch, variant)
+	tarballPath := filepath.Join(BinDir, tarballName)
+
+	foundBinary := false
+	if _, err := os.Stat(tarballPath); err == nil {
+		foundBinary = true
+	} else if BinaryMirror != "" {
+		// Try to fetch binary
+		index, _ := GetCachedRemoteIndex(cfg)
+		var expectedSum string
+		shouldTryDownload := true
+		if index != nil {
+			shouldTryDownload = false
+			for _, entry := range index {
+				if entry.Name == pkgName && entry.Version == version && entry.Revision == revision && entry.Arch == arch && entry.Variant == variant {
+					shouldTryDownload = true
+					expectedSum = entry.B3Sum
+					break
+				}
+			}
+		}
+		if shouldTryDownload {
+			if err := fetchBinaryPackage(pkgName, version, revision, cfg, true, expectedSum, false); err == nil {
+				foundBinary = true
+			}
+		}
+	}
+
+	if foundBinary {
+		isCriticalAtomic.Store(1)
+		defer isCriticalAtomic.Store(0)
+		handlePreInstallUninstall(outputPkgName, cfg, RootExec, true, nil)
+		if _, err := pkgInstall(tarballPath, outputPkgName, cfg, RootExec, true, false, false, nil); err != nil {
+			return false, fmt.Errorf("failed to install binary %s: %v", pkgName, err)
+		}
+		return true, nil
+	}
+
+	// 2. Build from source
+	_, err = pkgBuild(pkgName, cfg, UserExec, BuildOptions{Quiet: true})
+	if err != nil {
+		return false, fmt.Errorf("failed to build %s: %v", pkgName, err)
+	}
+
+	// 3. Install after build
+	isCriticalAtomic.Store(1)
+	defer isCriticalAtomic.Store(0)
+	handlePreInstallUninstall(outputPkgName, cfg, RootExec, true, nil)
+	if _, err := pkgInstall(tarballPath, outputPkgName, cfg, RootExec, true, false, false, nil); err != nil {
+		return false, fmt.Errorf("failed to install built package %s: %v", pkgName, err)
+	}
+	return true, nil
+}
+
+// uninstallBuildDependencies uninstalls a list of packages in reverse order.
+func uninstallBuildDependencies(packages []string, cfg *Config) {
+	// Uninstall in reverse order
+	for i := len(packages) - 1; i >= 0; i-- {
+		pkgName := packages[i]
+		colArrow.Print("-> ")
+		colSuccess.Printf("Removing build dependency: %s\n", pkgName)
+		if err := pkgUninstall(pkgName, cfg, RootExec, false, true, nil); err != nil {
+			colWarn.Printf("Warning: failed to uninstall build dependency %s: %v\n", pkgName, err)
+		}
+	}
+}
+

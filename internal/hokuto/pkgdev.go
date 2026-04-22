@@ -640,6 +640,9 @@ type RepologyEntry struct {
 
 // HandleAutoBumpCommand implements the logic of the automagic bump script.
 func HandleAutoBumpCommand(cfg *Config, autoBuild bool) error {
+	GlobalAssumeYes = true
+	defer func() { GlobalAssumeYes = false }()
+
 	repoURL := cfg.Values["REPOLOGY_URL"]
 	if repoURL == "" {
 		return fmt.Errorf("REPOLOGY_URL is not configured in hokuto.conf")
@@ -711,6 +714,16 @@ func HandleAutoBumpCommand(cfg *Config, autoBuild bool) error {
 		// Map name to repo convention (python:chardet -> python-chardet)
 		pkgName := strings.ReplaceAll(project, ":", "-")
 
+		// Specific name tweaks
+		switch pkgName {
+		case "gnumpc":
+			pkgName = "mpc"
+		case "elfutils":
+			pkgName = "libelf"
+		case "webkitgtk":
+			pkgName = "webkit2gtk-4.1"
+		}
+
 		var newVer string
 		var repologyCurrent string
 
@@ -722,12 +735,22 @@ func HandleAutoBumpCommand(cfg *Config, autoBuild bool) error {
 				repologyCurrent = e.Version
 			}
 		}
-		
-		// Repology often reports openssh versions with an underscore (10.3_p1)
-		// while the actual version used by openssh and our repo is 10.3p1.
-		if pkgName == "openssh" {
+
+		// Package-specific version tweaks
+		switch pkgName {
+		case "openssh":
+			// Repology often reports openssh versions with an underscore (10.3_p1)
+			// while the actual version used by openssh and our repo is 10.3p1.
 			newVer = strings.ReplaceAll(newVer, "_p", "p")
 			repologyCurrent = strings.ReplaceAll(repologyCurrent, "_p", "p")
+		case "imagemagick":
+			// repology version 7.1.2.21 -> local verion scheme: 7.1.2-21
+			if lastDot := strings.LastIndex(newVer, "."); lastDot != -1 {
+				newVer = newVer[:lastDot] + "-" + newVer[lastDot+1:]
+			}
+			if lastDot := strings.LastIndex(repologyCurrent, "."); lastDot != -1 {
+				repologyCurrent = repologyCurrent[:lastDot] + "-" + repologyCurrent[lastDot+1:]
+			}
 		}
 
 		if newVer == "" {
@@ -760,21 +783,32 @@ func HandleAutoBumpCommand(cfg *Config, autoBuild bool) error {
 
 			if autoBuild {
 				colNote.Printf(">> [BUILDING] %s (idle mode)\n", pkgName)
-				// Set build priority to idle for this process
-				originalPriority := buildPriority
-				buildPriority = "idle"
 
-				// Create a non-interactive executor for the build
-				buildExec := *UserExec
-				buildExec.Interactive = false
+				var buildErr error
+				installedBuildDeps, depErr := installBuildDependencies(pkgName, cfg)
+				if depErr != nil {
+					buildErr = fmt.Errorf("failed to install build dependencies: %v", depErr)
+				} else {
+					// Set build priority to idle for this process
+					originalPriority := buildPriority
+					buildPriority = "idle"
 
-				// Execute build but skip installation (autoInstall = false)
-				_, buildErr := pkgBuild(pkgName, cfg, &buildExec, BuildOptions{
-					Quiet: true, // Be a bit quieter in logs?
-				})
+					// Create a non-interactive executor for the build
+					buildExec := *UserExec
+					buildExec.Interactive = false
 
-				// Restore original priority
-				buildPriority = originalPriority
+					// Execute build but skip installation (autoInstall = false)
+					_, buildErr = pkgBuild(pkgName, cfg, &buildExec, BuildOptions{
+						Quiet: true, // Be a bit quieter in logs?
+					})
+
+					// Restore original priority
+					buildPriority = originalPriority
+
+					if len(installedBuildDeps) > 0 {
+						uninstallBuildDependencies(installedBuildDeps, cfg)
+					}
+				}
 
 				if buildErr != nil {
 					colError.Printf(">> [ERROR] build failed for %s: %v\n", pkgName, buildErr)

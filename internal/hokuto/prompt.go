@@ -29,6 +29,9 @@ func SetPromptHooks(onStart, onEnd func()) {
 }
 
 func askForConfirmation(p colorPrinter, format string, a ...any) bool {
+	if GlobalAssumeYes {
+		return true
+	}
 	interactiveMu.Lock()
 	defer interactiveMu.Unlock()
 
