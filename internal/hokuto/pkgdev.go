@@ -486,7 +486,38 @@ func bumpPackage(pkgName, expectedOldVersion, newVersion string) (string, error)
 	return pkgDir, nil
 }
 
-func handleSingleBumpCommand(pkgName, newVersion string) error {
+// buildBumpedPackage encapsules the build logic for a bumped package.
+func buildBumpedPackage(pkgName string, cfg *Config) error {
+	colNote.Printf(">> [BUILDING] %s (idle mode)\n", pkgName)
+
+	installedBuildDeps, depErr := installBuildDependencies(pkgName, cfg)
+	if depErr != nil {
+		return fmt.Errorf("failed to install build dependencies: %v", depErr)
+	}
+	defer func() {
+		if len(installedBuildDeps) > 0 {
+			uninstallBuildDependencies(installedBuildDeps, cfg)
+		}
+	}()
+
+	// Set build priority to idle for this process
+	originalPriority := buildPriority
+	buildPriority = "idle"
+	defer func() { buildPriority = originalPriority }()
+
+	// Create a non-interactive executor for the build
+	buildExec := *UserExec
+	buildExec.Interactive = false
+
+	// Execute build but skip installation (autoInstall = false)
+	_, buildErr := pkgBuild(pkgName, cfg, &buildExec, BuildOptions{
+		Quiet: true,
+	})
+
+	return buildErr
+}
+
+func handleSingleBumpCommand(pkgName, newVersion string, build bool, cfg *Config) error {
 	// If newVersion is empty, we infer it means "keep version, bump revision"
 	// So we need to look up the current version first.
 	if newVersion == "" {
@@ -523,10 +554,18 @@ func handleSingleBumpCommand(pkgName, newVersion string) error {
 
 	printGithubReleaseNotes(pkgDir)
 
+	if build {
+		if err := buildBumpedPackage(pkgName, cfg); err != nil {
+			return err
+		}
+		GeneratePkgDB(cfg)
+		handleUploadCommand([]string{"--sync"}, cfg)
+	}
+
 	return nil
 }
 
-func handleSetBumpCommand(pkgsetName, oldVersion, newVersion string) error {
+func handleSetBumpCommand(pkgsetName, oldVersion, newVersion string, build bool, cfg *Config) error {
 	sets, err := loadPkgsets()
 	if err != nil {
 		return fmt.Errorf("failed to load pkgsets: %v", err)
@@ -552,6 +591,12 @@ func handleSetBumpCommand(pkgsetName, oldVersion, newVersion string) error {
 		} else {
 			fmt.Fprintf(os.Stderr, "Warning: failed to determine git repo root for %s: %v\n", pkgName, err)
 		}
+
+		if build {
+			if err := buildBumpedPackage(pkgName, cfg); err != nil {
+				failed = append(failed, fmt.Sprintf("%s: build failed: %v", pkgName, err))
+			}
+		}
 	}
 
 	if len(failed) > 0 {
@@ -567,6 +612,11 @@ func handleSetBumpCommand(pkgsetName, oldVersion, newVersion string) error {
 		if err := pushGitRepo(repoRoot); err != nil {
 			colError.Printf("Failed to push repo %s: %v\n", repoRoot, err)
 		}
+	}
+
+	if build {
+		GeneratePkgDB(cfg)
+		handleUploadCommand([]string{"--sync"}, cfg)
 	}
 
 	return nil
@@ -772,7 +822,7 @@ func HandleAutoBumpCommand(cfg *Config, autoBuild bool) error {
 		}
 
 		colNote.Printf(">> [BUMPING] %s to %s\n", pkgName, newVer)
-		if err := handleSingleBumpCommand(pkgName, newVer); err != nil {
+		if err := handleSingleBumpCommand(pkgName, newVer, false, cfg); err != nil {
 			colError.Printf(">> [ERROR] bump failed for %s: %v\n", pkgName, err)
 			failedBumps = append(failedBumps, pkgName)
 			logMsg("BUMP_FAILED: %s to %s: %v\n", pkgName, newVer, err)
@@ -782,33 +832,7 @@ func HandleAutoBumpCommand(cfg *Config, autoBuild bool) error {
 			logMsg("BUMP_SUCCESS: %s: %s -> %s\n", pkgName, curVer, newVer)
 
 			if autoBuild {
-				colNote.Printf(">> [BUILDING] %s (idle mode)\n", pkgName)
-
-				var buildErr error
-				installedBuildDeps, depErr := installBuildDependencies(pkgName, cfg)
-				if depErr != nil {
-					buildErr = fmt.Errorf("failed to install build dependencies: %v", depErr)
-				} else {
-					// Set build priority to idle for this process
-					originalPriority := buildPriority
-					buildPriority = "idle"
-
-					// Create a non-interactive executor for the build
-					buildExec := *UserExec
-					buildExec.Interactive = false
-
-					// Execute build but skip installation (autoInstall = false)
-					_, buildErr = pkgBuild(pkgName, cfg, &buildExec, BuildOptions{
-						Quiet: true, // Be a bit quieter in logs?
-					})
-
-					// Restore original priority
-					buildPriority = originalPriority
-
-					if len(installedBuildDeps) > 0 {
-						uninstallBuildDependencies(installedBuildDeps, cfg)
-					}
-				}
+				buildErr := buildBumpedPackage(pkgName, cfg)
 
 				if buildErr != nil {
 					colError.Printf(">> [ERROR] build failed for %s: %v\n", pkgName, buildErr)
