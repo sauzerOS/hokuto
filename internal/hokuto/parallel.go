@@ -496,14 +496,22 @@ func (pm *ParallelManager) installPackage(pkgName string, userRequestedMap map[s
 
 	// Fix: Skip install for cross-builds as we don't want to install target binaries to host
 	// BUT, we MUST install cross-system packages (e.g. aarch64-gcc, aarch64-glibc)
+	// OR if we are building the entire cross-system (HOKUTO_CROSS_SYSTEM=1), we install everything.
 	if pm.Config.Values["HOKUTO_CROSS"] == "1" || pm.Config.Values["HOKUTO_CROSS_ARCH"] != "" {
+		isCrossSystem := pm.Config.Values["HOKUTO_CROSS_SYSTEM"] == "1"
 		crossArch := pm.Config.Values["HOKUTO_CROSS_ARCH"]
+		if crossArch == "arm64" {
+			crossArch = "aarch64"
+		}
+
 		isCrossSystemPkg := false
 		if crossArch != "" {
 			isCrossSystemPkg = strings.HasPrefix(pkgName, crossArch+"-")
 		}
 
-		if !isCrossSystemPkg {
+		// If it's a cross build but NOT building the whole system, ONLY install toolchain/libs
+		// (those with the arch prefix). Everything else is a target package and should stay in BinDir.
+		if !isCrossSystem && !isCrossSystemPkg {
 			isCriticalAtomic.Store(0)
 			if userRequestedMap[pkgName] {
 				addToWorld(pkgName)

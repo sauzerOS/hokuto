@@ -265,11 +265,11 @@ func buildRustFlags(cflags string, cpuFlags string, buildDir string, isGeneric b
 
 // BuildOptions encapsulates parameters for the build process
 type BuildOptions struct {
-	Bootstrap    bool
-	CurrentIndex int
-	TotalCount   int
-	Quiet        bool      // If true, suppress standard output logging (except errors/warnings)
-	LogWriter    io.Writer // Optional: redirect output to this writer (e.g., for parallel builds)
+	Bootstrap     bool
+	CurrentIndex  int
+	TotalCount    int
+	Quiet         bool      // If true, suppress standard output logging (except errors/warnings)
+	LogWriter     io.Writer // Optional: redirect output to this writer (e.g., for parallel builds)
 	UpdateWebsite bool      // If true, update the github.io status table
 }
 
@@ -834,42 +834,41 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, opts BuildOptions)
 				defaults["CXX"] = toolchainPrefix + "g++"
 				defaults["AR"] = toolchainPrefix + "ar"
 				defaults["RANLIB"] = toolchainPrefix + "ranlib"
+				defaults["OBJCOPY"] = toolchainPrefix + "objcopy"
+				defaults["OBJDUMP"] = toolchainPrefix + "objdump"
+				defaults["STRIP"] = toolchainPrefix + "strip"
 				defaults["PKG_CONFIG"] = toolchainPrefix + "pkg-config"
 			}
 			// In simple mode, keep normal compiler/linker settings (already set above)
 
+			// Determine the sysroot prefix for cross-compilation
+			sysrootPrefix := fmt.Sprintf("/usr/%s-linux-gnu", normalizedArch)
+
 			// Set CROSS_PREFIX based on cross-compilation mode
 			if cfg.Values["HOKUTO_CROSS_SYSTEM"] == "1" || cfg.Values["HOKUTO_CROSS_SIMPLE"] == "1" {
-				// Use /usr/<arch>-linux-gnu for toolchain/system packages in both cross modes
-				prefix := fmt.Sprintf("/usr/%s-linux-gnu", normalizedArch)
-				defaults["CROSS_PREFIX"] = prefix
+				// Use sysroot for toolchain/system packages in both cross modes
+				defaults["CROSS_PREFIX"] = sysrootPrefix
+			} else {
+				// Regular cross-compilation (user packages): use /usr (target perspective)
+				defaults["CROSS_PREFIX"] = "/usr"
+			}
 
-				// Ensure the cross-bin directory is in the PATH so tools like pkg-config can be found
-				// BUT only if we are NOT building a host-tool (otherwise we break the host compiler)
-				if !options["host-tool"] || !isCrossSystem {
-					currentPath := os.Getenv("PATH")
-					defaults["PATH"] = currentPath + ":" + filepath.Join(prefix, "bin")
-				}
+			// Ensure the cross-bin directory is in the PATH so tools like pkg-config can be found
+			// BUT only if we are NOT building a host-tool (otherwise we break the host compiler)
+			if !options["host-tool"] || !isCrossSystem {
+				currentPath := os.Getenv("PATH")
+				defaults["PATH"] = currentPath + ":" + filepath.Join(sysrootPrefix, "bin")
+			}
 
-				// Set PKG_CONFIG environment variables to avoid host pollution
-				// BUT skip this if we are building a host tool (native), so we use host libraries/headers
-				if !shouldBuildHostNative {
-					defaults["PKG_CONFIG_LIBDIR"] = filepath.Join(prefix, "lib", "pkgconfig") + ":" + filepath.Join(prefix, "share", "pkgconfig")
-					defaults["PKG_CONFIG_SYSROOT_DIR"] = prefix
-					defaults["PKG_CONFIG_PATH"] = "" // Clear to avoid host pollution
-				}
+			// Set PKG_CONFIG environment variables to avoid host pollution
+			// BUT skip this if we are building a host tool (native), so we use host libraries/headers
+			if !shouldBuildHostNative {
+				defaults["PKG_CONFIG_LIBDIR"] = filepath.Join(sysrootPrefix, "lib", "pkgconfig") + ":" + filepath.Join(sysrootPrefix, "share", "pkgconfig")
+				defaults["PKG_CONFIG_SYSROOT_DIR"] = sysrootPrefix
+				defaults["PKG_CONFIG_PATH"] = "" // Clear to avoid host pollution
 
 				// Set PYTHONPATH to include target site-packages for build-time module detection
-				defaults["PYTHONPATH"] = filepath.Join(prefix, "lib", "python3.14", "site-packages")
-			} else {
-				// Regular cross-compilation (user packages): use /usr
-				defaults["CROSS_PREFIX"] = "/usr"
-
-				// For regular cross builds, also add the cross toolchain bin to PATH
-				// This ensures we use the cross Rust compiler which has the target installed
-				prefix := fmt.Sprintf("/usr/%s-linux-gnu", normalizedArch)
-				currentPath := os.Getenv("PATH")
-				defaults["PATH"] = currentPath + ":" + filepath.Join(prefix, "bin")
+				defaults["PYTHONPATH"] = filepath.Join(sysrootPrefix, "lib", "python3.14", "site-packages")
 			}
 
 			// Rust cross-compilation setup
@@ -1527,8 +1526,8 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 	if err != nil {
 		return fmt.Errorf("package %s not found in HOKUTO_PATH: %w", pkgName, err)
 	}
- 
- 	// NEW: Load build options (consolidated from 'options' file or individual files)
+
+	// NEW: Load build options (consolidated from 'options' file or individual files)
 	options := loadBuildOptions(pkgDir)
 
 	// 1. Initialize a LOCAL temporary directory variable with the global default.
@@ -2697,9 +2696,9 @@ func handleBuildCommand(args []string, cfg *Config) error {
 			colArrow.Print("-> ")
 			colSuccess.Printf("Building: %s (%d/%d)\n", pkgName, i+1, totalBuildCount)
 			duration, err := pkgBuild(pkgName, cfg, UserExec, BuildOptions{
-				Bootstrap:    *bootstrap,
-				CurrentIndex: i + 1,
-				TotalCount:   totalBuildCount,
+				Bootstrap:     *bootstrap,
+				CurrentIndex:  i + 1,
+				TotalCount:    totalBuildCount,
 				UpdateWebsite: UpdateWebsiteIndex,
 			})
 			if err != nil {
@@ -3240,9 +3239,9 @@ func executeBuildPass(plan *BuildPlan, _ string, installAllTargets bool, cfg *Co
 			colNote.Printf("%s (%d/%d)\n", pkgName, currentIndex, totalInPlan)
 
 			duration, err := pkgBuild(pkgName, cfg, UserExec, BuildOptions{
-				Bootstrap:    *bootstrap,
-				CurrentIndex: currentIndex,
-				TotalCount:   totalInPlan,
+				Bootstrap:     *bootstrap,
+				CurrentIndex:  currentIndex,
+				TotalCount:    totalInPlan,
 				UpdateWebsite: UpdateWebsiteIndex,
 			})
 			if err != nil {
