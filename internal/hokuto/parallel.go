@@ -642,8 +642,9 @@ func (pm *ParallelManager) startBuild(pkgName string, idx, total int) {
 			Bootstrap:    false, // TODO: Propagate from global?
 			CurrentIndex: idx,
 			TotalCount:   total,
-			Quiet:        !interactive,
-			LogWriter:    logWriter,
+			Quiet:         !interactive,
+			LogWriter:     logWriter,
+			UpdateWebsite: UpdateWebsiteIndex,
 		}
 
 		var dur time.Duration

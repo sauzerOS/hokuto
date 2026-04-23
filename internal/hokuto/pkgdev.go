@@ -511,7 +511,8 @@ func buildBumpedPackage(pkgName string, cfg *Config) error {
 
 	// Execute build but skip installation (autoInstall = false)
 	_, buildErr := pkgBuild(pkgName, cfg, &buildExec, BuildOptions{
-		Quiet: true,
+		Quiet:         true,
+		UpdateWebsite: true,
 	})
 
 	return buildErr

@@ -29,6 +29,7 @@ var (
 	WantDebug            string
 	Debug                bool
 	Verbose              bool
+	UpdateWebsiteIndex   bool
 	WantLTO              string
 	VerifySignature      bool
 	HokutoGeneric        bool

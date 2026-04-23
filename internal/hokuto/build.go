@@ -270,6 +270,7 @@ type BuildOptions struct {
 	TotalCount   int
 	Quiet        bool      // If true, suppress standard output logging (except errors/warnings)
 	LogWriter    io.Writer // Optional: redirect output to this writer (e.g., for parallel builds)
+	UpdateWebsite bool      // If true, update the github.io status table
 }
 
 func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, opts BuildOptions) (time.Duration, error) {
@@ -1185,6 +1186,11 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, opts BuildOptions)
 		// Path to the build log (script creates and writes to this file)
 		logPath := filepath.Join(logDir, "build-log.txt")
 
+		if opts.UpdateWebsite {
+			fullVer := fmt.Sprintf("%s-%s", version, revision)
+			UpdateWebsiteStatus(pkgName, fullVer, "failed", logPath)
+		}
+
 		// If interactive, let user follow the log; otherwise show last N lines and continue.
 		if buildExec.Interactive {
 			tailCmd := exec.Command("tail", "-n", "50", "-f", logPath)
@@ -1404,6 +1410,11 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, opts BuildOptions)
 	}
 	if err := compressXZ(logPath, logXZPath, logExec); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: failed to compress build log: %v\n", err)
+	}
+
+	if opts.UpdateWebsite {
+		fullVer := fmt.Sprintf("%s-%s", version, revision)
+		UpdateWebsiteStatus(pkgName, fullVer, "success", logXZPath)
 	}
 
 	// Determine architecture and flags for metadata
@@ -2360,6 +2371,7 @@ func handleBuildCommand(args []string, cfg *Config) error {
 	var noDeps = buildCmd.Bool("nodeps", false, "Skip dependency checking and build only the specified package(s)")
 	var parallel = buildCmd.Int("j", 1, "Number of parallel jobs (default: 1)")
 	var parallelLong = buildCmd.Int("parallel", 1, "Number of parallel jobs (default: 1)")
+	var updateWebsite = buildCmd.Bool("index", false, "Update the github.io status table.")
 
 	// Custom usage function that excludes bootstrap flags from help
 	buildCmd.Usage = func() {
@@ -2401,6 +2413,7 @@ func handleBuildCommand(args []string, cfg *Config) error {
 		buildPriority = "normal"
 	}
 	Verbose = *verbose || *verboseLong
+	UpdateWebsiteIndex = *updateWebsite
 
 	// Handle generic build flag
 	if *genericBuild {
@@ -2687,6 +2700,7 @@ func handleBuildCommand(args []string, cfg *Config) error {
 				Bootstrap:    *bootstrap,
 				CurrentIndex: i + 1,
 				TotalCount:   totalBuildCount,
+				UpdateWebsite: UpdateWebsiteIndex,
 			})
 			if err != nil {
 				failedBuilds[pkgName] = err
@@ -3222,6 +3236,7 @@ func executeBuildPass(plan *BuildPlan, _ string, installAllTargets bool, cfg *Co
 				Bootstrap:    *bootstrap,
 				CurrentIndex: currentIndex,
 				TotalCount:   totalInPlan,
+				UpdateWebsite: UpdateWebsiteIndex,
 			})
 			if err != nil {
 				failed[pkgName] = err
