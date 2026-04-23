@@ -767,6 +767,8 @@ func HandleAutoBumpCommand(cfg *Config, autoBuild bool) error {
 
 		// Specific name tweaks
 		switch pkgName {
+		case "manpages":
+			pkgName = "man-pages"
 		case "gnumpc":
 			pkgName = "mpc"
 		case "elfutils":
