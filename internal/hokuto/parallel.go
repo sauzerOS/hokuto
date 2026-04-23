@@ -144,6 +144,11 @@ func RunParallelBuilds(plan *BuildPlan, cfg *Config, maxJobs int, userRequestedM
 						if dep.Cross && pm.Config.Values["HOKUTO_CROSS_ARCH"] == "" {
 							continue
 						}
+						if dep.CrossNative {
+							if pm.Config.Values["HOKUTO_CROSS_ARCH"] == "" || pm.Config.Values["HOKUTO_CROSS_SYSTEM"] == "1" {
+								continue
+							}
+						}
 						if !EnableMultilib && strings.HasSuffix(dep.Name, "-32") {
 							continue
 						}
@@ -551,6 +556,11 @@ func (pm *ParallelManager) canBuild(pkgName string) bool {
 		}
 		if dep.Cross && pm.Config.Values["HOKUTO_CROSS_ARCH"] == "" {
 			continue
+		}
+		if dep.CrossNative {
+			if pm.Config.Values["HOKUTO_CROSS_ARCH"] == "" || pm.Config.Values["HOKUTO_CROSS_SYSTEM"] == "1" {
+				continue
+			}
 		}
 
 		// Determine candidates: either the alternatives or just the single name

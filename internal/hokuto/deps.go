@@ -816,7 +816,7 @@ func compareVersions(a, b string) int {
 // Duplicates are only allowed for "gcc" - all other packages are added once.
 // This is used with the --alldeps flag to rebuild everything including duplicates.
 
-func getPackageDependenciesForward(pkgName string) ([]string, error) {
+func getPackageDependenciesForward(pkgName string, cfg *Config) ([]string, error) {
 	var result []string
 	seen := make(map[string]bool)       // Track non-gcc packages to avoid duplicates
 	inProgress := make(map[string]bool) // Track packages currently being processed to prevent infinite recursion
@@ -835,6 +835,7 @@ func getPackageDependenciesForward(pkgName string) ([]string, error) {
 			// Unmark when done (allows gcc to be processed multiple times in different branches)
 			delete(inProgress, currentPkg)
 		}()
+
 		// --- Find the Package Source Directory (pkgDir) ---
 		paths := strings.Split(repoPaths, ":")
 		var pkgDir string
@@ -865,6 +866,18 @@ func getPackageDependenciesForward(pkgName string) ([]string, error) {
 
 		// --- Recursively collect dependencies in forward order ---
 		for _, dep := range dependencies {
+			// FILTER: skip cross dependencies if not cross-compiling
+			if dep.Cross && cfg.Values["HOKUTO_CROSS_ARCH"] == "" {
+				continue
+			}
+
+			// FILTER: skip crossnative dependencies unless we are in a cross-native build
+			if dep.CrossNative {
+				if cfg.Values["HOKUTO_CROSS_ARCH"] == "" || cfg.Values["HOKUTO_CROSS_SYSTEM"] == "1" {
+					continue
+				}
+			}
+
 			depName := dep.Name
 
 			// Resolve alternative dependencies if present

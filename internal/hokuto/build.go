@@ -2664,7 +2664,7 @@ func handleBuildCommand(args []string, cfg *Config) error {
 		colSuccess.Println("Using forward-dependency build strategy for bootstrap/--alldeps mode.")
 		var fullBuildList []string
 		for _, pkgName := range packagesToProcess {
-			deps, err := getPackageDependenciesForward(pkgName)
+			deps, err := getPackageDependenciesForward(pkgName, cfg)
 			if err != nil {
 				return fmt.Errorf("error resolving forward dependencies for %s: %v", pkgName, err)
 			}
@@ -3158,6 +3158,13 @@ func executeBuildPass(plan *BuildPlan, _ string, installAllTargets bool, cfg *Co
 						continue
 					}
 
+					// FILTER: Ignore crossnative dependencies unless we are in a cross-native build
+					if dep.CrossNative {
+						if cfg.Values["HOKUTO_CROSS_ARCH"] == "" || cfg.Values["HOKUTO_CROSS_SYSTEM"] == "1" {
+							continue
+						}
+					}
+
 					// FILTER: Ignore 32-bit dependencies if multilib is disabled
 					if !EnableMultilib && strings.HasSuffix(dep.Name, "-32") {
 						continue
@@ -3263,6 +3270,18 @@ func executeBuildPass(plan *BuildPlan, _ string, installAllTargets bool, cfg *Co
 							fDeps, err := parseDependsFile(fDir)
 							if err == nil {
 								for _, d := range fDeps {
+									// FILTER: skip cross dependencies if not cross-compiling
+									if d.Cross && cfg.Values["HOKUTO_CROSS_ARCH"] == "" {
+										continue
+									}
+
+									// FILTER: skip crossnative dependencies unless we are in a cross-native build
+									if d.CrossNative {
+										if cfg.Values["HOKUTO_CROSS_ARCH"] == "" || cfg.Values["HOKUTO_CROSS_SYSTEM"] == "1" {
+											continue
+										}
+									}
+
 									if d.Name == pkgName {
 										isDependencyForThisPass = true
 										break
@@ -3324,6 +3343,18 @@ func executeBuildPass(plan *BuildPlan, _ string, installAllTargets bool, cfg *Co
 								deps, err := parseDependsFile(pDir)
 								if err == nil {
 									for _, d := range deps {
+										// FILTER: skip cross dependencies if not cross-compiling
+										if d.Cross && cfg.Values["HOKUTO_CROSS_ARCH"] == "" {
+											continue
+										}
+
+										// FILTER: skip crossnative dependencies unless we are in a cross-native build
+										if d.CrossNative {
+											if cfg.Values["HOKUTO_CROSS_ARCH"] == "" || cfg.Values["HOKUTO_CROSS_SYSTEM"] == "1" {
+												continue
+											}
+										}
+
 										if d.Name == pkgName && d.Make {
 											isMakeDep = true
 											break
@@ -3477,6 +3508,18 @@ func executeBuildPass(plan *BuildPlan, _ string, installAllTargets bool, cfg *Co
 				for _, dep := range deps {
 					if dep.Optional {
 						continue
+					}
+
+					// New filtering: skip cross dependencies if not cross-compiling
+					if dep.Cross && cfg.Values["HOKUTO_CROSS_ARCH"] == "" {
+						continue
+					}
+
+					// New filtering: skip crossnative dependencies unless we are in a cross-native build
+					if dep.CrossNative {
+						if cfg.Values["HOKUTO_CROSS_ARCH"] == "" || cfg.Values["HOKUTO_CROSS_SYSTEM"] == "1" {
+							continue
+						}
 					}
 
 					// FILTER: Ignore 32-bit dependencies if multilib is disabled

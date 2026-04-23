@@ -315,7 +315,7 @@ func parsePackageList(output []byte) (map[string]Package, error) {
 // checkDependencyBlocks checks if any installed package depends on a lower version
 // of the package being updated. Returns the blocking package name if found, empty string otherwise.
 
-func checkDependencyBlocks(pkgName string, newVersion string, installedPackages map[string]Package) string {
+func checkDependencyBlocks(pkgName string, newVersion string, installedPackages map[string]Package, cfg *Config) string {
 	// Iterate through all installed packages
 	for installedPkgName := range installedPackages {
 		// Skip the package itself
@@ -338,6 +338,18 @@ func checkDependencyBlocks(pkgName string, newVersion string, installedPackages 
 		}
 
 		for _, dep := range deps {
+			// FILTER: skip cross dependencies if not cross-compiling
+			if dep.Cross && cfg.Values["HOKUTO_CROSS_ARCH"] == "" {
+				continue
+			}
+
+			// FILTER: skip crossnative dependencies unless we are in a cross-native build
+			if dep.CrossNative {
+				if cfg.Values["HOKUTO_CROSS_ARCH"] == "" || cfg.Values["HOKUTO_CROSS_SYSTEM"] == "1" {
+					continue
+				}
+			}
+
 			if dep.Name != pkgName {
 				continue
 			}
@@ -411,7 +423,7 @@ func checkForUpgrades(_ context.Context, cfg *Config, maxJobs int, yes bool) err
 		blockReason := ""
 
 		// Check if blocked by installed package dependencies
-		blockingPkg := checkDependencyBlocks(pkg.Name, pkg.RepoVersion, installedPackages)
+		blockingPkg := checkDependencyBlocks(pkg.Name, pkg.RepoVersion, installedPackages, cfg)
 		if blockingPkg != "" {
 			shouldSkip = true
 			blockReason = fmt.Sprintf("%s update blocked by %s", pkg.Name, blockingPkg)
