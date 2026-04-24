@@ -733,6 +733,12 @@ func HandleAutoBumpCommand(cfg *Config, autoBuild bool) error {
 		}
 	}
 
+	// Load pkgsets for possible batch updates (e.g. linux kernel set)
+	sets, err := loadPkgsets()
+	if err != nil {
+		fmt.Printf("Warning: failed to load pkgsets: %v\n", err)
+	}
+
 	colArrow.Print("-> ")
 	colNote.Printf("Fetching outdated packages from Repology\n")
 
@@ -767,6 +773,12 @@ func HandleAutoBumpCommand(cfg *Config, autoBuild bool) error {
 
 		// Specific name tweaks
 		switch pkgName {
+		case "highway-simd-library":
+			pkgName = "highway"
+		case "tabby-terminal":
+			pkgName = "tabby"
+		case "minizip-ng":
+			pkgName = "minizip"
 		case "manpages":
 			pkgName = "man-pages"
 		case "gnumpc":
@@ -811,7 +823,15 @@ func HandleAutoBumpCommand(cfg *Config, autoBuild bool) error {
 		}
 
 		// Double check actual local version
-		curVer, _, err := getRepoVersion2(pkgName)
+		var curVer string
+		var isPkgSet bool
+		if pkgs, ok := sets[pkgName]; ok && len(pkgs) > 0 {
+			isPkgSet = true
+			curVer, _, err = getRepoVersion2(pkgs[0])
+		} else {
+			curVer, _, err = getRepoVersion2(pkgName)
+		}
+
 		if err != nil {
 			colWarn.Printf("Skipping %s: could not determine local version: %v\n", pkgName, err)
 			continue
@@ -825,25 +845,48 @@ func HandleAutoBumpCommand(cfg *Config, autoBuild bool) error {
 		}
 
 		colNote.Printf(">> [BUMPING] %s to %s\n", pkgName, newVer)
-		if err := handleSingleBumpCommand(pkgName, newVer, false, cfg); err != nil {
-			colError.Printf(">> [ERROR] bump failed for %s: %v\n", pkgName, err)
+		var bumpErr error
+		if isPkgSet {
+			bumpErr = handleSetBumpCommand(pkgName, curVer, newVer, false, cfg)
+		} else {
+			bumpErr = handleSingleBumpCommand(pkgName, newVer, false, cfg)
+		}
+
+		if bumpErr != nil {
+			colError.Printf(">> [ERROR] bump failed for %s: %v\n", pkgName, bumpErr)
 			failedBumps = append(failedBumps, pkgName)
-			logMsg("BUMP_FAILED: %s to %s: %v\n", pkgName, newVer, err)
+			logMsg("BUMP_FAILED: %s to %s: %v\n", pkgName, newVer, bumpErr)
 		} else {
 			colSuccess.Printf(">> [SUCCESS] %s updated.\n", pkgName)
 			successfullyBumped = append(successfullyBumped, pkgName)
 			logMsg("BUMP_SUCCESS: %s: %s -> %s\n", pkgName, curVer, newVer)
 
 			if autoBuild {
-				buildErr := buildBumpedPackage(pkgName, cfg)
+				var buildErrs []error
+				if isPkgSet {
+					for _, p := range sets[pkgName] {
+						if err := buildBumpedPackage(p, cfg); err != nil {
+							buildErrs = append(buildErrs, fmt.Errorf("%s: %v", p, err))
+						} else {
+							successfullyBuilt = append(successfullyBuilt, p)
+						}
+					}
+				} else {
+					if err := buildBumpedPackage(pkgName, cfg); err != nil {
+						buildErrs = append(buildErrs, err)
+					} else {
+						successfullyBuilt = append(successfullyBuilt, pkgName)
+					}
+				}
 
-				if buildErr != nil {
-					colError.Printf(">> [ERROR] build failed for %s: %v\n", pkgName, buildErr)
+				if len(buildErrs) > 0 {
+					for _, be := range buildErrs {
+						colError.Printf(">> [ERROR] build failed for %s: %v\n", pkgName, be)
+						logMsg("BUILD_FAILED: %s: %v\n", pkgName, be)
+					}
 					failedBuilds = append(failedBuilds, pkgName)
-					logMsg("BUILD_FAILED: %s: %v\n", pkgName, buildErr)
 				} else {
 					colSuccess.Printf(">> [SUCCESS] %s built.\n", pkgName)
-					successfullyBuilt = append(successfullyBuilt, pkgName)
 					logMsg("BUILD_SUCCESS: %s\n", pkgName)
 				}
 			}
