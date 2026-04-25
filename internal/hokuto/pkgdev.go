@@ -773,6 +773,10 @@ func HandleAutoBumpCommand(cfg *Config, autoBuild bool) error {
 
 		// Specific name tweaks
 		switch pkgName {
+		case "gnupg":
+			pkgName = "gnupg2"
+		case "lcms":
+			pkgName = "little-cms"
 		case "highway-simd-library":
 			pkgName = "highway"
 		case "tabby-terminal":
