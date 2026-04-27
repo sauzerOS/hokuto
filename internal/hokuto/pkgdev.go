@@ -773,6 +773,8 @@ func HandleAutoBumpCommand(cfg *Config, autoBuild bool) error {
 
 		// Specific name tweaks
 		switch pkgName {
+		case "pip":
+			pkgName = "python-pip"
 		case "gnupg":
 			pkgName = "gnupg2"
 		case "lcms":

@@ -587,6 +587,7 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, opts BuildOptions)
 			"XDG_CACHE_HOME":   filepath.Join(buildDir, ".cache"), // Prevent g-ir-scanner from using ~/.cache
 			"HOKUTO_ARCH":      targetArch,
 			"HOKUTO_BUILD_DIR": buildDir,
+			"CARGO_HOME":       filepath.Join(buildDir, "cargo"),
 			"GNU_MIRROR":       cfg.Values["GNU_MIRROR"],
 			"SET_HOKUTO_LTO":   cfg.Values["SET_HOKUTO_LTO"],
 			"MULTILIB":         multilibVal,
@@ -776,6 +777,7 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, opts BuildOptions)
 			"RUSTFLAGS":                  rustflags,
 			"GOFLAGS":                    "-trimpath -modcacherw",
 			"GOPATH":                     filepath.Join(buildDir, "go"),
+			"CARGO_HOME":                  filepath.Join(buildDir, "cargo"),
 			"HOKUTO_ROOT":                cfg.Values["HOKUTO_ROOT"],
 			"TMPDIR":                     currentTmpDir,
 			"XDG_CACHE_HOME":             filepath.Join(buildDir, ".cache"), // Prevent g-ir-scanner from using ~/.cache
