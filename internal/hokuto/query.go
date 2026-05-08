@@ -393,10 +393,22 @@ func GetRemotePackageEntry(pkgName string, cfg *Config, remoteIndex []RepoEntry)
 		return localBest
 	}
 
-	// 1. Preferred Variant
-	if match := searchInVariant(variant); match != nil {
-		return match, nil
+	var absoluteBest *RepoEntry
+
+	// Helper to update absoluteBest
+	updateBest := func(match *RepoEntry) {
+		if match == nil {
+			return
+		}
+		if absoluteBest == nil || isNewer(*match, *absoluteBest) ||
+			(match.Version == absoluteBest.Version && match.Revision == absoluteBest.Revision &&
+				match.Variant == variant && absoluteBest.Variant != variant) {
+			absoluteBest = match
+		}
 	}
+
+	// 1. Preferred Variant
+	updateBest(searchInVariant(variant))
 
 	// 2. Generic Variant (if preferred was not generic)
 	if !strings.Contains(variant, "generic") {
@@ -404,24 +416,20 @@ func GetRemotePackageEntry(pkgName string, cfg *Config, remoteIndex []RepoEntry)
 		if strings.HasPrefix(variant, "multi-") {
 			fallbackVariant = "multi-generic"
 		}
-		if match := searchInVariant(fallbackVariant); match != nil {
-			return match, nil
-		}
+		updateBest(searchInVariant(fallbackVariant))
 	}
 
 	// 3. Multi variants fallback
 	// If we are looking for non-multi (e.g. optimized) but only multi- exists, try that.
 	if !strings.HasPrefix(variant, "multi-") {
 		// Try multi- + variant (e.g. "optimized" -> "multi-optimized")
-		fallbackVariant := "multi-" + variant
-		if match := searchInVariant(fallbackVariant); match != nil {
-			return match, nil
-		}
-
+		updateBest(searchInVariant("multi-" + variant))
 		// Try multi-generic
-		if match := searchInVariant("multi-generic"); match != nil {
-			return match, nil
-		}
+		updateBest(searchInVariant("multi-generic"))
+	}
+
+	if absoluteBest != nil {
+		return absoluteBest, nil
 	}
 
 	if targetVersion != "" {

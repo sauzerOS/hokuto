@@ -555,21 +555,39 @@ func checkForUpgrades(_ context.Context, cfg *Config, maxJobs int, yes bool) err
 				continue
 			}
 
-			// 2. Check remote mirror (prefetch) — only if the package is in the remote index
 			if BinaryMirror != "" && len(remoteIndex) > 0 {
 				// Lookup checksum and verify the package exists in the index
 				var expectedSum string
 				foundInIndex := false
 				targetArch := GetSystemArchForPackage(cfg, pkgName)
-				targetVariant := GetSystemVariantForPackage(cfg, pkgName)
+				preferredVariant := GetSystemVariantForPackage(cfg, pkgName)
+				fallbackVariant := ""
+				if !strings.Contains(preferredVariant, "generic") {
+					fallbackVariant = "generic"
+					if strings.HasPrefix(preferredVariant, "multi-") {
+						fallbackVariant = "multi-generic"
+					}
+				}
+
+				var bestEntry *RepoEntry
 				for _, entry := range remoteIndex {
 					if entry.Name == pkgName && entry.Version == version &&
-						entry.Revision == revision && entry.Arch == targetArch &&
-						entry.Variant == targetVariant {
-						expectedSum = entry.B3Sum
-						foundInIndex = true
-						break
+						entry.Revision == revision && entry.Arch == targetArch {
+						if entry.Variant == preferredVariant {
+							e := entry
+							bestEntry = &e
+							break
+						}
+						if fallbackVariant != "" && entry.Variant == fallbackVariant {
+							e := entry
+							bestEntry = &e
+						}
 					}
+				}
+
+				if bestEntry != nil {
+					expectedSum = bestEntry.B3Sum
+					foundInIndex = true
 				}
 
 				// Only attempt download if the package was found in the remote index
@@ -635,15 +653,34 @@ func checkForUpgrades(_ context.Context, cfg *Config, maxJobs int, yes bool) err
 				var expectedSum string
 				foundInIndex := false
 				targetArch := GetSystemArchForPackage(cfg, pkgName)
-				targetVariant := GetSystemVariantForPackage(cfg, pkgName)
+				preferredVariant := GetSystemVariantForPackage(cfg, pkgName)
+				fallbackVariant := ""
+				if !strings.Contains(preferredVariant, "generic") {
+					fallbackVariant = "generic"
+					if strings.HasPrefix(preferredVariant, "multi-") {
+						fallbackVariant = "multi-generic"
+					}
+				}
+
+				var bestEntry *RepoEntry
 				for _, entry := range remoteIndex {
 					if entry.Name == pkgName && entry.Version == version &&
-						entry.Revision == revision && entry.Arch == targetArch &&
-						entry.Variant == targetVariant {
-						expectedSum = entry.B3Sum
-						foundInIndex = true
-						break
+						entry.Revision == revision && entry.Arch == targetArch {
+						if entry.Variant == preferredVariant {
+							e := entry
+							bestEntry = &e
+							break
+						}
+						if fallbackVariant != "" && entry.Variant == fallbackVariant {
+							e := entry
+							bestEntry = &e
+						}
 					}
+				}
+
+				if bestEntry != nil {
+					expectedSum = bestEntry.B3Sum
+					foundInIndex = true
 				}
 
 				// Only attempt download if the package was found in the remote index
@@ -658,6 +695,27 @@ func checkForUpgrades(_ context.Context, cfg *Config, maxJobs int, yes bool) err
 			arch := GetSystemArchForPackage(cfg, pkgName)
 			variant := GetSystemVariantForPackage(cfg, pkgName)
 			tarballPath := filepath.Join(BinDir, StandardizeRemoteName(outputPkgName, version, revision, arch, variant))
+
+			// If we found a different variant in the index and it was successfully fetched,
+			// we need to check for that path instead.
+			// Actually, we can just check if any variant exists in the loop below.
+			// But for consistency with sequential mode:
+			if BinaryMirror != "" && len(remoteIndex) > 0 {
+				// Re-verify which variant we actually have
+				targetArch := GetSystemArchForPackage(cfg, pkgName)
+
+				for _, entry := range remoteIndex {
+					if entry.Name == pkgName && entry.Version == version &&
+						entry.Revision == revision && entry.Arch == targetArch {
+						// Check if this variant's tarball exists
+						testPath := filepath.Join(BinDir, StandardizeRemoteName(outputPkgName, version, revision, targetArch, entry.Variant))
+						if _, err := os.Stat(testPath); err == nil {
+							tarballPath = testPath
+							break
+						}
+					}
+				}
+			}
 
 			if _, err := os.Stat(tarballPath); err == nil {
 				// Found binary! Return success with 0 duration to signal "skipped build" (ready for install)
@@ -727,14 +785,38 @@ func checkForUpgrades(_ context.Context, cfg *Config, maxJobs int, yes bool) err
 			var expectedSum string
 			foundInIndex := false
 			targetArch := GetSystemArchForPackage(cfg, pkgName)
-			targetVariant := GetSystemVariantForPackage(cfg, pkgName)
+			preferredVariant := GetSystemVariantForPackage(cfg, pkgName)
+			fallbackVariant := ""
+			if !strings.Contains(preferredVariant, "generic") {
+				fallbackVariant = "generic"
+				if strings.HasPrefix(preferredVariant, "multi-") {
+					fallbackVariant = "multi-generic"
+				}
+			}
+
+			var bestEntry *RepoEntry
 			for _, entry := range remoteIndex {
 				if entry.Name == pkgName && entry.Version == version &&
-					entry.Revision == revision && entry.Arch == targetArch &&
-					entry.Variant == targetVariant {
-					expectedSum = entry.B3Sum
-					foundInIndex = true
-					break
+					entry.Revision == revision && entry.Arch == targetArch {
+					if entry.Variant == preferredVariant {
+						e := entry
+						bestEntry = &e
+						break
+					}
+					if fallbackVariant != "" && entry.Variant == fallbackVariant {
+						e := entry
+						bestEntry = &e
+					}
+				}
+			}
+
+			if bestEntry != nil {
+				expectedSum = bestEntry.B3Sum
+				foundInIndex = true
+				// If we are using a fallback, update the tarball path
+				if bestEntry.Variant != preferredVariant {
+					tarballName = StandardizeRemoteName(outputPkgName, version, revision, targetArch, bestEntry.Variant)
+					tarballPath = filepath.Join(BinDir, tarballName)
 				}
 			}
 

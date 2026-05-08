@@ -43,42 +43,39 @@ func checkForRemoteUpgrades(_ context.Context, cfg *Config) error {
 		// (Assume current system settings)
 		// We filter remote index to find the entry matching pkg.Name
 		var remoteEntry RepoEntry
-		found := false
 
 		// We need to match based on system arch/variant preferences
 		targetArch := GetSystemArchForPackage(cfg, name)
 		// Determine variant (generic/optimized/multilib)
 		preferredVariant := GetSystemVariantForPackage(cfg, name)
-
-		for _, entry := range remoteIndex {
-			if entry.Name == name && entry.Arch == targetArch && entry.Variant == preferredVariant {
-				remoteEntry = entry
-				found = true
-				break
-			}
-		}
-
-		usingFallback := false
-		if !found && !strings.Contains(preferredVariant, "generic") {
-			// Try generic fallback
-			fallbackVariant := "generic"
+		fallbackVariant := ""
+		if !strings.Contains(preferredVariant, "generic") {
+			fallbackVariant = "generic"
 			if strings.HasPrefix(preferredVariant, "multi-") {
 				fallbackVariant = "multi-generic"
 			}
+		}
 
-			for _, entry := range remoteIndex {
-				if entry.Name == name && entry.Arch == targetArch && entry.Variant == fallbackVariant {
-					remoteEntry = entry
-					found = true
-					usingFallback = true
-					break
+		var bestEntry *RepoEntry
+		for _, entry := range remoteIndex {
+			if entry.Name == name && entry.Arch == targetArch {
+				if entry.Variant == preferredVariant || (fallbackVariant != "" && entry.Variant == fallbackVariant) {
+					if bestEntry == nil || isNewer(entry, *bestEntry) ||
+						(entry.Version == bestEntry.Version && entry.Revision == bestEntry.Revision &&
+							entry.Variant == preferredVariant && bestEntry.Variant != preferredVariant) {
+						e := entry
+						bestEntry = &e
+					}
 				}
 			}
 		}
 
-		if !found {
+		if bestEntry == nil {
 			continue // Package not in remote repo
 		}
+
+		remoteEntry = *bestEntry
+		usingFallback := remoteEntry.Variant == fallbackVariant && fallbackVariant != ""
 
 		// If using fallback, prompt now or mark it?
 		// Better to mark it in the version string or similar for the final table.
@@ -245,47 +242,35 @@ func checkForRemoteUpgrades(_ context.Context, cfg *Config) error {
 func installRemotePackage(pkgName string, cfg *Config, remoteIndex []RepoEntry) error {
 	// Find entry
 	var entry RepoEntry
-	found := false
 	arch := GetSystemArchForPackage(cfg, pkgName)
 	preferredVariant := GetSystemVariantForPackage(cfg, pkgName)
-
-	var bestMatch *RepoEntry
-	for _, e := range remoteIndex {
-		if e.Name == pkgName && e.Arch == arch && e.Variant == preferredVariant {
-			if bestMatch == nil || isNewer(e, *bestMatch) {
-				bestMatch = &e
-			}
-		}
-	}
-
-	if bestMatch != nil {
-		entry = *bestMatch
-		found = true
-	}
-
-	// FALLBACK: Try generic
-	if !found && !strings.Contains(preferredVariant, "generic") {
-		fallbackVariant := "generic"
+	fallbackVariant := ""
+	if !strings.Contains(preferredVariant, "generic") {
+		fallbackVariant = "generic"
 		if strings.HasPrefix(preferredVariant, "multi-") {
 			fallbackVariant = "multi-generic"
 		}
+	}
 
-		for _, e := range remoteIndex {
-			if e.Name == pkgName && e.Arch == arch && e.Variant == fallbackVariant {
-				if bestMatch == nil || isNewer(e, *bestMatch) {
-					bestMatch = &e
+	var bestMatch *RepoEntry
+	for _, e := range remoteIndex {
+		if e.Name == pkgName && e.Arch == arch {
+			if e.Variant == preferredVariant || (fallbackVariant != "" && e.Variant == fallbackVariant) {
+				if bestMatch == nil || isNewer(e, *bestMatch) ||
+					(e.Version == bestMatch.Version && e.Revision == bestMatch.Revision &&
+						e.Variant == preferredVariant && bestMatch.Variant != preferredVariant) {
+					entryCopy := e
+					bestMatch = &entryCopy
 				}
 			}
 		}
-		if bestMatch != nil {
-			entry = *bestMatch
-			found = true
-		}
 	}
 
-	if !found {
-		return fmt.Errorf("package %s not in remote index for %s (%s)", pkgName, arch, preferredVariant)
+	if bestMatch == nil {
+		return fmt.Errorf("package %s not in remote index for %s (preferred: %s)", pkgName, arch, preferredVariant)
 	}
+
+	entry = *bestMatch
 
 	version := entry.Version
 	revision := entry.Revision
