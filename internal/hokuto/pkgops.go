@@ -297,6 +297,19 @@ func generateLibDeps(outputDir, libdepsFile string, execCtx *Executor) error {
 		return nil
 	}
 
+	// Build a map of filenames provided by this package to avoid self-dependencies
+	providedFiles := make(map[string]struct{})
+	var findFilesOutput bytes.Buffer
+	findFilesCmd := exec.Command("find", outputDir, "-type", "f")
+	findFilesCmd.Stdout = &findFilesOutput
+	findFilesCmd.Stderr = io.Discard
+	if err := execCtx.Run(findFilesCmd); err == nil {
+		scanner := bufio.NewScanner(bytes.NewReader(findFilesOutput.Bytes()))
+		for scanner.Scan() {
+			providedFiles[filepath.Base(scanner.Text())] = struct{}{}
+		}
+	}
+
 	debugf("Found %d executable files to check for dependencies.\n", len(files))
 
 	type result struct{ libs []string }
@@ -308,7 +321,7 @@ func generateLibDeps(outputDir, libdepsFile string, execCtx *Executor) error {
 	worker := func() {
 		defer wg.Done()
 		for file := range fileCh {
-			var fileOut, lddOut bytes.Buffer
+			var fileOut, readelfOut bytes.Buffer
 
 			// 1. Check if file is an ELF binary (must use a privileged executor)
 			cmdFile := exec.Command("file", "--brief", file)
@@ -323,26 +336,32 @@ func generateLibDeps(outputDir, libdepsFile string, execCtx *Executor) error {
 				continue
 			}
 
-			// 2. Run ldd to find dependencies (must use a privileged executor)
-			lddCmd := exec.Command("ldd", file)
-			lddCmd.Stdout = &lddOut
-			lddCmd.Stderr = io.Discard
+			// 2. Run readelf -d to find direct dependencies (must use a privileged executor)
+			readelfCmd := exec.Command("readelf", "-d", file)
+			readelfCmd.Stdout = &readelfOut
+			readelfCmd.Stderr = io.Discard
 
-			if err := execCtx.Run(lddCmd); err != nil {
+			if err := execCtx.Run(readelfCmd); err != nil {
 				continue
 			}
 
 			var libs []string
-			scanner := bufio.NewScanner(bytes.NewReader(lddOut.Bytes()))
+			scanner := bufio.NewScanner(bytes.NewReader(readelfOut.Bytes()))
 			for scanner.Scan() {
 				line := scanner.Text()
-				parts := strings.Fields(line)
-				if len(parts) >= 3 && parts[1] == "=>" {
-					libPath := parts[2]
-					if strings.HasPrefix(libPath, "/") &&
-						!strings.HasPrefix(libPath, outputDir) &&
-						!matchesIgnore(libPath) {
-						libs = append(libs, filepath.Base(libPath))
+				if !strings.Contains(line, "(NEEDED)") {
+					continue
+				}
+
+				// Format: 0x0000000000000001 (NEEDED)             Shared library: [libassuan.so.9]
+				idxStart := strings.Index(line, "[")
+				idxEnd := strings.Index(line, "]")
+				if idxStart != -1 && idxEnd != -1 && idxEnd > idxStart {
+					libName := line[idxStart+1 : idxEnd]
+					// Filter out ignored patterns and libraries provided by this package
+					_, provided := providedFiles[libName]
+					if !matchesIgnore(libName) && !provided {
+						libs = append(libs, libName)
 					}
 				}
 			}

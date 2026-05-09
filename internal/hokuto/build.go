@@ -777,7 +777,7 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, opts BuildOptions)
 			"RUSTFLAGS":                  rustflags,
 			"GOFLAGS":                    "-trimpath -modcacherw",
 			"GOPATH":                     filepath.Join(buildDir, "go"),
-			"CARGO_HOME":                  filepath.Join(buildDir, "cargo"),
+			"CARGO_HOME":                 filepath.Join(buildDir, "cargo"),
 			"HOKUTO_ROOT":                cfg.Values["HOKUTO_ROOT"],
 			"TMPDIR":                     currentTmpDir,
 			"XDG_CACHE_HOME":             filepath.Join(buildDir, ".cache"), // Prevent g-ir-scanner from using ~/.cache
@@ -1230,11 +1230,13 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, opts BuildOptions)
 	}
 
 	// Generate libdeps
-	libdepsFile := filepath.Join(installedDir, "libdeps")
-	if err := generateLibDeps(outputDir, libdepsFile, buildExec); err != nil {
-		fmt.Printf("Warning: failed to generate libdeps: %v\n", err)
-	} else {
-		debugf("Library dependencies written to %s\n", libdepsFile)
+	if !options["binary"] {
+		libdepsFile := filepath.Join(installedDir, "libdeps")
+		if err := generateLibDeps(outputDir, libdepsFile, buildExec); err != nil {
+			fmt.Printf("Warning: failed to generate libdeps: %v\n", err)
+		} else {
+			debugf("Library dependencies written to %s\n", libdepsFile)
+		}
 	}
 
 	// Generate depends (use outputPkgName for cross-system builds)
@@ -2149,11 +2151,13 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 	}
 
 	// Generate libdeps
-	libdepsFile := filepath.Join(installedDir, "libdeps")
-	if err := generateLibDeps(outputDir, libdepsFile, buildExec); err != nil {
-		fmt.Printf("Warning: failed to generate libdeps: %v\n", err)
-	} else {
-		debugf("Library dependencies written to %s\n", libdepsFile)
+	if !options["binary"] {
+		libdepsFile := filepath.Join(installedDir, "libdeps")
+		if err := generateLibDeps(outputDir, libdepsFile, buildExec); err != nil {
+			fmt.Printf("Warning: failed to generate libdeps: %v\n", err)
+		} else {
+			debugf("Library dependencies written to %s\n", libdepsFile)
+		}
 	}
 
 	// Generate depends (use outputPkgName for cross-system builds)
