@@ -772,7 +772,16 @@ func HandleAutoBumpCommand(cfg *Config, autoBuild bool) error {
 		pkgName := strings.ReplaceAll(project, ":", "-")
 
 		// Specific name tweaks
+		// Works for pkgname or pkgset
 		switch pkgName {
+                case "intel-microcode":
+			pkgName = "intel-ucode"
+		case "gstreamer":
+			pkgName = "gst"
+		case "openal-soft":
+			pkgName = "openal"
+		case "maturin":
+			pkgName = "python-maturin"
 		case "pip":
 			pkgName = "python-pip"
 		case "gnupg":
