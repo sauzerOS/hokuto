@@ -329,6 +329,18 @@ func findPackageDir(pkgName string) (string, error) {
 		}
 	}
 
+	// Check if this is a versioned package name (pkg-MAJOR)
+	// If so, add the base name to searchNames as a fallback.
+	for _, name := range searchNames {
+		if lastDash := strings.LastIndex(name, "-"); lastDash != -1 {
+			suffix := name[lastDash+1:]
+			if _, err := strconv.Atoi(suffix); err == nil {
+				baseName := name[:lastDash]
+				searchNames = append(searchNames, baseName)
+			}
+		}
+	}
+
 	paths := strings.Split(repoPaths, ":")
 	for _, name := range searchNames {
 		for _, repoPath := range paths {
@@ -461,6 +473,15 @@ func isMultilibPackage(pkgName string) bool {
 	}
 	// Remove -multi suffix if present for lookup
 	baseName := strings.TrimSuffix(pkgName, "-multi")
+
+	// Also handle versioned names (pkg-MAJOR) by checking the base name
+	if lastDash := strings.LastIndex(baseName, "-"); lastDash != -1 {
+		suffix := baseName[lastDash+1:]
+		if _, err := strconv.Atoi(suffix); err == nil {
+			baseName = baseName[:lastDash]
+		}
+	}
+
 	for _, multilibPkg := range MultilibPackages {
 		if multilibPkg == baseName {
 			return true

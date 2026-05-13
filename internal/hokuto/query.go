@@ -375,7 +375,17 @@ func GetRemotePackageEntry(pkgName string, cfg *Config, remoteIndex []RepoEntry)
 		var localBest *RepoEntry
 		for i := range remoteIndex {
 			entry := &remoteIndex[i]
-			if entry.Name == lookupName && entry.Arch == arch && entry.Variant == searchVariant {
+			// Match logic: exact name or versioned name (pkg-MAJOR)
+			match := entry.Name == lookupName
+			if !match && targetVersion != "" {
+				// If looking for a specific version, also check if the index has it under pkg-MAJOR
+				major := strings.Split(targetVersion, ".")[0]
+				if major != "" && entry.Name == lookupName+"-"+major {
+					match = true
+				}
+			}
+
+			if match && entry.Arch == arch && entry.Variant == searchVariant {
 				if targetVersion != "" {
 					if entry.Version == targetVersion {
 						if targetRevision != "" && entry.Revision != targetRevision {

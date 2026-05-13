@@ -964,7 +964,10 @@ func prepareVersionedPackage(arg string) (string, error) {
 	major := strings.Split(foundVersion, ".")[0]
 	renamedPkgName := pkgName
 	if major != "" {
-		renamedPkgName = fmt.Sprintf("%s-%s", pkgName, major)
+		suffix := "-" + major
+		if !strings.HasSuffix(pkgName, suffix) {
+			renamedPkgName = fmt.Sprintf("%s-%s", pkgName, major)
+		}
 	}
 
 	// 4. Extract the package files from the commit
