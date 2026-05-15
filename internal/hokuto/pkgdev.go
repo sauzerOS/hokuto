@@ -774,6 +774,8 @@ func HandleAutoBumpCommand(cfg *Config, autoBuild bool) error {
 		// Specific name tweaks
 		// Works for pkgname or pkgset
 		switch pkgName {
+		case "aom":
+			pkgName = "libaom"
                 case "intel-microcode":
 			pkgName = "intel-ucode"
 		case "gstreamer":
