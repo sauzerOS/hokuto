@@ -98,7 +98,7 @@ func getExtraSubs(pkgName string) (map[string]string, error) {
 	return nil, nil
 }
 
-func applySubstitutions(content, version, pkgName string, extraSubs map[string]string) string {
+func applySubstitutions(content, version, revision, pkgName string, extraSubs map[string]string) string {
 	sepFunc := func(r rune) bool {
 		return r == '.' || r == '_' || r == '-'
 	}
@@ -151,6 +151,7 @@ func applySubstitutions(content, version, pkgName string, extraSubs map[string]s
 		"${version-glued-last}", versionGluedLast,
 		"${version-last-only}", versionLastOnly,
 		"${version-kernel}", versionKernel,
+		"${revision}", revision,
 		"${pkgname}", pkgName,
 	}
 
@@ -316,6 +317,10 @@ func editPackage(pkgName string, openAll bool) error {
 			return fmt.Errorf("version file is empty")
 		}
 		version := versionFields[0]
+		revision := "1"
+		if len(versionFields) > 1 {
+			revision = versionFields[1]
+		}
 
 		dotSourcesData, err := os.ReadFile(dotSourcesPath)
 		if err != nil {
@@ -329,7 +334,7 @@ func editPackage(pkgName string, openAll bool) error {
 			fmt.Printf("Warning: failed to get extra substitutions: %v\n", err)
 		}
 
-		updatedSources := applySubstitutions(string(dotSourcesData), version, pkgName, extraSubs)
+		updatedSources := applySubstitutions(string(dotSourcesData), version, revision, pkgName, extraSubs)
 		if err := os.WriteFile(sourcesPath, []byte(updatedSources), 0o644); err != nil {
 			return fmt.Errorf("failed to write updated sources file: %v", err)
 		}
@@ -455,7 +460,7 @@ func bumpPackage(pkgName, expectedOldVersion, newVersion string) (string, error)
 		return "", fmt.Errorf("failed to get extra substitutions: %w", err)
 	}
 
-	updatedSources := applySubstitutions(string(dotSourcesData), newVersion, pkgName, extraSubs)
+	updatedSources := applySubstitutions(string(dotSourcesData), newVersion, strconv.Itoa(newRev), pkgName, extraSubs)
 	sourcesPath := filepath.Join(pkgDir, "sources")
 	if err := os.WriteFile(sourcesPath, []byte(updatedSources), 0o644); err != nil {
 		return "", fmt.Errorf("%s: failed to update sources file", pkgName)

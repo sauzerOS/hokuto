@@ -474,19 +474,26 @@ func isMultilibPackage(pkgName string) bool {
 	// Remove -multi suffix if present for lookup
 	baseName := strings.TrimSuffix(pkgName, "-multi")
 
-	// Also handle versioned names (pkg-MAJOR) by checking the base name
-	if lastDash := strings.LastIndex(baseName, "-"); lastDash != -1 {
-		suffix := baseName[lastDash+1:]
-		if _, err := strconv.Atoi(suffix); err == nil {
-			baseName = baseName[:lastDash]
-		}
-	}
-
+	// First check the exact name
 	for _, multilibPkg := range MultilibPackages {
 		if multilibPkg == baseName {
 			return true
 		}
 	}
+
+	// Also handle versioned names (pkg-MAJOR) by checking the base name
+	if lastDash := strings.LastIndex(baseName, "-"); lastDash != -1 {
+		suffix := baseName[lastDash+1:]
+		if _, err := strconv.Atoi(suffix); err == nil {
+			strippedName := baseName[:lastDash]
+			for _, multilibPkg := range MultilibPackages {
+				if multilibPkg == strippedName {
+					return true
+				}
+			}
+		}
+	}
+
 	return false
 }
 
