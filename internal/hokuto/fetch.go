@@ -607,8 +607,7 @@ func downloadViaBrowser(url, destPath string, quiet bool) error {
 
 // fetchBinaryPackage attempts to download a binary package from the configured mirror.
 
-// fetchBinaryPackage attempts to download a binary package from the configured mirror.
-func fetchBinaryPackage(pkgName, version, revision string, cfg *Config, quiet bool, expectedSum string, force bool) error {
+func fetchSpecificBinaryPackage(pkgName, version, revision, variant string, cfg *Config, quiet bool, expectedSum string, force bool) error {
 	lookupName := pkgName
 	if idx := strings.Index(pkgName, "@"); idx != -1 {
 		lookupName = pkgName[:idx]
@@ -619,7 +618,6 @@ func fetchBinaryPackage(pkgName, version, revision string, cfg *Config, quiet bo
 	}
 
 	arch := GetSystemArchForPackage(cfg, lookupName)
-	variant := GetSystemVariantForPackage(cfg, lookupName)
 	filename := StandardizeRemoteName(lookupName, version, revision, arch, variant)
 	url := fmt.Sprintf("%s/%s", BinaryMirror, filename)
 	destPath := filepath.Join(BinDir, filename)
@@ -649,6 +647,16 @@ func fetchBinaryPackage(pkgName, version, revision string, cfg *Config, quiet bo
 	}
 
 	return nil
+}
+
+// fetchBinaryPackage attempts to download a binary package from the configured mirror.
+func fetchBinaryPackage(pkgName, version, revision string, cfg *Config, quiet bool, expectedSum string, force bool) error {
+	lookupName := pkgName
+	if idx := strings.Index(pkgName, "@"); idx != -1 {
+		lookupName = pkgName[:idx]
+	}
+	variant := GetSystemVariantForPackage(cfg, lookupName)
+	return fetchSpecificBinaryPackage(pkgName, version, revision, variant, cfg, quiet, expectedSum, force)
 }
 
 // prefetchSources runs in a background goroutine to download sources.

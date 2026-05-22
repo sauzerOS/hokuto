@@ -311,7 +311,7 @@ func resolveRemoteDependencies(pkgName string, visited map[string]bool, plan *[]
 		}
 	} else {
 		// Fallback: Fetch binary package to read depends (older index or missing info)
-		if err := fetchBinaryPackage(entry.Name, entry.Version, entry.Revision, cfg, false, entry.B3Sum, false); err != nil {
+		if err := fetchSpecificBinaryPackage(entry.Name, entry.Version, entry.Revision, entry.Variant, cfg, false, entry.B3Sum, false); err != nil {
 			return fmt.Errorf("failed to fetch remote package for dependency resolution (%s): %v", pkgName, err)
 		}
 
