@@ -781,7 +781,7 @@ func HandleAutoBumpCommand(cfg *Config, autoBuild bool) error {
 		switch pkgName {
 		case "aom":
 			pkgName = "libaom"
-                case "intel-microcode":
+        case "intel-microcode":
 			pkgName = "intel-ucode"
 		case "gstreamer":
 			pkgName = "gst"
@@ -791,6 +791,8 @@ func HandleAutoBumpCommand(cfg *Config, autoBuild bool) error {
 			pkgName = "python-maturin"
 		case "pip":
 			pkgName = "python-pip"
+		case"python-cython":
+			pkgName = "cython"
 		case "gnupg":
 			pkgName = "gnupg2"
 		case "lcms":
