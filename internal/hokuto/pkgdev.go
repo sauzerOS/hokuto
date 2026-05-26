@@ -139,6 +139,15 @@ func applySubstitutions(content, version, revision, pkgName string, extraSubs ma
 		sqliteVer = fmt.Sprintf("%d%02d%02d%02d", v[0], v[1], v[2], v[3])
 	}
 
+	// Logic for ${version-libburnia}: 1.5.8.2 -> 1.5.8.pl02, 1.5.8 -> 1.5.8
+	versionLibburnia := version
+	partsLibburnia := strings.Split(version, ".")
+	if len(partsLibburnia) == 4 {
+		if val, err := strconv.Atoi(partsLibburnia[3]); err == nil {
+			versionLibburnia = fmt.Sprintf("%s.%s.%s.pl%02d", partsLibburnia[0], partsLibburnia[1], partsLibburnia[2], val)
+		}
+	}
+
 	args := []string{
 		"${version}", version,
 		"${version-clean}", strings.ReplaceAll(version, "_", "."),
@@ -152,6 +161,7 @@ func applySubstitutions(content, version, revision, pkgName string, extraSubs ma
 		"${version-glued-last}", versionGluedLast,
 		"${version-last-only}", versionLastOnly,
 		"${version-kernel}", versionKernel,
+		"${version-libburnia}", versionLibburnia,
 		"${revision}", revision,
 		"${pkgname}", pkgName,
 	}
@@ -953,15 +963,6 @@ func tweakVersion(pkgName, ver string) string {
 		// repology version 7.1.2.21 -> local verion scheme: 7.1.2-21
 		if lastDot := strings.LastIndex(ver, "."); lastDot != -1 {
 			return ver[:lastDot] + "-" + ver[lastDot+1:]
-		}
-	case "libisoburn", "libburn", "libisofs":
-		// Arch Linux packages libburnia releases with an extra . for patch levels, e.g. 1.5.8.2 -> 1.5.8.pl02
-		// Convert X.Y.Z.P to X.Y.Z.pl0P
-		parts := strings.Split(ver, ".")
-		if len(parts) == 4 {
-			if val, err := strconv.Atoi(parts[3]); err == nil {
-				return fmt.Sprintf("%s.%s.%s.pl%02d", parts[0], parts[1], parts[2], val)
-			}
 		}
 	}
 	return ver
