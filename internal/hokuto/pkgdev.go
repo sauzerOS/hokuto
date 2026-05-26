@@ -827,21 +827,8 @@ func HandleAutoBumpCommand(cfg *Config, autoBuild bool) error {
 		}
 
 		// Package-specific version tweaks
-		switch pkgName {
-		case "openssh":
-			// Repology often reports openssh versions with an underscore (10.3_p1)
-			// while the actual version used by openssh and our repo is 10.3p1.
-			newVer = strings.ReplaceAll(newVer, "_p", "p")
-			repologyCurrent = strings.ReplaceAll(repologyCurrent, "_p", "p")
-		case "imagemagick":
-			// repology version 7.1.2.21 -> local verion scheme: 7.1.2-21
-			if lastDot := strings.LastIndex(newVer, "."); lastDot != -1 {
-				newVer = newVer[:lastDot] + "-" + newVer[lastDot+1:]
-			}
-			if lastDot := strings.LastIndex(repologyCurrent, "."); lastDot != -1 {
-				repologyCurrent = repologyCurrent[:lastDot] + "-" + repologyCurrent[lastDot+1:]
-			}
-		}
+		newVer = tweakVersion(pkgName, newVer)
+		repologyCurrent = tweakVersion(pkgName, repologyCurrent)
 
 		if newVer == "" {
 			continue // Should not happen if it's outdated
@@ -952,4 +939,30 @@ func HandleAutoBumpCommand(cfg *Config, autoBuild bool) error {
 
 	colSuccess.Println("=== Work Complete ===")
 	return nil
+}
+
+// tweakVersion maps external repository version formats (e.g. from Repology/Arch Linux)
+// to local version format schemes for specific packages.
+func tweakVersion(pkgName, ver string) string {
+	switch pkgName {
+	case "openssh":
+		// Repology often reports openssh versions with an underscore (10.3_p1)
+		// while the actual version used by openssh and our repo is 10.3p1.
+		return strings.ReplaceAll(ver, "_p", "p")
+	case "imagemagick":
+		// repology version 7.1.2.21 -> local verion scheme: 7.1.2-21
+		if lastDot := strings.LastIndex(ver, "."); lastDot != -1 {
+			return ver[:lastDot] + "-" + ver[lastDot+1:]
+		}
+	case "libisoburn", "libburn", "libisofs":
+		// Arch Linux packages libburnia releases with an extra . for patch levels, e.g. 1.5.8.2 -> 1.5.8.pl02
+		// Convert X.Y.Z.P to X.Y.Z.pl0P
+		parts := strings.Split(ver, ".")
+		if len(parts) == 4 {
+			if val, err := strconv.Atoi(parts[3]); err == nil {
+				return fmt.Sprintf("%s.%s.%s.pl%02d", parts[0], parts[1], parts[2], val)
+			}
+		}
+	}
+	return ver
 }
