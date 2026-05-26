@@ -161,11 +161,7 @@ func prepareSources(pkgName, pkgDir, buildDir string, execCtx *Executor) error {
 
 		case isUrlSource:
 			// Other URL sources (archives): Source path is the symlink in the cache dir (SourcesDir/pkgName/filename)
-			urlPath, err := url.Parse(relPath)
-			if err != nil {
-				return fmt.Errorf("invalid URL in sources file: %v", err)
-			}
-			filenameOnDisk := filepath.Base(urlPath.Path)
+			filenameOnDisk := filepath.Base(relPath)
 			if filenameOverride != "" {
 				filenameOnDisk = filenameOverride
 			}

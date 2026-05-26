@@ -51,9 +51,9 @@ func getAntigravityString() (string, error) {
 		return "", fmt.Errorf("failed to read JS body: %v", err)
 	}
 
-	// Look for the version string in any link (Windows/Mac links are hardcoded in the JS)
-	// href:"https://edgedl.me.gvt1.com/edgedl/release2/j0qc3/antigravity/stable/1.16.5-6703236727046144/windows-x64/Antigravity.exe"
-	re := regexp.MustCompile(`/stable/[\d\.]+-(\d+)/`)
+	// Look for the version string in any link
+	// href:"https://edgedl.me.gvt1.com/edgedl/release2/j0qc3/antigravity/stable/2.0.3-6242596486512640/linux-x64/Antigravity%20IDE.tar.gz"
+	re := regexp.MustCompile(`/stable/[\d\.]+-(\d+)/linux-x64/Antigravity%20IDE\.tar\.gz`)
 	matches := re.FindSubmatch(jsBody)
 	if len(matches) < 2 {
 		return "", fmt.Errorf("could not find version string in JS file")
@@ -81,7 +81,7 @@ func getVSCodeString() (string, error) {
 
 func getExtraSubs(pkgName string) (map[string]string, error) {
 	base := filepath.Base(pkgName)
-	if base == "antigravity" {
+	if base == "antigravity-ide" {
 		s, err := getAntigravityString()
 		if err != nil {
 			return nil, err
@@ -144,6 +144,7 @@ func applySubstitutions(content, version, revision, pkgName string, extraSubs ma
 		"${version-clean}", strings.ReplaceAll(version, "_", "."),
 		"${version_}", strings.ReplaceAll(version, ".", "_"),
 		"${version-}", strings.ReplaceAll(version, ".", "-"),
+		"${version-undertomid}", strings.ReplaceAll(version, "_", "-"),
 		"${version-major}", major,
 		"${version-major-minor}", majorMinor,
 		"${version-sqlite}", sqliteVer,
@@ -781,7 +782,7 @@ func HandleAutoBumpCommand(cfg *Config, autoBuild bool) error {
 		switch pkgName {
 		case "aom":
 			pkgName = "libaom"
-        case "intel-microcode":
+		case "intel-microcode":
 			pkgName = "intel-ucode"
 		case "gstreamer":
 			pkgName = "gst"
@@ -791,7 +792,7 @@ func HandleAutoBumpCommand(cfg *Config, autoBuild bool) error {
 			pkgName = "python-maturin"
 		case "pip":
 			pkgName = "python-pip"
-		case"python-cython":
+		case "python-cython":
 			pkgName = "cython"
 		case "gnupg":
 			pkgName = "gnupg2"
