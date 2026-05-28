@@ -8,6 +8,8 @@ import (
 	"os/exec"
 	"syscall"
 	"time"
+
+	"golang.org/x/term"
 )
 
 // Executor provides a consistent interface for executing commands,
@@ -46,30 +48,57 @@ func (e *Executor) ensureSudo() error {
 	if os.Geteuid() == 0 || !e.ShouldRunAsRoot {
 		return nil
 	}
-	// 1. First, perform a non-interactive check (`sudo -nv`) to see if the ticket is still valid.
-	// This is fast and avoids any user interaction if the ticket is fresh.
-	checkCmd := exec.CommandContext(e.Context, "sudo", "-nv")
-	checkCmd.Stdout = io.Discard
-	checkCmd.Stderr = io.Discard
 
-	if err := checkCmd.Run(); err == nil {
-		// Success (exit code 0): The sudo ticket is valid. Nothing more to do.
-		return nil
+	for {
+		if e.Context.Err() != nil {
+			return e.Context.Err()
+		}
+
+		// 1. First, perform a non-interactive check (`sudo -nv`) to see if the ticket is still valid.
+		// This is fast and avoids any user interaction if the ticket is fresh.
+		checkCmd := exec.CommandContext(e.Context, "sudo", "-nv")
+		checkCmd.Stdout = io.Discard
+		checkCmd.Stderr = io.Discard
+
+		if err := checkCmd.Run(); err == nil {
+			// Success (exit code 0): The sudo ticket is valid. Nothing more to do.
+			return nil
+		}
+
+		if e.Context.Err() != nil {
+			return e.Context.Err()
+		}
+
+		// Non-interactive check failed — the ticket has likely expired.
+		// We must now re-authenticate interactively using `sudo -v`.
+		colArrow.Print("-> ")
+		colSuccess.Println("Sudo ticket has expired. Re-authenticating")
+
+		startTime := time.Now()
+		// Use a dedicated interactive runner that does NOT set a new process group.
+		// This ensures `sudo` can correctly access the TTY for password input.
+		err := runInteractiveCommand(e.Context, "sudo", "-v")
+		if err == nil {
+			colArrow.Print("-> ")
+			colSuccess.Println("Re-authenticated via sudo successfully.")
+			return nil
+		}
+
+		if e.Context.Err() != nil {
+			return e.Context.Err()
+		}
+
+		// If it's not a terminal or it failed extremely fast (e.g. non-interactive failure or sudo not configured),
+		// we should not retry to avoid a tight infinite loop.
+		isStdinTerminal := term.IsTerminal(int(os.Stdin.Fd()))
+		if !isStdinTerminal || time.Since(startTime) < 2*time.Second {
+			return fmt.Errorf("sudo re-authentication failed: %w", err)
+		}
+
+		colArrow.Print("-> ")
+		colWarn.Println("Sudo authentication failed or timed out. Retrying...")
+		time.Sleep(1 * time.Second)
 	}
-
-	// Non-interactive check failed — the ticket has likely expired.
-	// We must now re-authenticate interactively using `sudo -v`.
-	colArrow.Print("-> ")
-	colSuccess.Println("Sudo ticket has expired. Re-authenticating")
-
-	// Use a dedicated interactive runner that does NOT set a new process group.
-	// This ensures `sudo` can correctly access the TTY for password input.
-	if err := runInteractiveCommand(e.Context, "sudo", "-v"); err != nil {
-		return fmt.Errorf("sudo re-authentication failed: %w", err)
-	}
-	colArrow.Print("-> ")
-	colSuccess.Println("Re-authenticated via sudo successfully.")
-	return nil
 }
 
 // Run executes the given command, elevating via sudo -E only when needed.
