@@ -793,6 +793,12 @@ func getPackageDependenciesToUninstall(name string) []string {
 		return []string{name}
 	case "cursor":
 		return []string{name}
+        case "kapidox":
+		return []string{name}
+	case "mercurial":
+		return []string{name}
+	case "pdfarranger":
+		return []string{name}
 	default:
 		if strings.HasPrefix(name, "python-") || strings.HasPrefix(name, "cython-") {
 			return []string{name}

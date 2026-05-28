@@ -790,6 +790,8 @@ func HandleAutoBumpCommand(cfg *Config, autoBuild bool) error {
 		// Specific name tweaks
 		// Works for pkgname or pkgset
 		switch pkgName {
+		case "pcsc-lite":
+			pkgName = "pcsclite"
 		case "aom":
 			pkgName = "libaom"
 		case "intel-microcode":
