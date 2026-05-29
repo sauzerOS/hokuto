@@ -12,9 +12,12 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/gookit/color"
 )
 
 func getAntigravityString() (string, error) {
@@ -705,8 +708,16 @@ type RepologyEntry struct {
 	Status  string `json:"status"`
 }
 
+type AutoBumpCandidate struct {
+	PkgName         string
+	CurVersion      string
+	NewVersion      string
+	RepologyCurrent string
+	IsPkgSet        bool
+}
+
 // HandleAutoBumpCommand implements the logic of the automagic bump script.
-func HandleAutoBumpCommand(cfg *Config, autoBuild bool) error {
+func HandleAutoBumpCommand(cfg *Config, autoBuild bool, assumeYes bool) error {
 	GlobalAssumeYes = true
 	defer func() { GlobalAssumeYes = false }()
 
@@ -778,18 +789,25 @@ func HandleAutoBumpCommand(cfg *Config, autoBuild bool) error {
 		return nil
 	}
 
-	var successfullyBumped []string
-	var failedBumps []string
-	var successfullyBuilt []string
-	var failedBuilds []string
+	var candidates []AutoBumpCandidate
 
-	for project, entries := range projects {
+	// Sort project names to scan deterministically
+	var projectNames []string
+	for proj := range projects {
+		projectNames = append(projectNames, proj)
+	}
+	sort.Strings(projectNames)
+
+	for _, project := range projectNames {
+		entries := projects[project]
 		// Map name to repo convention (python:chardet -> python-chardet)
 		pkgName := strings.ReplaceAll(project, ":", "-")
 
 		// Specific name tweaks
 		// Works for pkgname or pkgset
 		switch pkgName {
+		case "zerotier-one":
+			pkgName = "zerotier"
 		case "pcsc-lite":
 			pkgName = "pcsclite"
 		case "aom":
@@ -867,6 +885,63 @@ func HandleAutoBumpCommand(cfg *Config, autoBuild bool) error {
 			colSuccess.Printf(">> [SKIP] %s is already at %s locally.\n", pkgName, newVer)
 			continue
 		}
+
+		candidates = append(candidates, AutoBumpCandidate{
+			PkgName:         pkgName,
+			CurVersion:      curVer,
+			NewVersion:      newVer,
+			RepologyCurrent: repologyCurrent,
+			IsPkgSet:        isPkgSet,
+		})
+	}
+
+	if len(candidates) == 0 {
+		colSuccess.Println("No packages need to be bumped.")
+		return nil
+	}
+
+	// Sort candidates alphabetically by PkgName for selection TUI
+	sort.SliceStable(candidates, func(i, j int) bool {
+		return candidates[i].PkgName < candidates[j].PkgName
+	})
+
+	fmt.Println()
+	colSuccess.Printf("--- %d Package(s) to Bump ---\n", len(candidates))
+	for i, cand := range candidates {
+		colArrow.Print("-> ")
+		fmt.Printf("%2d) ", i+1)
+		color.Bold.Printf("%s", cand.PkgName)
+		fmt.Print(": ")
+		colNote.Printf("%s -> %s\n", cand.CurVersion, cand.NewVersion)
+	}
+
+	var indices []int
+	var ok bool
+	if assumeYes {
+		for i := range candidates {
+			indices = append(indices, i)
+		}
+		ok = true
+	} else {
+		indices, ok = AskForSelection("Bump (a)ll, (q)uit, or pick packages to bump/ignore (numbers or -numbers):", len(candidates))
+	}
+
+	if !ok {
+		colNote.Println("Bump canceled by user.")
+		return nil
+	}
+
+	var successfullyBumped []string
+	var failedBumps []string
+	var successfullyBuilt []string
+	var failedBuilds []string
+
+	for _, idx := range indices {
+		cand := candidates[idx]
+		pkgName := cand.PkgName
+		curVer := cand.CurVersion
+		newVer := cand.NewVersion
+		isPkgSet := cand.IsPkgSet
 
 		colNote.Printf(">> [BUMPING] %s to %s\n", pkgName, newVer)
 		var bumpErr error

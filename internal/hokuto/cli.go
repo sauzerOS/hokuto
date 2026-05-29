@@ -1362,13 +1362,16 @@ func Main() {
 		var isSet = bumpCmd.Bool("set", false, "Bump a package set")
 		var auto = bumpCmd.Bool("auto", false, "Automagically bump outdated packages using Repology")
 		var build = bumpCmd.Bool("build", false, "Automatically build bumped packages in --idle mode")
+		var yes = bumpCmd.Bool("y", false, "Assume 'yes' to all prompts")
+		var yesLong = bumpCmd.Bool("yes", false, "Assume 'yes' to all prompts")
 		if err := bumpCmd.Parse(os.Args[2:]); err != nil {
 			fmt.Fprintf(os.Stderr, "Error parsing bump flags: %v\n", err)
 			os.Exit(1)
 		}
 
 		if *auto {
-			if err := HandleAutoBumpCommand(cfg, *build); err != nil {
+			effectiveYes := *yes || *yesLong
+			if err := HandleAutoBumpCommand(cfg, *build, effectiveYes); err != nil {
 				fmt.Fprintf(os.Stderr, "Auto bump failed: %v\n", err)
 				os.Exit(1)
 			}
