@@ -806,6 +806,14 @@ func HandleAutoBumpCommand(cfg *Config, autoBuild bool, assumeYes bool) error {
 		// Specific name tweaks
 		// Works for pkgname or pkgset
 		switch pkgName {
+		case "libtorrent-rasterbar":
+			pkgName = "libtorrent"
+		case "cairomm":
+			pkgName = "libcairomm1"
+		case "hatchling":
+			pkgName = "python-hatchling"
+		case "legendary-heroic":
+			pkgName = "legendary"
 		case "zerotier-one":
 			pkgName = "zerotier"
 		case "pcsc-lite":
