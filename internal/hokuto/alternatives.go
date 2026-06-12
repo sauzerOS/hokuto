@@ -496,13 +496,8 @@ func findPackageOwningFile(hRoot, targetAbsPath string) string {
 		return ""
 	}
 
-	targetClean := filepath.Clean(targetAbsPath)
-	hRootClean := filepath.Clean(hRoot)
-	relPath := targetClean
-	if strings.HasPrefix(targetClean, hRootClean) {
-		relPath = targetClean[len(hRootClean):]
-	}
-	relPath = strings.TrimPrefix(relPath, "/")
+	canonicalTarget := canonicalizePath(hRoot, targetAbsPath)
+	canonicalTargetNoSlash := strings.TrimPrefix(canonicalTarget, "/")
 
 	for _, e := range entries {
 		if !e.IsDir() {
@@ -535,12 +530,6 @@ func findPackageOwningFile(hRoot, targetAbsPath string) string {
 				continue
 			}
 
-			// The path usually comes first, but might contain spaces?
-			// Hokuto manifest format: "path checksum" or "path"
-			// Wait, uninstall.go logic:
-			// lastSpace := strings.LastIndexAny(line, " \t")
-			// path := line[:lastSpace]
-
 			lastSpace := strings.LastIndexAny(line, " \t")
 			var mPath string
 			if lastSpace == -1 {
@@ -549,9 +538,10 @@ func findPackageOwningFile(hRoot, targetAbsPath string) string {
 				mPath = strings.TrimSpace(line[:lastSpace])
 			}
 
-			// Normalize manifest path
-			mPathClean := strings.TrimPrefix(mPath, "/")
-			if mPathClean == relPath {
+			// Normalize manifest path using canonicalizePath
+			canonicalMPath := canonicalizePath(hRoot, mPath)
+			canonicalMPathNoSlash := strings.TrimPrefix(canonicalMPath, "/")
+			if canonicalMPathNoSlash == canonicalTargetNoSlash {
 				found = true
 				break
 			}

@@ -1167,7 +1167,7 @@ func checkStagingConflicts(pkgName, stagingDir, rootDir, stagingManifest string,
 				continue
 			}
 			manifestFilePath := fields[0]
-			cleanPath := filepath.Clean(manifestFilePath)
+			cleanPath := canonicalizePath(rootDir, manifestFilePath)
 			cleanPathNoSlash := strings.TrimPrefix(cleanPath, "/")
 			currentPkgFiles[cleanPath] = true
 			currentPkgFiles[cleanPathNoSlash] = true
@@ -1201,7 +1201,7 @@ func checkStagingConflicts(pkgName, stagingDir, rootDir, stagingManifest string,
 				}
 				manifestFilePath := fields[0]
 				// Store both with and without leading slash for fast lookup
-				cleanPath := filepath.Clean(manifestFilePath)
+				cleanPath := canonicalizePath(rootDir, manifestFilePath)
 				cleanPathNoSlash := strings.TrimPrefix(cleanPath, "/")
 				fileOwnerMap[cleanPath] = otherPkgName
 				if cleanPathNoSlash != cleanPath {
@@ -1253,8 +1253,8 @@ func checkStagingConflicts(pkgName, stagingDir, rootDir, stagingManifest string,
 		}
 		filePath := parts[0] // Path from manifest (may have leading slash)
 		// Normalize path: remove leading slash for comparison
-		filePathClean := strings.TrimPrefix(filePath, "/")
-		filePathClean = filepath.Clean(filePathClean)
+		filePathClean := canonicalizePath(rootDir, filePath)
+		filePathCleanNoSlash := strings.TrimPrefix(filePathClean, "/")
 
 		// Ignore internal metadata files
 		if strings.Contains(filePathClean, "var/db/hokuto") {
@@ -1271,7 +1271,7 @@ func checkStagingConflicts(pkgName, stagingDir, rootDir, stagingManifest string,
 
 		// File exists in target - check for conflicts using cached owner map
 		// First check if file is owned by current package (normal upgrade scenario)
-		if currentPkgFiles[filePathClean] || currentPkgFiles[filePath] {
+		if currentPkgFiles[filePathClean] || currentPkgFiles[filePathCleanNoSlash] || currentPkgFiles[filePath] {
 			// File is in current package's manifest - this is a normal upgrade, skip conflict check
 			continue
 		}
@@ -1279,7 +1279,7 @@ func checkStagingConflicts(pkgName, stagingDir, rootDir, stagingManifest string,
 		ownerPkg := fileOwnerMap[filePathClean]
 		if ownerPkg == "" {
 			// Try with leading slash
-			ownerPkg = fileOwnerMap[filePath]
+			ownerPkg = fileOwnerMap[filePathCleanNoSlash]
 		}
 
 		if ownerPkg != "" && ownerPkg != pkgName {

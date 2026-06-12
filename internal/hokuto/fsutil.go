@@ -763,3 +763,31 @@ func removeFileAsRoot(path string, execCtx *Executor) error {
 	cmd := exec.Command("sudo", "rm", "-f", path)
 	return execCtx.Run(cmd)
 }
+
+// canonicalizePath joins rootDir and path, resolves symlinks, and returns the path relative to rootDir
+func canonicalizePath(rootDir, path string) string {
+	cleanPath := filepath.Clean(path)
+	absPath := filepath.Join(rootDir, strings.TrimPrefix(cleanPath, "/"))
+
+	resolved, err := filepath.EvalSymlinks(absPath)
+	if err != nil {
+		// If the file doesn't exist, resolve symlinks of its parent directory.
+		dir := filepath.Dir(absPath)
+		base := filepath.Base(absPath)
+		if resolvedDir, err := filepath.EvalSymlinks(dir); err == nil {
+			resolved = filepath.Join(resolvedDir, base)
+		} else {
+			resolved = absPath
+		}
+	}
+
+	rel, err := filepath.Rel(rootDir, resolved)
+	if err != nil {
+		return cleanPath
+	}
+
+	if strings.HasPrefix(path, "/") {
+		return "/" + strings.TrimPrefix(rel, "/")
+	}
+	return strings.TrimPrefix(rel, "/")
+}

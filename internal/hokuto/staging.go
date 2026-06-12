@@ -40,6 +40,9 @@ func removeObsoleteFiles(pkgName, stagingDir, rootDir string) ([]string, error) 
 			// Split into path and optional checksum: path is always first token
 			parts := strings.SplitN(line, "  ", 2) // manifest uses "␣␣" separator
 			path := strings.Fields(parts[0])[0]    // defensive: take first token
+			canonical := canonicalizePath(rootDir, path)
+			stagingSet[canonical] = struct{}{}
+			stagingSet[strings.TrimPrefix(canonical, "/")] = struct{}{}
 			stagingSet[path] = struct{}{}
 		}
 		if err := sc.Err(); err != nil {
@@ -52,7 +55,7 @@ func removeObsoleteFiles(pkgName, stagingDir, rootDir string) ([]string, error) 
 	// Build an index of file ownership once (for all packages except current)
 	// This avoids scanning all manifests for each file
 	debugf("Building file ownership index...\n")
-	fileOwnerIndex := buildFileOwnerIndex(pkgName)
+	fileOwnerIndex := buildFileOwnerIndex(pkgName, rootDir)
 	debugf("File ownership index built (indexed %d files)\n", len(fileOwnerIndex))
 
 	// Scan installed manifest; add files missing from staging manifest
@@ -66,7 +69,15 @@ func removeObsoleteFiles(pkgName, stagingDir, rootDir string) ([]string, error) 
 		parts := strings.SplitN(line, "  ", 2)
 		path := strings.Fields(parts[0])[0]
 
-		// if present in staging manifest -> skip
+		// Check if canonical path matches
+		canonicalPath := canonicalizePath(rootDir, path)
+		canonicalPathNoSlash := strings.TrimPrefix(canonicalPath, "/")
+		if _, ok := stagingSet[canonicalPath]; ok {
+			continue
+		}
+		if _, ok := stagingSet[canonicalPathNoSlash]; ok {
+			continue
+		}
 		if _, ok := stagingSet[path]; ok {
 			continue
 		}
@@ -82,20 +93,13 @@ func removeObsoleteFiles(pkgName, stagingDir, rootDir string) ([]string, error) 
 
 			// Check if this file is owned by another package using the index
 			// Try both with and without leading slash for matching
-			normalizedPath := filepath.Clean(path)
-			normalizedPathNoSlash := strings.TrimPrefix(normalizedPath, "/")
-			normalizedPathWithSlash := "/" + normalizedPathNoSlash
-
-			if _, owned := fileOwnerIndex[normalizedPath]; owned {
-				// File is owned by another package, don't delete it
+			if _, owned := fileOwnerIndex[canonicalPath]; owned {
 				continue
 			}
-			if _, owned := fileOwnerIndex[normalizedPathWithSlash]; owned {
-				// File is owned by another package, don't delete it
+			if _, owned := fileOwnerIndex[canonicalPathNoSlash]; owned {
 				continue
 			}
-			if _, owned := fileOwnerIndex[normalizedPathNoSlash]; owned {
-				// File is owned by another package, don't delete it
+			if _, owned := fileOwnerIndex[path]; owned {
 				continue
 			}
 			// File is not owned by another package, schedule for deletion
@@ -113,7 +117,7 @@ func removeObsoleteFiles(pkgName, stagingDir, rootDir string) ([]string, error) 
 // buildFileOwnerIndex builds a map of file paths (normalized) to package names
 // for all installed packages except excludePkg. This allows O(1) lookups instead
 // of scanning all manifests for each file.
-func buildFileOwnerIndex(excludePkg string) map[string]string {
+func buildFileOwnerIndex(excludePkg, rootDir string) map[string]string {
 	index := make(map[string]string)
 
 	entries, err := os.ReadDir(Installed)
@@ -149,9 +153,8 @@ func buildFileOwnerIndex(excludePkg string) map[string]string {
 			}
 			manifestPath := fields[0]
 
-			// Normalize the path and add to index
-			// Handle both "/usr/bin/file" and "usr/bin/file" formats consistently
-			normalizedPath := filepath.Clean(manifestPath)
+			// Normalize the path and add to index using canonicalizePath
+			normalizedPath := canonicalizePath(rootDir, manifestPath)
 			// Also add normalized path without leading slash for matching
 			normalizedPathNoSlash := strings.TrimPrefix(normalizedPath, "/")
 			normalizedPathWithSlash := "/" + normalizedPathNoSlash
