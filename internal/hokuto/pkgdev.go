@@ -852,16 +852,31 @@ func HandleAutoBumpCommand(cfg *Config, autoBuild bool, assumeYes bool) error {
 			pkgName = "webkit2gtk-4.1"
 		}
 
-		var newVer string
+		var newestVer string
+		var develVer string
 		var repologyCurrent string
 
 		for _, e := range entries {
 			if e.Status == "newest" {
-				newVer = e.Version
+				if newestVer == "" || compareVersions(e.Version, newestVer) > 0 {
+					newestVer = e.Version
+				}
+			}
+			if e.Status == "devel" {
+				if develVer == "" || compareVersions(e.Version, develVer) > 0 {
+					develVer = e.Version
+				}
 			}
 			if e.Repo == "sauzeros" {
-				repologyCurrent = e.Version
+				if repologyCurrent == "" || compareVersions(e.Version, repologyCurrent) > 0 {
+					repologyCurrent = e.Version
+				}
 			}
+		}
+
+		newVer := newestVer
+		if newVer == "" {
+			newVer = develVer
 		}
 
 		// Package-specific version tweaks
