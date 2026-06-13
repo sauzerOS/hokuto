@@ -875,7 +875,9 @@ func HandleAutoBumpCommand(cfg *Config, autoBuild bool, assumeYes bool) error {
 		}
 
 		newVer := newestVer
-		if newVer == "" {
+		if pkgName == "wine" && develVer != "" {
+			newVer = develVer
+		} else if newVer == "" {
 			newVer = develVer
 		}
 
