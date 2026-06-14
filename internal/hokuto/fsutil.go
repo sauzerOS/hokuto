@@ -767,18 +767,24 @@ func removeFileAsRoot(path string, execCtx *Executor) error {
 // canonicalizePath joins rootDir and path, resolves symlinks, and returns the path relative to rootDir
 func canonicalizePath(rootDir, path string) string {
 	cleanPath := filepath.Clean(path)
+	if cleanPath == "/" {
+		if strings.HasPrefix(path, "/") {
+			return "/"
+		}
+		return ""
+	}
 	absPath := filepath.Join(rootDir, strings.TrimPrefix(cleanPath, "/"))
 
-	resolved, err := filepath.EvalSymlinks(absPath)
-	if err != nil {
-		// If the file doesn't exist, resolve symlinks of its parent directory.
-		dir := filepath.Dir(absPath)
-		base := filepath.Base(absPath)
-		if resolvedDir, err := filepath.EvalSymlinks(dir); err == nil {
-			resolved = filepath.Join(resolvedDir, base)
-		} else {
-			resolved = absPath
-		}
+	// Resolve symlinks of the parent directory only, to preserve the final component if it's a symlink.
+	dir := filepath.Dir(absPath)
+	base := filepath.Base(absPath)
+
+	resolvedDir, err := filepath.EvalSymlinks(dir)
+	var resolved string
+	if err == nil {
+		resolved = filepath.Join(resolvedDir, base)
+	} else {
+		resolved = absPath
 	}
 
 	rel, err := filepath.Rel(rootDir, resolved)
@@ -791,3 +797,4 @@ func canonicalizePath(rootDir, path string) string {
 	}
 	return strings.TrimPrefix(rel, "/")
 }
+
