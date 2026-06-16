@@ -783,6 +783,7 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, opts BuildOptions)
 			"XDG_CACHE_HOME":             filepath.Join(buildDir, ".cache"), // Prevent g-ir-scanner from using ~/.cache
 			"CONFIG_SITE":                ("/usr/share/config.site"),
 			"HOKUTO_ARCH":                targetArch,
+			"HOKUTO_GENERIC":             cfg.Values["HOKUTO_GENERIC"],
 			"MULTILIB":                   multilibVal,
 			"HOKUTO_BUILD_DIR":           buildDir,
 			"GNU_MIRROR":                 cfg.Values["GNU_MIRROR"],
