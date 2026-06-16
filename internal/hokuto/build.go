@@ -96,7 +96,7 @@ func sanitizeFlagsForCrossCompilation(flags string, _ string) string {
 			continue // Skip these flags
 		}
 		// Also remove x86-64 specific flags when cross-compiling
-		if strings.HasPrefix(flag, "-march=x86-64") || strings.HasPrefix(flag, "-march=x86_64") {
+		if strings.HasPrefix(flag, "-march=x86-64-v2") || strings.HasPrefix(flag, "-march=x86_64-v2") {
 			continue
 		}
 		sanitizedFlags = append(sanitizedFlags, flag)
@@ -482,7 +482,7 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, opts BuildOptions)
 	}
 
 	// Define the base C/C++/LD flags
-	var defaultCFLAGS = "-O2 -march=x86-64 -mtune=generic -pipe -fPIC"
+	var defaultCFLAGS = "-O2 -march=x86-64-v2 -mtune=generic -pipe -fPIC"
 	var defaultLDFLAGS = ""
 
 	// Define core count to use
@@ -553,7 +553,7 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, opts BuildOptions)
 
 		case "x86_64":
 			lfsTgt = "x86_64-lfs-linux-gnu"
-			cflags = "-O2 -march=x86-64 -mtune=generic -pipe -fPIC"
+			cflags = "-O2 -march=x86-64-v2 -mtune=generic -pipe -fPIC"
 
 		default:
 			lfsTgt = fmt.Sprintf("%s-lfs-linux-gnu", targetArch)
@@ -1644,7 +1644,7 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 	}
 
 	// Define the base C/C++/LD flags
-	var defaultCFLAGS = "-O2 -march=x86-64 -mtune=generic -pipe -fPIC"
+	var defaultCFLAGS = "-O2 -march=x86-64-v2 -mtune=generic -pipe -fPIC"
 	var defaultLDFLAGS = ""
 
 	// Define core count to use
