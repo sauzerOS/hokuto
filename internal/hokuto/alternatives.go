@@ -2,7 +2,6 @@ package hokuto
 
 import (
 	"bufio"
-	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -1109,16 +1108,14 @@ func handleAlternativeSwitch(hRoot string, db *GlobalAlternativesDB, targetPkg s
 
 	chosenOwner := options[selection-1]
 
-	// Execute switch
-	execCtx := &Executor{Context: context.Background()} // or use existing context?
+	// Execute switch using the global root executor so sudo authentication,
+	// re-authentication, and environment handling match other privileged flows.
+	execCtx := RootExec
 	count := 0
 
 	// Need to lock DB update? This runs sequentially so it's fine, but saving needs root privileges logic if not root.
 	// But `saveAlternativesDB` handles root check.
-	// However, moving files requires root. Check effective UID.
-	if os.Getuid() != 0 {
-		return fmt.Errorf("must be root to switch alternatives")
-	}
+	// File moves/copies are performed through execCtx and will elevate when needed.
 
 	for _, path := range affectedFiles {
 		entry := db.Files[path]
