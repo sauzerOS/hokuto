@@ -79,7 +79,18 @@ func GetSystemVariantForPackage(cfg *Config, pkgName string) string {
 
 	// Cross-packages (prefixed with architecture) or forced generic logic
 	isCrossPkg := strings.HasPrefix(pkgName, "aarch64-") || strings.HasPrefix(pkgName, "x86_64-")
-	if HokutoGeneric || cfg.Values["HOKUTO_GENERIC"] == "1" || cfg.Values["HOKUTO_CROSS_ARCH"] != "" || isCrossPkg {
+	
+	isGenericOpt := false
+	if pkgName != "" {
+		if pkgDir, err := findPackageMetadataDir(pkgName); err == nil && pkgDir != "" {
+			opts := loadBuildOptions(pkgDir)
+			if opts["generic"] {
+				isGenericOpt = true
+			}
+		}
+	}
+
+	if HokutoGeneric || cfg.Values["HOKUTO_GENERIC"] == "1" || cfg.Values["HOKUTO_CROSS_ARCH"] != "" || isCrossPkg || isGenericOpt {
 		baseVariant = "generic"
 	}
 

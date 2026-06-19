@@ -650,7 +650,7 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, opts BuildOptions)
 		isCross := cfg.Values["HOKUTO_CROSS_ARCH"] != ""
 
 		// Check if generic build is enabled
-		isGeneric := cfg.Values["HOKUTO_GENERIC"] == "1"
+		isGeneric := cfg.Values["HOKUTO_GENERIC"] == "1" || options["generic"]
 
 		if isGeneric {
 			// Generic build: use CFLAGS_GEN and CFLAGS_GEN_LTO
@@ -762,6 +762,11 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, opts BuildOptions)
 		// Build RUSTFLAGS based on CFLAGS and CPU flags
 		rustflags := buildRustFlags(cflagsVal, cpuFlags, buildDir, isGeneric)
 
+		hokutoGenericEnv := cfg.Values["HOKUTO_GENERIC"]
+		if isGeneric {
+			hokutoGenericEnv = "1"
+		}
+
 		defaults = map[string]string{
 			"AR":                         "gcc-ar",
 			"CC":                         "cc",
@@ -783,7 +788,7 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, opts BuildOptions)
 			"XDG_CACHE_HOME":             filepath.Join(buildDir, ".cache"), // Prevent g-ir-scanner from using ~/.cache
 			"CONFIG_SITE":                ("/usr/share/config.site"),
 			"HOKUTO_ARCH":                targetArch,
-			"HOKUTO_GENERIC":             cfg.Values["HOKUTO_GENERIC"],
+			"HOKUTO_GENERIC":             hokutoGenericEnv,
 			"MULTILIB":                   multilibVal,
 			"HOKUTO_BUILD_DIR":           buildDir,
 			"GNU_MIRROR":                 cfg.Values["GNU_MIRROR"],
@@ -1426,7 +1431,7 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, opts BuildOptions)
 	cflagsVal := defaults["CFLAGS"]
 
 	// Determine if this is a generic build
-	isGeneric := cfg.Values["HOKUTO_GENERIC"] == "1"
+	isGeneric := cfg.Values["HOKUTO_GENERIC"] == "1" || options["generic"]
 
 	// If ARM64, it's ONLY generic if cross-simple/nocrossopt/cross-system was used or CFLAGS_ARM64 was missing
 	if !isGeneric && targetArch == "aarch64" {
@@ -2336,7 +2341,7 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 	isMultilib := detectMultilib(outputDir)
 
 	// Determine variant for naming - include multilib prefix if detected
-	isGeneric := cfg.Values["HOKUTO_GENERIC"] == "1" || cfg.Values["HOKUTO_CROSS_ARCH"] != ""
+	isGeneric := cfg.Values["HOKUTO_GENERIC"] == "1" || cfg.Values["HOKUTO_CROSS_ARCH"] != "" || options["generic"]
 	variant := IdentifyVariant(pkgName, isGeneric, isMultilib)
 
 	// Generate package archive (using output package name if cross-system is enabled)
