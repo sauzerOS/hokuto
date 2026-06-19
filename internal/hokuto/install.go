@@ -993,6 +993,16 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 		// can handle them (queue them for parallel execution). We do NOT prompt or rebuild here.
 		if managed {
 			parallelRebuilds = append(parallelRebuilds, affectedList...)
+		} else if isRemoteUpdate() {
+			// Print warning and skip rebuilds for remote binary update
+			colArrow.Print("\n-> ")
+			cPrintf(colWarn, "The following packages depend on libraries that were removed/upgraded:\n")
+			for _, pkg := range affectedList {
+				libs := affectedPackages[pkg]
+				cPrintf(colWarn, "  %s (needs: %s)\n", pkg, strings.Join(libs, ", "))
+			}
+			colArrow.Print("-> ")
+			cPrintf(colInfo, "Skipping library rebuild prompts for remote binary updates.\n")
 		} else {
 			// --- Sequential Handling (managed=false) ---
 			// 8a. Prompt for rebuild (Hokuto is guaranteed to be run in a terminal)
@@ -1570,4 +1580,19 @@ func isExplicitYes() bool {
 		}
 	}
 	return false
+}
+
+// isRemoteUpdate checks if the user is running a remote update (hokuto update --remote)
+func isRemoteUpdate() bool {
+	hasUpdate := false
+	hasRemote := false
+	for _, arg := range os.Args {
+		if arg == "update" || arg == "u" {
+			hasUpdate = true
+		}
+		if arg == "--remote" || arg == "-remote" {
+			hasRemote = true
+		}
+	}
+	return hasUpdate && hasRemote
 }
