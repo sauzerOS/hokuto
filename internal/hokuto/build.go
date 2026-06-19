@@ -2668,6 +2668,23 @@ func handleBuildCommand(args []string, cfg *Config) error {
 	var failedBuilds = make(map[string]error)
 	var totalElapsedTime time.Duration
 	var totalBuildCount int
+	var builtWithoutInstallingTargets bool
+	var temporaryBuildDeps []string
+	addTemporaryBuildDep := func(pkgName string) {
+		for _, existing := range temporaryBuildDeps {
+			if existing == pkgName {
+				return
+			}
+		}
+		temporaryBuildDeps = append(temporaryBuildDeps, pkgName)
+	}
+	cleanupTemporaryBuildDeps := func() {
+		if len(temporaryBuildDeps) == 0 {
+			return
+		}
+		uninstallBuildDependencies(temporaryBuildDeps, cfg)
+		temporaryBuildDeps = nil
+	}
 
 	// ** STRATEGY 1: Bootstrap or --alldeps mode **
 	if *bootstrap || *allDeps {
@@ -2803,6 +2820,7 @@ func handleBuildCommand(args []string, cfg *Config) error {
 							return fmt.Errorf("fatal error installing binary %s: %v", depPkg, err)
 						}
 						isCriticalAtomic.Store(0)
+						addTemporaryBuildDep(outputDepPkg)
 					} else {
 						packagesThatMustBeBuilt[depPkg] = true
 					}
@@ -2846,6 +2864,7 @@ func handleBuildCommand(args []string, cfg *Config) error {
 											return fmt.Errorf("fatal error installing downloaded binary %s: %v", depPkg, err)
 										}
 										isCriticalAtomic.Store(0)
+										addTemporaryBuildDep(outputDepPkg)
 									} else {
 										packagesThatMustBeBuilt[depPkg] = true
 									}
@@ -2910,8 +2929,11 @@ func handleBuildCommand(args []string, cfg *Config) error {
 				colInfo.Printf("Build order for this group: %s\n\n", strings.Join(plan.Order, " -> "))
 
 				progressCount := 0
-				failedThisGroup, _, elapsedThisGroup := executeBuildPass(plan, pkgName, true, cfg, bootstrap, userRequestedMap, &progressCount)
+				failedThisGroup, _, elapsedThisGroup, installedDepsThisGroup := executeBuildPass(plan, pkgName, true, cfg, bootstrap, userRequestedMap, &progressCount)
 				totalElapsedTime += elapsedThisGroup
+				for _, dep := range installedDepsThisGroup {
+					addTemporaryBuildDep(dep)
+				}
 				for k, v := range failedThisGroup {
 					failedBuilds[k] = v
 				}
@@ -3059,9 +3081,12 @@ func handleBuildCommand(args []string, cfg *Config) error {
 				return nil
 			}
 
-			failedPass1, targetsPass1, elapsedPass1 := executeBuildPass(initialPlan, "Initial Pass", false, cfg, bootstrap, userRequestedMap, &progressCount)
+			failedPass1, targetsPass1, elapsedPass1, installedDepsPass1 := executeBuildPass(initialPlan, "Initial Pass", false, cfg, bootstrap, userRequestedMap, &progressCount)
 			totalElapsedTime = elapsedPass1
 			failedBuilds = failedPass1
+			for _, dep := range installedDepsPass1 {
+				addTemporaryBuildDep(dep)
+			}
 
 			if len(targetsPass1) > 0 {
 				// Skip installation prompt and installation for cross-compilation without system flag
@@ -3083,6 +3108,7 @@ func handleBuildCommand(args []string, cfg *Config) error {
 					shouldInstall = askForConfirmation(colWarn, "-> Install built %s: %s", pkgNoun, colNote.Sprint(strings.Join(outputPkgNames, ", ")))
 				}
 				if shouldInstall && !isCrossWithoutSystem {
+					installedRequestedTarget := false
 					for i, finalPkg := range targetsPass1 {
 						if _, failed := failedBuilds[finalPkg]; failed {
 							continue
@@ -3099,11 +3125,13 @@ func handleBuildCommand(args []string, cfg *Config) error {
 							colArrow.Print("-> ")
 							color.Danger.Printf("Installation failed for %s: %v\n", outputFinalPkg, err)
 							failedBuilds[finalPkg] = fmt.Errorf("final installation failed: %w", err)
+							cleanupTemporaryBuildDeps()
 							goto BuildSummary // Abort the whole process
 						} else {
 							// Add package to world file
 							if userRequestedMap[finalPkg] {
 								addToWorld(finalPkg)
+								installedRequestedTarget = true
 							}
 							colArrow.Print("-> ")
 							colSuccess.Printf("Installing:")
@@ -3111,6 +3139,13 @@ func handleBuildCommand(args []string, cfg *Config) error {
 						}
 						isCriticalAtomic.Store(0)
 					}
+					if !installedRequestedTarget {
+						builtWithoutInstallingTargets = true
+						cleanupTemporaryBuildDeps()
+					}
+				} else {
+					builtWithoutInstallingTargets = true
+					cleanupTemporaryBuildDeps()
 				}
 			}
 		}
@@ -3121,7 +3156,11 @@ BuildSummary:
 	// --- Final Report ---
 	if len(failedBuilds) == 0 {
 		colArrow.Print("-> ")
-		colSuccess.Printf("All packages built and installed successfully (%d/%d) Time: %s\n", totalBuildCount, totalBuildCount, totalElapsedTime.Truncate(time.Second))
+		if builtWithoutInstallingTargets {
+			colSuccess.Printf("All packages built successfully (%d/%d) Time: %s\n", totalBuildCount, totalBuildCount, totalElapsedTime.Truncate(time.Second))
+		} else {
+			colSuccess.Printf("All packages built and installed successfully (%d/%d) Time: %s\n", totalBuildCount, totalBuildCount, totalElapsedTime.Truncate(time.Second))
+		}
 		return nil
 	}
 	color.Danger.Print("-> ")
@@ -3140,11 +3179,12 @@ BuildSummary:
 
 // Helper for HandleBuildCommand to execute a single build pass based on the provided BuildPlan.
 
-func executeBuildPass(plan *BuildPlan, _ string, installAllTargets bool, cfg *Config, bootstrap *bool, userRequestedMap map[string]bool, progressCount *int) (map[string]error, []string, time.Duration) {
+func executeBuildPass(plan *BuildPlan, _ string, installAllTargets bool, cfg *Config, bootstrap *bool, userRequestedMap map[string]bool, progressCount *int) (map[string]error, []string, time.Duration, []string) {
 
 	toBuild := plan.Order
 	failed := make(map[string]error)
 	var successfullyBuiltTargets []string
+	var installedBuildDeps []string
 	builtThisPass := make(map[string]bool)
 	var totalElapsedTime time.Duration
 	passInProgress := true
@@ -3329,7 +3369,7 @@ func executeBuildPass(plan *BuildPlan, _ string, installAllTargets bool, cfg *Co
 						colArrow.Print("-> ")
 						color.Danger.Printf("Installation failed for %s: %v\n", outputPkgName, installErr)
 						failed[pkgName] = fmt.Errorf("post-build installation failed: %w", installErr)
-						return failed, successfullyBuiltTargets, totalElapsedTime // Abort this pass
+						return failed, successfullyBuiltTargets, totalElapsedTime, installedBuildDeps // Abort this pass
 					}
 					colArrow.Print("-> ")
 					colSuccess.Printf("Installing:")
@@ -3345,6 +3385,7 @@ func executeBuildPass(plan *BuildPlan, _ string, installAllTargets bool, cfg *Co
 					// If the user did NOT request it explicitly, check if it was pulled in
 					// as a 'make' dependency by any other package in the toBuild list.
 					if !userRequestedMap[pkgName] {
+						installedBuildDeps = append(installedBuildDeps, outputPkgName)
 						isMakeDep := false
 						// Scan all packages in the plan (including those already built or waiting)
 						// to see if any of them list 'pkgName' as a 'make' dependency.
@@ -3450,7 +3491,7 @@ func executeBuildPass(plan *BuildPlan, _ string, installAllTargets bool, cfg *Co
 							colArrow.Print("-> ")
 							color.Danger.Printf("Installation failed for rebuilt %s: %v\n", outputParent, installErr)
 							failed[parent] = fmt.Errorf("install of rebuilt '%s' failed: %w", parent, installErr)
-							return failed, successfullyBuiltTargets, totalElapsedTime // Abort
+							return failed, successfullyBuiltTargets, totalElapsedTime, installedBuildDeps // Abort
 						} else {
 							isCriticalAtomic.Store(0)
 							colArrow.Print("-> ")
@@ -3499,7 +3540,7 @@ func executeBuildPass(plan *BuildPlan, _ string, installAllTargets bool, cfg *Co
 						colArrow.Print("-> ")
 						color.Danger.Printf("Installation failed for post-build %s: %v\n", outputRebuildPkg, installErr)
 						failed[pkgName] = fmt.Errorf("install of post-built '%s' failed: %w", rebuildPkg, installErr)
-						return failed, successfullyBuiltTargets, totalElapsedTime // Abort
+						return failed, successfullyBuiltTargets, totalElapsedTime, installedBuildDeps // Abort
 					}
 					isCriticalAtomic.Store(0)
 				}
@@ -3564,5 +3605,5 @@ func executeBuildPass(plan *BuildPlan, _ string, installAllTargets bool, cfg *Co
 			}
 		}
 	}
-	return failed, successfullyBuiltTargets, totalElapsedTime
+	return failed, successfullyBuiltTargets, totalElapsedTime, installedBuildDeps
 }
