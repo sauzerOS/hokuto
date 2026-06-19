@@ -905,6 +905,7 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 	if err := rsyncStaging(stagingDir, rootDir, execCtx); err != nil {
 		return nil, fmt.Errorf("failed to sync staging to %s: %v", rootDir, err)
 	}
+	invalidateFileOwnershipPackage(pkgName)
 
 	// 6. Remove files that were scheduled for deletion
 	for _, p := range filesToDelete {
@@ -964,6 +965,7 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 						fmt.Fprintf(logger, "%s", colWarn.Sprintf("WARNING: Failed to sync rebuilt package %s to root: %v\n", rebuildPkg, err))
 						continue
 					}
+					invalidateFileOwnershipPackage(rebuildPkg)
 
 					rmCmd := exec.Command("rm", "-rf", filepath.Join(tmpDir, rebuildPkg))
 					if err := execCtx.Run(rmCmd); err != nil {
@@ -1112,6 +1114,7 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 						fmt.Fprintf(logger, "%s", colWarn.Sprintf("WARNING: Failed to sync rebuilt package %s to root: %v\n", pkg, err))
 						continue // Skip cleanup on sync failure
 					}
+					invalidateFileOwnershipPackage(pkg)
 
 					rmCmd := exec.Command("rm", "-rf", filepath.Join(tmpDir, pkg))
 					if err := execCtx.Run(rmCmd); err != nil {
@@ -1157,9 +1160,9 @@ func checkStagingConflicts(pkgName, stagingDir, rootDir, stagingManifest string,
 		return nil
 	}
 
-	// Build a map of file -> owner package once (instead of calling findOwnerPackage for each file)
-	// This is much more efficient when checking many files
-	fileOwnerMap := make(map[string]string)
+	// Use the shared ownership snapshot instead of rebuilding an owner map for
+	// every package install. The snapshot refreshes only manifests that changed.
+	ownershipSnapshot := getFileOwnershipSnapshot(rootDir)
 	// Also build a set of files owned by the current package (for upgrade scenarios)
 	currentPkgFiles := make(map[string]bool)
 
@@ -1181,43 +1184,6 @@ func checkStagingConflicts(pkgName, stagingDir, rootDir, stagingManifest string,
 			cleanPathNoSlash := strings.TrimPrefix(cleanPath, "/")
 			currentPkgFiles[cleanPath] = true
 			currentPkgFiles[cleanPathNoSlash] = true
-		}
-	}
-
-	entries, err := os.ReadDir(Installed)
-	if err == nil {
-		for _, e := range entries {
-			if !e.IsDir() {
-				continue
-			}
-			otherPkgName := e.Name()
-			if otherPkgName == pkgName {
-				continue // Skip current package (already handled above)
-			}
-			manifestPath := filepath.Join(Installed, otherPkgName, "manifest")
-			data, err := os.ReadFile(manifestPath)
-			if err != nil {
-				continue
-			}
-			scanner := bufio.NewScanner(bytes.NewReader(data))
-			for scanner.Scan() {
-				line := strings.TrimSpace(scanner.Text())
-				if line == "" || strings.HasSuffix(line, "/") {
-					continue
-				}
-				fields := strings.Fields(line)
-				if len(fields) == 0 {
-					continue
-				}
-				manifestFilePath := fields[0]
-				// Store both with and without leading slash for fast lookup
-				cleanPath := canonicalizePath(rootDir, manifestFilePath)
-				cleanPathNoSlash := strings.TrimPrefix(cleanPath, "/")
-				fileOwnerMap[cleanPath] = otherPkgName
-				if cleanPathNoSlash != cleanPath {
-					fileOwnerMap[cleanPathNoSlash] = otherPkgName
-				}
-			}
 		}
 	}
 
@@ -1286,10 +1252,9 @@ func checkStagingConflicts(pkgName, stagingDir, rootDir, stagingManifest string,
 			continue
 		}
 
-		ownerPkg := fileOwnerMap[filePathClean]
+		ownerPkg := ownershipSnapshot.ownerOtherThan(filePathClean, pkgName)
 		if ownerPkg == "" {
-			// Try with leading slash
-			ownerPkg = fileOwnerMap[filePathCleanNoSlash]
+			ownerPkg = ownershipSnapshot.ownerOtherThan(filePathCleanNoSlash, pkgName)
 		}
 
 		if ownerPkg != "" && ownerPkg != pkgName {

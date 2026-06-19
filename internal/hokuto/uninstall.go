@@ -438,6 +438,7 @@ func pkgUninstall(pkgName string, cfg *Config, execCtx *Executor, force, yes boo
 			debugf("Removed package metadata: %s\n", installedDir)
 		}
 	}
+	invalidateFileOwnershipPackage(pkgName)
 
 	// 10. Run post-uninstall hook if present (unchanged)
 	postScript := filepath.Join(installedDir, "post-uninstall")

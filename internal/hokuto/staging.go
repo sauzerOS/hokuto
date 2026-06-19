@@ -10,7 +10,220 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
+	"time"
 )
+
+type packageOwnershipEntry struct {
+	manifestPath string
+	modTime      time.Time
+	size         int64
+	paths        []string
+}
+
+type fileOwnershipSnapshot struct {
+	owners map[string][]string
+}
+
+func (s *fileOwnershipSnapshot) ownerOtherThan(path, excludePkg string) string {
+	if s == nil {
+		return ""
+	}
+	for _, owner := range s.owners[path] {
+		if owner != excludePkg {
+			return owner
+		}
+	}
+	return ""
+}
+
+type fileOwnershipCache struct {
+	mu           sync.Mutex
+	rootDir      string
+	installedDir string
+	packages     map[string]packageOwnershipEntry
+	snapshot     *fileOwnershipSnapshot
+}
+
+var globalFileOwnershipCache fileOwnershipCache
+
+func getFileOwnershipSnapshot(rootDir string) *fileOwnershipSnapshot {
+	return globalFileOwnershipCache.snapshotFor(rootDir, Installed)
+}
+
+func invalidateFileOwnershipPackage(pkgName string) {
+	globalFileOwnershipCache.invalidatePackage(pkgName)
+}
+
+func (c *fileOwnershipCache) invalidatePackage(pkgName string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.packages == nil {
+		return
+	}
+	delete(c.packages, pkgName)
+	c.snapshot = nil
+}
+
+func (c *fileOwnershipCache) snapshotFor(rootDir, installedDir string) *fileOwnershipSnapshot {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.packages == nil || c.rootDir != rootDir || c.installedDir != installedDir {
+		c.rootDir = rootDir
+		c.installedDir = installedDir
+		c.packages = make(map[string]packageOwnershipEntry)
+		c.snapshot = nil
+	}
+
+	entries, err := os.ReadDir(installedDir)
+	if err != nil {
+		c.packages = make(map[string]packageOwnershipEntry)
+		c.snapshot = &fileOwnershipSnapshot{owners: make(map[string][]string)}
+		return c.snapshot
+	}
+
+	changed := c.snapshot == nil
+	dirCache := make(map[string]string)
+	seen := make(map[string]bool, len(entries))
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+
+		pkgName := e.Name()
+		seen[pkgName] = true
+		manifestPath := filepath.Join(installedDir, pkgName, "manifest")
+		info, err := os.Stat(manifestPath)
+		if err != nil {
+			if _, ok := c.packages[pkgName]; ok {
+				delete(c.packages, pkgName)
+				changed = true
+			}
+			continue
+		}
+
+		cached, ok := c.packages[pkgName]
+		if ok && cached.manifestPath == manifestPath && cached.modTime.Equal(info.ModTime()) && cached.size == info.Size() {
+			continue
+		}
+
+		paths := readManifestOwnershipPaths(manifestPath, rootDir, dirCache)
+		c.packages[pkgName] = packageOwnershipEntry{
+			manifestPath: manifestPath,
+			modTime:      info.ModTime(),
+			size:         info.Size(),
+			paths:        paths,
+		}
+		changed = true
+	}
+
+	for pkgName := range c.packages {
+		if !seen[pkgName] {
+			delete(c.packages, pkgName)
+			changed = true
+		}
+	}
+
+	if changed {
+		owners := make(map[string][]string)
+		for pkgName, entry := range c.packages {
+			for _, path := range entry.paths {
+				owners[path] = appendUniqueOwner(owners[path], pkgName)
+			}
+		}
+		c.snapshot = &fileOwnershipSnapshot{owners: owners}
+	}
+
+	return c.snapshot
+}
+
+func readManifestOwnershipPaths(manifestPath, rootDir string, dirCache map[string]string) []string {
+	data, err := os.ReadFile(manifestPath)
+	if err != nil {
+		return nil
+	}
+
+	pathSet := make(map[string]struct{})
+	scanner := bufio.NewScanner(strings.NewReader(string(data)))
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasSuffix(line, "/") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) == 0 {
+			continue
+		}
+
+		addOwnershipPathVariants(pathSet, rootDir, fields[0], dirCache)
+	}
+
+	paths := make([]string, 0, len(pathSet))
+	for path := range pathSet {
+		paths = append(paths, path)
+	}
+	return paths
+}
+
+func addOwnershipPathVariants(pathSet map[string]struct{}, rootDir, manifestPath string, dirCache map[string]string) {
+	normalizedPath := canonicalizePathCached(rootDir, manifestPath, dirCache)
+	normalizedPathNoSlash := strings.TrimPrefix(normalizedPath, "/")
+	normalizedPathWithSlash := "/" + normalizedPathNoSlash
+
+	if normalizedPath != "" {
+		pathSet[normalizedPath] = struct{}{}
+	}
+	if normalizedPathWithSlash != "/" {
+		pathSet[normalizedPathWithSlash] = struct{}{}
+	}
+	if normalizedPathNoSlash != "" {
+		pathSet[normalizedPathNoSlash] = struct{}{}
+	}
+}
+
+func canonicalizePathCached(rootDir, path string, dirCache map[string]string) string {
+	cleanPath := filepath.Clean(path)
+	if cleanPath == "/" {
+		if strings.HasPrefix(path, "/") {
+			return "/"
+		}
+		return ""
+	}
+
+	absPath := filepath.Join(rootDir, strings.TrimPrefix(cleanPath, "/"))
+	dir := filepath.Dir(absPath)
+	base := filepath.Base(absPath)
+
+	resolvedDir, ok := dirCache[dir]
+	if !ok {
+		if resolved, err := filepath.EvalSymlinks(dir); err == nil {
+			resolvedDir = resolved
+		} else {
+			resolvedDir = dir
+		}
+		dirCache[dir] = resolvedDir
+	}
+
+	rel, err := filepath.Rel(rootDir, filepath.Join(resolvedDir, base))
+	if err != nil {
+		return cleanPath
+	}
+	if strings.HasPrefix(path, "/") {
+		return "/" + strings.TrimPrefix(rel, "/")
+	}
+	return strings.TrimPrefix(rel, "/")
+}
+
+func appendUniqueOwner(owners []string, pkgName string) []string {
+	for _, owner := range owners {
+		if owner == pkgName {
+			return owners
+		}
+	}
+	return append(owners, pkgName)
+}
 
 // removeObsoleteFiles compares the installed manifest (under Installed/<pkg>/manifest)
 // with the manifest present in the staging tree. It returns a slice of absolute
@@ -55,8 +268,8 @@ func removeObsoleteFiles(pkgName, stagingDir, rootDir string) ([]string, error) 
 	// Build an index of file ownership once (for all packages except current)
 	// This avoids scanning all manifests for each file
 	debugf("Building file ownership index...\n")
-	fileOwnerIndex := buildFileOwnerIndex(pkgName, rootDir)
-	debugf("File ownership index built (indexed %d files)\n", len(fileOwnerIndex))
+	ownershipSnapshot := getFileOwnershipSnapshot(rootDir)
+	debugf("File ownership index built (indexed %d files)\n", len(ownershipSnapshot.owners))
 
 	// Scan installed manifest; add files missing from staging manifest
 	iscanner := bufio.NewScanner(strings.NewReader(string(installedData)))
@@ -91,15 +304,10 @@ func removeObsoleteFiles(pkgName, stagingDir, rootDir string) ([]string, error) 
 				debugf("Checked %d obsolete files...\n", filesChecked)
 			}
 
-			// Check if this file is owned by another package using the index
-			// Try both with and without leading slash for matching
-			if _, owned := fileOwnerIndex[canonicalPath]; owned {
-				continue
-			}
-			if _, owned := fileOwnerIndex[canonicalPathNoSlash]; owned {
-				continue
-			}
-			if _, owned := fileOwnerIndex[path]; owned {
+			// Check if this file is owned by another package using the index.
+			if ownershipSnapshot.ownerOtherThan(canonicalPath, pkgName) != "" ||
+				ownershipSnapshot.ownerOtherThan(canonicalPathNoSlash, pkgName) != "" ||
+				ownershipSnapshot.ownerOtherThan(path, pkgName) != "" {
 				continue
 			}
 			// File is not owned by another package, schedule for deletion
@@ -119,61 +327,10 @@ func removeObsoleteFiles(pkgName, stagingDir, rootDir string) ([]string, error) 
 // of scanning all manifests for each file.
 func buildFileOwnerIndex(excludePkg, rootDir string) map[string]string {
 	index := make(map[string]string)
-
-	entries, err := os.ReadDir(Installed)
-	if err != nil {
-		return index
-	}
-
-	for _, e := range entries {
-		if !e.IsDir() {
-			continue
-		}
-		pkgName := e.Name()
-		// Skip the excluded package
-		if pkgName == excludePkg {
-			continue
-		}
-
-		manifestPath := filepath.Join(Installed, pkgName, "manifest")
-		data, err := os.ReadFile(manifestPath)
-		if err != nil {
-			continue // skip unreadable manifests
-		}
-
-		scanner := bufio.NewScanner(strings.NewReader(string(data)))
-		for scanner.Scan() {
-			line := strings.TrimSpace(scanner.Text())
-			if line == "" || strings.HasSuffix(line, "/") {
-				continue
-			}
-			fields := strings.Fields(line)
-			if len(fields) == 0 {
-				continue
-			}
-			manifestPath := fields[0]
-
-			// Normalize the path and add to index using canonicalizePath
-			normalizedPath := canonicalizePath(rootDir, manifestPath)
-			// Also add normalized path without leading slash for matching
-			normalizedPathNoSlash := strings.TrimPrefix(normalizedPath, "/")
-			normalizedPathWithSlash := "/" + normalizedPathNoSlash
-
-			// Store in index with both formats (with and without leading slash)
-			// Store the first package that owns this file (in case of duplicates)
-			if _, exists := index[normalizedPath]; !exists {
-				index[normalizedPath] = pkgName
-			}
-			if normalizedPath != normalizedPathWithSlash {
-				if _, exists := index[normalizedPathWithSlash]; !exists {
-					index[normalizedPathWithSlash] = pkgName
-				}
-			}
-			if normalizedPath != normalizedPathNoSlash && normalizedPathNoSlash != "" {
-				if _, exists := index[normalizedPathNoSlash]; !exists {
-					index[normalizedPathNoSlash] = pkgName
-				}
-			}
+	snapshot := getFileOwnershipSnapshot(rootDir)
+	for path := range snapshot.owners {
+		if owner := snapshot.ownerOtherThan(path, excludePkg); owner != "" {
+			index[path] = owner
 		}
 	}
 
