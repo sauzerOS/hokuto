@@ -428,6 +428,42 @@ func generateLibDeps(outputDir, libdepsFile string, execCtx *Executor) error {
 	return nil
 }
 
+func splitMetadataCandidates(pkgName, baseName string) []string {
+	names := []string{pkgName}
+	for _, prefix := range []string{"aarch64-", "x86_64-"} {
+		if strings.HasPrefix(pkgName, prefix) {
+			names = append(names, strings.TrimPrefix(pkgName, prefix))
+			break
+		}
+	}
+
+	var candidates []string
+	seen := make(map[string]bool)
+	for _, name := range names {
+		for _, candidate := range []string{
+			baseName + "." + name,
+			filepath.Join("split", name, baseName),
+		} {
+			if !seen[candidate] {
+				candidates = append(candidates, candidate)
+				seen[candidate] = true
+			}
+		}
+	}
+	candidates = append(candidates, baseName)
+	return candidates
+}
+
+func findPackageMetadataFile(pkgDir, pkgName, baseName string) string {
+	for _, rel := range splitMetadataCandidates(pkgName, baseName) {
+		path := filepath.Join(pkgDir, rel)
+		if fi, err := os.Stat(path); err == nil && !fi.IsDir() {
+			return path
+		}
+	}
+	return filepath.Join(pkgDir, baseName)
+}
+
 func generateDepends(pkgName, pkgDir, outputDir, rootDir string, execCtx *Executor, bootstrap bool) error {
 	installedDir := filepath.Join(outputDir, "var", "db", "hokuto", "installed", pkgName)
 	dependsFile := filepath.Join(installedDir, "depends")
@@ -498,7 +534,7 @@ func generateDepends(pkgName, pkgDir, outputDir, rootDir string, execCtx *Execut
 
 	// --- Part 2: Merge manually specified dependencies from the repo file ---
 	// Preserve full dependency specifications including version constraints
-	repoDepends := filepath.Join(pkgDir, "depends")
+	repoDepends := findPackageMetadataFile(pkgDir, pkgName, "depends")
 	if data, err := os.ReadFile(repoDepends); err == nil {
 		for _, line := range strings.Split(string(data), "\n") {
 			line = strings.TrimSpace(line)
@@ -767,7 +803,7 @@ func getPackageDependenciesToUninstall(name string) []string {
 		return []string{"18-sed"}
 	case "hokuto":
 		return []string{"21-hokuto"}
-        case "make-ca":
+	case "make-ca":
 		return []string{"ca-certificates"}
 	case "cython":
 		return []string{name}
@@ -793,7 +829,7 @@ func getPackageDependenciesToUninstall(name string) []string {
 		return []string{name}
 	case "cursor":
 		return []string{name}
-        case "kapidox":
+	case "kapidox":
 		return []string{name}
 	case "mercurial":
 		return []string{name}

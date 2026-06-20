@@ -273,6 +273,214 @@ type BuildOptions struct {
 	UpdateWebsite bool      // If true, update the github.io status table
 }
 
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'"
+}
+
+func runSplitScript(pkgDir, outputDir, splitDir, version, pkgName string, buildExec *Executor, env []string, opts BuildOptions) error {
+	splitScript := filepath.Join(pkgDir, "split")
+	if fi, err := os.Stat(splitScript); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("failed to stat split script: %w", err)
+	} else if fi.IsDir() {
+		return nil
+	}
+
+	if !opts.Quiet {
+		colArrow.Print("-> ")
+		colSuccess.Printf("Running split script for %s\n", pkgName)
+	}
+	cmdStr := fmt.Sprintf("cd %s && %s %s %s %s %s",
+		shellQuote(filepath.Dir(splitScript)),
+		shellQuote(splitScript),
+		shellQuote(outputDir),
+		shellQuote(splitDir),
+		shellQuote(version),
+		shellQuote(pkgName))
+	cmd := exec.Command("sh", "-c", cmdStr)
+	cmd.Env = append([]string{}, env...)
+	cmd.Env = append(cmd.Env,
+		"HOKUTO_OUTPUT_DIR="+outputDir,
+		"HOKUTO_SPLIT_DIR="+splitDir,
+		"HOKUTO_PACKAGE="+pkgName,
+		"HOKUTO_VERSION="+version,
+	)
+	if opts.LogWriter != nil {
+		cmd.Stdout = opts.LogWriter
+		cmd.Stderr = opts.LogWriter
+	} else if Verbose || Debug {
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+	}
+	if err := buildExec.Run(cmd); err != nil {
+		return fmt.Errorf("split script failed for %s: %w", pkgName, err)
+	}
+	return nil
+}
+
+func discoverSplitOutputDirs(splitRoot string) ([]string, error) {
+	entries, err := os.ReadDir(splitRoot)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+
+	var names []string
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		name := strings.TrimSpace(entry.Name())
+		if name == "" || strings.Contains(name, "/") || name == "." || name == ".." {
+			continue
+		}
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names, nil
+}
+
+func hasPackagePayload(outputDir string) (bool, error) {
+	metadataPrefix := filepath.Join(outputDir, "var", "db", "hokuto", "installed")
+	hasPayload := false
+	err := filepath.Walk(outputDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if path == outputDir {
+			return nil
+		}
+		if strings.HasPrefix(path, metadataPrefix) {
+			if info.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		hasPayload = true
+		if info.IsDir() {
+			return filepath.SkipDir
+		}
+		return filepath.SkipDir
+	})
+	return hasPayload, err
+}
+
+func copyOptionalMetadataFile(src, dst string, execCtx *Executor) error {
+	if fi, err := os.Stat(src); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	} else if fi.IsDir() {
+		return nil
+	}
+	cpCmd := exec.Command("cp", "--remove-destination", src, dst)
+	return execCtx.Run(cpCmd)
+}
+
+func packageSplitOutputs(parentPkgName, pkgDir, splitRoot, version, revision, targetArch, cflagsVal string, isGeneric bool, shouldStrip bool, buildExec *Executor, cfg *Config, opts BuildOptions, elapsed time.Duration) error {
+	splitNames, err := discoverSplitOutputDirs(splitRoot)
+	if err != nil {
+		return fmt.Errorf("failed to read split output dir: %w", err)
+	}
+	if len(splitNames) == 0 {
+		return nil
+	}
+
+	for _, splitName := range splitNames {
+		splitOutputDir := filepath.Join(splitRoot, splitName)
+		hasPayload, err := hasPackagePayload(splitOutputDir)
+		if err != nil {
+			return fmt.Errorf("failed to inspect split package %s: %w", splitName, err)
+		}
+		if !hasPayload {
+			debugf("Skipping empty split package output %s\n", splitOutputDir)
+			continue
+		}
+
+		outputSplitName := getOutputPackageName(splitName, cfg)
+		if !opts.Quiet {
+			colArrow.Print("-> ")
+			colSuccess.Printf("Packaging split package %s from %s\n", outputSplitName, parentPkgName)
+		}
+
+		installedDir := filepath.Join(splitOutputDir, "var", "db", "hokuto", "installed", outputSplitName)
+		mkdirCmd := exec.Command("mkdir", "-p", installedDir)
+		if err := buildExec.Run(mkdirCmd); err != nil {
+			return fmt.Errorf("failed to create installed dir for split package %s: %w", outputSplitName, err)
+		}
+
+		parentOptions := loadBuildOptions(pkgDir)
+		if !parentOptions["binary"] {
+			libdepsFile := filepath.Join(installedDir, "libdeps")
+			if err := generateLibDeps(splitOutputDir, libdepsFile, buildExec); err != nil {
+				fmt.Printf("Warning: failed to generate libdeps for split package %s: %v\n", outputSplitName, err)
+			}
+		}
+
+		if err := generateDepends(outputSplitName, pkgDir, splitOutputDir, rootDir, buildExec, opts.Bootstrap); err != nil {
+			return fmt.Errorf("failed to generate depends for split package %s: %w", outputSplitName, err)
+		}
+
+		if shouldStrip {
+			if err := stripPackage(splitOutputDir, buildExec, opts.LogWriter); err != nil {
+				return fmt.Errorf("split package %s failed during stripping phase: %w", outputSplitName, err)
+			}
+		}
+
+		if err := copyOptionalMetadataFile(filepath.Join(pkgDir, "version"), filepath.Join(installedDir, "version"), buildExec); err != nil {
+			return fmt.Errorf("failed to copy version file for split package %s: %w", outputSplitName, err)
+		}
+		if err := copyOptionalMetadataFile(filepath.Join(pkgDir, "build"), filepath.Join(installedDir, "build"), buildExec); err != nil {
+			return fmt.Errorf("failed to copy build file for split package %s: %w", outputSplitName, err)
+		}
+		if err := copyOptionalMetadataFile(filepath.Join(pkgDir, "options"), filepath.Join(installedDir, "options"), buildExec); err != nil {
+			return fmt.Errorf("failed to copy options file for split package %s: %w", outputSplitName, err)
+		}
+		postInstallSrc := findPackageMetadataFile(pkgDir, outputSplitName, "post-install")
+		if postInstallSrc != filepath.Join(pkgDir, "post-install") {
+			if err := copyOptionalMetadataFile(postInstallSrc, filepath.Join(installedDir, "post-install"), buildExec); err != nil {
+				return fmt.Errorf("failed to copy split post-install file for %s: %w", outputSplitName, err)
+			}
+		}
+
+		buildTimeFile := filepath.Join(installedDir, "buildtime")
+		echoCmd := exec.Command("sh", "-c", fmt.Sprintf("echo '%s' | tee %s > /dev/null 2>&1", elapsed.String(), shellQuote(buildTimeFile)))
+		if err := buildExec.Run(echoCmd); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to save split build time to %s: %v\n", buildTimeFile, err)
+		}
+
+		isMultilib := detectMultilib(splitOutputDir)
+		pkginfoExec := buildExec
+		if buildExec.ShouldRunAsRoot {
+			pkginfoExec = RootExec
+		}
+		if err := WritePackageInfo(splitOutputDir, outputSplitName, version, revision, targetArch, cflagsVal, isGeneric, isMultilib, pkginfoExec); err != nil {
+			return fmt.Errorf("failed to write pkginfo for split package %s: %w", outputSplitName, err)
+		}
+		if err := generateManifest(splitOutputDir, installedDir, buildExec); err != nil {
+			return fmt.Errorf("failed to generate manifest for split package %s: %w", outputSplitName, err)
+		}
+		signExec := buildExec
+		if buildExec.ShouldRunAsRoot {
+			signExec = RootExec
+		}
+		if err := SignPackage(splitOutputDir, outputSplitName, signExec, opts.LogWriter); err != nil {
+			return fmt.Errorf("failed to sign split package %s: %w", outputSplitName, err)
+		}
+
+		variant := IdentifyVariant(splitName, isGeneric, isMultilib)
+		if err := createPackageTarball(outputSplitName, version, revision, targetArch, variant, splitOutputDir, buildExec, opts.LogWriter); err != nil {
+			return fmt.Errorf("failed to package split tarball %s: %w", outputSplitName, err)
+		}
+	}
+	return nil
+}
+
 func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, opts BuildOptions) (time.Duration, error) {
 
 	// Define the ANSI escape code format for setting the terminal title.
@@ -384,6 +592,7 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, opts BuildOptions)
 	logDir := filepath.Join(pkgTmpDir, "log")
 	buildDir := filepath.Join(pkgTmpDir, "build")
 	outputDir := filepath.Join(pkgTmpDir, "output")
+	splitRoot := filepath.Join(pkgTmpDir, "split")
 
 	// First try to cleanup pkgTmpDir with Go's os.RemoveAll
 	if os.Geteuid() == 0 {
@@ -401,7 +610,7 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, opts BuildOptions)
 	}
 
 	// Rereate build/output dirs (non-root, inside TMPDIR)
-	for _, dir := range []string{buildDir, outputDir, logDir} {
+	for _, dir := range []string{buildDir, outputDir, logDir, splitRoot} {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return 0, fmt.Errorf("failed to create dir %s: %v", dir, err)
 		}
@@ -579,18 +788,20 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, opts BuildOptions)
 			"CXXFLAGS":  cflags,
 			"LDFLAGS":   "",
 			// Crucial: Put LFS tools first in PATH
-			"PATH":             filepath.Join(lfsRoot, "tools/bin") + ":/usr/bin:/bin",
-			"MAKEFLAGS":        fmt.Sprintf("-j%d", numCores),
-			"CONFIG_SITE":      filepath.Join(lfsRoot, "usr/share/config.site"),
-			"HOKUTO_ROOT":      lfsRoot,
-			"TMPDIR":           currentTmpDir,
-			"XDG_CACHE_HOME":   filepath.Join(buildDir, ".cache"), // Prevent g-ir-scanner from using ~/.cache
-			"HOKUTO_ARCH":      targetArch,
-			"HOKUTO_BUILD_DIR": buildDir,
-			"CARGO_HOME":       filepath.Join(buildDir, "cargo"),
-			"GNU_MIRROR":       cfg.Values["GNU_MIRROR"],
-			"SET_HOKUTO_LTO":   cfg.Values["SET_HOKUTO_LTO"],
-			"MULTILIB":         multilibVal,
+			"PATH":              filepath.Join(lfsRoot, "tools/bin") + ":/usr/bin:/bin",
+			"MAKEFLAGS":         fmt.Sprintf("-j%d", numCores),
+			"CONFIG_SITE":       filepath.Join(lfsRoot, "usr/share/config.site"),
+			"HOKUTO_ROOT":       lfsRoot,
+			"TMPDIR":            currentTmpDir,
+			"XDG_CACHE_HOME":    filepath.Join(buildDir, ".cache"), // Prevent g-ir-scanner from using ~/.cache
+			"HOKUTO_ARCH":       targetArch,
+			"HOKUTO_BUILD_DIR":  buildDir,
+			"HOKUTO_OUTPUT_DIR": outputDir,
+			"HOKUTO_SPLIT_DIR":  splitRoot,
+			"CARGO_HOME":        filepath.Join(buildDir, "cargo"),
+			"GNU_MIRROR":        cfg.Values["GNU_MIRROR"],
+			"SET_HOKUTO_LTO":    cfg.Values["SET_HOKUTO_LTO"],
+			"MULTILIB":          multilibVal,
 		}
 
 		if cfg.Values["HOKUTO_GENERIC"] == "1" {
@@ -791,6 +1002,8 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, opts BuildOptions)
 			"HOKUTO_GENERIC":             hokutoGenericEnv,
 			"MULTILIB":                   multilibVal,
 			"HOKUTO_BUILD_DIR":           buildDir,
+			"HOKUTO_OUTPUT_DIR":          outputDir,
+			"HOKUTO_SPLIT_DIR":           splitRoot,
 			"GNU_MIRROR":                 cfg.Values["GNU_MIRROR"],
 		}
 
@@ -1224,6 +1437,10 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, opts BuildOptions)
 	elapsed := time.Since(startTime).Truncate(time.Second)
 	debugf("\n%s built successfully in %s, output in %s\n", pkgName, elapsed, outputDir)
 
+	if err := runSplitScript(pkgDir, outputDir, splitRoot, version, pkgName, buildExec, env, opts); err != nil {
+		return 0, err
+	}
+
 	// Determine output package name (rename if cross-system is enabled)
 	outputPkgName := getOutputPackageName(pkgName, cfg)
 
@@ -1477,6 +1694,10 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, opts BuildOptions)
 	// Generate package archive (using output package name if cross-system is enabled)
 	if err := createPackageTarball(outputPkgName, version, revision, targetArch, variant, outputDir, buildExec, opts.LogWriter); err != nil {
 		return 0, fmt.Errorf("failed to package tarball: %v", err)
+	}
+
+	if err := packageSplitOutputs(pkgName, pkgDir, splitRoot, version, revision, targetArch, cflagsVal, isGeneric, shouldStrip, buildExec, cfg, opts, elapsed); err != nil {
+		return 0, err
 	}
 
 	// Cleanup tmpdirs
