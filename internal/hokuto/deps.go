@@ -16,6 +16,34 @@ import (
 // Cache for resolved alternative dependencies to avoid prompting multiple times
 var alternativeDepCache = make(map[string]string)
 
+var baseDevelPackages = []string{
+	"autoconf",
+	"automake",
+	"binutils",
+	"bison",
+	"file",
+	"findutils",
+	"flex",
+	"gawk",
+	"gcc",
+	"gcc-libs",
+	"gettext",
+	"grep",
+	"gzip",
+	"libtool",
+	"m4",
+	"make",
+	"patch",
+	"pkgconf",
+	"sed",
+	"which",
+}
+
+var multilibDevelPackages = []string{
+	"lib32-glibc",
+	"lib32-gcc-libs",
+}
+
 // MovePackageToFront moves a specific package to the beginning of the list if it exists.
 func MovePackageToFront(list []string, pkgName string) []string {
 	foundIdx := -1
@@ -34,6 +62,179 @@ func MovePackageToFront(list []string, pkgName string) []string {
 	newList = append(newList, list[:foundIdx]...)
 	newList = append(newList, list[foundIdx+1:]...)
 	return newList
+}
+
+func multilibEnabled(cfg *Config) bool {
+	return EnableMultilib || (cfg != nil && cfg.Values["HOKUTO_MULTILIB"] == "1")
+}
+
+func isMultilibPackageDepName(name string) bool {
+	return strings.HasPrefix(name, "lib32-") || strings.HasSuffix(name, "-32")
+}
+
+func shouldSkipMultilibMakeDep(dep DepSpec, name string, cfg *Config) bool {
+	return dep.Make && !multilibEnabled(cfg) && isMultilibPackageDepName(name)
+}
+
+func dependencyVariantCandidates(pkgName string, cfg *Config) []string {
+	preferred := GetSystemVariantForPackage(cfg, pkgName)
+	candidates := []string{preferred}
+	add := func(v string) {
+		for _, existing := range candidates {
+			if existing == v {
+				return
+			}
+		}
+		candidates = append(candidates, v)
+	}
+
+	switch preferred {
+	case "optimized":
+		add("generic")
+		add("multi-optimized")
+		add("multi-generic")
+	case "generic":
+		add("optimized")
+		add("multi-generic")
+		add("multi-optimized")
+	case "multi-optimized":
+		add("multi-generic")
+		add("optimized")
+		add("generic")
+	case "multi-generic":
+		add("multi-optimized")
+		add("generic")
+		add("optimized")
+	}
+
+	return candidates
+}
+
+func findCachedBinaryTarball(pkgName string, cfg *Config) string {
+	for _, variant := range dependencyVariantCandidates(pkgName, cfg) {
+		tarballPath, _, _ := findNewestTarball(pkgName, variant)
+		if tarballPath != "" {
+			return tarballPath
+		}
+	}
+	return ""
+}
+
+func depSpecsFromNames(names []string) []DepSpec {
+	deps := make([]DepSpec, 0, len(names))
+	for _, name := range names {
+		if strings.TrimSpace(name) != "" {
+			deps = append(deps, DepSpec{Name: name})
+		}
+	}
+	return deps
+}
+
+func resolveBinaryDependenciesFromArchive(pkgName string, cfg *Config, remoteIndex []RepoEntry, allowRemote bool) ([]DepSpec, bool, error) {
+	lookupName := pkgName
+	if idx := strings.Index(pkgName, "@"); idx != -1 {
+		lookupName = pkgName[:idx]
+	}
+
+	if tarballPath := findCachedBinaryTarball(lookupName, cfg); tarballPath != "" {
+		deps, err := scanTarballDependencySpecs(tarballPath)
+		if err != nil {
+			return nil, true, fmt.Errorf("failed to scan dependencies from %s: %w", filepath.Base(tarballPath), err)
+		}
+		return deps, true, nil
+	}
+
+	if allowRemote && len(remoteIndex) == 0 && BinaryMirror != "" {
+		if idx, err := GetCachedRemoteIndex(cfg); err == nil {
+			remoteIndex = idx
+		} else {
+			debugf("Failed to fetch remote index for %s dependency fallback: %v\n", lookupName, err)
+		}
+	}
+
+	if len(remoteIndex) == 0 {
+		return nil, false, nil
+	}
+
+	entryRef, err := GetRemotePackageEntry(lookupName, cfg, remoteIndex)
+	if err != nil {
+		return nil, false, nil
+	}
+	entry := *entryRef
+
+	if len(entry.Depends) > 0 {
+		return depSpecsFromNames(entry.Depends), true, nil
+	}
+
+	if err := fetchSpecificBinaryPackage(entry.Name, entry.Version, entry.Revision, entry.Variant, cfg, true, entry.B3Sum, false); err != nil {
+		return nil, true, fmt.Errorf("failed to fetch %s for dependency resolution: %w", lookupName, err)
+	}
+
+	arch := GetSystemArchForPackage(cfg, entry.Name)
+	tarballName := StandardizeRemoteName(entry.Name, entry.Version, entry.Revision, arch, entry.Variant)
+	tarballPath := filepath.Join(BinDir, tarballName)
+	deps, err := scanTarballDependencySpecs(tarballPath)
+	if err != nil {
+		return nil, true, fmt.Errorf("failed to scan dependencies from %s: %w", tarballName, err)
+	}
+	return deps, true, nil
+}
+
+func splitDependencySourceCandidates(pkgName string) []string {
+	var candidates []string
+	add := func(name string) {
+		if name == "" || name == pkgName {
+			return
+		}
+		for _, existing := range candidates {
+			if existing == name {
+				return
+			}
+		}
+		candidates = append(candidates, name)
+	}
+
+	if strings.HasPrefix(pkgName, "lib32-") {
+		add(strings.TrimPrefix(pkgName, "lib32-"))
+	}
+	return candidates
+}
+
+func findSplitDependencySource(pkgName string) (string, bool) {
+	for _, candidate := range splitDependencySourceCandidates(pkgName) {
+		if _, err := findPackageMetadataDir(candidate); err == nil {
+			return candidate, true
+		}
+	}
+	return "", false
+}
+
+func resolveDependencyList(parentPkg string, deps []DepSpec, visited map[string]bool, plan *[]string, force bool, yes bool, cfg *Config, remoteIndex []RepoEntry) error {
+	for _, dep := range deps {
+		if dep.Make {
+			continue
+		}
+
+		depName := dep.Name
+		if len(dep.Alternatives) > 0 {
+			resolved, err := resolveAlternativeDep(dep, yes, cfg)
+			if err != nil {
+				return fmt.Errorf("failed to resolve alternative dependency for %s: %w", parentPkg, err)
+			}
+			depName = resolved
+		}
+
+		if !force {
+			if findInstalledSatisfying(depName, dep.Op, dep.Version) != "" {
+				continue
+			}
+		}
+
+		if err := resolveBinaryDependencies(depName, visited, plan, force, yes, cfg, remoteIndex); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // resolveBinaryDependencies recursively finds missing dependencies for a package.
@@ -93,7 +294,18 @@ func resolveBinaryDependencies(pkgName string, visited map[string]bool, plan *[]
 	}
 	pkgDir, err := findPackageMetadataDir(lookupName)
 	if err != nil {
-		return fmt.Errorf("cannot resolve dependencies for %s: source not found in HOKUTO_PATH", pkgName)
+		deps, found, depErr := resolveBinaryDependenciesFromArchive(pkgName, cfg, remoteIndex, true)
+		if depErr != nil {
+			return depErr
+		}
+		if !found {
+			return fmt.Errorf("cannot resolve dependencies for %s: source not found in HOKUTO_PATH", pkgName)
+		}
+		if err := resolveDependencyList(pkgName, deps, visited, plan, force, yes, cfg, remoteIndex); err != nil {
+			return err
+		}
+		*plan = append(*plan, pkgName)
+		return nil
 	}
 
 	// 4. Parse dependencies
@@ -103,39 +315,8 @@ func resolveBinaryDependencies(pkgName string, visited map[string]bool, plan *[]
 	}
 
 	// 5. Recurse for each dependency
-	for _, dep := range deps {
-		// Skip build-time only dependencies
-		if dep.Make {
-			continue
-		}
-
-		// FILTER: Ignore 32-bit dependencies if multilib is disabled
-		if !EnableMultilib && strings.HasSuffix(dep.Name, "-32") {
-			continue
-		}
-
-		// Resolve alternative dependencies if present
-		depName := dep.Name
-		if len(dep.Alternatives) > 0 {
-			resolved, err := resolveAlternativeDep(dep, yes)
-			if err != nil {
-				return fmt.Errorf("failed to resolve alternative dependency for %s: %w", pkgName, err)
-			}
-			depName = resolved
-		}
-
-		// Check if any installed package (including name-MAJOR) satisfies the dependency
-		if !force {
-			satisfying := findInstalledSatisfying(depName, dep.Op, dep.Version)
-			if satisfying != "" {
-				// Dependency satisfied by an installed package
-				continue
-			}
-		}
-
-		if err := resolveBinaryDependencies(depName, visited, plan, force, yes, cfg, remoteIndex); err != nil {
-			return err
-		}
+	if err := resolveDependencyList(pkgName, deps, visited, plan, force, yes, cfg, remoteIndex); err != nil {
+		return err
 	}
 
 	// 6. Add current package to plan (Post-order traversal)
@@ -148,7 +329,7 @@ func resolveBinaryDependencies(pkgName string, visited map[string]bool, plan *[]
 // - creates directory $newPackageDir/<pkg>
 // - creates build, version, sources files with the right modes and contents
 
-func resolveMissingDeps(pkgName string, processed map[string]bool, missing *[]string, forceBuild map[string]bool, cfg *Config) error {
+func resolveMissingDeps(pkgName string, processed map[string]bool, missing *[]string, forceBuild map[string]bool, cfg *Config, noRemote bool) error {
 
 	// 1. Mark this package as processed to prevent infinite recursion
 	if processed[pkgName] {
@@ -158,16 +339,32 @@ func resolveMissingDeps(pkgName string, processed map[string]bool, missing *[]st
 
 	// --- 3. Find the Package Source Directory (pkgDir) ---
 	pkgDir, err := findPackageMetadataDir(pkgName)
+	var dependencies []DepSpec
 	if err != nil {
-		return err
-	}
-
-	// --- 4. Parse the depends file (Now that we have the confirmed pkgDir) ---
-
-	// Check if a depends file exists in the located pkgDir.
-	dependencies, err := parseDependsFile(pkgDir)
-	if err != nil {
-		return fmt.Errorf("failed to parse dependencies for %s: %w", pkgName, err)
+		archiveDeps, found, depErr := resolveBinaryDependenciesFromArchive(pkgName, cfg, nil, !noRemote)
+		if depErr != nil {
+			return depErr
+		}
+		if !found {
+			if sourcePkg, ok := findSplitDependencySource(pkgName); ok {
+				if err := resolveMissingDeps(sourcePkg, processed, missing, forceBuild, cfg, noRemote); err != nil {
+					return err
+				}
+				if !isPackageInstalled(pkgName) {
+					*missing = append(*missing, pkgName)
+				}
+				return nil
+			}
+			return err
+		}
+		dependencies = archiveDeps
+	} else {
+		// --- 4. Parse the depends file (Now that we have the confirmed pkgDir) ---
+		// Check if a depends file exists in the located pkgDir.
+		dependencies, err = parseDependsFile(pkgDir)
+		if err != nil {
+			return fmt.Errorf("failed to parse dependencies for %s: %w", pkgName, err)
+		}
 	}
 
 	// --- 5. Recursively check all dependencies ---
@@ -204,7 +401,7 @@ func resolveMissingDeps(pkgName string, processed map[string]bool, missing *[]st
 
 		// Resolve alternative dependencies if present
 		if len(dep.Alternatives) > 0 {
-			resolved, err := resolveAlternativeDep(dep, false) // resolveMissingDeps doesn't have yes flag, use false
+			resolved, err := resolveAlternativeDep(dep, false, cfg) // resolveMissingDeps doesn't have yes flag, use false
 			if err != nil {
 				return fmt.Errorf("failed to resolve alternative dependency: %w", err)
 			}
@@ -221,8 +418,7 @@ func resolveMissingDeps(pkgName string, processed map[string]bool, missing *[]st
 			continue
 		}
 
-		// FILTER: Ignore 32-bit dependencies if multilib is disabled
-		if !EnableMultilib && strings.HasSuffix(depName, "-32") {
+		if shouldSkipMultilibMakeDep(dep, depName, cfg) {
 			continue
 		}
 
@@ -249,7 +445,7 @@ func resolveMissingDeps(pkgName string, processed map[string]bool, missing *[]st
 			}
 		}
 
-		if err := resolveMissingDeps(depName, processed, missing, forceBuild, cfg); err != nil {
+		if err := resolveMissingDeps(depName, processed, missing, forceBuild, cfg, noRemote); err != nil {
 			// Propagate the error up
 			return err
 		}
@@ -332,34 +528,8 @@ func resolveRemoteDependencies(pkgName string, visited map[string]bool, plan *[]
 	}
 
 	// 7. Recurse
-	for _, dep := range deps {
-		// Skip build-time only dependencies (Make=true)
-		if dep.Make {
-			continue
-		}
-		if !EnableMultilib && strings.HasSuffix(dep.Name, "-32") {
-			continue
-		}
-
-		depName := dep.Name
-		if len(dep.Alternatives) > 0 {
-			resolved, err := resolveAlternativeDep(dep, yes)
-			if err != nil {
-				return fmt.Errorf("failed to resolve alternative dependency for %s: %w", pkgName, err)
-			}
-			depName = resolved
-		}
-
-		if !force {
-			if findInstalledSatisfying(depName, dep.Op, dep.Version) != "" {
-				continue
-			}
-		}
-
-		// Try to resolve using normal logic (local source preferred), fallback to remote is built-in
-		if err := resolveBinaryDependencies(depName, visited, plan, force, yes, cfg, remoteIndex); err != nil {
-			return err
-		}
+	if err := resolveDependencyList(pkgName, deps, visited, plan, force, yes, cfg, remoteIndex); err != nil {
+		return err
 	}
 
 	// 8. Add to plan
@@ -370,7 +540,7 @@ func resolveRemoteDependencies(pkgName string, visited map[string]bool, plan *[]
 // resolveAlternativeDep resolves an alternative dependency by checking which alternatives are available
 // and prompting the user to choose. Returns the chosen package name.
 // Uses a cache to avoid prompting multiple times for the same alternative set.
-func resolveAlternativeDep(dep DepSpec, yes bool) (string, error) {
+func resolveAlternativeDep(dep DepSpec, yes bool, cfg *Config) (string, error) {
 	if len(dep.Alternatives) < 2 {
 		// Not an alternative dependency, return the name as-is
 		return dep.Name, nil
@@ -402,8 +572,7 @@ func resolveAlternativeDep(dep DepSpec, yes bool) (string, error) {
 	var installed []string
 	var available []string
 	for _, altName := range dep.Alternatives {
-		// FILTER: Ignore 32-bit dependencies if multilib is disabled
-		if !EnableMultilib && strings.HasSuffix(altName, "-32") {
+		if shouldSkipMultilibMakeDep(dep, altName, cfg) {
 			continue
 		}
 
@@ -574,6 +743,9 @@ func resolveBuildPlan(targetPackages []string, userRequestedPackages map[string]
 
 		pkgDir, err := findPackageMetadataDir(pkgName)
 		if err != nil {
+			if sourcePkg, ok := findSplitDependencySource(pkgName); ok {
+				return processPkg(sourcePkg)
+			}
 			return fmt.Errorf("package source not found for '%s': %w", pkgName, err)
 		}
 
@@ -615,7 +787,7 @@ func resolveBuildPlan(targetPackages []string, userRequestedPackages map[string]
 
 			// Resolve alternative dependencies if present
 			if len(dep.Alternatives) > 0 {
-				resolved, err := resolveAlternativeDep(dep, false) // Use false for build (no yes flag available)
+				resolved, err := resolveAlternativeDep(dep, false, cfg) // Use false for build (no yes flag available)
 				if err != nil {
 					return fmt.Errorf("failed to resolve alternative dependency for %s: %w", pkgName, err)
 				}
@@ -654,8 +826,7 @@ func resolveBuildPlan(targetPackages []string, userRequestedPackages map[string]
 				continue
 			}
 
-			// FILTER: Ignore 32-bit dependencies if multilib is disabled
-			if !EnableMultilib && strings.HasSuffix(depName, "-32") {
+			if shouldSkipMultilibMakeDep(dep, depName, cfg) {
 				continue
 			}
 
@@ -882,7 +1053,7 @@ func getPackageDependenciesForward(pkgName string, cfg *Config) ([]string, error
 
 			// Resolve alternative dependencies if present
 			if len(dep.Alternatives) > 0 {
-				resolved, err := resolveAlternativeDep(dep, false) // Use false for build (no yes flag available)
+				resolved, err := resolveAlternativeDep(dep, false, cfg) // Use false for build (no yes flag available)
 				if err != nil {
 					return fmt.Errorf("failed to resolve alternative dependency: %w", err)
 				}
@@ -894,8 +1065,7 @@ func getPackageDependenciesForward(pkgName string, cfg *Config) ([]string, error
 				continue
 			}
 
-			// FILTER: Ignore 32-bit dependencies if multilib is disabled
-			if !EnableMultilib && strings.HasSuffix(depName, "-32") {
+			if shouldSkipMultilibMakeDep(dep, depName, cfg) {
 				continue
 			}
 
@@ -975,10 +1145,6 @@ func getInstalledDeps(pkgName string) ([]string, error) {
 		// Parse "pkgname>=1.0" -> "pkgname"
 		name, _, _, _, _, _, _, _ := parseDepToken(line)
 		if name != "" && name != pkgName {
-			// FILTER: Ignore 32-bit dependencies if multilib is disabled
-			if !EnableMultilib && strings.HasSuffix(name, "-32") {
-				continue
-			}
 			deps = append(deps, name)
 		}
 	}
@@ -1122,7 +1288,7 @@ func installBuildDependencies(pkgName string, cfg *Config) ([]string, error) {
 	masterProcessed := make(map[string]bool)
 	userRequested := map[string]bool{pkgName: true}
 
-	if err := resolveMissingDeps(pkgName, masterProcessed, &missing, userRequested, cfg); err != nil {
+	if err := resolveMissingDeps(pkgName, masterProcessed, &missing, userRequested, cfg, false); err != nil {
 		return newlyInstalled, fmt.Errorf("failed to resolve dependencies for %s: %v", pkgName, err)
 	}
 
@@ -1143,7 +1309,7 @@ func installBuildDependencies(pkgName string, cfg *Config) ([]string, error) {
 		}
 
 		// Try to install from binary or build
-		installed, err := ensurePackageInstalled(depPkg, cfg)
+		installed, err := ensurePackageInstalled(depPkg, cfg, false)
 		if err != nil {
 			return newlyInstalled, err
 		}
@@ -1156,11 +1322,11 @@ func installBuildDependencies(pkgName string, cfg *Config) ([]string, error) {
 }
 
 // ensurePackageInstalled handles the "fetch binary OR build and then install" logic for a single package.
-func ensurePackageInstalled(pkgName string, cfg *Config) (bool, error) {
+func ensurePackageInstalled(pkgName string, cfg *Config, noRemote bool) (bool, error) {
 	// 1. Get repo version
 	version, revision, err := getRepoVersion2(pkgName)
 	if err != nil {
-		return false, fmt.Errorf("failed to get version for %s: %v", pkgName, err)
+		return ensureBinaryOnlyPackageInstalled(pkgName, cfg, noRemote)
 	}
 
 	outputPkgName := getOutputPackageName(pkgName, cfg)
@@ -1172,7 +1338,7 @@ func ensurePackageInstalled(pkgName string, cfg *Config) (bool, error) {
 	foundBinary := false
 	if _, err := os.Stat(tarballPath); err == nil {
 		foundBinary = true
-	} else if BinaryMirror != "" {
+	} else if !noRemote && BinaryMirror != "" {
 		// Try to fetch binary
 		index, _ := GetCachedRemoteIndex(cfg)
 		var expectedSum string
@@ -1220,6 +1386,81 @@ func ensurePackageInstalled(pkgName string, cfg *Config) (bool, error) {
 	return true, nil
 }
 
+func installBinaryTarball(tarballPath, pkgName string, cfg *Config) (bool, error) {
+	isCriticalAtomic.Store(1)
+	defer isCriticalAtomic.Store(0)
+	handlePreInstallUninstall(pkgName, cfg, RootExec, true, nil)
+	if _, err := pkgInstall(tarballPath, pkgName, cfg, RootExec, true, false, false, nil); err != nil {
+		return false, fmt.Errorf("failed to install binary %s: %v", pkgName, err)
+	}
+	return true, nil
+}
+
+func ensureBinaryOnlyPackageInstalled(pkgName string, cfg *Config, noRemote bool) (bool, error) {
+	if tarballPath := findCachedBinaryTarball(pkgName, cfg); tarballPath != "" {
+		return installBinaryTarball(tarballPath, pkgName, cfg)
+	}
+
+	if noRemote || BinaryMirror == "" {
+		return false, fmt.Errorf("source not found for %s and no cached binary package is available", pkgName)
+	}
+
+	index, err := GetCachedRemoteIndex(cfg)
+	if err != nil {
+		return false, fmt.Errorf("source not found for %s and failed to fetch remote index: %w", pkgName, err)
+	}
+
+	entryRef, err := GetRemotePackageEntry(pkgName, cfg, index)
+	if err != nil {
+		return false, fmt.Errorf("source not found for %s and no remote binary package is available: %w", pkgName, err)
+	}
+	entry := *entryRef
+	if err := fetchSpecificBinaryPackage(entry.Name, entry.Version, entry.Revision, entry.Variant, cfg, true, entry.B3Sum, false); err != nil {
+		return false, fmt.Errorf("failed to fetch binary %s: %w", pkgName, err)
+	}
+
+	arch := GetSystemArchForPackage(cfg, entry.Name)
+	tarballPath := filepath.Join(BinDir, StandardizeRemoteName(entry.Name, entry.Version, entry.Revision, arch, entry.Variant))
+	return installBinaryTarball(tarballPath, entry.Name, cfg)
+}
+
+func requiredDevelPackages(cfg *Config, includeMultilib bool) []string {
+	required := append([]string{}, baseDevelPackages...)
+	if includeMultilib && multilibEnabled(cfg) {
+		required = append(required, multilibDevelPackages...)
+	}
+	return required
+}
+
+func ensureDevelPackagesInstalled(cfg *Config, includeMultilib bool, noRemote bool) ([]string, error) {
+	var missing []string
+	for _, pkgName := range requiredDevelPackages(cfg, includeMultilib) {
+		if isPackageInstalled(pkgName) {
+			continue
+		}
+		missing = append(missing, pkgName)
+	}
+	if len(missing) == 0 {
+		return nil, nil
+	}
+
+	colArrow.Print("-> ")
+	colSuccess.Printf("Installing missing devel packages: %s\n", strings.Join(missing, ", "))
+
+	var newlyInstalled []string
+	for _, pkgName := range missing {
+		installed, err := ensurePackageInstalled(pkgName, cfg, noRemote)
+		if err != nil {
+			return newlyInstalled, err
+		}
+		if installed {
+			newlyInstalled = append(newlyInstalled, getOutputPackageName(pkgName, cfg))
+		}
+	}
+
+	return newlyInstalled, nil
+}
+
 // uninstallBuildDependencies uninstalls a list of packages in reverse order.
 func uninstallBuildDependencies(packages []string, cfg *Config) {
 	// Uninstall in reverse order
@@ -1232,4 +1473,3 @@ func uninstallBuildDependencies(packages []string, cfg *Config) {
 		}
 	}
 }
-

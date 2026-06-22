@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/url"
 	"os"
 	"os/exec"
@@ -17,6 +18,79 @@ import (
 	"strings"
 	"sync"
 )
+
+func copyDirContentsFallback(src, dst string) error {
+	walkRoot, err := filepath.EvalSymlinks(src)
+	if err != nil {
+		return err
+	}
+	return filepath.WalkDir(walkRoot, func(path string, entry fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+
+		rel, err := filepath.Rel(walkRoot, path)
+		if err != nil {
+			return err
+		}
+		if rel == "." {
+			return os.MkdirAll(dst, 0o755)
+		}
+
+		target := filepath.Join(dst, rel)
+		info, err := os.Lstat(path)
+		if err != nil {
+			return err
+		}
+
+		switch {
+		case info.IsDir():
+			if err := os.MkdirAll(target, info.Mode().Perm()); err != nil {
+				return err
+			}
+			return os.Chtimes(target, info.ModTime(), info.ModTime())
+		case info.Mode()&os.ModeSymlink != 0:
+			linkTarget, err := os.Readlink(path)
+			if err != nil {
+				return err
+			}
+			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+				return err
+			}
+			_ = os.Remove(target)
+			return os.Symlink(linkTarget, target)
+		case info.Mode().IsRegular():
+			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+				return err
+			}
+			if err := copyFile(path, target); err != nil {
+				return err
+			}
+			return os.Chtimes(target, info.ModTime(), info.ModTime())
+		default:
+			debugf("Skipping unsupported source entry type %s: %s\n", info.Mode().Type(), path)
+			return nil
+		}
+	})
+}
+
+func copySourceContents(srcPath, targetDir, sourceKind string, execCtx *Executor) error {
+	if _, err := exec.LookPath("rsync"); err == nil {
+		rsyncCmd := exec.Command("rsync", "-a", srcPath+"/", targetDir)
+		if err := execCtx.Run(rsyncCmd); err == nil {
+			return nil
+		} else {
+			debugf("rsync failed while copying %s source %s to %s, falling back to internal copy: %v\n", sourceKind, srcPath, targetDir, err)
+		}
+	} else {
+		debugf("rsync not found, using internal copy for %s source %s\n", sourceKind, srcPath)
+	}
+
+	if err := copyDirContentsFallback(srcPath, targetDir); err != nil {
+		return fmt.Errorf("internal copy failed for %s source contents from %s to %s: %w", sourceKind, srcPath, targetDir, err)
+	}
+	return nil
+}
 
 func prepareSources(pkgName, pkgDir, buildDir string, execCtx *Executor) error {
 	// Assuming CacheDir, SourcesDir, Executor, etc. are available in scope.
@@ -106,10 +180,7 @@ func prepareSources(pkgName, pkgDir, buildDir string, execCtx *Executor) error {
 				return fmt.Errorf("git source %s exists but is not a directory: %s", relPath, srcPath)
 			}
 
-			// ACTION: Copy CONTENTS of srcPath into targetDir
-			// We use rsync -a src/ dest/ to copy contents without creating a subdir
-			rsyncCmd := exec.Command("rsync", "-a", srcPath+"/", targetDir)
-			if err := execCtx.Run(rsyncCmd); err != nil {
+			if err := copySourceContents(srcPath, targetDir, "git", execCtx); err != nil {
 				return fmt.Errorf("failed to copy git source contents from %s to %s: %v", srcPath, targetDir, err)
 			}
 			// Git source handled, move to the next line
@@ -129,9 +200,7 @@ func prepareSources(pkgName, pkgDir, buildDir string, execCtx *Executor) error {
 				return fmt.Errorf("SVN source %s exists but is not a directory: %s", relPath, srcPath)
 			}
 
-			// ACTION: Copy CONTENTS of srcPath into targetDir
-			rsyncCmd := exec.Command("rsync", "-a", srcPath+"/", targetDir)
-			if err := execCtx.Run(rsyncCmd); err != nil {
+			if err := copySourceContents(srcPath, targetDir, "SVN", execCtx); err != nil {
 				return fmt.Errorf("failed to copy SVN source contents from %s to %s: %v", srcPath, targetDir, err)
 			}
 			// SVN source handled, move to the next line
@@ -151,9 +220,7 @@ func prepareSources(pkgName, pkgDir, buildDir string, execCtx *Executor) error {
 				return fmt.Errorf("HG source %s exists but is not a directory: %s", relPath, srcPath)
 			}
 
-			// ACTION: Copy CONTENTS of srcPath into targetDir
-			rsyncCmd := exec.Command("rsync", "-a", srcPath+"/", targetDir)
-			if err := execCtx.Run(rsyncCmd); err != nil {
+			if err := copySourceContents(srcPath, targetDir, "HG", execCtx); err != nil {
 				return fmt.Errorf("failed to copy HG source contents from %s to %s: %v", srcPath, targetDir, err)
 			}
 			// HG source handled, move to the next line
@@ -775,20 +842,20 @@ func getPackageDependenciesToUninstall(name string) []string {
 		return []string{"01-binutils-1", "19-binutils-2"}
 	case "linux-headers":
 		return []string{"03-linux-headers"}
-	case "mingw":
-		return []string{"mingw-headers"}
-	case "mingw-gcc":
-		return []string{"mingw-gcc-static"}
 	case "m4":
 		return []string{"06-m4"}
 	case "ncurses":
 		return []string{"07-ncurses"}
 	case "bash":
 		return []string{"08-bash"}
+	case "coreutils":
+		return []string{"09-coreutils"}
 	case "diffutils":
 		return []string{"10-diffutils"}
 	case "file":
 		return []string{"11-file"}
+	case "findutils":
+		return []string{"12-findutils"}
 	case "gawk":
 		return []string{"13-gawk"}
 	case "grep":
@@ -803,8 +870,16 @@ func getPackageDependenciesToUninstall(name string) []string {
 		return []string{"18-sed"}
 	case "hokuto":
 		return []string{"21-hokuto"}
-	case "make-ca":
-		return []string{"ca-certificates"}
+	case "ca-certificates":
+		return []string{"22-ca-certificates"}
+	case "nano":
+		return []string{"23-nano"}
+	case "bzip2":
+		return []string{"24-bzip2"}
+	case "mingw":
+		return []string{"mingw-headers"}
+	case "mingw-gcc":
+		return []string{"mingw-gcc-static"}
 	case "cython":
 		return []string{name}
 	case "dbus-python":

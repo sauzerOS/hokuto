@@ -46,6 +46,7 @@ func printHelp() {
 		{"uninstall, r", "<pkg>", "Uninstall package(s)"},
 		{"update, u", "[options]", "Update repositories and check for upgrades"},
 		{"manifest, m", "<pkg>", "Show the file list for an installed package"},
+		{"unmanaged", "", "List files in /etc and /usr not owned by installed packages"},
 		{"find, f", "<query>", "Find which package matches query string"},
 		{"new, n", "<pkg>", "Create a new package skeleton"},
 		{"edit, e", "<pkg>", "Edit a package's build files"},
@@ -1207,6 +1208,12 @@ func Main() {
 		}
 		pkg := os.Args[2]
 		if err := showManifest(pkg); err != nil {
+			fmt.Fprintln(os.Stderr, "Error:", err)
+			os.Exit(1)
+		}
+
+	case "unmanaged":
+		if err := handleUnmanagedCommand(cfg); err != nil {
 			fmt.Fprintln(os.Stderr, "Error:", err)
 			os.Exit(1)
 		}

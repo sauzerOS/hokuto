@@ -5,6 +5,7 @@ package hokuto
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -13,6 +14,23 @@ import (
 
 	"github.com/gookit/color"
 )
+
+func appendLineToFile(path, line string) error {
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err == nil {
+		defer f.Close()
+		_, err = f.WriteString(line + "\n")
+		return err
+	}
+	if !os.IsPermission(err) || os.Geteuid() == 0 {
+		return err
+	}
+
+	cmd := exec.Command("tee", "-a", path)
+	cmd.Stdin = strings.NewReader(line + "\n")
+	cmd.Stdout = io.Discard
+	return RootExec.Run(cmd)
+}
 
 func addToWorld(pkgName string) error {
 	// 1. Read existing world
@@ -29,26 +47,7 @@ func addToWorld(pkgName string) error {
 		}
 	}
 
-	// 2. Append new package
-	f, err := os.OpenFile(WorldFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	if err != nil {
-		// Try with root if permission denied
-		if os.IsPermission(err) {
-			if os.Geteuid() == 0 {
-				// This shouldn't happen if we're root, but for robust logic:
-				return fmt.Errorf("permission denied writing to world file even as root")
-			}
-			cmd := exec.Command("sh", "-c", fmt.Sprintf("echo '%s' >> %s", pkgName, WorldFile))
-			return RootExec.Run(cmd)
-		}
-		return err
-	}
-	defer f.Close()
-
-	if _, err := f.WriteString(pkgName + "\n"); err != nil {
-		return err
-	}
-	return nil
+	return appendLineToFile(WorldFile, pkgName)
 }
 
 // removeFromWorld removes a package from the world file.
@@ -91,13 +90,7 @@ func removeFromWorld(pkgName string) error {
 			if os.Geteuid() == 0 {
 				return fmt.Errorf("permission denied writing to world file even as root")
 			}
-			tmpFile, _ := os.CreateTemp("", "world-tmp")
-			tmpFile.WriteString(newContent)
-			tmpFile.Close()
-			defer os.Remove(tmpFile.Name())
-
-			cmd := exec.Command("cp", tmpFile.Name(), WorldFile)
-			return RootExec.Run(cmd)
+			return writeRootFile(WorldFile, []byte(newContent), 0644, RootExec)
 		}
 		return err
 	}
@@ -118,24 +111,7 @@ func addToWorldMake(pkgName string) error {
 		}
 	}
 
-	// 2. Append
-	f, err := os.OpenFile(WorldMakeFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	if err != nil {
-		if os.IsPermission(err) {
-			if os.Geteuid() == 0 {
-				return fmt.Errorf("permission denied writing to world_make file even as root")
-			}
-			cmd := exec.Command("sh", "-c", fmt.Sprintf("echo '%s' >> %s", pkgName, WorldMakeFile))
-			return RootExec.Run(cmd)
-		}
-		return err
-	}
-	defer f.Close()
-
-	if _, err := f.WriteString(pkgName + "\n"); err != nil {
-		return err
-	}
-	return nil
+	return appendLineToFile(WorldMakeFile, pkgName)
 }
 
 // removeFromWorldMake removes a package from the world_make file.
@@ -172,12 +148,7 @@ func removeFromWorldMake(pkgName string) error {
 			if os.Geteuid() == 0 {
 				return fmt.Errorf("permission denied writing to world_make file even as root")
 			}
-			tmpFile, _ := os.CreateTemp("", "worldmake-tmp")
-			tmpFile.WriteString(newContent)
-			tmpFile.Close()
-			defer os.Remove(tmpFile.Name())
-			cmd := exec.Command("cp", tmpFile.Name(), WorldMakeFile)
-			return RootExec.Run(cmd)
+			return writeRootFile(WorldMakeFile, []byte(newContent), 0644, RootExec)
 		}
 		return err
 	}

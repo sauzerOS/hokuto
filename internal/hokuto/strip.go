@@ -82,7 +82,7 @@ func stripPackage(outputDir string, buildExec *Executor, logger io.Writer) error
 			// --- MODIFICATION END ---
 
 			// Save original permissions
-			statCmd := exec.Command("sh", "-c", fmt.Sprintf("stat -c %%a %q", p))
+			statCmd := exec.Command("stat", "-c", "%a", p)
 			var permOut bytes.Buffer
 			statCmd.Stdout = &permOut
 			statCmd.Stderr = stderrWriter // Use the conditional writer

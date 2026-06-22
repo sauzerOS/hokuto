@@ -525,6 +525,12 @@ func findPackagesByManifestString(query string) error {
 		return fmt.Errorf("empty search string")
 	}
 
+	root := rootDir
+	if root == "" {
+		root = "/"
+	}
+	canonicalQuery := filepath.ToSlash(filepath.Clean(canonicalizePath(root, query)))
+
 	entries, err := os.ReadDir(Installed)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -572,7 +578,8 @@ func findPackagesByManifestString(query string) error {
 				continue
 			}
 
-			if strings.Contains(path, query) {
+			canonicalPath := filepath.ToSlash(filepath.Clean(canonicalizePath(root, path)))
+			if strings.Contains(path, query) || strings.Contains(canonicalPath, canonicalQuery) {
 				match = true
 				break
 			}

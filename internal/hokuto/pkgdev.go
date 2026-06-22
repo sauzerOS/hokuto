@@ -22,7 +22,8 @@ import (
 
 func getAntigravityString() (string, error) {
 	baseURL := "https://antigravity.google"
-	resp, err := http.Get(baseURL + "/download/linux")
+	client := simpleHTTPClient()
+	resp, err := client.Get(baseURL + "/download/linux")
 	if err != nil {
 		return "", fmt.Errorf("failed to fetch download page: %v", err)
 	}
@@ -43,7 +44,7 @@ func getAntigravityString() (string, error) {
 	jsFile := string(matchesScript[1])
 
 	// Fetch main.js
-	respJS, err := http.Get(baseURL + "/" + jsFile)
+	respJS, err := client.Get(baseURL + "/" + jsFile)
 	if err != nil {
 		return "", fmt.Errorf("failed to fetch JS file %s: %v", jsFile, err)
 	}
@@ -68,7 +69,7 @@ func getAntigravityString() (string, error) {
 func getVSCodeString() (string, error) {
 	downloadURL := "https://code.visualstudio.com/sha/download?build=stable&os=linux-x64"
 	// Use HEAD request to follow redirects and get the final URL
-	resp, err := http.Head(downloadURL)
+	resp, err := simpleHTTPClient().Head(downloadURL)
 	if err != nil {
 		return "", fmt.Errorf("failed to fetch VS Code download link: %v", err)
 	}
@@ -682,7 +683,7 @@ func printGithubReleaseNotes(pkgDir string) {
 
 			if owner != "" && repo != "" && tag != "" {
 				apiURL := fmt.Sprintf("https://api.github.com/repos/%s/%s/releases/tags/%s", owner, repo, tag)
-				resp, err := http.Get(apiURL)
+				resp, err := simpleHTTPClient().Get(apiURL)
 				if err == nil && resp.StatusCode == 200 {
 					defer resp.Body.Close()
 					var result struct {
@@ -769,7 +770,7 @@ func HandleAutoBumpCommand(cfg *Config, autoBuild bool, assumeYes bool) error {
 	colArrow.Print("-> ")
 	colNote.Printf("Fetching outdated packages from Repology\n")
 
-	resp, err := http.Get(repoURL)
+	resp, err := simpleHTTPClient().Get(repoURL)
 	if err != nil {
 		return fmt.Errorf("failed to fetch from Repology: %v", err)
 	}

@@ -22,6 +22,9 @@ import (
 	"github.com/chromedp/cdproto/browser"
 	"github.com/chromedp/cdproto/network"
 	"github.com/chromedp/chromedp"
+	gogit "github.com/go-git/go-git/v5"
+	gogitconfig "github.com/go-git/go-git/v5/config"
+	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/klauspost/compress/zstd"
 	"github.com/schollz/progressbar/v3"
 	"golang.org/x/sys/unix"
@@ -69,6 +72,102 @@ func newHttpClient() (*http.Client, error) {
 			return nil
 		},
 	}, nil
+}
+
+func simpleHTTPClient() *http.Client {
+	return &http.Client{Timeout: 30 * time.Second}
+}
+
+func checkoutGoGitRef(repo *gogit.Repository, ref string) error {
+	if strings.TrimSpace(ref) == "" {
+		return nil
+	}
+
+	remoteRef := strings.TrimPrefix(ref, "origin/")
+	candidates := []plumbing.Revision{
+		plumbing.Revision("refs/remotes/origin/" + remoteRef),
+		plumbing.Revision("refs/remotes/" + ref),
+		plumbing.Revision("refs/heads/" + ref),
+		plumbing.Revision("refs/tags/" + ref),
+		plumbing.Revision(ref),
+	}
+
+	var hash *plumbing.Hash
+	for _, candidate := range candidates {
+		resolved, err := repo.ResolveRevision(candidate)
+		if err == nil && resolved != nil {
+			hash = resolved
+			break
+		}
+	}
+	if hash == nil {
+		return fmt.Errorf("git ref %s not found", ref)
+	}
+
+	wt, err := repo.Worktree()
+	if err != nil {
+		return err
+	}
+	return wt.Checkout(&gogit.CheckoutOptions{
+		Hash:  *hash,
+		Force: true,
+	})
+}
+
+func ensureGoGitCheckout(gitURL, ref, sharedPath string, quiet bool) error {
+	var repo *gogit.Repository
+	if _, err := os.Stat(sharedPath); os.IsNotExist(err) {
+		cloneOpts := &gogit.CloneOptions{
+			URL: gitURL,
+		}
+		if !quiet || Debug {
+			cloneOpts.Progress = os.Stderr
+		}
+		var cloneErr error
+		repo, cloneErr = gogit.PlainClone(sharedPath, false, cloneOpts)
+		if cloneErr != nil {
+			return fmt.Errorf("go-git clone failed: %w", cloneErr)
+		}
+	} else {
+		var openErr error
+		repo, openErr = gogit.PlainOpen(sharedPath)
+		if openErr != nil {
+			_ = os.RemoveAll(sharedPath)
+			return ensureGoGitCheckout(gitURL, ref, sharedPath, quiet)
+		}
+
+		fetchOpts := &gogit.FetchOptions{
+			RemoteName: "origin",
+			RefSpecs: []gogitconfig.RefSpec{
+				"+refs/heads/*:refs/remotes/origin/*",
+				"+refs/tags/*:refs/tags/*",
+			},
+		}
+		if !quiet || Debug {
+			fetchOpts.Progress = os.Stderr
+		}
+		if err := repo.Fetch(fetchOpts); err != nil && err != gogit.NoErrAlreadyUpToDate {
+			return fmt.Errorf("go-git fetch failed: %w", err)
+		}
+	}
+
+	if err := checkoutGoGitRef(repo, ref); err != nil {
+		return err
+	}
+	return nil
+}
+
+func linkSharedGitCheckout(pkgName, pkgLinkDir, repoName, sharedPath string) (string, error) {
+	destPath := filepath.Join(pkgLinkDir, repoName)
+	if _, err := os.Lstat(destPath); err == nil {
+		if err := os.RemoveAll(destPath); err != nil {
+			return "", fmt.Errorf("failed to replace git checkout link for %s: %v", pkgName, err)
+		}
+	}
+	if err := os.Symlink(sharedPath, destPath); err != nil {
+		return "", fmt.Errorf("failed to link shared checkout for %s: %v", pkgName, err)
+	}
+	return destPath, nil
 }
 
 // downloadFile downloads a URL into the hokuto cache.
@@ -812,6 +911,52 @@ func fetchSourcesWithOptions(pkgName, pkgDir string, processGit bool, quiet bool
 			parts = strings.Split(strings.TrimSuffix(gitURL, ".git"), "/")
 			repoName := parts[len(parts)-1]
 
+			// --- SHARED CHECKOUT (Working Tree) ---
+			// We share the checkout between packages if they use the same URL and ref.
+			checkoutsDir := filepath.Join(CacheStore, "checkouts")
+			os.MkdirAll(checkoutsDir, 0o755)
+
+			checkoutHashInput := gitURL
+			if ref != "" {
+				checkoutHashInput += "#" + ref
+			}
+			checkoutHash := hashString(checkoutHashInput)[:12]
+			sharedPath := filepath.Join(checkoutsDir, repoName+"-"+checkoutHash)
+
+			if _, err := exec.LookPath("git"); err != nil {
+				err := func() error {
+					lockPath := sharedPath + ".lock"
+					lFile, err := os.Create(lockPath)
+					if err != nil {
+						return fmt.Errorf("failed to create lock file for go-git checkout: %v", err)
+					}
+					defer os.Remove(lockPath)
+					defer lFile.Close()
+
+					if err := unix.Flock(int(lFile.Fd()), unix.LOCK_EX); err != nil {
+						return fmt.Errorf("failed to lock go-git checkout: %v", err)
+					}
+					defer unix.Flock(int(lFile.Fd()), unix.LOCK_UN)
+
+					if !quiet {
+						cPrintf(colInfo, "git not found; using go-git for %s@%s\n", gitURL, ref)
+					}
+					return ensureGoGitCheckout(gitURL, ref, sharedPath, quiet)
+				}()
+				if err != nil {
+					return err
+				}
+
+				destPath, err := linkSharedGitCheckout(pkgName, pkgLinkDir, repoName, sharedPath)
+				if err != nil {
+					return err
+				}
+				if !quiet {
+					cPrintf(colInfo, "Git repository ready (go-git): %s\n", destPath)
+				}
+				continue
+			}
+
 			// --- 1. SHARED BARE CACHE (objects only) ---
 			gitCacheDir := filepath.Join(CacheStore, "git")
 			os.MkdirAll(gitCacheDir, 0o755)
@@ -863,18 +1008,6 @@ func fetchSourcesWithOptions(pkgName, pkgDir string, processGit bool, quiet bool
 			if err != nil {
 				return err
 			}
-
-			// --- 2. SHARED CHECKOUT (Working Tree) ---
-			// We share the checkout between packages if they use the same URL and ref.
-			checkoutsDir := filepath.Join(CacheStore, "checkouts")
-			os.MkdirAll(checkoutsDir, 0o755)
-
-			checkoutHashInput := gitURL
-			if ref != "" {
-				checkoutHashInput += "#" + ref
-			}
-			checkoutHash := hashString(checkoutHashInput)[:12]
-			sharedPath := filepath.Join(checkoutsDir, repoName+"-"+checkoutHash)
 
 			err = func() error {
 				lockPath := sharedPath + ".lock"
@@ -936,13 +1069,9 @@ func fetchSourcesWithOptions(pkgName, pkgDir string, processGit bool, quiet bool
 			}
 
 			// --- 3. LINK PACKAGE TO SHARED CHECKOUT ---
-			destPath := filepath.Join(pkgLinkDir, repoName)
-			// Remove anything that's currently there (old directory or legacy checkout)
-			if _, err := os.Lstat(destPath); err == nil {
-				os.RemoveAll(destPath)
-			}
-			if err := os.Symlink(sharedPath, destPath); err != nil {
-				return fmt.Errorf("failed to link shared checkout for %s: %v", pkgName, err)
+			destPath, err := linkSharedGitCheckout(pkgName, pkgLinkDir, repoName, sharedPath)
+			if err != nil {
+				return err
 			}
 
 			if !quiet {

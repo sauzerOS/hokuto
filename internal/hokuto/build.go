@@ -11,7 +11,6 @@ import (
 	"io"
 	"log"
 	"maps"
-	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -48,6 +47,62 @@ func loadBuildOptions(pkgDir string) map[string]bool {
 	}
 
 	return options
+}
+
+func packageSetHasBuildOption(pkgNames []string, option string) bool {
+	for _, pkgName := range pkgNames {
+		pkgDir, err := findPackageDir(pkgName)
+		if err != nil {
+			debugf("Skipping %s option check for %s: %v\n", option, pkgName, err)
+			continue
+		}
+		if loadBuildOptions(pkgDir)[option] {
+			return true
+		}
+	}
+	return false
+}
+
+func addMappedSplitDependency(splitDepsBySource map[string][]string, sourcePkg, splitPkg string) {
+	if sourcePkg == "" || splitPkg == "" {
+		return
+	}
+	for _, existing := range splitDepsBySource[sourcePkg] {
+		if existing == splitPkg {
+			return
+		}
+	}
+	splitDepsBySource[sourcePkg] = append(splitDepsBySource[sourcePkg], splitPkg)
+}
+
+func installBuiltSplitDependency(sourcePkg, splitPkg string, cfg *Config) error {
+	if isPackageInstalled(splitPkg) {
+		return nil
+	}
+	version, revision, err := getRepoVersion2(sourcePkg)
+	if err != nil {
+		return err
+	}
+	pkgDir, err := findPackageMetadataDir(sourcePkg)
+	if err != nil {
+		return err
+	}
+	options := loadBuildOptions(pkgDir)
+	isGeneric := cfg.Values["HOKUTO_GENERIC"] == "1" || options["generic"]
+	arch := GetSystemArchForPackage(cfg, sourcePkg)
+	variant := IdentifyVariant(splitPkg, isGeneric, isMultilibPackageDepName(splitPkg))
+	tarballPath := filepath.Join(BinDir, StandardizeRemoteName(splitPkg, version, revision, arch, variant))
+	if _, err := os.Stat(tarballPath); err != nil {
+		return fmt.Errorf("expected split package tarball missing: %s", tarballPath)
+	}
+
+	isCriticalAtomic.Store(1)
+	defer isCriticalAtomic.Store(0)
+	handlePreInstallUninstall(splitPkg, cfg, RootExec, true, nil)
+	if _, err := pkgInstall(tarballPath, splitPkg, cfg, RootExec, true, false, false, nil); err != nil {
+		return err
+	}
+	return nil
 }
 
 // getScriptExitCode extracts the exit code from a script log file
@@ -449,10 +504,11 @@ func packageSplitOutputs(parentPkgName, pkgDir, splitRoot, version, revision, ta
 		}
 
 		buildTimeFile := filepath.Join(installedDir, "buildtime")
-		echoCmd := exec.Command("sh", "-c", fmt.Sprintf("echo '%s' | tee %s > /dev/null 2>&1", elapsed.String(), shellQuote(buildTimeFile)))
-		if err := buildExec.Run(echoCmd); err != nil {
+		if err := writeRootFile(buildTimeFile, []byte(elapsed.String()+"\n"), 0644, buildExec); err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: failed to save split build time to %s: %v\n", buildTimeFile, err)
 		}
+
+		removeLibtoolArchives(splitOutputDir, buildExec)
 
 		isMultilib := detectMultilib(splitOutputDir)
 		pkginfoExec := buildExec
@@ -478,6 +534,216 @@ func packageSplitOutputs(parentPkgName, pkgDir, splitRoot, version, revision, ta
 			return fmt.Errorf("failed to package split tarball %s: %w", outputSplitName, err)
 		}
 	}
+	return nil
+}
+
+type builtPackageFinalization struct {
+	sourcePkgName string
+	outputPkgName string
+	pkgDir        string
+	outputDir     string
+	version       string
+	revision      string
+	targetArch    string
+	cflagsVal     string
+	logPath       string
+	options       map[string]bool
+	buildExec     *Executor
+	logger        io.Writer
+	elapsed       time.Duration
+	shouldStrip   bool
+	isGeneric     bool
+	bootstrap     bool
+	updateWebsite bool
+}
+
+func removePathFromOutput(outputDir, relPath string, execCtx *Executor) {
+	target := filepath.Join(outputDir, relPath)
+	if os.Geteuid() == 0 {
+		_ = os.RemoveAll(target)
+		return
+	}
+	rmCmd := exec.Command("rm", "-rf", target)
+	_ = execCtx.Run(rmCmd)
+}
+
+func removeLibtoolArchives(outputDir string, execCtx *Executor) {
+	var matches []string
+	err := filepath.WalkDir(outputDir, func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".la") {
+			return nil
+		}
+		rel, err := filepath.Rel(outputDir, path)
+		if err != nil {
+			return nil
+		}
+		matches = append(matches, "/"+filepath.ToSlash(rel))
+		return nil
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: failed to scan for libtool archives in %s: %v\n", outputDir, err)
+		return
+	}
+	for _, relPath := range matches {
+		removePathFromOutput(outputDir, relPath, execCtx)
+	}
+	if len(matches) > 0 {
+		debugf("Removed %d libtool archive (.la) file(s) from %s\n", len(matches), outputDir)
+	}
+}
+
+func cleanPackagedOutput(outputDir string, execCtx *Executor) {
+	removeLibtoolArchives(outputDir, execCtx)
+
+	for _, infoPath := range []string{
+		"/usr/share/info/dir",
+		"/tools/share/info/dir",
+		"/usr/aarch64-linux-gnu/share/info/dir",
+	} {
+		removePathFromOutput(outputDir, infoPath, execCtx)
+	}
+
+	for _, pattern := range []string{
+		filepath.Join(outputDir, "lib", "perl5", "*", "core_perl", "perllocal.pod"),
+		filepath.Join(outputDir, "usr", "lib", "perl5", "*", "core_perl", "perllocal.pod"),
+		filepath.Join(outputDir, "usr", "aarch64-linux-gnu", "lib", "perl5", "*", "core_perl", "perllocal.pod"),
+	} {
+		matches, err := filepath.Glob(pattern)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to glob for perllocal.pod pattern %s: %v\n", pattern, err)
+			continue
+		}
+		if len(matches) == 0 {
+			continue
+		}
+		rmArgs := append([]string{"-f"}, matches...)
+		if err := execCtx.Run(exec.Command("rm", rmArgs...)); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to delete perllocal.pod files: %v\n", err)
+		}
+	}
+
+	localePattern := filepath.Join(outputDir, "usr", "share", "locale", "*")
+	if localeMatches, err := filepath.Glob(localePattern); err == nil {
+		for _, path := range localeMatches {
+			base := filepath.Base(path)
+			if !strings.HasPrefix(base, "en") {
+				removePathFromOutput(outputDir, strings.TrimPrefix(path, outputDir), execCtx)
+			}
+		}
+	}
+
+	for _, docPath := range []string{
+		"/usr/share/doc",
+		"/usr/aarch64-linux-gnu/share/doc",
+	} {
+		removePathFromOutput(outputDir, docPath, execCtx)
+	}
+}
+
+func finalizeBuiltPackage(in builtPackageFinalization) error {
+	if in.logger == nil {
+		in.logger = os.Stdout
+	}
+
+	installedDir := filepath.Join(in.outputDir, "var", "db", "hokuto", "installed", in.outputPkgName)
+	debugf("Creating metadata directory: %s\n", installedDir)
+	if err := in.buildExec.Run(exec.Command("mkdir", "-p", installedDir)); err != nil {
+		return fmt.Errorf("failed to create installed dir: %w", err)
+	}
+
+	if !in.options["binary"] {
+		libdepsFile := filepath.Join(installedDir, "libdeps")
+		if err := generateLibDeps(in.outputDir, libdepsFile, in.buildExec); err != nil {
+			fmt.Printf("Warning: failed to generate libdeps: %v\n", err)
+		} else {
+			debugf("Library dependencies written to %s\n", libdepsFile)
+		}
+	}
+
+	if err := generateDepends(in.outputPkgName, in.pkgDir, in.outputDir, rootDir, in.buildExec, in.bootstrap); err != nil {
+		return fmt.Errorf("failed to generate depends: %w", err)
+	}
+	debugf("Depends written to %s\n", filepath.Join(installedDir, "depends"))
+
+	if in.shouldStrip {
+		if err := stripPackage(in.outputDir, in.buildExec, in.logger); err != nil {
+			return fmt.Errorf("build failed during stripping phase for %s: %w", in.sourcePkgName, err)
+		}
+	} else {
+		debugf("Skipping binary stripping for %s (NoStrip is true).\n", in.sourcePkgName)
+	}
+
+	if err := copyOptionalMetadataFile(filepath.Join(in.pkgDir, "version"), filepath.Join(installedDir, "version"), in.buildExec); err != nil {
+		return fmt.Errorf("failed to copy version file: %w", err)
+	}
+	if err := copyOptionalMetadataFile(filepath.Join(in.pkgDir, "build"), filepath.Join(installedDir, "build"), in.buildExec); err != nil {
+		return fmt.Errorf("failed to copy build file: %w", err)
+	}
+	if err := copyOptionalMetadataFile(filepath.Join(in.pkgDir, "options"), filepath.Join(installedDir, "options"), in.buildExec); err != nil {
+		return fmt.Errorf("failed to copy options file: %w", err)
+	}
+	if err := copyOptionalMetadataFile(filepath.Join(in.pkgDir, "post-install"), filepath.Join(installedDir, "post-install"), in.buildExec); err != nil {
+		return fmt.Errorf("failed to copy post-install file: %w", err)
+	}
+
+	if in.buildExec.ShouldRunAsRoot {
+		asRootFile := filepath.Join(installedDir, "asroot")
+		if err := in.buildExec.Run(exec.Command("touch", asRootFile)); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to create asroot marker file %s: %v\n", asRootFile, err)
+		}
+		debugf("Added asroot marker file to package metadata (package built as root)\n")
+	}
+
+	buildTimeFile := filepath.Join(installedDir, "buildtime")
+	if err := writeRootFile(buildTimeFile, []byte(in.elapsed.String()+"\n"), 0644, in.buildExec); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: failed to save build time to %s: %v\n", buildTimeFile, err)
+	}
+
+	cleanPackagedOutput(in.outputDir, in.buildExec)
+
+	logXZPath := filepath.Join(installedDir, "log.xz")
+	logExec := in.buildExec
+	if in.buildExec.ShouldRunAsRoot {
+		logExec = RootExec
+	}
+	if err := compressXZ(in.logPath, logXZPath, logExec); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: failed to compress build log: %v\n", err)
+	}
+
+	if in.updateWebsite {
+		fullVer := fmt.Sprintf("%s-%s", in.version, in.revision)
+		UpdateWebsiteStatus(in.sourcePkgName, fullVer, "success", logXZPath)
+	}
+
+	isMultilib := detectMultilib(in.outputDir)
+	pkginfoExec := in.buildExec
+	if in.buildExec.ShouldRunAsRoot {
+		pkginfoExec = RootExec
+	}
+	if err := WritePackageInfo(in.outputDir, in.outputPkgName, in.version, in.revision, in.targetArch, in.cflagsVal, in.isGeneric, isMultilib, pkginfoExec); err != nil {
+		return fmt.Errorf("failed to write pkginfo: %w", err)
+	}
+
+	if err := generateManifest(in.outputDir, installedDir, in.buildExec); err != nil {
+		return fmt.Errorf("failed to generate manifest: %w", err)
+	}
+
+	signExec := in.buildExec
+	if in.buildExec.ShouldRunAsRoot {
+		signExec = RootExec
+	}
+	if err := SignPackage(in.outputDir, in.outputPkgName, signExec, in.logger); err != nil {
+		return fmt.Errorf("failed to sign package: %w", err)
+	}
+
+	variant := IdentifyVariant(in.sourcePkgName, in.isGeneric, isMultilib)
+	if err := createPackageTarball(in.outputPkgName, in.version, in.revision, in.targetArch, variant, in.outputDir, in.buildExec, in.logger); err != nil {
+		return fmt.Errorf("failed to package tarball: %w", err)
+	}
+
 	return nil
 }
 
@@ -1444,204 +1710,9 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, opts BuildOptions)
 	// Determine output package name (rename if cross-system is enabled)
 	outputPkgName := getOutputPackageName(pkgName, cfg)
 
-	// Create /var/db/hokuto/installed/<outputPkgName> inside the staging outputDir
-	installedDir := filepath.Join(outputDir, "var", "db", "hokuto", "installed", outputPkgName)
-	debugf("Creating metadata directory: %s\n", installedDir)
-	mkdirCmd := exec.Command("mkdir", "-p", installedDir)
-	if err := buildExec.Run(mkdirCmd); err != nil {
-		return 0, fmt.Errorf("failed to create installed dir: %v", err)
-	}
-
-	// Generate libdeps
-	if !options["binary"] {
-		libdepsFile := filepath.Join(installedDir, "libdeps")
-		if err := generateLibDeps(outputDir, libdepsFile, buildExec); err != nil {
-			fmt.Printf("Warning: failed to generate libdeps: %v\n", err)
-		} else {
-			debugf("Library dependencies written to %s\n", libdepsFile)
-		}
-	}
-
-	// Generate depends (use outputPkgName for cross-system builds)
-	if err := generateDepends(outputPkgName, pkgDir, outputDir, rootDir, buildExec, opts.Bootstrap); err != nil {
-		return 0, fmt.Errorf("failed to generate depends: %v", err)
-	}
-	debugf("Depends written to %s\n", filepath.Join(installedDir, "depends"))
-
 	debugf("%s built successfully, output in %s\n", pkgName, outputDir)
 
-	// Strip the package
-	if shouldStrip {
-		// NOTE: stripPackage uses buildExec (UserExec) to run the external 'strip' command
-		if err := stripPackage(outputDir, buildExec, opts.LogWriter); err != nil {
-			// Treat strip failure as a build failure (or a warning, depending on policy)
-			return 0, fmt.Errorf("build failed during stripping phase for %s: %w", pkgName, err)
-		}
-	} else {
-		debugf("Skipping binary stripping for %s (NoStrip is true).\n", pkgName)
-	}
-
-	// Copy version file from pkgDir
-	versionSrc := filepath.Join(pkgDir, "version")
-	versionDst := filepath.Join(installedDir, "version")
-	cpCmd := exec.Command("cp", "--remove-destination", versionSrc, versionDst)
-	if err := buildExec.Run(cpCmd); err != nil {
-		return 0, fmt.Errorf("failed to copy version file: %v", err)
-	}
-
-	// Copy build file from pkgDir
-	buildSrc := filepath.Join(pkgDir, "build")
-	buildDst := filepath.Join(installedDir, "build")
-	cpbCmd := exec.Command("cp", "--remove-destination", buildSrc, buildDst)
-	if err := buildExec.Run(cpbCmd); err != nil {
-		return 0, fmt.Errorf("failed to copy build file: %v", err)
-	}
-
-	// Copy options file from pkgDir if it exists
-	optionsSrc := filepath.Join(pkgDir, "options")
-	optionsDst := filepath.Join(installedDir, "options")
-
-	if fi, err := os.Stat(optionsSrc); err == nil && !fi.IsDir() {
-		cpCmd := exec.Command("cp", "--remove-destination", optionsSrc, optionsDst)
-		if err := buildExec.Run(cpCmd); err != nil {
-			return 0, fmt.Errorf("failed to copy options file: %v", err)
-		}
-	}
-
-	// Copy post-install file from pkgDir if it exists
-	postinstallSrc := filepath.Join(pkgDir, "post-install")
-	postinstallDst := filepath.Join(installedDir, "post-install")
-
-	if fi, err := os.Stat(postinstallSrc); err == nil && !fi.IsDir() {
-		// ensure installedDir exists
-		if err := os.MkdirAll(filepath.Dir(postinstallDst), 0o755); err != nil {
-			return 0, fmt.Errorf("failed to create installed dir: %v", err)
-		}
-
-		cpCmd := exec.Command("cp", "--remove-destination", postinstallSrc, postinstallDst)
-		if err := buildExec.Run(cpCmd); err != nil {
-			return 0, fmt.Errorf("failed to copy post-install file: %v", err)
-		}
-	} else if err != nil && !os.IsNotExist(err) {
-		return 0, fmt.Errorf("failed to stat post-install file: %v", err)
-	}
-
-	// Add asroot file to package metadata if the package was built as root
-	if buildExec.ShouldRunAsRoot {
-		asRootFile := filepath.Join(installedDir, "asroot")
-		touchCmd := exec.Command("touch", asRootFile)
-		if err := buildExec.Run(touchCmd); err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: failed to create asroot marker file %s: %v\n", asRootFile, err)
-		}
-		debugf("Added asroot marker file to package metadata (package built as root)\n")
-	}
-
-	// Calculate the elapsed time
 	elapsed = time.Since(startTime)
-
-	// Format the duration into a string (e.g., "1m30.5s")
-	durationStr := fmt.Sprintf("%v", elapsed)
-
-	// Define the output file path
-	buildTimeFile := filepath.Join(installedDir, "buildtime")
-
-	// Save the duration to the file silently using 'echo' and 'tee' via the Executor.
-	echoCmd := exec.Command("sh", "-c",
-		// The shell command is wrapped with '> /dev/null 2>&1' to redirect all output to null.
-		fmt.Sprintf("echo '%s' | tee %s > /dev/null 2>&1", durationStr, buildTimeFile))
-
-	// We use the same Executor context that was used for the build directory creation
-	if err := buildExec.Run(echoCmd); err != nil {
-		fmt.Fprintf(os.Stderr, "Warning: failed to save build time to %s: %v\n", buildTimeFile, err)
-	}
-	// delete /usr/share/info/dir and /tools/info/dir
-	for _, infoPath := range []string{
-		"/usr/share/info/dir",
-		"/tools/share/info/dir",
-		"/usr/aarch64-linux-gnu/share/info/dir",
-	} {
-		infodirPath := filepath.Join(outputDir, infoPath)
-		infoRmCmd := exec.Command("rm", "-rf", infodirPath)
-		if err := buildExec.Run(infoRmCmd); err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: failed to delete %s: %v\n", infoPath, err)
-		}
-	}
-
-	// delete /usr/lib/perl5/*/core_perl/perllocal.pod
-	// Check both /lib/perl5, /usr/lib/perl5 and /usr/aarch64-linux-gnu/lib/perl5 locations
-	perllocalPatterns := []string{
-		filepath.Join(outputDir, "lib", "perl5", "*", "core_perl", "perllocal.pod"),
-		filepath.Join(outputDir, "usr", "lib", "perl5", "*", "core_perl", "perllocal.pod"),
-		filepath.Join(outputDir, "usr", "aarch64-linux-gnu", "lib", "perl5", "*", "core_perl", "perllocal.pod"),
-	}
-
-	var matches []string
-	for _, p := range perllocalPatterns {
-		m, err := filepath.Glob(p)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: failed to glob for perllocal.pod pattern %s: %v\n", p, err)
-			continue
-		}
-		matches = append(matches, m...)
-	}
-	if len(matches) > 0 {
-		// Prepare the command arguments: ["rm", "-f"] followed by all file paths
-		rmArgs := []string{"rm", "-f"}
-		rmArgs = append(rmArgs, matches...)
-
-		// The "rm" command is run against all gathered paths
-		perlRmCmd := exec.Command(rmArgs[0], rmArgs[1:]...)
-
-		if err := buildExec.Run(perlRmCmd); err != nil {
-			// Note: rm -f will not return an error if the files were not found,
-			// but it will if permission is denied, or other fatal errors occur.
-			fmt.Fprintf(os.Stderr, "Warning: failed to delete perllocal.pod files: %v\n", err)
-		}
-	}
-
-	// delete non-en locales in /usr/share/locale
-	localePattern := filepath.Join(outputDir, "usr", "share", "locale", "*")
-	if localeMatches, err := filepath.Glob(localePattern); err == nil {
-		for _, path := range localeMatches {
-			base := filepath.Base(path)
-			if !strings.HasPrefix(base, "en") {
-				rmCmd := exec.Command("rm", "-rf", path)
-				if err := buildExec.Run(rmCmd); err != nil {
-					fmt.Fprintf(os.Stderr, "Warning: failed to delete locale %s: %v\n", base, err)
-				}
-			}
-		}
-	}
-	// delete /usr/share/doc directory and /usr/aarch64-linux-gnu/share/doc
-	docPaths := []string{
-		filepath.Join(outputDir, "usr", "share", "doc"),
-		filepath.Join(outputDir, "usr", "aarch64-linux-gnu", "share", "doc"),
-	}
-
-	for _, docPath := range docPaths {
-		if os.Geteuid() == 0 {
-			_ = os.RemoveAll(docPath)
-		} else {
-			docRmCmd := exec.Command("rm", "-rf", docPath)
-			_ = buildExec.Run(docRmCmd)
-		}
-	}
-
-	// Compress build log to package metadata
-	logXZPath := filepath.Join(installedDir, "log.xz")
-	// Use RootExec when package was built as root to handle root-owned files
-	logExec := buildExec
-	if buildExec.ShouldRunAsRoot {
-		logExec = RootExec
-	}
-	if err := compressXZ(logPath, logXZPath, logExec); err != nil {
-		fmt.Fprintf(os.Stderr, "Warning: failed to compress build log: %v\n", err)
-	}
-
-	if opts.UpdateWebsite {
-		fullVer := fmt.Sprintf("%s-%s", version, revision)
-		UpdateWebsiteStatus(pkgName, fullVer, "success", logXZPath)
-	}
 
 	// Determine architecture and flags for metadata
 	targetArch := defaults["HOKUTO_ARCH"]
@@ -1660,40 +1731,26 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, opts BuildOptions)
 		isGeneric = true
 	}
 
-	// Detect multilib in output directory
-	isMultilib := detectMultilib(outputDir)
-
-	// 1. Generate pkginfo (before manifest) so it's included in the manifest
-	// Use RootExec when package was built as root to handle root-owned files
-	pkginfoExec := buildExec
-	if buildExec.ShouldRunAsRoot {
-		pkginfoExec = RootExec
-	}
-	if err := WritePackageInfo(outputDir, outputPkgName, version, revision, targetArch, cflagsVal, isGeneric, isMultilib, pkginfoExec); err != nil {
-		return 0, fmt.Errorf("failed to write pkginfo: %v", err)
-	}
-
-	// 2. Generate manifest (includes pkginfo and itself)
-	if err := generateManifest(outputDir, installedDir, buildExec); err != nil {
-		return 0, fmt.Errorf("failed to generate manifest: %v", err)
-	}
-
-	// 3. Sign the package metadata and manifest
-	// Use RootExec when package was built as root to handle root-owned files
-	signExec := buildExec
-	if buildExec.ShouldRunAsRoot {
-		signExec = RootExec
-	}
-	if err := SignPackage(outputDir, outputPkgName, signExec, opts.LogWriter); err != nil {
-		return 0, fmt.Errorf("failed to sign package: %v", err)
-	}
-
-	// Determine variant for naming - include multilib prefix if detected
-	variant := IdentifyVariant(pkgName, isGeneric, isMultilib)
-
-	// Generate package archive (using output package name if cross-system is enabled)
-	if err := createPackageTarball(outputPkgName, version, revision, targetArch, variant, outputDir, buildExec, opts.LogWriter); err != nil {
-		return 0, fmt.Errorf("failed to package tarball: %v", err)
+	if err := finalizeBuiltPackage(builtPackageFinalization{
+		sourcePkgName: pkgName,
+		outputPkgName: outputPkgName,
+		pkgDir:        pkgDir,
+		outputDir:     outputDir,
+		version:       version,
+		revision:      revision,
+		targetArch:    targetArch,
+		cflagsVal:     cflagsVal,
+		logPath:       logPath,
+		options:       options,
+		buildExec:     buildExec,
+		logger:        opts.LogWriter,
+		elapsed:       elapsed,
+		shouldStrip:   shouldStrip,
+		isGeneric:     isGeneric,
+		bootstrap:     opts.Bootstrap,
+		updateWebsite: opts.UpdateWebsite,
+	}); err != nil {
+		return 0, err
 	}
 
 	if err := packageSplitOutputs(pkgName, pkgDir, splitRoot, version, revision, targetArch, cflagsVal, isGeneric, shouldStrip, buildExec, cfg, opts, elapsed); err != nil {
@@ -2369,206 +2426,30 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 	// Determine output package name (rename if cross-system is enabled)
 	outputPkgName := getOutputPackageName(pkgName, cfg)
 
-	// Create /var/db/hokuto/installed/<outputPkgName> inside the staging outputDir
-	installedDir := filepath.Join(outputDir, "var", "db", "hokuto", "installed", outputPkgName)
-	debugf("Creating metadata directory: %s\n", installedDir)
-	mkdirCmd := exec.Command("mkdir", "-p", installedDir)
-	if err := buildExec.Run(mkdirCmd); err != nil {
-		return fmt.Errorf("failed to create installed dir: %v", err)
-	}
-
-	// Generate libdeps
-	if !options["binary"] {
-		libdepsFile := filepath.Join(installedDir, "libdeps")
-		if err := generateLibDeps(outputDir, libdepsFile, buildExec); err != nil {
-			fmt.Printf("Warning: failed to generate libdeps: %v\n", err)
-		} else {
-			debugf("Library dependencies written to %s\n", libdepsFile)
-		}
-	}
-
-	// Generate depends (use outputPkgName for cross-system builds)
-	if err := generateDepends(outputPkgName, pkgDir, outputDir, rootDir, buildExec, false); err != nil {
-		return fmt.Errorf("failed to generate depends: %v", err)
-	}
-	debugf("Depends written to %s\n", filepath.Join(installedDir, "depends"))
-
 	debugf("%s built successfully, output in %s\n", pkgName, outputDir)
 
-	// Strip the package
-	if shouldStrip {
-		// NOTE: stripPackage uses buildExec (UserExec) to run the external 'strip' command
-		if err := stripPackage(outputDir, buildExec, logger); err != nil {
-			// Treat strip failure as a build failure (or a warning, depending on policy)
-			return fmt.Errorf("build failed during stripping phase for %s: %w", pkgName, err)
-		}
-	} else {
-		debugf("Skipping binary stripping for %s (NoStrip is true).\n", pkgName)
-	}
-
-	// Copy version file from pkgDir
-	versionSrc := filepath.Join(pkgDir, "version")
-	versionDst := filepath.Join(installedDir, "version")
-	cpCmd := exec.Command("cp", "--remove-destination", versionSrc, versionDst)
-	if err := buildExec.Run(cpCmd); err != nil {
-		return fmt.Errorf("failed to copy version file: %v", err)
-	}
-
-	// Copy build file from pkgDir
-	buildSrc := filepath.Join(pkgDir, "build")
-	buildDst := filepath.Join(installedDir, "build")
-	cpbCmd := exec.Command("cp", "--remove-destination", buildSrc, buildDst)
-	if err := buildExec.Run(cpbCmd); err != nil {
-		return fmt.Errorf("failed to copy build file: %v", err)
-	}
-
-	// Copy post-install file from pkgDir if it exists
-	postinstallSrc := filepath.Join(pkgDir, "post-install")
-	postinstallDst := filepath.Join(installedDir, "post-install")
-
-	if fi, err := os.Stat(postinstallSrc); err == nil && !fi.IsDir() {
-		// ensure installedDir exists
-		if err := os.MkdirAll(filepath.Dir(postinstallDst), 0o755); err != nil {
-			return fmt.Errorf("failed to create installed dir: %v", err)
-		}
-
-		cpCmd := exec.Command("cp", "--remove-destination", postinstallSrc, postinstallDst)
-		if err := buildExec.Run(cpCmd); err != nil {
-			return fmt.Errorf("failed to copy post-install file: %v", err)
-		}
-	} else if err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("failed to stat post-install file: %v", err)
-	}
-
-	// Add asroot file to package metadata if the package was built as root
-	if buildExec.ShouldRunAsRoot {
-		asRootFile := filepath.Join(installedDir, "asroot")
-		touchCmd := exec.Command("touch", asRootFile)
-		if err := buildExec.Run(touchCmd); err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: failed to create asroot marker file %s: %v\n", asRootFile, err)
-		}
-		debugf("Added asroot marker file to package metadata (package built as root)\n")
-	}
-
-	// Calculate the elapsed time
 	elapsed = time.Since(startTime)
 
-	// Format the duration into a string (e.g., "1m30.5s")
-	durationStr := fmt.Sprintf("%v", elapsed)
-
-	// Define the output file path
-	buildTimeFile := filepath.Join(installedDir, "buildtime")
-
-	// Save the duration to the file silently using 'echo' and 'tee' via the Executor.
-	echoCmd := exec.Command("sh", "-c",
-		// The shell command is wrapped with '> /dev/null 2>&1' to redirect all output to null.
-		fmt.Sprintf("echo '%s' | tee %s > /dev/null 2>&1", durationStr, buildTimeFile))
-
-	// We use the same Executor context that was used for the build directory creation
-	if err := buildExec.Run(echoCmd); err != nil {
-		fmt.Fprintf(os.Stderr, "Warning: failed to save build time to %s: %v\n", buildTimeFile, err)
-	}
-	// delete /usr/share/info/dir and /tools/info/dir
-	for _, infoPath := range []string{"/usr/share/info/dir", "/tools/share/info/dir"} {
-		infodirPath := filepath.Join(outputDir, infoPath)
-		infoRmCmd := exec.Command("rm", "-rf", infodirPath)
-		if err := buildExec.Run(infoRmCmd); err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: failed to delete %s: %v\n", infoPath, err)
-		}
-	}
-
-	// delete /usr/lib/perl5/*/core_perl/perllocal.pod
-	// Check both /lib/perl5 and /usr/lib/perl5 locations
-	perllocalPatterns := []string{
-		filepath.Join(outputDir, "lib", "perl5", "*", "core_perl", "perllocal.pod"),
-		filepath.Join(outputDir, "usr", "lib", "perl5", "*", "core_perl", "perllocal.pod"),
-	}
-
-	var matches []string
-	for _, p := range perllocalPatterns {
-		m, err := filepath.Glob(p)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: failed to glob for perllocal.pod pattern %s: %v\n", p, err)
-			continue
-		}
-		matches = append(matches, m...)
-	}
-	if len(matches) > 0 {
-		// Prepare the command arguments: ["rm", "-f"] followed by all file paths
-		rmArgs := []string{"rm", "-f"}
-		rmArgs = append(rmArgs, matches...)
-
-		// The "rm" command is run against all gathered paths
-		perlRmCmd := exec.Command(rmArgs[0], rmArgs[1:]...)
-
-		if err := buildExec.Run(perlRmCmd); err != nil {
-			// Note: rm -f will not return an error if the files were not found,
-			// but it will if permission is denied, or other fatal errors occur.
-			fmt.Fprintf(os.Stderr, "Warning: failed to delete perllocal.pod files: %v\n", err)
-		}
-	}
-
-	// delete non-en locales in /usr/share/locale
-	localePattern := filepath.Join(outputDir, "usr", "share", "locale", "*")
-	if localeMatches, err := filepath.Glob(localePattern); err == nil {
-		for _, path := range localeMatches {
-			base := filepath.Base(path)
-			if !strings.HasPrefix(base, "en") {
-				rmCmd := exec.Command("rm", "-rf", path)
-				if err := buildExec.Run(rmCmd); err != nil {
-					fmt.Fprintf(os.Stderr, "Warning: failed to delete locale %s: %v\n", base, err)
-				}
-			}
-		}
-	}
-
-	// delete /usr/share/doc directory
-	docPath := filepath.Join(outputDir, "usr", "share", "doc")
-	if os.Geteuid() == 0 {
-		_ = os.RemoveAll(docPath)
-	} else {
-		docRmCmd := exec.Command("rm", "-rf", docPath)
-		_ = buildExec.Run(docRmCmd)
-	}
-
-	// Compress build log to package metadata
-	logXZPath := filepath.Join(installedDir, "log.xz")
-	// Use RootExec when package was built as root to handle root-owned files
-	logExec := buildExec
-	if buildExec.ShouldRunAsRoot {
-		logExec = RootExec
-	}
-	if err := compressXZ(logPath, logXZPath, logExec); err != nil {
-		fmt.Fprintf(os.Stderr, "Warning: failed to compress build log: %v\n", err)
-	}
-
-	// Generate manifest
-	if err := generateManifest(outputDir, installedDir, buildExec); err != nil {
-		return fmt.Errorf("failed to generate manifest: %v", err)
-	}
-
-	// Normalize ownership to root:root if the build was NOT run as root.
-	// This ensures that when rsyncStaging copies these files to the root filesystem,
-	// they have the correct system ownership.
-	if !buildExec.ShouldRunAsRoot {
-		debugf("Normalizing ownership of output directory to root:root\n")
-		chownCmd := exec.Command("chown", "-R", "0:0", outputDir)
-		if err := RootExec.Run(chownCmd); err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: failed to normalize ownership of %s: %v\n", outputDir, err)
-		}
-	}
-
-	// Detect multilib in output directory
-	isMultilib := detectMultilib(outputDir)
-
-	// Determine variant for naming - include multilib prefix if detected
 	isGeneric := cfg.Values["HOKUTO_GENERIC"] == "1" || cfg.Values["HOKUTO_CROSS_ARCH"] != "" || options["generic"]
-	variant := IdentifyVariant(pkgName, isGeneric, isMultilib)
-
-	// Generate package archive (using output package name if cross-system is enabled)
-	// This ensures the binary cache is kept in sync with the rebuild.
-	if err := createPackageTarball(outputPkgName, version, revision, targetArch, variant, outputDir, buildExec, logger); err != nil {
-		return fmt.Errorf("failed to package tarball: %v", err)
+	if err := finalizeBuiltPackage(builtPackageFinalization{
+		sourcePkgName: pkgName,
+		outputPkgName: outputPkgName,
+		pkgDir:        pkgDir,
+		outputDir:     outputDir,
+		version:       version,
+		revision:      revision,
+		targetArch:    targetArch,
+		cflagsVal:     cflagsVal,
+		logPath:       logPath,
+		options:       options,
+		buildExec:     buildExec,
+		logger:        logger,
+		elapsed:       elapsed,
+		shouldStrip:   shouldStrip,
+		isGeneric:     isGeneric,
+		bootstrap:     false,
+	}); err != nil {
+		return err
 	}
 
 	//Set title to success status
@@ -2601,6 +2482,8 @@ func handleBuildCommand(args []string, cfg *Config) error {
 	var genericBuild = buildCmd.Bool("generic", false, "Use _GEN flags and store packages in generic subfolder")
 	var crossArch = buildCmd.String("cross", "", "Enable cross-compilation for target architecture (e.g., arm64)")
 	var noDeps = buildCmd.Bool("nodeps", false, "Skip dependency checking and build only the specified package(s)")
+	var noDevel = buildCmd.Bool("no-devel", false, "Skip automatic base-devel dependency installation")
+	var noRemote = buildCmd.Bool("no-remote", false, "Do not use the remote binary mirror for build dependency resolution or installs")
 	var parallel = buildCmd.Int("j", 1, "Number of parallel jobs (default: 1)")
 	var parallelLong = buildCmd.Int("parallel", 1, "Number of parallel jobs (default: 1)")
 	var updateWebsite = buildCmd.Bool("index", false, "Update the github.io status table.")
@@ -2713,7 +2596,7 @@ func handleBuildCommand(args []string, cfg *Config) error {
 			tmpFile := filepath.Join(os.TempDir(), "bootstrap-repo.tar.xz")
 			colArrow.Print("-> ")
 			colSuccess.Printf("Downloading bootstrap repo from %s\n", url)
-			resp, err := http.Get(url)
+			resp, err := simpleHTTPClient().Get(url)
 			if err != nil {
 				return fmt.Errorf("failed to download bootstrap repo: %v", err)
 			}
@@ -2906,6 +2789,21 @@ func handleBuildCommand(args []string, cfg *Config) error {
 		uninstallBuildDependencies(temporaryBuildDeps, cfg)
 		temporaryBuildDeps = nil
 	}
+	defer cleanupTemporaryBuildDeps()
+
+	if !*bootstrap && !*noDevel {
+		includeMultilibDevel := packageSetHasBuildOption(packagesToProcess, "multilib")
+		installedDevelDeps, err := ensureDevelPackagesInstalled(cfg, includeMultilibDevel, *noRemote)
+		if err != nil {
+			return fmt.Errorf("failed to prepare devel packages: %w", err)
+		}
+		for _, dep := range installedDevelDeps {
+			addTemporaryBuildDep(dep)
+		}
+	} else if *noDevel {
+		colArrow.Print("-> ")
+		colWarn.Println("Skipping devel package check (--no-devel enabled)")
+	}
 
 	// ** STRATEGY 1: Bootstrap or --alldeps mode **
 	if *bootstrap || *allDeps {
@@ -2992,6 +2890,7 @@ func handleBuildCommand(args []string, cfg *Config) error {
 	} else {
 		// ** STRATEGY 2: Normal Build Mode **
 		var packagesThatMustBeBuilt map[string]bool
+		splitDepsBySource := make(map[string][]string)
 
 		if *noDeps {
 			// Skip dependency resolution when --nodeps is set
@@ -3008,7 +2907,7 @@ func handleBuildCommand(args []string, cfg *Config) error {
 			masterProcessed := make(map[string]bool)
 			var missingDeps []string
 			for _, pkgName := range packagesToProcess {
-				if err := resolveMissingDeps(pkgName, masterProcessed, &missingDeps, userRequestedMap, cfg); err != nil {
+				if err := resolveMissingDeps(pkgName, masterProcessed, &missingDeps, userRequestedMap, cfg, *noRemote); err != nil {
 					return fmt.Errorf("error resolving dependencies for %s: %v", pkgName, err)
 				}
 			}
@@ -3021,6 +2920,27 @@ func handleBuildCommand(args []string, cfg *Config) error {
 
 			for _, depPkg := range missingDeps {
 				if packagesThatMustBeBuilt[depPkg] {
+					continue
+				}
+				if _, err := findPackageMetadataDir(depPkg); err != nil {
+					if isPackageInstalled(depPkg) {
+						continue
+					}
+					installed, installErr := ensurePackageInstalled(depPkg, cfg, *noRemote)
+					if installErr == nil {
+						if installed {
+							addTemporaryBuildDep(depPkg)
+						}
+						continue
+					}
+					sourcePkg, ok := findSplitDependencySource(depPkg)
+					if !ok {
+						return fmt.Errorf("error: dependency %s has no source package and could not be installed as a binary package: %w", depPkg, installErr)
+					}
+					colArrow.Print("-> ")
+					colInfo.Printf("Dependency %s is a split package; scheduling %s to build it\n", depPkg, sourcePkg)
+					packagesThatMustBeBuilt[sourcePkg] = true
+					addMappedSplitDependency(splitDepsBySource, sourcePkg, depPkg)
 					continue
 				}
 				version, revision, err := getRepoVersion2(depPkg)
@@ -3048,7 +2968,7 @@ func handleBuildCommand(args []string, cfg *Config) error {
 				} else {
 					// Local binary missing. Try to fetch from remote mirror.
 					foundRemote := false
-					if BinaryMirror != "" {
+					if !*noRemote && BinaryMirror != "" {
 						// Optimization: Check remote index first
 						index, err := GetCachedRemoteIndex(cfg)
 						shouldTryDownload := true
@@ -3150,7 +3070,7 @@ func handleBuildCommand(args []string, cfg *Config) error {
 				colInfo.Printf("Build order for this group: %s\n\n", strings.Join(plan.Order, " -> "))
 
 				progressCount := 0
-				failedThisGroup, _, elapsedThisGroup, installedDepsThisGroup := executeBuildPass(plan, pkgName, true, cfg, bootstrap, userRequestedMap, &progressCount)
+				failedThisGroup, _, elapsedThisGroup, installedDepsThisGroup := executeBuildPass(plan, pkgName, true, cfg, bootstrap, userRequestedMap, nil, &progressCount)
 				totalElapsedTime += elapsedThisGroup
 				for _, dep := range installedDepsThisGroup {
 					addTemporaryBuildDep(dep)
@@ -3250,7 +3170,7 @@ func handleBuildCommand(args []string, cfg *Config) error {
 					}
 
 					// Try to fetch binary if configured
-					if BinaryMirror != "" {
+					if !*noRemote && BinaryMirror != "" {
 						// Optimization: Check remote index first
 						index, err := GetCachedRemoteIndex(cfg)
 						shouldTryDownload := true
@@ -3302,7 +3222,7 @@ func handleBuildCommand(args []string, cfg *Config) error {
 				return nil
 			}
 
-			failedPass1, targetsPass1, elapsedPass1, installedDepsPass1 := executeBuildPass(initialPlan, "Initial Pass", false, cfg, bootstrap, userRequestedMap, &progressCount)
+			failedPass1, targetsPass1, elapsedPass1, installedDepsPass1 := executeBuildPass(initialPlan, "Initial Pass", false, cfg, bootstrap, userRequestedMap, splitDepsBySource, &progressCount)
 			totalElapsedTime = elapsedPass1
 			failedBuilds = failedPass1
 			for _, dep := range installedDepsPass1 {
@@ -3400,7 +3320,7 @@ BuildSummary:
 
 // Helper for HandleBuildCommand to execute a single build pass based on the provided BuildPlan.
 
-func executeBuildPass(plan *BuildPlan, _ string, installAllTargets bool, cfg *Config, bootstrap *bool, userRequestedMap map[string]bool, progressCount *int) (map[string]error, []string, time.Duration, []string) {
+func executeBuildPass(plan *BuildPlan, _ string, installAllTargets bool, cfg *Config, bootstrap *bool, userRequestedMap map[string]bool, splitDepsBySource map[string][]string, progressCount *int) (map[string]error, []string, time.Duration, []string) {
 
 	toBuild := plan.Order
 	failed := make(map[string]error)
@@ -3437,8 +3357,7 @@ func executeBuildPass(plan *BuildPlan, _ string, installAllTargets bool, cfg *Co
 						}
 					}
 
-					// FILTER: Ignore 32-bit dependencies if multilib is disabled
-					if !EnableMultilib && strings.HasSuffix(dep.Name, "-32") {
+					if shouldSkipMultilibMakeDep(dep, dep.Name, cfg) {
 						continue
 					}
 
@@ -3569,12 +3488,14 @@ func executeBuildPass(plan *BuildPlan, _ string, installAllTargets bool, cfg *Co
 
 				// Check if this package triggers any post-build rebuilds ---
 				triggersRebuilds := len(plan.PostBuildRebuilds[pkgName]) > 0
+				requiredSplitDeps := splitDepsBySource[pkgName]
+				triggersSplitDeps := len(requiredSplitDeps) > 0
 
 				// We install immediately IF:
 				//  - It's a dependency, OR
 				//  - It's a user target that is a dependency for something else in this batch, OR
 				//  - It's a user target that triggers a post-build rebuild.
-				shouldInstallNow := !userRequestedMap[pkgName] || isDependencyForThisPass || triggersRebuilds
+				shouldInstallNow := !userRequestedMap[pkgName] || isDependencyForThisPass || triggersRebuilds || triggersSplitDeps
 
 				if installAllTargets || shouldInstallNow {
 					// Install the package immediately.
@@ -3646,6 +3567,20 @@ func executeBuildPass(plan *BuildPlan, _ string, installAllTargets bool, cfg *Co
 					}
 
 					isCriticalAtomic.Store(0)
+
+					for _, splitPkg := range requiredSplitDeps {
+						if err := installBuiltSplitDependency(pkgName, splitPkg, cfg); err != nil {
+							colArrow.Print("-> ")
+							color.Danger.Printf("Installation failed for split dependency %s: %v\n", splitPkg, err)
+							failed[pkgName] = fmt.Errorf("split dependency install failed for %s: %w", splitPkg, err)
+							return failed, successfullyBuiltTargets, totalElapsedTime, installedBuildDeps
+						}
+						colArrow.Print("-> ")
+						colSuccess.Printf("Installing split dependency:")
+						colNote.Printf(" %s\n", splitPkg)
+						installedBuildDeps = append(installedBuildDeps, splitPkg)
+						builtThisPass[splitPkg] = true
+					}
 				} else {
 					// This is a standalone user target. Defer installation until the end.
 					successfullyBuiltTargets = append(successfullyBuiltTargets, pkgName)
@@ -3795,8 +3730,7 @@ func executeBuildPass(plan *BuildPlan, _ string, installAllTargets bool, cfg *Co
 						}
 					}
 
-					// FILTER: Ignore 32-bit dependencies if multilib is disabled
-					if !EnableMultilib && strings.HasSuffix(dep.Name, "-32") {
+					if shouldSkipMultilibMakeDep(dep, dep.Name, cfg) {
 						continue
 					}
 

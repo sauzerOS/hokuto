@@ -4,7 +4,16 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strings"
 	"time"
+)
+
+type privilegeBackend string
+
+const (
+	privilegeBackendUnset privilegeBackend = ""
+	privilegeBackendSudo  privilegeBackend = "sudo"
+	privilegeBackendRun0  privilegeBackend = "run0"
 )
 
 // needsRootPrivileges checks if any of the requested operations require root
@@ -58,36 +67,29 @@ func needsRootPrivileges(args []string) bool {
 	return false
 }
 
-// authenticateOnce performs a single authentication check at program start
-func authenticateOnce(quiet bool) error {
-	if os.Geteuid() == 0 {
-		return nil // Already root
+func authenticateSudo() error {
+	if _, err := exec.LookPath("sudo"); err != nil {
+		return err
 	}
-
-	// Try run0 first
-	/*if _, err := exec.LookPath("run0"); err == nil {
-		// run0 uses polkit - test with a simple command
-		cmd := exec.Command("run0", "true")
-		cmd.Stdin = os.Stdin
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-		if err := cmd.Run(); err != nil {
-			return fmt.Errorf("run0 authentication failed: %w", err)
-		}
-		cPrintln(colInfo, "Authenticated via run0")
-		return nil
-	}*/
-
-	// Fallback to sudo
 	cmd := exec.Command("sudo", "-v")
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("sudo authentication failed: %w", err)
-	}
+	return cmd.Run()
+}
 
-	// Start keep-alive goroutine for sudo
+func authenticateRun0() error {
+	if _, err := exec.LookPath("run0"); err != nil {
+		return err
+	}
+	cmd := exec.Command("run0", "true")
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
+}
+
+func startSudoKeepAlive() {
 	go func() {
 		ticker := time.NewTicker(4 * time.Minute)
 		defer ticker.Stop()
@@ -95,11 +97,58 @@ func authenticateOnce(quiet bool) error {
 			exec.Command("sudo", "-nv").Run()
 		}
 	}()
+}
 
-	if !quiet {
-		//cPrintln(colNote, "-> Authenticated via sudo")
-		colArrow.Print("-> ")
-		colSuccess.Println("Authenticated via sudo")
+func newPrivilegedCommand(name string, args ...string) *exec.Cmd {
+	if os.Geteuid() == 0 {
+		return exec.Command(name, args...)
 	}
-	return nil
+	if activePrivilegeBackend == privilegeBackendRun0 {
+		run0Args := append([]string{"--pipe", name}, args...)
+		return exec.Command("run0", run0Args...)
+	}
+	sudoArgs := append([]string{"-E", name}, args...)
+	return exec.Command("sudo", sudoArgs...)
+}
+
+// authenticateOnce performs a single authentication check at program start
+func authenticateOnce(quiet bool) error {
+	if os.Geteuid() == 0 {
+		return nil // Already root
+	}
+
+	if err := authenticateSudo(); err == nil {
+		activePrivilegeBackend = privilegeBackendSudo
+		startSudoKeepAlive()
+		if !quiet {
+			colArrow.Print("-> ")
+			colSuccess.Println("Authenticated via sudo")
+		}
+		return nil
+	} else {
+		debugf("sudo authentication unavailable: %v\n", err)
+	}
+
+	if err := authenticateRun0(); err == nil {
+		activePrivilegeBackend = privilegeBackendRun0
+		if !quiet {
+			colArrow.Print("-> ")
+			colSuccess.Println("Authenticated via run0")
+		}
+		return nil
+	} else {
+		debugf("run0 authentication unavailable: %v\n", err)
+	}
+
+	var missing []string
+	if _, err := exec.LookPath("sudo"); err != nil {
+		missing = append(missing, "sudo")
+	}
+	if _, err := exec.LookPath("run0"); err != nil {
+		missing = append(missing, "run0")
+	}
+	if len(missing) == 2 {
+		return fmt.Errorf("no privilege escalation helper found: %s", strings.Join(missing, ", "))
+	}
+	return fmt.Errorf("privilege authentication failed with sudo and run0")
 }

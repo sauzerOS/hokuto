@@ -149,7 +149,7 @@ func RunParallelBuilds(plan *BuildPlan, cfg *Config, maxJobs int, userRequestedM
 								continue
 							}
 						}
-						if !EnableMultilib && strings.HasSuffix(dep.Name, "-32") {
+						if shouldSkipMultilibMakeDep(dep, dep.Name, pm.Config) {
 							continue
 						}
 
@@ -162,7 +162,7 @@ func RunParallelBuilds(plan *BuildPlan, cfg *Config, maxJobs int, userRequestedM
 						satisfied := false
 						failedDep := ""
 						for _, cand := range candidates {
-							if !EnableMultilib && strings.HasSuffix(cand, "-32") {
+							if shouldSkipMultilibMakeDep(dep, cand, pm.Config) {
 								continue
 							}
 							if _, f := pm.Failed[cand]; f {
@@ -580,7 +580,7 @@ func (pm *ParallelManager) canBuild(pkgName string) bool {
 		// Check if satisfied by ANY candidate
 		satisfied := false
 		for _, cand := range candidates {
-			if !EnableMultilib && strings.HasSuffix(cand, "-32") {
+			if shouldSkipMultilibMakeDep(dep, cand, pm.Config) {
 				continue
 			}
 
@@ -657,9 +657,9 @@ func (pm *ParallelManager) startBuild(pkgName string, idx, total int) {
 	go func() {
 		// Call pkgBuild with Quiet flag and LogWriter
 		opts := BuildOptions{
-			Bootstrap:    false, // TODO: Propagate from global?
-			CurrentIndex: idx,
-			TotalCount:   total,
+			Bootstrap:     false, // TODO: Propagate from global?
+			CurrentIndex:  idx,
+			TotalCount:    total,
 			Quiet:         !interactive,
 			LogWriter:     logWriter,
 			UpdateWebsite: UpdateWebsiteIndex,

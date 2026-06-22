@@ -3,7 +3,6 @@ package hokuto
 import (
 	"fmt"
 	"os"
-	"os/exec"
 	"os/user"
 	"path/filepath"
 	"strconv"
@@ -160,7 +159,7 @@ func ensureHokutoOwnership(cfg *Config) error {
 					return fmt.Errorf("failed to fix recursive ownership of %s natively: %w", path, err)
 				}
 			} else {
-				cmd := exec.Command("sudo", "chown", "-R", fmt.Sprintf("%s:%s", targetUser, targetGroup), path)
+				cmd := newPrivilegedCommand("chown", "-R", fmt.Sprintf("%s:%s", targetUser, targetGroup), path)
 				if err := cmd.Run(); err != nil {
 					return fmt.Errorf("failed to fix ownership of %s: %w", path, err)
 				}

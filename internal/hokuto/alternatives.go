@@ -24,6 +24,18 @@ type AlternativeRequest struct {
 	KeepOriginal bool
 }
 
+type alternativeFileInfo struct {
+	Sum  string
+	Mode string
+	UID  int
+	GID  int
+}
+
+type alternativeBatchContext struct {
+	incomingFiles map[string]alternativeFileInfo
+	ownerByPath   map[string]string
+}
+
 // GlobalAlternativesDBPath is the path to the global alternatives database
 const GlobalAlternativesDBPath = "var/db/hokuto/alternatives/db.json"
 
@@ -125,32 +137,118 @@ func ensureStoreDir(hRoot string, execCtx *Executor) error {
 	return execCtx.Run(cmd)
 }
 
+func alternativeFileMetadata(path string) (alternativeFileInfo, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return alternativeFileInfo{}, err
+	}
+
+	meta := alternativeFileInfo{
+		Mode: fmt.Sprintf("%04o", info.Mode().Perm()),
+	}
+	if sysStat, ok := info.Sys().(*syscall.Stat_t); ok {
+		meta.UID = int(sysStat.Uid)
+		meta.GID = int(sysStat.Gid)
+	}
+	return meta, nil
+}
+
+func parseManifestFilePath(line string) string {
+	line = strings.TrimSpace(line)
+	if line == "" {
+		return ""
+	}
+	lastSpace := strings.LastIndexAny(line, " \t")
+	if lastSpace == -1 {
+		return line
+	}
+	return strings.TrimSpace(line[:lastSpace])
+}
+
+func buildAlternativeOwnerCache(hRoot string) map[string]string {
+	ownerByPath := make(map[string]string)
+	installedRoot := filepath.Join(hRoot, "var", "db", "hokuto", "installed")
+	entries, err := os.ReadDir(installedRoot)
+	if err != nil {
+		return ownerByPath
+	}
+
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		pkgName := e.Name()
+		manifestPath := filepath.Join(installedRoot, pkgName, "manifest")
+		f, err := os.Open(manifestPath)
+		if err != nil {
+			continue
+		}
+
+		scanner := bufio.NewScanner(f)
+		for scanner.Scan() {
+			manifestPath := parseManifestFilePath(scanner.Text())
+			if manifestPath == "" || strings.HasSuffix(manifestPath, "/") {
+				continue
+			}
+			canonicalPath := canonicalizePath(hRoot, manifestPath)
+			canonicalNoSlash := strings.TrimPrefix(canonicalPath, "/")
+			if _, exists := ownerByPath[canonicalPath]; !exists {
+				ownerByPath[canonicalPath] = pkgName
+			}
+			if _, exists := ownerByPath[canonicalNoSlash]; !exists {
+				ownerByPath[canonicalNoSlash] = pkgName
+			}
+		}
+		_ = f.Close()
+	}
+	return ownerByPath
+}
+
+func alternativeOwnerFromCache(ctx *alternativeBatchContext, hRoot, targetAbsPath string) string {
+	if ctx == nil || len(ctx.ownerByPath) == 0 {
+		return findPackageOwningFile(hRoot, targetAbsPath)
+	}
+	canonicalTarget := canonicalizePath(hRoot, targetAbsPath)
+	if owner := ctx.ownerByPath[canonicalTarget]; owner != "" {
+		return owner
+	}
+	return ctx.ownerByPath[strings.TrimPrefix(canonicalTarget, "/")]
+}
+
 // registerAlternative registers an alternative (internal helper for batch processing).
 // It assumes the caller manages the DB lifecycle and concurrency via dbMu.
-func registerAlternative(hRoot, filePath string, req AlternativeRequest, execCtx *Executor, db *GlobalAlternativesDB, dbMu *sync.Mutex) error {
+func registerAlternative(hRoot, filePath string, req AlternativeRequest, execCtx *Executor, db *GlobalAlternativesDB, dbMu *sync.Mutex, batchCtx *alternativeBatchContext) error {
 	incomingPkg := req.IncomingPkg
 	currentPkg := req.CurrentPkg
 	incomingFile := req.IncomingFile
 	keepOriginal := req.KeepOriginal
-	// Calculate B3Sum of the incoming file
-	incomingSum, err := ComputeChecksum(incomingFile, execCtx)
-	if err != nil {
-		return fmt.Errorf("failed to compute checksum of incoming file: %w", err)
+
+	var incomingInfo alternativeFileInfo
+	var ok bool
+	if batchCtx != nil {
+		incomingInfo, ok = batchCtx.incomingFiles[incomingFile]
+	}
+	if !ok {
+		sum, err := ComputeChecksum(incomingFile, execCtx)
+		if err != nil {
+			return fmt.Errorf("failed to compute checksum of incoming file: %w", err)
+		}
+		incomingInfo.Sum = sum
 	}
 
 	// Get stats of incoming file for metadata
-	incStat, err := os.Lstat(incomingFile)
-	if err != nil {
-		return fmt.Errorf("failed to stat incoming file: %w", err)
+	if incomingInfo.Mode == "" {
+		meta, err := alternativeFileMetadata(incomingFile)
+		if err != nil {
+			return fmt.Errorf("failed to stat incoming file: %w", err)
+		}
+		meta.Sum = incomingInfo.Sum
+		incomingInfo = meta
 	}
-	incMode := fmt.Sprintf("%04o", incStat.Mode().Perm())
-	var incUID, incGID int
-	if sysStat, ok := incStat.Sys().(*syscall.Stat_t); ok {
-		incUID = int(sysStat.Uid)
-		incGID = int(sysStat.Gid)
-	}
+	incomingSum := incomingInfo.Sum
 
 	dbMu.Lock()
+	defer dbMu.Unlock()
 	if db.Files == nil {
 		db.Files = make(map[string]*FileEntry)
 	}
@@ -241,7 +339,7 @@ func registerAlternative(hRoot, filePath string, req AlternativeRequest, execCtx
 		alt.Owners = append(alt.Owners, pkg)
 	}
 
-	incomingAlt := getOrCreateAlt(incomingSum, incMode, incUID, incGID)
+	incomingAlt := getOrCreateAlt(incomingSum, incomingInfo.Mode, incomingInfo.UID, incomingInfo.GID)
 	addOwner(incomingAlt, incomingPkg)
 
 	if keepOriginal {
@@ -301,22 +399,15 @@ func registerAlternative(hRoot, filePath string, req AlternativeRequest, execCtx
 			// Register valid existing file as active
 			if _, err := os.Lstat(targetAbsPath); err == nil {
 				currentSum, _ := ComputeChecksum(targetAbsPath, execCtx)
-				// getting stats...
-				currStat, _ := os.Lstat(targetAbsPath)
-				currMode := fmt.Sprintf("%04o", currStat.Mode().Perm())
-				var currUID, currGID int
-				if sysStat, ok := currStat.Sys().(*syscall.Stat_t); ok {
-					currUID = int(sysStat.Uid)
-					currGID = int(sysStat.Gid)
-				}
+				currInfo, _ := alternativeFileMetadata(targetAbsPath)
 
-				currAlt := getOrCreateAlt(currentSum, currMode, currUID, currGID)
+				currAlt := getOrCreateAlt(currentSum, currInfo.Mode, currInfo.UID, currInfo.GID)
 
 				// Try to find the local owner
 				if currentPkg != "" {
 					addOwner(currAlt, currentPkg)
 				} else if len(currAlt.Owners) == 0 {
-					if owner := findPackageOwningFile(hRoot, targetAbsPath); owner != "" {
+					if owner := alternativeOwnerFromCache(batchCtx, hRoot, targetAbsPath); owner != "" {
 						currAlt.Owners = append(currAlt.Owners, owner)
 					} else {
 						currAlt.Owners = append(currAlt.Owners, "unmanaged")
@@ -364,20 +455,14 @@ func registerAlternative(hRoot, filePath string, req AlternativeRequest, execCtx
 				// but usually "Use New" implies overwriting.
 				// However, if we want to restore it later, we MUST stash it and register it.
 				currentSum, _ := ComputeChecksum(targetAbsPath, execCtx)
-				currStat, _ := os.Lstat(targetAbsPath)
-				currMode := fmt.Sprintf("%04o", currStat.Mode().Perm())
-				var currUID, currGID int
-				if sysStat, ok := currStat.Sys().(*syscall.Stat_t); ok {
-					currUID = int(sysStat.Uid)
-					currGID = int(sysStat.Gid)
-				}
+				currInfo, _ := alternativeFileMetadata(targetAbsPath)
 
-				currAlt := getOrCreateAlt(currentSum, currMode, currUID, currGID)
+				currAlt := getOrCreateAlt(currentSum, currInfo.Mode, currInfo.UID, currInfo.GID)
 
 				if currentPkg != "" {
 					addOwner(currAlt, currentPkg)
 				} else if len(currAlt.Owners) == 0 {
-					if owner := findPackageOwningFile(hRoot, targetAbsPath); owner != "" {
+					if owner := alternativeOwnerFromCache(batchCtx, hRoot, targetAbsPath); owner != "" {
 						currAlt.Owners = append(currAlt.Owners, owner)
 					} else {
 						currAlt.Owners = append(currAlt.Owners, "unmanaged")
@@ -420,8 +505,6 @@ func registerAlternative(hRoot, filePath string, req AlternativeRequest, execCtx
 		// to the target location. We just update the DB state here.
 	}
 
-	dbMu.Unlock()
-
 	// File operations (copying to store) are done, and DB is updated in memory.
 	// Saving happens in BatchRegisterAlternatives.
 	return nil
@@ -446,6 +529,38 @@ func BatchRegisterAlternatives(hRoot string, requests []AlternativeRequest, exec
 		return err
 	}
 
+	incomingPaths := make([]string, 0, len(requests))
+	seenIncoming := make(map[string]bool, len(requests))
+	incomingInfo := make(map[string]alternativeFileInfo, len(requests))
+	for _, req := range requests {
+		if req.IncomingFile == "" || seenIncoming[req.IncomingFile] {
+			continue
+		}
+		seenIncoming[req.IncomingFile] = true
+		incomingPaths = append(incomingPaths, req.IncomingFile)
+	}
+
+	checksums, err := ComputeChecksums(incomingPaths, execCtx)
+	if err != nil {
+		return fmt.Errorf("failed to compute alternative checksums: %w", err)
+	}
+	for _, path := range incomingPaths {
+		meta, err := alternativeFileMetadata(path)
+		if err != nil {
+			return fmt.Errorf("failed to stat alternative file %s: %w", path, err)
+		}
+		meta.Sum = checksums[path]
+		if meta.Sum == "" {
+			return fmt.Errorf("failed to compute checksum for alternative file %s", path)
+		}
+		incomingInfo[path] = meta
+	}
+
+	batchCtx := &alternativeBatchContext{
+		incomingFiles: incomingInfo,
+		ownerByPath:   buildAlternativeOwnerCache(hRoot),
+	}
+
 	var dbMu sync.Mutex
 	var wg sync.WaitGroup
 	errCh := make(chan error, len(requests))
@@ -462,7 +577,7 @@ func BatchRegisterAlternatives(hRoot string, requests []AlternativeRequest, exec
 			sem <- struct{}{}        // Acquire
 			defer func() { <-sem }() // Release
 
-			if err := registerAlternative(hRoot, r.FilePath, r, execCtx, db, &dbMu); err != nil {
+			if err := registerAlternative(hRoot, r.FilePath, r, execCtx, db, &dbMu, batchCtx); err != nil {
 				errCh <- fmt.Errorf("failed to register alternative for %s: %w", r.FilePath, err)
 			}
 		}(req)

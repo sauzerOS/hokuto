@@ -79,7 +79,7 @@ func GetSystemVariantForPackage(cfg *Config, pkgName string) string {
 
 	// Cross-packages (prefixed with architecture) or forced generic logic
 	isCrossPkg := strings.HasPrefix(pkgName, "aarch64-") || strings.HasPrefix(pkgName, "x86_64-")
-	
+
 	isGenericOpt := false
 	if pkgName != "" {
 		if pkgDir, err := findPackageMetadataDir(pkgName); err == nil && pkgDir != "" {
@@ -220,6 +220,41 @@ func scanTarballMetadata(tarballPath string) (map[string]string, []string, error
 	}
 
 	return metadata, dependencies, nil
+}
+
+func scanTarballDependencySpecs(tarballPath string) ([]DepSpec, error) {
+	f, err := os.Open(tarballPath)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	zsr, err := zstd.NewReader(f)
+	if err != nil {
+		return nil, err
+	}
+	defer zsr.Close()
+
+	tr := tar.NewReader(zsr)
+	for {
+		header, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+
+		if strings.HasSuffix(header.Name, "/depends") {
+			data, err := io.ReadAll(tr)
+			if err != nil {
+				return nil, fmt.Errorf("failed to read depends from %s: %w", tarballPath, err)
+			}
+			return parseDependsData(data)
+		}
+	}
+
+	return []DepSpec{}, nil
 }
 
 func ParsePkgInfo(data []byte) map[string]string {

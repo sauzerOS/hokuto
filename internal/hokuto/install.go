@@ -1497,36 +1497,6 @@ func checkStagingConflicts(pkgName, stagingDir, rootDir, stagingManifest string,
 		}
 	}
 
-	// Remove entries from staging manifest for files that were removed from staging
-	if len(filesRemovedFromStaging) > 0 {
-		// filesRemovedFromStaging was populated from stagingFilesToRemove.
-		// Wait, filesRemovedFromStaging is the argument passed to this function.
-		// We are updating the map passed by the caller?
-		// No, `filesRemovedFromStaging` is a map passed into checkStagingConflicts.
-		// BUT `checkStagingConflicts` populates it?
-		// Let's check signature: `filesRemovedFromStaging map[string]bool`. It's a map pointer.
-		// In previous logic: `filesRemovedFromStaging[c.filePath] = true`.
-
-		// Logic change: We should ONLY call removeManifestEntries for things we REALLY want gone from manifest.
-		// Since we decided that "Keep Original" for alternatives means "Shared Ownership", we want it IN manifest.
-		// So we should NOT set filesRemovedFromStaging[c.filePath] = true for alternatives.
-
-		// However, we DO want to remove the file from staging disk.
-		// That is handled by `stagingFilesToRemove` loop above (lines 1366-1374).
-
-		// So the previous edits I made:
-		// `stagingFilesToRemove[c.filePath] = true` handles disk removal.
-		// `filesRemovedFromStaging[c.filePath] = true` handled manifest removal.
-		// I removed the line `filesRemovedFromStaging[c.filePath] = true` in my mind, but did I remove it in code?
-		// In previous step (1610), I replaced the loop.
-		// Let's verify what I wrote in step 1610.
-		// I wrote: `stagingFilesToRemove[c.filePath] = true`.
-		// I did NOT write `filesRemovedFromStaging[c.filePath] = true` inside the loop.
-		// BUT in the POST-PROCESSING loop (lines 1366-1374 in new code, lines 1373 in view):
-		// `filesRemovedFromStaging[c.filePath] = true` IS THERE.
-		// I need to remove THAT line.
-	}
-
 	if len(filesRemovedFromStaging) > 0 {
 		if err := removeManifestEntries(stagingManifest, filesRemovedFromStaging, execCtx); err != nil {
 			// Non-fatal, but log the error

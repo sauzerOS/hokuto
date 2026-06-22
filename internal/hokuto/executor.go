@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"strings"
 	"syscall"
 	"time"
 
@@ -38,6 +39,27 @@ func runInteractiveCommand(ctx context.Context, name string, arg ...string) erro
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
+}
+
+// ensurePrivilege checks if the selected privilege backend is still usable and
+// re-prompts if necessary. sudo supports ticket refresh; run0 delegates auth to
+// polkit for each elevated command after the initial startup check.
+func (e *Executor) ensurePrivilege() error {
+	if os.Geteuid() == 0 || !e.ShouldRunAsRoot {
+		return nil
+	}
+	if activePrivilegeBackend == privilegeBackendUnset {
+		if err := authenticateOnce(true); err != nil {
+			return err
+		}
+	}
+	if activePrivilegeBackend == privilegeBackendRun0 {
+		if _, err := exec.LookPath("run0"); err != nil {
+			return fmt.Errorf("run0 privilege backend is selected but run0 is unavailable: %w", err)
+		}
+		return nil
+	}
+	return e.ensureSudo()
 }
 
 // ensureSudo checks if the sudo ticket is still valid and re-prompts if necessary.
@@ -101,9 +123,20 @@ func (e *Executor) ensureSudo() error {
 	}
 }
 
-// Run executes the given command, elevating via sudo -E only when needed.
+func run0SetenvArgs(env []string) []string {
+	args := make([]string, 0, len(env))
+	for _, item := range env {
+		if item == "" || !strings.Contains(item, "=") {
+			continue
+		}
+		args = append(args, "--setenv="+item)
+	}
+	return args
+}
+
+// Run executes the given command, elevating via the selected backend only when needed.
 // It wires up stdio, isolates the child in its own process group for cleanup,
-// and calls ensureSudo() to avoid unnecessary password prompts.
+// and calls ensurePrivilege() to avoid unnecessary password prompts.
 func (e *Executor) Run(cmd *exec.Cmd) error {
 	// --- Phase 0: wire up stdio ---
 	// --- Phase 0: wire up stdio ---
@@ -126,7 +159,7 @@ func (e *Executor) Run(cmd *exec.Cmd) error {
 	}
 
 	// --- Phase 1: maybe check privilege ---
-	if err := e.ensureSudo(); err != nil {
+	if err := e.ensurePrivilege(); err != nil {
 		return err
 	}
 
@@ -144,24 +177,22 @@ func (e *Executor) Run(cmd *exec.Cmd) error {
 
 	// 2c. Apply privilege wrapper if needed
 	if e.ShouldRunAsRoot && os.Geteuid() != 0 {
-		// Try run0 first (preferred)
-		/*if _, err := exec.LookPath("run0"); err == nil {
-			args := []string{}
-
-			// Set working directory if specified
+		switch activePrivilegeBackend {
+		case privilegeBackendRun0:
+			args := []string{"--pipe"}
 			if cmd.Dir != "" {
-				args = append(args, "--working-directory="+cmd.Dir)
+				args = append(args, "--chdir="+cmd.Dir)
 			}
-
+			childEnv := cmd.Env
+			if len(childEnv) == 0 {
+				childEnv = os.Environ()
+			}
+			args = append(args, run0SetenvArgs(childEnv)...)
 			args = append(args, basePath)
 			args = append(args, baseArgs...)
 			finalCmd = exec.CommandContext(e.Context, "run0", args...)
-
-			// Don't set Dir since we used --working-directory
 			finalCmd.Dir = ""
-		} else {*/
-		// Fallback to sudo -E
-		{
+		default:
 			args := append([]string{"-E", basePath}, baseArgs...)
 			finalCmd = exec.CommandContext(e.Context, "sudo", args...)
 			finalCmd.Dir = cmd.Dir
@@ -172,7 +203,9 @@ func (e *Executor) Run(cmd *exec.Cmd) error {
 	}
 
 	// preserve or inherit the environment
-	if len(cmd.Env) > 0 {
+	if e.ShouldRunAsRoot && os.Geteuid() != 0 && activePrivilegeBackend == privilegeBackendRun0 {
+		finalCmd.Env = os.Environ()
+	} else if len(cmd.Env) > 0 {
 		finalCmd.Env = cmd.Env
 	} else {
 		finalCmd.Env = os.Environ()

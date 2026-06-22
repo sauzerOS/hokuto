@@ -35,6 +35,8 @@ func PostInstallTasks(execCtx *Executor, logger io.Writer) error {
 		{"systemd-tmpfiles", []string{"--create"}},
 		{"ldconfig", nil},
 		{"glib-compile-schemas", []string{"/usr/share/glib-2.0/schemas"}},
+		{"/usr/bin/gio-querymodules", []string{"/usr/lib/gio/modules"}},
+		{"/usr/bin/gio-querymodules-32", []string{"/usr/lib32/gio/modules"}},
 		{"gdk-pixbuf-query-loaders", []string{"--update-cache"}},
 		//{"update-mime-database", []string{"/usr/share/mime"}},
 		{"update-desktop-database", []string{"/usr/share/applications"}},

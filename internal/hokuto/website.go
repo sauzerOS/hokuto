@@ -44,13 +44,26 @@ func UpdateWebsiteStatus(pkgName, version, status, logPath string) error {
 			// Extract/Copy log
 			logFileName := fmt.Sprintf("%s-%s.txt", pkgName, version)
 			dstLogPath := filepath.Join(logsDir, logFileName)
-			
+
 			// If it's a .xz file, decompress it
 			if strings.HasSuffix(logPath, ".xz") {
-				// Use xz -dc to decompress to stdout and redirect to target file
-				cmd := exec.Command("sh", "-c", fmt.Sprintf("xz -dc %s > %s", logPath, dstLogPath))
-				if err := cmd.Run(); err != nil {
-					debugf("Warning: failed to decompress log %s: %v\n", logPath, err)
+				out, err := os.Create(dstLogPath)
+				if err != nil {
+					debugf("Warning: failed to create decompressed log %s: %v\n", dstLogPath, err)
+				}
+				cmd := exec.Command("xz", "-dc", logPath)
+				if err == nil {
+					cmd.Stdout = out
+				}
+				runErr := err
+				if runErr == nil {
+					runErr = cmd.Run()
+				}
+				if out != nil {
+					out.Close()
+				}
+				if runErr != nil {
+					debugf("Warning: failed to decompress log %s: %v\n", logPath, runErr)
 					// Fallback to plain copy (it will be binary but at least something is there)
 					cpCmd := exec.Command("cp", logPath, dstLogPath)
 					cpCmd.Run()
@@ -100,14 +113,14 @@ func UpdateWebsiteStatus(pkgName, version, status, logPath string) error {
 	if err := addCmd.Run(); err != nil {
 		debugf("Warning: git add failed in website repo: %v\n", err)
 	}
-	
+
 	commitMsg := fmt.Sprintf("Update status for %s %s (%s)", pkgName, version, status)
 	commitCmd := exec.Command("git", "-C", websiteRepo, "commit", "-m", commitMsg)
 	if err := commitCmd.Run(); err != nil {
 		// Commit might fail if there are no changes, which is fine
 		debugf("Note: git commit skipped or failed: %v\n", err)
 	}
-	
+
 	pushCmd := exec.Command("git", "-C", websiteRepo, "push")
 	if err := pushCmd.Run(); err != nil {
 		return fmt.Errorf("failed to push to website repo: %v", err)

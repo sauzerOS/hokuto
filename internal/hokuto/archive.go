@@ -5,7 +5,7 @@ package hokuto
 
 import (
 	"archive/tar"
-	"bytes"
+	"bufio"
 	"compress/bzip2"
 	"fmt"
 	"io"
@@ -82,19 +82,37 @@ func unzipGo(src, dest string) error {
 func shouldStripTar(archive string) (bool, error) {
 	debugf("Running strip check for tar extraction")
 
-	// Only list first 51 entries - much faster for large archives
-	cmd := exec.Command("sh", "-c", fmt.Sprintf("tar tf %s | head -n 51", archive))
-
-	var out bytes.Buffer
-	cmd.Stdout = &out
+	cmd := exec.Command("tar", "tf", archive)
 	cmd.Stderr = io.Discard
 
-	if err := cmd.Run(); err != nil {
-		// Tar failed to read or list the file.
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return false, fmt.Errorf("tar tf failed: %w", err)
+	}
+	if err := cmd.Start(); err != nil {
 		return false, fmt.Errorf("tar tf failed: %w", err)
 	}
 
-	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+	var lines []string
+	scanner := bufio.NewScanner(stdout)
+	for scanner.Scan() {
+		lines = append(lines, scanner.Text())
+		if len(lines) >= 51 {
+			break
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		return false, fmt.Errorf("tar tf failed: %w", err)
+	}
+	if len(lines) >= 51 && cmd.Process != nil {
+		_ = cmd.Process.Kill()
+	}
+	if err := cmd.Wait(); err != nil && len(lines) == 0 {
+		return false, fmt.Errorf("tar tf failed: %w", err)
+	}
+
 	if len(lines) == 0 || lines[0] == "" {
 		// Archive is empty
 		return false, nil
@@ -306,6 +324,25 @@ func extractTar(realPath, dest string) error {
 	return nil
 }
 
+func safeTarPath(dest, name string) (string, error) {
+	cleanName := filepath.Clean(name)
+	if cleanName == "." {
+		return filepath.Clean(dest), nil
+	}
+	if filepath.IsAbs(cleanName) || cleanName == ".." || strings.HasPrefix(cleanName, ".."+string(os.PathSeparator)) {
+		return "", fmt.Errorf("unsafe tar path: %s", name)
+	}
+	destAbs, err := filepath.Abs(dest)
+	if err != nil {
+		return "", err
+	}
+	target := filepath.Join(destAbs, cleanName)
+	if target != destAbs && !strings.HasPrefix(target, destAbs+string(os.PathSeparator)) {
+		return "", fmt.Errorf("unsafe tar path: %s", name)
+	}
+	return target, nil
+}
+
 // unpackTarballFallback extracts a .tar.zst into dest using pure-Go.
 func unpackTarballFallback(tarballPath, dest string) error {
 	f, err := os.Open(tarballPath)
@@ -329,7 +366,10 @@ func unpackTarballFallback(tarballPath, dest string) error {
 		if err != nil {
 			return fmt.Errorf("tar read: %w", err)
 		}
-		target := filepath.Join(dest, hdr.Name)
+		target, err := safeTarPath(dest, hdr.Name)
+		if err != nil {
+			return err
+		}
 
 		switch hdr.Typeflag {
 		case tar.TypeDir:
@@ -366,6 +406,24 @@ func unpackTarballFallback(tarballPath, dest string) error {
 			if os.Geteuid() == 0 {
 				_ = unix.Lchown(target, hdr.Uid, hdr.Gid)
 			}
+		case tar.TypeLink:
+			linkTarget, err := safeTarPath(dest, hdr.Linkname)
+			if err != nil {
+				return err
+			}
+			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+				return err
+			}
+			_ = os.Remove(target)
+			if err := os.Link(linkTarget, target); err != nil {
+				return fmt.Errorf("failed to create hard link %s -> %s: %w", target, linkTarget, err)
+			}
+			if os.Geteuid() == 0 {
+				_ = os.Chown(target, hdr.Uid, hdr.Gid)
+			}
+			_ = os.Chtimes(target, hdr.AccessTime, hdr.ModTime)
+		default:
+			debugf("Skipping unsupported package tar entry type %c: %s\n", hdr.Typeflag, hdr.Name)
 		}
 	}
 	return nil

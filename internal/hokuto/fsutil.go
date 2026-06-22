@@ -76,8 +76,8 @@ func listOutputFilesWithTypes(outputDir string, execCtx *Executor) ([]FileListEn
 				return nil
 			}
 
-			// Filter out libtool .la files and charset.alias
-			if strings.HasSuffix(rel, ".la") || strings.HasSuffix(rel, "charset.alias") {
+			// Filter out charset.alias noise from generated manifests.
+			if strings.HasSuffix(rel, "charset.alias") {
 				return nil
 			}
 
@@ -143,8 +143,8 @@ func listOutputFilesWithTypes(outputDir string, execCtx *Executor) ([]FileListEn
 			continue
 		}
 
-		// Filter out libtool .la files and charset.alias
-		if strings.HasSuffix(rel, ".la") || strings.HasSuffix(rel, "charset.alias") {
+		// Filter out charset.alias noise from generated manifests.
+		if strings.HasSuffix(rel, "charset.alias") {
 			continue
 		}
 
@@ -682,10 +682,13 @@ func readFileAsRoot(path string) ([]byte, error) {
 	}
 	// Only force sudo if we are not root and permission denied or similar
 	if os.Geteuid() != 0 {
-		cmd := exec.Command("sudo", "cat", path)
-		out, err := cmd.Output()
-		if err == nil {
-			return out, nil
+		if RootExec != nil {
+			cmd := exec.Command("cat", path)
+			var out bytes.Buffer
+			cmd.Stdout = &out
+			if err := RootExec.Run(cmd); err == nil {
+				return out.Bytes(), nil
+			}
 		}
 	}
 	return nil, err
@@ -716,14 +719,14 @@ func writeFileAsRoot(path string, data []byte, perm os.FileMode, execCtx *Execut
 	}
 	tmpFile.Close()
 
-	// Move via sudo cp to preserve content, then chmod
-	cpCmd := exec.Command("sudo", "cp", tmpName, path)
+	// Move via the privileged executor to preserve content, then chmod.
+	cpCmd := exec.Command("cp", tmpName, path)
 	if err := execCtx.Run(cpCmd); err != nil {
 		return fmt.Errorf("failed to write file %s as root: %w", path, err)
 	}
 
 	// Set permissions
-	chmodCmd := exec.Command("sudo", "chmod", fmt.Sprintf("%o", perm), path)
+	chmodCmd := exec.Command("chmod", fmt.Sprintf("%o", perm), path)
 	if err := execCtx.Run(chmodCmd); err != nil {
 		return fmt.Errorf("failed to chmod file %s as root: %w", path, err)
 	}
@@ -742,8 +745,8 @@ func copyFileAsRoot(src, dst string, execCtx *Executor) error {
 		return copyFile(src, dst)
 	}
 
-	// Use sudo cp to preserve attributes if possible
-	cmd := exec.Command("sudo", "cp", "-a", src, dst)
+	// Use the privileged executor to preserve attributes if possible.
+	cmd := exec.Command("cp", "-a", src, dst)
 	return execCtx.Run(cmd)
 }
 
@@ -759,8 +762,7 @@ func removeFileAsRoot(path string, execCtx *Executor) error {
 		return err
 	}
 
-	// Use sudo rm
-	cmd := exec.Command("sudo", "rm", "-f", path)
+	cmd := exec.Command("rm", "-f", path)
 	return execCtx.Run(cmd)
 }
 
@@ -797,4 +799,3 @@ func canonicalizePath(rootDir, path string) string {
 	}
 	return strings.TrimPrefix(rel, "/")
 }
-

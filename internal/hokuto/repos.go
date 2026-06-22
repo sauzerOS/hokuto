@@ -2,13 +2,339 @@ package hokuto
 
 import (
 	"bufio"
+	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
+
+	gogit "github.com/go-git/go-git/v5"
+	"github.com/schollz/progressbar/v3"
 )
+
+type lfsPointer struct {
+	Path string
+	OID  string
+	Size int64
+}
+
+type lfsBatchObject struct {
+	OID  string `json:"oid"`
+	Size int64  `json:"size"`
+}
+
+type lfsBatchRequest struct {
+	Operation string           `json:"operation"`
+	Transfers []string         `json:"transfers,omitempty"`
+	Objects   []lfsBatchObject `json:"objects"`
+}
+
+type lfsBatchAction struct {
+	Href   string            `json:"href"`
+	Header map[string]string `json:"header,omitempty"`
+}
+
+type lfsBatchResponseObject struct {
+	OID     string                    `json:"oid"`
+	Size    int64                     `json:"size"`
+	Actions map[string]lfsBatchAction `json:"actions"`
+	Error   *struct {
+		Code    int    `json:"code"`
+		Message string `json:"message"`
+	} `json:"error,omitempty"`
+}
+
+type lfsBatchResponse struct {
+	Objects []lfsBatchResponseObject `json:"objects"`
+}
+
+func isGoGitRepository(path string) bool {
+	if _, err := gogit.PlainOpen(path); err == nil {
+		return true
+	}
+	return false
+}
+
+func cloneRepositoryInternal(repoName, repoURL, targetPath string) error {
+	_, err := gogit.PlainClone(targetPath, false, &gogit.CloneOptions{
+		URL:      repoURL,
+		Progress: os.Stderr,
+	})
+	if err != nil {
+		return fmt.Errorf("go-git clone failed for %s: %w", repoName, err)
+	}
+	return nil
+}
+
+func parseLFSPointer(data []byte) (lfsPointer, bool) {
+	text := string(data)
+	if !strings.HasPrefix(text, "version https://git-lfs.github.com/spec/v1\n") {
+		return lfsPointer{}, false
+	}
+	var ptr lfsPointer
+	hasSize := false
+	for _, line := range strings.Split(text, "\n") {
+		line = strings.TrimSpace(line)
+		switch {
+		case strings.HasPrefix(line, "oid sha256:"):
+			ptr.OID = strings.TrimPrefix(line, "oid sha256:")
+		case strings.HasPrefix(line, "size "):
+			if _, err := fmt.Sscanf(strings.TrimPrefix(line, "size "), "%d", &ptr.Size); err != nil {
+				return lfsPointer{}, false
+			}
+			hasSize = true
+		}
+	}
+	if ptr.OID == "" || !hasSize || ptr.Size < 0 {
+		return lfsPointer{}, false
+	}
+	return ptr, true
+}
+
+func findLFSPointers(repoPath string) ([]lfsPointer, error) {
+	var pointers []lfsPointer
+	err := filepath.WalkDir(repoPath, func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if entry.IsDir() {
+			if entry.Name() == ".git" {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		if !info.Mode().IsRegular() || info.Size() > 1024 {
+			return nil
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		ptr, ok := parseLFSPointer(data)
+		if !ok {
+			return nil
+		}
+		ptr.Path = path
+		pointers = append(pointers, ptr)
+		return nil
+	})
+	return pointers, err
+}
+
+func lfsBatchEndpoint(repoURL string) string {
+	base := strings.TrimSuffix(repoURL, "/")
+	if !strings.HasSuffix(base, ".git") {
+		base += ".git"
+	}
+	return base + "/info/lfs/objects/batch"
+}
+
+func fetchLFSBatch(repoURL string, pointers []lfsPointer) (map[string]lfsBatchResponseObject, error) {
+	reqBody := lfsBatchRequest{
+		Operation: "download",
+		Transfers: []string{"basic"},
+		Objects:   make([]lfsBatchObject, 0, len(pointers)),
+	}
+	for _, ptr := range pointers {
+		reqBody.Objects = append(reqBody.Objects, lfsBatchObject{OID: ptr.OID, Size: ptr.Size})
+	}
+	data, err := json.Marshal(reqBody)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodPost, lfsBatchEndpoint(repoURL), bytes.NewReader(data))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "application/vnd.git-lfs+json")
+	req.Header.Set("Content-Type", "application/vnd.git-lfs+json")
+
+	client, err := newHttpClient()
+	if err != nil {
+		return nil, err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return nil, fmt.Errorf("LFS batch request failed: %s: %s", resp.Status, strings.TrimSpace(string(body)))
+	}
+
+	var batch lfsBatchResponse
+	if err := json.NewDecoder(resp.Body).Decode(&batch); err != nil {
+		return nil, err
+	}
+	objects := make(map[string]lfsBatchResponseObject, len(batch.Objects))
+	for _, obj := range batch.Objects {
+		objects[obj.OID] = obj
+	}
+	return objects, nil
+}
+
+func lfsProgressDescription(repoPath string, index, total int, ptr lfsPointer) string {
+	displayPath := ptr.Path
+	if rel, err := filepath.Rel(repoPath, ptr.Path); err == nil {
+		displayPath = rel
+	}
+	if len(displayPath) > 70 {
+		displayPath = "..." + displayPath[len(displayPath)-67:]
+	}
+	return fmt.Sprintf("   [%d/%d] %s", index, total, displayPath)
+}
+
+func newLFSProgressBar(total int64, description string) *progressbar.ProgressBar {
+	return progressbar.NewOptions64(
+		total,
+		progressbar.OptionSetDescription(description),
+		progressbar.OptionSetWriter(os.Stderr),
+		progressbar.OptionShowBytes(true),
+		progressbar.OptionSetWidth(30),
+		progressbar.OptionThrottle(10*time.Millisecond),
+		progressbar.OptionShowCount(),
+		progressbar.OptionOnCompletion(func() {
+			fmt.Fprint(os.Stderr, "\n")
+		}),
+		progressbar.OptionSetTheme(progressbar.Theme{
+			Saucer:        "=",
+			SaucerHead:    ">",
+			SaucerPadding: " ",
+			BarStart:      "[",
+			BarEnd:        "]",
+		}),
+	)
+}
+
+func downloadLFSObject(repoPath string, index, total int, ptr lfsPointer, obj lfsBatchResponseObject) error {
+	if obj.Error != nil {
+		return fmt.Errorf("LFS object %s unavailable: %s", ptr.OID, obj.Error.Message)
+	}
+	action, ok := obj.Actions["download"]
+	if !ok || action.Href == "" {
+		return fmt.Errorf("LFS object %s has no download action", ptr.OID)
+	}
+	req, err := http.NewRequest(http.MethodGet, action.Href, nil)
+	if err != nil {
+		return err
+	}
+	for k, v := range action.Header {
+		req.Header.Set(k, v)
+	}
+	client, err := newHttpClient()
+	if err != nil {
+		return err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("LFS download failed for %s: %s", ptr.OID, resp.Status)
+	}
+
+	tmpPath := ptr.Path + ".hokuto-lfs"
+	out, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	if err != nil {
+		return err
+	}
+	hasher := sha256.New()
+	bar := newLFSProgressBar(ptr.Size, lfsProgressDescription(repoPath, index, total, ptr))
+	written, copyErr := io.Copy(io.MultiWriter(out, hasher, bar), resp.Body)
+	closeErr := out.Close()
+	if copyErr != nil {
+		_ = os.Remove(tmpPath)
+		return copyErr
+	}
+	if closeErr != nil {
+		_ = os.Remove(tmpPath)
+		return closeErr
+	}
+	if written != ptr.Size {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("LFS object %s size mismatch: got %d, want %d", ptr.OID, written, ptr.Size)
+	}
+	if got := hex.EncodeToString(hasher.Sum(nil)); got != ptr.OID {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("LFS object %s checksum mismatch: got %s", ptr.OID, got)
+	}
+	info, err := os.Stat(ptr.Path)
+	if err == nil {
+		_ = os.Chmod(tmpPath, info.Mode().Perm())
+	}
+	return os.Rename(tmpPath, ptr.Path)
+}
+
+func resolveRepositoryLFS(repoName, repoURL, repoPath string) error {
+	pointers, err := findLFSPointers(repoPath)
+	if err != nil {
+		return err
+	}
+	if len(pointers) == 0 {
+		debugf("No LFS pointer files found for %s\n", repoName)
+		return nil
+	}
+
+	return downloadRepositoryLFS(repoName, repoURL, repoPath, pointers)
+}
+
+func maybeResolveRepositoryLFS(repoName, repoURL, repoPath string, checkoutLFS *bool, askedLFS *bool) error {
+	pointers, err := findLFSPointers(repoPath)
+	if err != nil {
+		return err
+	}
+	if len(pointers) == 0 {
+		debugf("No missing LFS objects found for %s\n", repoName)
+		return nil
+	}
+
+	if !*askedLFS {
+		colArrow.Print("-> ")
+		*checkoutLFS = askForConfirmation(colSuccess, "Checkout Git LFS objects now?")
+		*askedLFS = true
+	}
+	if !*checkoutLFS {
+		colArrow.Print("-> ")
+		colWarn.Printf("Skipping %d LFS assets for %s\n", len(pointers), repoName)
+		return nil
+	}
+
+	return downloadRepositoryLFS(repoName, repoURL, repoPath, pointers)
+}
+
+func downloadRepositoryLFS(repoName, repoURL, repoPath string, pointers []lfsPointer) error {
+	colArrow.Print("-> ")
+	colSuccess.Printf("Downloading %d LFS assets for %s\n", len(pointers), repoName)
+	objects, err := fetchLFSBatch(repoURL, pointers)
+	if err != nil {
+		return err
+	}
+	for i, ptr := range pointers {
+		obj, ok := objects[ptr.OID]
+		if !ok {
+			return fmt.Errorf("LFS batch response missing object %s", ptr.OID)
+		}
+		if err := downloadLFSObject(repoPath, i+1, len(pointers), ptr, obj); err != nil {
+			return err
+		}
+	}
+	return nil
+}
 
 func handleInitReposCommand(cfg *Config) error {
 	rootDir := cfg.Values["HOKUTO_ROOT"]
@@ -28,12 +354,10 @@ func handleInitReposCommand(cfg *Config) error {
 	for _, repo := range repos {
 		path := filepath.Join(repoDir, repo)
 		if _, err := os.Stat(path); err == nil {
-			// Check if it's an actual git repo
-			checkCmd := exec.Command("git", "-C", path, "rev-parse", "--is-inside-work-tree")
-			if err := checkCmd.Run(); err == nil {
+			if isGoGitRepository(path) {
 				colArrow.Print("-> ")
-				colWarn.Printf("Warning: %s already exists and is a git repository.\n", path)
-				return fmt.Errorf("repository %s already exists. Please remove it manually if you want to re-initialize", path)
+				colInfo.Printf("Using existing git repository: %s\n", path)
+				continue
 			}
 
 			// If it exists but is not a git repo, remove it
@@ -104,24 +428,25 @@ func handleInitReposCommand(cfg *Config) error {
 		enabledRepos = append(enabledRepos, "cosmic")
 	}
 
+	checkoutLFS := false
+	askedLFS := false
 	for _, repo := range enabledRepos {
 		targetPath := filepath.Join(repoDir, repo)
 		url := urls[repo]
 
-		colArrow.Print("-> ")
-		colSuccess.Printf("Cloning %s repository from %s\n", repo, url)
-
-		cloneCmd := exec.Command("git", "clone", url, targetPath)
-		cloneCmd.Stdout = os.Stdout
-		cloneCmd.Stderr = os.Stderr
-		if err := UserExec.Run(cloneCmd); err != nil {
-			return fmt.Errorf("failed to clone %s: %v", repo, err)
+		if isGoGitRepository(targetPath) {
+			colArrow.Print("-> ")
+			colSuccess.Printf("Repository %s already initialized at %s\n", repo, targetPath)
+		} else {
+			colArrow.Print("-> ")
+			colSuccess.Printf("Cloning %s repository from %s\n", repo, url)
+			if err := cloneRepositoryInternal(repo, url, targetPath); err != nil {
+				return fmt.Errorf("failed to clone %s: %v", repo, err)
+			}
 		}
 
-		// --- git-lfs check AFTER sauzeros clone ---
 		if repo == "sauzeros" {
 			// Update cfg.Values["HOKUTO_PATH"] temporarily to include the new repo
-			// so that if we need to install git-lfs, hokuto knows where to find it.
 			oldPath := cfg.Values["HOKUTO_PATH"]
 			if oldPath == "" {
 				cfg.Values["HOKUTO_PATH"] = targetPath
@@ -130,34 +455,11 @@ func handleInitReposCommand(cfg *Config) error {
 			}
 			// Refresh repo paths in the global variable too
 			repoPaths = cfg.Values["HOKUTO_PATH"]
-
-			if _, err := exec.LookPath("git-lfs"); err != nil {
-				colArrow.Print("-> ")
-				colWarn.Println(" git-lfs is required but not installed.")
-				colArrow.Print("-> ")
-				if askForConfirmation(colInfo, " Would you like to attempt to install git-lfs now?") {
-					// Try to install git-lfs via hokuto
-					installCmd := exec.Command("hokuto", "install", "git-lfs")
-					if err := UserExec.Run(installCmd); err != nil {
-						colArrow.Print("-> ")
-						colWarn.Printf("Warning: Failed to install git-lfs: %v\n", err)
-						colInfo.Println("Please install git-lfs manually for full repository support.")
-					}
-				}
-			} else {
-				// Initialize git-lfs for the current user
-				exec.Command("git", "lfs", "install").Run()
-			}
 		}
 
-		// Ensure git-lfs files are pulled
-		if _, err := exec.LookPath("git-lfs"); err == nil {
+		if err := maybeResolveRepositoryLFS(repo, url, targetPath, &checkoutLFS, &askedLFS); err != nil {
 			colArrow.Print("-> ")
-			colSuccess.Printf("Downloading LFS assets for %s\n", repo)
-			lfsPullCmd := exec.Command("git", "-C", targetPath, "lfs", "pull")
-			lfsPullCmd.Stdout = os.Stdout
-			lfsPullCmd.Stderr = os.Stderr
-			_ = UserExec.Run(lfsPullCmd)
+			colWarn.Printf("Warning: failed to download LFS assets for %s: %v\n", repo, err)
 		}
 
 		// Install git hooks
@@ -181,7 +483,6 @@ func handleInitReposCommand(cfg *Config) error {
 
 	return nil
 }
-
 
 func installGitHooks(repoPath string) error {
 	hooksDir := filepath.Join(repoPath, ".git", "hooks")
@@ -291,10 +592,11 @@ func updateHokutoConfig(rootDir string, enableKDE, enableCosmic bool) error {
 	}
 
 	if os.Geteuid() == 0 {
-		if err := os.Rename(tmpFile, configPath); err != nil {
-			os.Remove(tmpFile)
+		if err := copyFile(tmpFile, configPath); err != nil {
+			_ = os.Remove(tmpFile)
 			return fmt.Errorf("failed to update config file natively: %v", err)
 		}
+		_ = os.Remove(tmpFile)
 	} else {
 		mvCmd := exec.Command("mv", tmpFile, configPath)
 		if err := RootExec.Run(mvCmd); err != nil {

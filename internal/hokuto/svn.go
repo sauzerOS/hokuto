@@ -212,7 +212,7 @@ func svnDownloadFile(client *http.Client, baseURL, remotePath, localPath string)
 //
 // The function uses concurrent downloads (up to 8 parallel) for performance.
 func svnCheckout(baseURL, repoPath, revision, destDir string, quiet bool) error {
-	client := &http.Client{}
+	client := simpleHTTPClient()
 
 	// Determine the PROPFIND/GET base path.
 	// If a revision is specified, we access the tree via !svn/bc/REVISION/path.

@@ -1,12 +1,13 @@
 package hokuto
 
-// Code in this file was split out of main.go for readability.
-// No behavior changes intended.
-
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path"
@@ -15,6 +16,8 @@ import (
 	"strings"
 	"time"
 
+	gogit "github.com/go-git/go-git/v5"
+	"github.com/go-git/go-git/v5/plumbing/object"
 	"github.com/gookit/color"
 )
 
@@ -110,11 +113,354 @@ func getBaseRepoPath(fullPath string) string {
 	return repoDir // Return the relative path if the original wasn't absolute (though it should be)
 }
 
+func updateRepoWithSystemGit(dir string) {
+	cmd := exec.Command("git", "pull")
+	cmd.Dir = dir
+
+	output, err := cmd.CombinedOutput()
+	outputStr := strings.TrimSpace(string(output))
+
+	if err != nil {
+		if strings.Contains(outputStr, "would be overwritten by merge") {
+			colArrow.Print("-> ")
+			colWarn.Printf("Repository %s has local changes that would be overwritten.\n", dir)
+			colArrow.Print("-> ")
+			fmt.Printf("Output:\n%s\n", outputStr)
+
+			if askForConfirmation(colWarn, "Discard local changes and pull updates from remote?") {
+				resetCmd := exec.Command("git", "reset", "--hard", "HEAD")
+				resetCmd.Dir = dir
+				resetOutput, resetErr := resetCmd.CombinedOutput()
+				if resetErr != nil {
+					fmt.Printf("Error resetting repository %s: %v\nOutput:\n%s\n", dir, resetErr, strings.TrimSpace(string(resetOutput)))
+					return
+				}
+
+				cleanCmd := exec.Command("git", "clean", "-fd")
+				cleanCmd.Dir = dir
+				cleanOutput, cleanErr := cleanCmd.CombinedOutput()
+				if cleanErr != nil {
+					fmt.Printf("Warning: Error cleaning repository %s: %v\nOutput:\n%s\n", dir, cleanErr, strings.TrimSpace(string(cleanOutput)))
+				}
+
+				retryCmd := exec.Command("git", "pull")
+				retryCmd.Dir = dir
+				retryOutput, retryErr := retryCmd.CombinedOutput()
+				retryOutputStr := strings.TrimSpace(string(retryOutput))
+
+				if retryErr != nil {
+					fmt.Printf("Error pulling repo %s after reset: %v\nOutput:\n%s\n", dir, retryErr, retryOutputStr)
+				} else {
+					colArrow.Print("-> ")
+					colSuccess.Printf("Successfully pulled repo %s after discarding local changes\nOutput:\n%s\n", dir, retryOutputStr)
+				}
+			} else {
+				colArrow.Print("-> ")
+				colWarn.Printf("Skipping repository %s (local changes preserved)\n", dir)
+			}
+		} else {
+			fmt.Printf("Error pulling repo %s: %v\nOutput:\n%s\n", dir, err, outputStr)
+		}
+	} else {
+		colArrow.Print("-> ")
+		colSuccess.Printf("Successfully pulled repo %s\nOutput:\n%s\n", dir, outputStr)
+	}
+}
+
+func updateRepoWithGoGit(dir string) {
+	repo, err := gogit.PlainOpen(dir)
+	if err != nil {
+		fmt.Printf("Error opening repo %s with go-git: %v\n", dir, err)
+		return
+	}
+
+	wt, err := repo.Worktree()
+	if err != nil {
+		fmt.Printf("Error opening worktree for repo %s: %v\n", dir, err)
+		return
+	}
+
+	var preservedLFS map[string]string
+	if err := pullRepoWithGoGit(wt, dir); err != nil {
+		if !isGoGitDirtyWorktreeError(err) {
+			fmt.Printf("Error pulling repo %s with go-git: %v\n", dir, err)
+			return
+		}
+
+		lfsOnly, lfsCache, lfsErr := preserveHydratedLFSChanges(repo, wt, dir)
+		if lfsErr != nil {
+			debugf("Failed to preserve hydrated LFS assets for %s: %v\n", dir, lfsErr)
+		} else {
+			preservedLFS = lfsCache
+		}
+
+		if !lfsOnly {
+			colArrow.Print("-> ")
+			colWarn.Printf("Repository %s has local changes that would be overwritten.\n", dir)
+			printGoGitDiscardedChanges(repo, wt, dir)
+			if !askForConfirmation(colWarn, "Discard local changes and pull updates from remote?") {
+				cleanupPreservedLFS(preservedLFS)
+				colArrow.Print("-> ")
+				colWarn.Printf("Skipping repository %s (local changes preserved)\n", dir)
+				return
+			}
+		} else if len(preservedLFS) > 0 {
+			colArrow.Print("-> ")
+			colInfo.Printf("Preserving %d hydrated LFS asset(s) during go-git update\n", len(preservedLFS))
+		}
+
+		if err := wt.Reset(&gogit.ResetOptions{Mode: gogit.HardReset}); err != nil {
+			cleanupPreservedLFS(preservedLFS)
+			fmt.Printf("Error resetting repository %s with go-git: %v\n", dir, err)
+			return
+		}
+		if err := wt.Clean(&gogit.CleanOptions{Dir: true}); err != nil {
+			fmt.Printf("Warning: Error cleaning repository %s with go-git: %v\n", dir, err)
+		}
+		if err := pullRepoWithGoGit(wt, dir); err != nil {
+			cleanupPreservedLFS(preservedLFS)
+			fmt.Printf("Error pulling repo %s with go-git after reset: %v\n", dir, err)
+			return
+		}
+		if err := restorePreservedLFS(repo, dir, preservedLFS); err != nil {
+			cleanupPreservedLFS(preservedLFS)
+			fmt.Printf("Warning: failed to restore preserved LFS assets for %s: %v\n", dir, err)
+		}
+		colArrow.Print("-> ")
+		if lfsOnly {
+			colSuccess.Printf("Successfully pulled repo %s while preserving LFS assets (go-git)\n", dir)
+		} else {
+			colSuccess.Printf("Successfully pulled repo %s after discarding local changes (go-git)\n", dir)
+		}
+	}
+
+	resolveUpdatedRepoLFS(repo, dir)
+}
+
+func getHeadTree(repo *gogit.Repository) (*object.Tree, error) {
+	ref, err := repo.Head()
+	if err != nil {
+		return nil, err
+	}
+	commit, err := repo.CommitObject(ref.Hash())
+	if err != nil {
+		return nil, err
+	}
+	return commit.Tree()
+}
+
+func treeLFSPointer(tree *object.Tree, relPath string) (lfsPointer, bool) {
+	file, err := tree.File(filepath.ToSlash(relPath))
+	if err != nil {
+		return lfsPointer{}, false
+	}
+	if file.Size > 1024 {
+		return lfsPointer{}, false
+	}
+	contents, err := file.Contents()
+	if err != nil {
+		return lfsPointer{}, false
+	}
+	ptr, ok := parseLFSPointer([]byte(contents))
+	return ptr, ok
+}
+
+func sha256File(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	hasher := sha256.New()
+	if _, err := io.Copy(hasher, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(hasher.Sum(nil)), nil
+}
+
+func workingFileMatchesLFSPointer(path string, ptr lfsPointer) bool {
+	info, err := os.Lstat(path)
+	if err != nil || !info.Mode().IsRegular() || info.Size() != ptr.Size {
+		return false
+	}
+	sum, err := sha256File(path)
+	return err == nil && sum == ptr.OID
+}
+
+func preserveHydratedLFSChanges(repo *gogit.Repository, wt *gogit.Worktree, repoPath string) (bool, map[string]string, error) {
+	status, err := wt.Status()
+	if err != nil {
+		return false, nil, err
+	}
+	tree, err := getHeadTree(repo)
+	if err != nil {
+		return false, nil, err
+	}
+
+	preserved := make(map[string]string)
+	hasNonLFSChanges := false
+	for relPath, fileStatus := range status {
+		if fileStatus.Worktree == gogit.Unmodified && fileStatus.Staging == gogit.Unmodified {
+			continue
+		}
+		ptr, ok := treeLFSPointer(tree, relPath)
+		if !ok {
+			hasNonLFSChanges = true
+			continue
+		}
+		absPath := filepath.Join(repoPath, filepath.FromSlash(relPath))
+		if !workingFileMatchesLFSPointer(absPath, ptr) {
+			hasNonLFSChanges = true
+			continue
+		}
+
+		cachePath := filepath.Join(os.TempDir(), fmt.Sprintf("hokuto-lfs-preserve-%d-%s", os.Getpid(), ptr.OID))
+		if _, exists := preserved[relPath]; !exists {
+			if err := copyFile(absPath, cachePath); err != nil {
+				return false, preserved, err
+			}
+			preserved[relPath] = cachePath
+		}
+	}
+
+	return len(preserved) > 0 && !hasNonLFSChanges, preserved, nil
+}
+
+func localChangesToDiscard(repo *gogit.Repository, wt *gogit.Worktree, repoPath string) ([]string, error) {
+	status, err := wt.Status()
+	if err != nil {
+		return nil, err
+	}
+	tree, treeErr := getHeadTree(repo)
+
+	var changes []string
+	for relPath, fileStatus := range status {
+		if fileStatus.Worktree == gogit.Unmodified && fileStatus.Staging == gogit.Unmodified {
+			continue
+		}
+		if treeErr == nil {
+			ptr, ok := treeLFSPointer(tree, relPath)
+			if ok {
+				absPath := filepath.Join(repoPath, filepath.FromSlash(relPath))
+				if workingFileMatchesLFSPointer(absPath, ptr) {
+					continue
+				}
+			}
+		}
+		changes = append(changes, fmt.Sprintf("%c%c %s", fileStatus.Staging, fileStatus.Worktree, relPath))
+	}
+	sort.Strings(changes)
+	return changes, nil
+}
+
+func printGoGitDiscardedChanges(repo *gogit.Repository, wt *gogit.Worktree, repoPath string) {
+	changes, err := localChangesToDiscard(repo, wt, repoPath)
+	if err != nil {
+		colArrow.Print("-> ")
+		colWarn.Printf("Warning: failed to list local changes: %v\n", err)
+		return
+	}
+	if len(changes) == 0 {
+		return
+	}
+
+	colArrow.Print("-> ")
+	colWarn.Println("Local changes that would be discarded:")
+	for _, change := range changes {
+		colWarn.Printf("   %s\n", change)
+	}
+}
+
+func restorePreservedLFS(repo *gogit.Repository, repoPath string, preserved map[string]string) error {
+	if len(preserved) == 0 {
+		return nil
+	}
+	defer cleanupPreservedLFS(preserved)
+
+	tree, err := getHeadTree(repo)
+	if err != nil {
+		return err
+	}
+	restored := 0
+	for relPath, cachePath := range preserved {
+		ptr, ok := treeLFSPointer(tree, relPath)
+		if !ok {
+			continue
+		}
+		if !workingFileMatchesLFSPointer(cachePath, ptr) {
+			continue
+		}
+		targetPath := filepath.Join(repoPath, filepath.FromSlash(relPath))
+		if err := copyFile(cachePath, targetPath); err != nil {
+			return err
+		}
+		restored++
+	}
+	if restored > 0 {
+		colArrow.Print("-> ")
+		colSuccess.Printf("Restored %d existing LFS asset(s)\n", restored)
+	}
+	return nil
+}
+
+func cleanupPreservedLFS(preserved map[string]string) {
+	for _, path := range preserved {
+		_ = os.Remove(path)
+	}
+}
+
+func pullRepoWithGoGit(wt *gogit.Worktree, dir string) error {
+	err := wt.Pull(&gogit.PullOptions{
+		RemoteName: "origin",
+		Progress:   os.Stderr,
+	})
+	if errors.Is(err, gogit.NoErrAlreadyUpToDate) {
+		colArrow.Print("-> ")
+		colSuccess.Printf("Repository %s is already up to date (go-git)\n", dir)
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	colArrow.Print("-> ")
+	colSuccess.Printf("Successfully pulled repo %s (go-git)\n", dir)
+	return nil
+}
+
+func isGoGitDirtyWorktreeError(err error) bool {
+	return errors.Is(err, gogit.ErrWorktreeNotClean) || errors.Is(err, gogit.ErrUnstagedChanges)
+}
+
+func resolveUpdatedRepoLFS(repo *gogit.Repository, dir string) {
+	remote, err := repo.Remote("origin")
+	if err != nil {
+		debugf("Skipping LFS resolution for %s: missing origin remote: %v\n", dir, err)
+		return
+	}
+	cfg := remote.Config()
+	if len(cfg.URLs) == 0 {
+		debugf("Skipping LFS resolution for %s: origin has no URL\n", dir)
+		return
+	}
+	checkoutLFS := false
+	askedLFS := false
+	if err := maybeResolveRepositoryLFS(filepath.Base(dir), cfg.URLs[0], dir, &checkoutLFS, &askedLFS); err != nil {
+		colArrow.Print("-> ")
+		colWarn.Printf("Warning: failed to download LFS assets for %s: %v\n", dir, err)
+	}
+}
+
 // updateRepos updates each unique repository found in repoPaths
 
 func updateRepos() {
 	// 1. Split the global repoPaths string by the path separator ":"
 	paths := strings.Split(repoPaths, ":")
+	_, gitErr := exec.LookPath("git")
+	useGoGit := gitErr != nil
+	if useGoGit {
+		colArrow.Print("-> ")
+		colWarn.Println("git not found; updating repositories with internal go-git")
+	}
 
 	// 2. Determine the unique base repository directories
 	uniqueRepoDirs := make(map[string]struct{})
@@ -132,64 +478,10 @@ func updateRepos() {
 		colArrow.Print("-> ")
 		colSuccess.Printf("%s\n", dir)
 
-		// 3. Execute 'git pull' in each unique directory
-		// We use dir as the working directory for 'git pull'
-		cmd := exec.Command("git", "pull")
-		cmd.Dir = dir // Set the working directory for the command
-
-		// Capture output for logging and error checking
-		output, err := cmd.CombinedOutput()
-		outputStr := strings.TrimSpace(string(output))
-
-		if err != nil {
-			// Check if the error is due to local changes that would be overwritten
-			if strings.Contains(outputStr, "would be overwritten by merge") {
-				colArrow.Print("-> ")
-				colWarn.Printf("Repository %s has local changes that would be overwritten.\n", dir)
-				colArrow.Print("-> ")
-				fmt.Printf("Output:\n%s\n", outputStr)
-
-				// Prompt user to discard local changes
-				if askForConfirmation(colWarn, "Discard local changes and pull updates from remote?") {
-					// Reset local changes
-					resetCmd := exec.Command("git", "reset", "--hard", "HEAD")
-					resetCmd.Dir = dir
-					resetOutput, resetErr := resetCmd.CombinedOutput()
-					if resetErr != nil {
-						fmt.Printf("Error resetting repository %s: %v\nOutput:\n%s\n", dir, resetErr, strings.TrimSpace(string(resetOutput)))
-						continue
-					}
-
-					// Clean untracked files that might conflict
-					cleanCmd := exec.Command("git", "clean", "-fd")
-					cleanCmd.Dir = dir
-					cleanOutput, cleanErr := cleanCmd.CombinedOutput()
-					if cleanErr != nil {
-						fmt.Printf("Warning: Error cleaning repository %s: %v\nOutput:\n%s\n", dir, cleanErr, strings.TrimSpace(string(cleanOutput)))
-					}
-
-					// Retry git pull
-					retryCmd := exec.Command("git", "pull")
-					retryCmd.Dir = dir
-					retryOutput, retryErr := retryCmd.CombinedOutput()
-					retryOutputStr := strings.TrimSpace(string(retryOutput))
-
-					if retryErr != nil {
-						fmt.Printf("Error pulling repo %s after reset: %v\nOutput:\n%s\n", dir, retryErr, retryOutputStr)
-					} else {
-						colArrow.Print("-> ")
-						colSuccess.Printf("Successfully pulled repo %s after discarding local changes\nOutput:\n%s\n", dir, retryOutputStr)
-					}
-				} else {
-					colArrow.Print("-> ")
-					colWarn.Printf("Skipping repository %s (local changes preserved)\n", dir)
-				}
-			} else {
-				fmt.Printf("Error pulling repo %s: %v\nOutput:\n%s\n", dir, err, outputStr)
-			}
+		if useGoGit {
+			updateRepoWithGoGit(dir)
 		} else {
-			colArrow.Print("-> ")
-			colSuccess.Printf("Successfully pulled repo %s\nOutput:\n%s\n", dir, outputStr)
+			updateRepoWithSystemGit(dir)
 		}
 	}
 }
