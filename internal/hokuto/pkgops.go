@@ -840,8 +840,6 @@ func getPackageDependenciesToUninstall(name string) []string {
 		return []string{"02-gcc-1", "20-gcc-2", "05-libstdc++"}
 	case "binutils":
 		return []string{"01-binutils-1", "19-binutils-2"}
-	case "linux-headers":
-		return []string{"03-linux-headers"}
 	case "m4":
 		return []string{"06-m4"}
 	case "ncurses":
@@ -870,8 +868,6 @@ func getPackageDependenciesToUninstall(name string) []string {
 		return []string{"18-sed"}
 	case "hokuto":
 		return []string{"21-hokuto"}
-	case "ca-certificates":
-		return []string{"22-ca-certificates"}
 	case "nano":
 		return []string{"23-nano"}
 	case "bzip2":
