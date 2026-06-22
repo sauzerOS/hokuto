@@ -302,6 +302,11 @@ func copyTreeWithTar(src, dst string, execCtx *Executor) error {
 				cmd := exec.Command("cat", path)
 				var out bytes.Buffer
 				cmd.Stdout = &out
+				if Debug {
+					cmd.Stderr = os.Stderr
+				} else {
+					cmd.Stderr = io.Discard
+				}
 				if err := execCtx.Run(cmd); err != nil {
 					return fmt.Errorf("failed to read file %s with privileges: %w", path, err)
 				}
@@ -680,12 +685,17 @@ func readFileAsRoot(path string) ([]byte, error) {
 	if err == nil {
 		return data, nil
 	}
-	// Only force sudo if we are not root and permission denied or similar
-	if os.Geteuid() != 0 {
+	// Only force sudo/run0 when the direct read failed because of permissions.
+	if os.Geteuid() != 0 && os.IsPermission(err) {
 		if RootExec != nil {
 			cmd := exec.Command("cat", path)
 			var out bytes.Buffer
 			cmd.Stdout = &out
+			if Debug {
+				cmd.Stderr = os.Stderr
+			} else {
+				cmd.Stderr = io.Discard
+			}
 			if err := RootExec.Run(cmd); err == nil {
 				return out.Bytes(), nil
 			}
