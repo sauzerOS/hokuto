@@ -670,13 +670,22 @@ func findPackageOwningFile(hRoot, targetAbsPath string) string {
 	return ""
 }
 
-// restoreAlternativesOnUninstall checks if the uninstalled package was the owner of the active file.
-// If so, it tries to restore another alternative.
 func restoreAlternativesOnUninstall(pkgName, hRoot string, execCtx *Executor) (map[string]bool, error) {
+	return restoreAlternativesOnUninstallSet(pkgName, hRoot, execCtx, map[string]bool{pkgName: true})
+}
+
+// restoreAlternativesOnUninstallSet checks if an uninstall removes the owner of
+// the active file. If so, it restores an alternative that is not also being
+// removed in the same operation.
+func restoreAlternativesOnUninstallSet(pkgName, hRoot string, execCtx *Executor, removing map[string]bool) (map[string]bool, error) {
 	db, err := loadAlternativesDB(hRoot)
 	if err != nil {
 		return nil, err
 	}
+	if removing == nil {
+		removing = make(map[string]bool)
+	}
+	removing[pkgName] = true
 
 	restoredFiles := make(map[string]bool)
 	modified := false
@@ -695,7 +704,7 @@ func restoreAlternativesOnUninstall(pkgName, hRoot string, execCtx *Executor) (m
 			isOwner := false
 			newOwners := []string{}
 			for _, o := range alt.Owners {
-				if o == pkgName {
+				if removing[o] {
 					isOwner = true
 				} else {
 					newOwners = append(newOwners, o)

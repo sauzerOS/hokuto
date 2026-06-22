@@ -337,7 +337,11 @@ func safeTarPath(dest, name string) (string, error) {
 		return "", err
 	}
 	target := filepath.Join(destAbs, cleanName)
-	if target != destAbs && !strings.HasPrefix(target, destAbs+string(os.PathSeparator)) {
+	rel, err := filepath.Rel(destAbs, target)
+	if err != nil {
+		return "", err
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) || filepath.IsAbs(rel) {
 		return "", fmt.Errorf("unsafe tar path: %s", name)
 	}
 	return target, nil

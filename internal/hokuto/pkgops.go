@@ -969,9 +969,14 @@ func handlePreInstallUninstall(pkgName string, cfg *Config, execCtx *Executor, f
 			fcPrintf(logger, colSuccess, " to avoid install conflicts\n")
 		}
 
+		removingSet := make(map[string]bool, len(depsToActuallyUninstall))
+		for _, dep := range depsToActuallyUninstall {
+			removingSet[dep] = true
+		}
+
 		for _, dep := range depsToActuallyUninstall {
 			// Use force and yes flags to ensure silent, non-interactive uninstallation.
-			if err := pkgUninstall(dep, cfg, execCtx, true, true, logger); err != nil {
+			if err := pkgUninstallWithRemovalSet(dep, cfg, execCtx, true, true, logger, removingSet); err != nil {
 				// This is a non-fatal warning. The installation should proceed.
 				debugf("Warning: failed to uninstall conflicting package %s: %v\n", dep, err)
 			} else {

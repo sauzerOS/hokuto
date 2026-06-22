@@ -17,6 +17,10 @@ import (
 )
 
 func pkgUninstall(pkgName string, cfg *Config, execCtx *Executor, force, yes bool, logger io.Writer) error {
+	return pkgUninstallWithRemovalSet(pkgName, cfg, execCtx, force, yes, logger, nil)
+}
+
+func pkgUninstallWithRemovalSet(pkgName string, cfg *Config, execCtx *Executor, force, yes bool, logger io.Writer, removing map[string]bool) error {
 	if logger == nil {
 		logger = os.Stdout
 	}
@@ -185,7 +189,7 @@ func pkgUninstall(pkgName string, cfg *Config, execCtx *Executor, force, yes boo
 	// Track which files were restored and should be kept (from "no package" or other installed packages)
 	restoredFilesToKeep := make(map[string]bool)
 	// New API: returns map of restored files
-	if restoredMap, err := restoreAlternativesOnUninstall(pkgName, hRoot, execCtx); err != nil {
+	if restoredMap, err := restoreAlternativesOnUninstallSet(pkgName, hRoot, execCtx, removing); err != nil {
 		debugf("Warning: failed to restore alternatives for %s: %v\n", pkgName, err)
 		// Non-fatal, continue with uninstall
 	} else {
