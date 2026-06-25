@@ -509,9 +509,12 @@ func downloadFileWithOptions(originalURL, finalURL, destFile string, opt downloa
 		return fmt.Errorf("failed to create parent directory for %s: %w", absPath, err)
 	}
 	lockPath := absPath + ".lock"
+	tmpPath := fmt.Sprintf("%s.part.%d.%d", absPath, os.Getpid(), time.Now().UnixNano())
+	_ = os.Remove(tmpPath)
+	defer os.Remove(tmpPath)
 
 	// Create/Open a lock file to prevent race conditions between background prefetcher and main builder
-	lFile, err := os.Create(lockPath)
+	lFile, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
 		return fmt.Errorf("failed to create lock file: %w", err)
 	}
@@ -528,18 +531,8 @@ func downloadFileWithOptions(originalURL, finalURL, destFile string, opt downloa
 	// The background worker might have finished it while we were waiting for the lock.
 	if _, err := os.Stat(absPath); err == nil && !opt.Force {
 		debugf("File %s appeared after acquiring lock, skipping download.\n", absPath)
-		// Remove lock file since we're not downloading
-		_ = os.Remove(lockPath)
 		return nil
 	}
-
-	// Ensure lock file is removed on successful download
-	defer func() {
-		if _, err := os.Stat(absPath); err == nil {
-			// File exists, download succeeded, remove lock file
-			_ = os.Remove(lockPath)
-		}
-	}()
 
 	// --- Primary Choice: Native Go HTTP Client ---
 	// We try native first for speed and standard behavior.
@@ -607,13 +600,12 @@ func downloadFileWithOptions(originalURL, finalURL, destFile string, opt downloa
 				break
 			}
 
-			// Success! Proceed to write file.
-			out, err := os.Create(absPath)
+			// Success! Proceed to write a temporary file, then atomically publish it.
+			out, err := os.Create(tmpPath)
 			if err != nil {
 				resp.Body.Close()
-				return fmt.Errorf("failed to create destination file %s: %w", absPath, err)
+				return fmt.Errorf("failed to create temporary destination file %s: %w", tmpPath, err)
 			}
-			defer out.Close()
 
 			var writer io.Writer = out
 			var bar *progressbar.ProgressBar
@@ -658,8 +650,15 @@ func downloadFileWithOptions(originalURL, finalURL, destFile string, opt downloa
 				bar.Finish()
 			}
 			if err != nil {
+				_ = out.Close()
 				// Write failed
 				return fmt.Errorf("failed to write to destination file: %w", err)
+			}
+			if err := out.Close(); err != nil {
+				return fmt.Errorf("failed to close temporary destination file %s: %w", tmpPath, err)
+			}
+			if err := os.Rename(tmpPath, absPath); err != nil {
+				return fmt.Errorf("failed to publish downloaded file %s: %w", absPath, err)
 			}
 
 			if !opt.Quiet {
@@ -703,8 +702,11 @@ func downloadFileWithOptions(originalURL, finalURL, destFile string, opt downloa
 
 	// --- Fallback: Browser Download (chromedp) ---
 	debugf("Falling back to browser download (chromedp)\n")
-	browserErr := downloadViaBrowser(finalURL, absPath, opt.Quiet)
+	browserErr := downloadViaBrowser(finalURL, tmpPath, opt.Quiet)
 	if browserErr == nil {
+		if err := os.Rename(tmpPath, absPath); err != nil {
+			return fmt.Errorf("failed to publish browser-downloaded file %s: %w", absPath, err)
+		}
 		if !opt.Quiet {
 			colArrow.Print("-> ")
 			displayFilename := filepath.Base(finalURL)
@@ -716,7 +718,10 @@ func downloadFileWithOptions(originalURL, finalURL, destFile string, opt downloa
 
 	// --- Fallback: Wget ---
 	debugf("Browser download failed: %v. Falling back to wget...\n", browserErr)
-	if err := downloadViaWget(finalURL, absPath, opt.Quiet); err == nil {
+	if err := downloadViaWget(finalURL, tmpPath, opt.Quiet); err == nil {
+		if err := os.Rename(tmpPath, absPath); err != nil {
+			return fmt.Errorf("failed to publish wget-downloaded file %s: %w", absPath, err)
+		}
 		if !opt.Quiet {
 			colArrow.Print("-> ")
 			displayFilename := filepath.Base(finalURL)
@@ -1530,32 +1535,45 @@ func fetchSourcesWithOptions(pkgName, pkgDir string, processGit bool, quiet bool
 			}
 		}
 
-		if _, err := os.Stat(cachePath); os.IsNotExist(err) {
-			// --- NEW: Check for custom downloader script ---
-			downloadScript := filepath.Join(pkgDir, "download")
-			if _, err := os.Stat(downloadScript); err == nil {
+		downloadScript := filepath.Join(pkgDir, "download")
+		if _, err := os.Stat(downloadScript); err == nil {
+			if err := withExclusiveDownloadLock(cachePath, func() error {
+				if _, err := os.Stat(cachePath); err == nil {
+					debugf("Already in cache: %s\n", cachePath)
+					return nil
+				}
+				tmpPath := fmt.Sprintf("%s.part.%d.%d", cachePath, os.Getpid(), time.Now().UnixNano())
+				_ = os.Remove(tmpPath)
+				defer os.Remove(tmpPath)
+
 				if !quiet {
 					colArrow.Print("-> ")
 					colSuccess.Printf("Using custom downloader for %s\n", origFilename)
 				}
-				cmd := exec.Command(downloadScript, originalSourceURL, cachePath)
+				cmd := exec.Command(downloadScript, originalSourceURL, tmpPath)
 				cmd.Env = os.Environ()
 				cmd.Stdout = os.Stdout
 				cmd.Stderr = os.Stderr
 				if err := cmd.Run(); err != nil {
 					return fmt.Errorf("custom downloader failed for %s: %v", origFilename, err)
 				}
-			} else {
-				downloader := downloadFile
-				if quiet {
-					downloader = downloadFileQuiet
+				if err := os.Rename(tmpPath, cachePath); err != nil {
+					return fmt.Errorf("failed to publish custom-downloaded file %s: %w", cachePath, err)
 				}
-				if err := downloader(originalSourceURL, substitutedURL, cachePath); err != nil {
-					return fmt.Errorf("failed to download %s: %v", substitutedURL, err)
-				}
+				return nil
+			}); err != nil {
+				return err
 			}
 		} else {
-			debugf("Already in cache: %s\n", cachePath)
+			downloader := downloadFile
+			if quiet {
+				downloader = downloadFileQuiet
+			}
+			// Always enter the downloader so this path honors any in-progress
+			// background prefetch lock before considering the cache file complete.
+			if err := downloader(originalSourceURL, substitutedURL, cachePath); err != nil {
+				return fmt.Errorf("failed to download %s: %v", substitutedURL, err)
+			}
 		}
 
 		linkPath = filepath.Join(pkgLinkDir, origFilename)

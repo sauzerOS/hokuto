@@ -106,6 +106,10 @@ func printPackageSuggestions(pkgName, rootDir string, logger io.Writer) {
 }
 
 func installMissingPackageRuntimeDependencies(pkgName string, cfg *Config, logger io.Writer, quiet bool) error {
+	if cfg != nil && cfg.Values["HOKUTO_BOOTSTRAP"] == "1" {
+		return nil
+	}
+
 	dependsPath := filepath.Join(rootDir, "var", "db", "hokuto", "installed", pkgName, "depends")
 	data, err := os.ReadFile(dependsPath)
 	if err != nil {

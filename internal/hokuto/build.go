@@ -2955,6 +2955,7 @@ func handleBuildCommand(args []string, cfg *Config) error {
 		cfg.Values["LFS"] = *bootstrapDir
 		cfg.Values["HOKUTO_ROOT"] = *bootstrapDir
 		cfg.Values["HOKUTO_CACHE_DIR"] = filepath.Join(*bootstrapDir, "var", "cache", "hokuto")
+		cfg.Values["HOKUTO_BOOTSTRAP"] = "1"
 		// Disable signature verification during bootstrap
 		cfg.Values["HOKUTO_VERIFY_SIGNATURE"] = "0"
 		VerifySignature = false

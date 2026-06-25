@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 
@@ -69,6 +70,59 @@ func withSharedDownloadLock(lockBase string, fn func() error) error {
 		return err
 	}
 	defer unix.Flock(int(f.Fd()), unix.LOCK_UN)
+	return fn()
+}
+
+func withExclusiveDownloadLock(lockBase string, fn func() error) error {
+	lockPath := lockBase + ".lock"
+	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	if err := unix.Flock(int(f.Fd()), unix.LOCK_EX); err != nil {
+		return err
+	}
+	defer unix.Flock(int(f.Fd()), unix.LOCK_UN)
+	return fn()
+}
+
+func withSharedDownloadLocks(lockBases []string, fn func() error) error {
+	if len(lockBases) == 0 {
+		return fn()
+	}
+
+	seen := make(map[string]bool, len(lockBases))
+	var unique []string
+	for _, lockBase := range lockBases {
+		if lockBase == "" || seen[lockBase] {
+			continue
+		}
+		seen[lockBase] = true
+		unique = append(unique, lockBase)
+	}
+	sort.Strings(unique)
+
+	var files []*os.File
+	defer func() {
+		for i := len(files) - 1; i >= 0; i-- {
+			_ = unix.Flock(int(files[i].Fd()), unix.LOCK_UN)
+			_ = files[i].Close()
+		}
+	}()
+
+	for _, lockBase := range unique {
+		f, err := os.OpenFile(lockBase+".lock", os.O_CREATE|os.O_RDWR, 0o644)
+		if err != nil {
+			return err
+		}
+		if err := unix.Flock(int(f.Fd()), unix.LOCK_SH); err != nil {
+			_ = f.Close()
+			return err
+		}
+		files = append(files, f)
+	}
+
 	return fn()
 }
 
@@ -137,6 +191,7 @@ func verifyOrCreateChecksums(pkgName, pkgDir string, force bool, logger io.Write
 
 	// 1. COLLECT: Gather all existing files that need verification
 	var filesToVerify []string
+	var lockBasesToVerify []string
 	if !force {
 		for _, fname := range expectedFiles {
 			if _, exists := existing[fname]; exists {
@@ -146,6 +201,12 @@ func verifyOrCreateChecksums(pkgName, pkgDir string, force bool, logger io.Write
 					path = filepath.Join(pkgDir, src)
 				} else {
 					path = filepath.Join(pkgSrcDir, fname)
+					if target, err := os.Readlink(path); err == nil {
+						if !filepath.IsAbs(target) {
+							target = filepath.Join(filepath.Dir(path), target)
+						}
+						lockBasesToVerify = append(lockBasesToVerify, filepath.Clean(target))
+					}
 				}
 				filesToVerify = append(filesToVerify, path)
 			}
@@ -154,8 +215,11 @@ func verifyOrCreateChecksums(pkgName, pkgDir string, force bool, logger io.Write
 
 	computedSums := make(map[string]string)
 	if len(filesToVerify) > 0 {
-		var err error
-		computedSums, err = ComputeChecksums(filesToVerify, UserExec)
+		err := withSharedDownloadLocks(lockBasesToVerify, func() error {
+			var computeErr error
+			computedSums, computeErr = ComputeChecksums(filesToVerify, UserExec)
+			return computeErr
+		})
 		if err != nil {
 			return fmt.Errorf("failed to verify existing files: %v", err)
 		}
