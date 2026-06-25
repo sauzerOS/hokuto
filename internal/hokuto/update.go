@@ -180,24 +180,28 @@ func updateRepoWithGoGit(dir string) {
 		return
 	}
 
-	var preservedLFS map[string]string
+	localChangesBeforePull, changesErr := localChangesToDiscard(repo, wt, dir)
+	if changesErr != nil {
+		debugf("Failed to snapshot local changes for %s before pull: %v\n", dir, changesErr)
+	}
+	lfsOnlyBeforePull, preservedLFS, lfsErr := preserveHydratedLFSChanges(repo, wt, dir)
+	if lfsErr != nil {
+		debugf("Failed to snapshot hydrated LFS assets for %s before pull: %v\n", dir, lfsErr)
+		preservedLFS = nil
+	}
+	defer cleanupPreservedLFS(preservedLFS)
+
 	if err := pullRepoWithGoGit(wt, dir); err != nil {
 		if !isGoGitDirtyWorktreeError(err) {
 			fmt.Printf("Error pulling repo %s with go-git: %v\n", dir, err)
 			return
 		}
 
-		lfsOnly, lfsCache, lfsErr := preserveHydratedLFSChanges(repo, wt, dir)
-		if lfsErr != nil {
-			debugf("Failed to preserve hydrated LFS assets for %s: %v\n", dir, lfsErr)
-		} else {
-			preservedLFS = lfsCache
-		}
-
-		if !lfsOnly {
+		hasLocalChanges := changesErr != nil || len(localChangesBeforePull) > 0
+		if hasLocalChanges && !lfsOnlyBeforePull {
 			colArrow.Print("-> ")
 			colWarn.Printf("Repository %s has local changes that would be overwritten.\n", dir)
-			printGoGitDiscardedChanges(repo, wt, dir)
+			printGoGitDiscardedChanges(localChangesBeforePull, changesErr)
 			if !askForConfirmation(colWarn, "Discard local changes and pull updates from remote?") {
 				cleanupPreservedLFS(preservedLFS)
 				colArrow.Print("-> ")
@@ -207,6 +211,8 @@ func updateRepoWithGoGit(dir string) {
 		} else if len(preservedLFS) > 0 {
 			colArrow.Print("-> ")
 			colInfo.Printf("Preserving %d hydrated LFS asset(s) during go-git update\n", len(preservedLFS))
+		} else {
+			debugf("go-git reported dirty worktree for %s, but no pre-pull local changes were found\n", dir)
 		}
 
 		if err := wt.Reset(&gogit.ResetOptions{Mode: gogit.HardReset}); err != nil {
@@ -227,10 +233,12 @@ func updateRepoWithGoGit(dir string) {
 			fmt.Printf("Warning: failed to restore preserved LFS assets for %s: %v\n", dir, err)
 		}
 		colArrow.Print("-> ")
-		if lfsOnly {
+		if lfsOnlyBeforePull {
 			colSuccess.Printf("Successfully pulled repo %s while preserving LFS assets (go-git)\n", dir)
-		} else {
+		} else if hasLocalChanges {
 			colSuccess.Printf("Successfully pulled repo %s after discarding local changes (go-git)\n", dir)
+		} else {
+			colSuccess.Printf("Successfully pulled repo %s after retrying go-git update (go-git)\n", dir)
 		}
 	}
 
@@ -353,8 +361,7 @@ func localChangesToDiscard(repo *gogit.Repository, wt *gogit.Worktree, repoPath 
 	return changes, nil
 }
 
-func printGoGitDiscardedChanges(repo *gogit.Repository, wt *gogit.Worktree, repoPath string) {
-	changes, err := localChangesToDiscard(repo, wt, repoPath)
+func printGoGitDiscardedChanges(changes []string, err error) {
 	if err != nil {
 		colArrow.Print("-> ")
 		colWarn.Printf("Warning: failed to list local changes: %v\n", err)
@@ -1018,6 +1025,9 @@ func checkForUpgrades(_ context.Context, cfg *Config, maxJobs int, yes bool) err
 			return pkgBuild(pkgName, cfg, exec, opts)
 		}
 
+		if _, err := installAvailableBinaryDependenciesForPlan(updatePlan, cfg, false); err != nil {
+			return err
+		}
 		if err := RunParallelBuilds(updatePlan, cfg, maxJobs, userRequestedMap, yes, smartBuilder); err != nil {
 			return err
 		}

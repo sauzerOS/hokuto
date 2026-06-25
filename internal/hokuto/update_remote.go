@@ -197,7 +197,7 @@ func checkForRemoteUpgrades(_ context.Context, cfg *Config) error {
 		// We need a fresh visited map for each root or shared? Shared is better to skip re-checks.
 		// But resolveBinaryDependencies with visited will skip.
 		// We can use the global visited for this run.
-		if err := resolveBinaryDependencies(pkgName, visited, &depPlan, false, true, cfg, remoteIndex); err != nil {
+		if err := resolveBinaryDependencies(pkgName, visited, &depPlan, false, true, cfg, remoteIndex, true); err != nil {
 			color.Danger.Printf("Failed to resolve dependencies for %s: %v\n", pkgName, err)
 			continue // Skip this update?
 		}

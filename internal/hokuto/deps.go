@@ -91,12 +91,16 @@ func dependencyVariantCandidates(pkgName string, cfg *Config) []string {
 	switch preferred {
 	case "optimized":
 		add("generic")
-		add("multi-optimized")
-		add("multi-generic")
+		if isMultilibPackage(pkgName) {
+			add("multi-optimized")
+			add("multi-generic")
+		}
 	case "generic":
 		add("optimized")
-		add("multi-generic")
-		add("multi-optimized")
+		if isMultilibPackage(pkgName) {
+			add("multi-generic")
+			add("multi-optimized")
+		}
 	case "multi-optimized":
 		add("multi-generic")
 		add("optimized")
@@ -114,6 +118,17 @@ func findCachedBinaryTarball(pkgName string, cfg *Config) string {
 	for _, variant := range dependencyVariantCandidates(pkgName, cfg) {
 		tarballPath, _, _ := findNewestTarball(pkgName, variant)
 		if tarballPath != "" {
+			return tarballPath
+		}
+	}
+	return ""
+}
+
+func findCachedBinaryTarballVersion(pkgName, version, revision string, cfg *Config) string {
+	arch := GetSystemArchForPackage(cfg, pkgName)
+	for _, variant := range dependencyVariantCandidates(pkgName, cfg) {
+		tarballPath := filepath.Join(BinDir, StandardizeRemoteName(pkgName, version, revision, arch, variant))
+		if _, err := os.Stat(tarballPath); err == nil {
 			return tarballPath
 		}
 	}
@@ -142,6 +157,10 @@ func resolveBinaryDependenciesFromArchive(pkgName string, cfg *Config, remoteInd
 			return nil, true, fmt.Errorf("failed to scan dependencies from %s: %w", filepath.Base(tarballPath), err)
 		}
 		return deps, true, nil
+	}
+
+	if !allowRemote {
+		return nil, false, nil
 	}
 
 	if allowRemote && len(remoteIndex) == 0 && BinaryMirror != "" {
@@ -209,9 +228,37 @@ func findSplitDependencySource(pkgName string) (string, bool) {
 	return "", false
 }
 
-func resolveDependencyList(parentPkg string, deps []DepSpec, visited map[string]bool, plan *[]string, force bool, yes bool, cfg *Config, remoteIndex []RepoEntry) error {
+func dependencyBinaryAvailable(pkgName string, cfg *Config, noRemote bool) bool {
+	lookupName := pkgName
+	if idx := strings.Index(pkgName, "@"); idx != -1 {
+		lookupName = pkgName[:idx]
+	}
+
+	if version, revision, err := getRepoVersion2(lookupName); err == nil {
+		outputName := getOutputPackageName(lookupName, cfg)
+		if findCachedBinaryTarballVersion(outputName, version, revision, cfg) != "" {
+			return true
+		}
+	} else if findCachedBinaryTarball(lookupName, cfg) != "" {
+		debugf("Using versionless cached binary availability check for %s: %v\n", lookupName, err)
+		return true
+	}
+	if noRemote || BinaryMirror == "" {
+		return false
+	}
+
+	index, err := GetCachedRemoteIndex(cfg)
+	if err != nil {
+		debugf("Skipping remote binary availability check for %s: %v\n", lookupName, err)
+		return false
+	}
+	_, err = GetRemotePackageEntry(lookupName, cfg, index)
+	return err == nil
+}
+
+func resolveDependencyList(parentPkg string, deps []DepSpec, visited map[string]bool, plan *[]string, force bool, yes bool, cfg *Config, remoteIndex []RepoEntry, allowRemote bool) error {
 	for _, dep := range deps {
-		if dep.Make {
+		if dep.Make || dep.Optional || dep.Rebuild || dep.Suggest {
 			continue
 		}
 
@@ -230,7 +277,7 @@ func resolveDependencyList(parentPkg string, deps []DepSpec, visited map[string]
 			}
 		}
 
-		if err := resolveBinaryDependencies(depName, visited, plan, force, yes, cfg, remoteIndex); err != nil {
+		if err := resolveBinaryDependencies(depName, visited, plan, force, yes, cfg, remoteIndex, allowRemote); err != nil {
 			return err
 		}
 	}
@@ -242,7 +289,7 @@ func resolveDependencyList(parentPkg string, deps []DepSpec, visited map[string]
 // 'visited' tracks packages processed in this specific resolution pass to prevent cycles.
 // cfg is used to check if multilib is enabled and resolve package names accordingly.
 
-func resolveBinaryDependencies(pkgName string, visited map[string]bool, plan *[]string, force bool, yes bool, cfg *Config, remoteIndex []RepoEntry) error {
+func resolveBinaryDependencies(pkgName string, visited map[string]bool, plan *[]string, force bool, yes bool, cfg *Config, remoteIndex []RepoEntry, allowRemote bool) error {
 	// 1. Cycle detection
 	if visited[pkgName] {
 		return nil
@@ -260,7 +307,7 @@ func resolveBinaryDependencies(pkgName string, visited map[string]bool, plan *[]
 	// 3. Remote Resolution (Priority if remoteIndex is provided)
 	// If the user requested --remote (implied by non-empty remoteIndex), we prioritize
 	// the remote package's dependencies over the local source definition.
-	if len(remoteIndex) > 0 {
+	if allowRemote && len(remoteIndex) > 0 {
 		// Check if package exists in remote index
 		found := false
 		lookupName := pkgName
@@ -294,14 +341,14 @@ func resolveBinaryDependencies(pkgName string, visited map[string]bool, plan *[]
 	}
 	pkgDir, err := findPackageMetadataDir(lookupName)
 	if err != nil {
-		deps, found, depErr := resolveBinaryDependenciesFromArchive(pkgName, cfg, remoteIndex, true)
+		deps, found, depErr := resolveBinaryDependenciesFromArchive(pkgName, cfg, remoteIndex, allowRemote)
 		if depErr != nil {
 			return depErr
 		}
 		if !found {
 			return fmt.Errorf("cannot resolve dependencies for %s: source not found in HOKUTO_PATH", pkgName)
 		}
-		if err := resolveDependencyList(pkgName, deps, visited, plan, force, yes, cfg, remoteIndex); err != nil {
+		if err := resolveDependencyList(pkgName, deps, visited, plan, force, yes, cfg, remoteIndex, allowRemote); err != nil {
 			return err
 		}
 		*plan = append(*plan, pkgName)
@@ -315,7 +362,7 @@ func resolveBinaryDependencies(pkgName string, visited map[string]bool, plan *[]
 	}
 
 	// 5. Recurse for each dependency
-	if err := resolveDependencyList(pkgName, deps, visited, plan, force, yes, cfg, remoteIndex); err != nil {
+	if err := resolveDependencyList(pkgName, deps, visited, plan, force, yes, cfg, remoteIndex, allowRemote); err != nil {
 		return err
 	}
 
@@ -336,6 +383,12 @@ func resolveMissingDeps(pkgName string, processed map[string]bool, missing *[]st
 		return nil
 	}
 	processed[pkgName] = true
+
+	if !forceBuild[pkgName] && isPackageInstalled(pkgName) {
+		return nil
+	}
+
+	binaryAvailableForPkg := !forceBuild[pkgName] && dependencyBinaryAvailable(pkgName, cfg, noRemote)
 
 	// --- 3. Find the Package Source Directory (pkgDir) ---
 	pkgDir, err := findPackageMetadataDir(pkgName)
@@ -369,6 +422,13 @@ func resolveMissingDeps(pkgName string, processed map[string]bool, missing *[]st
 
 	// --- 5. Recursively check all dependencies ---
 	for _, dep := range dependencies {
+		if dep.RuntimeOnly || dep.Suggest {
+			continue
+		}
+		if dep.Optional && !forceBuild[pkgName] {
+			continue
+		}
+
 		// New filtering: skip cross dependencies if not cross-compiling
 		if dep.Cross && cfg.Values["HOKUTO_CROSS_ARCH"] == "" {
 			continue
@@ -413,8 +473,8 @@ func resolveMissingDeps(pkgName string, processed map[string]bool, missing *[]st
 			continue
 		}
 
-		// Skip Make dependencies if the package is installed and not forced to rebuild
-		if dep.Make && isPackageInstalled(pkgName) && !forceBuild[pkgName] {
+		// Skip Make dependencies if this package will not be built from source.
+		if dep.Make && (isPackageInstalled(pkgName) || binaryAvailableForPkg) && !forceBuild[pkgName] {
 			continue
 		}
 
@@ -528,7 +588,7 @@ func resolveRemoteDependencies(pkgName string, visited map[string]bool, plan *[]
 	}
 
 	// 7. Recurse
-	if err := resolveDependencyList(pkgName, deps, visited, plan, force, yes, cfg, remoteIndex); err != nil {
+	if err := resolveDependencyList(pkgName, deps, visited, plan, force, yes, cfg, remoteIndex, true); err != nil {
 		return err
 	}
 
@@ -652,17 +712,17 @@ func resolveAlternativeDep(dep DepSpec, yes bool, cfg *Config) (string, error) {
 
 // parseDepToken parses tokens like "pkg", "pkg<=1.2.3 optional", "pkg rebuild" and returns name, op, version, and flags.
 
-func parseDepToken(token string) (name string, op string, ver string, optional bool, rebuild bool, makeDep bool, cross bool, crossNative bool) {
+func parseDepToken(token string) (name string, op string, ver string, optional bool, rebuild bool, makeDep bool, cross bool, crossNative bool, runtimeOnly bool, suggest bool) {
 	// Split by whitespace to separate package spec from flags
 	parts := strings.Fields(token)
 	if len(parts) == 0 {
-		return "", "", "", false, false, false, false, false
+		return "", "", "", false, false, false, false, false, false, false
 	}
 
 	pkgSpec := parts[0]
 	// Check for flags in remaining parts
 	for i := 1; i < len(parts); i++ {
-		switch parts[i] {
+		switch strings.ToLower(parts[i]) {
 		case "optional":
 			optional = true
 		case "rebuild":
@@ -674,6 +734,10 @@ func parseDepToken(token string) (name string, op string, ver string, optional b
 		case "crossnative":
 			crossNative = true
 			cross = true // Implies cross because it's only for cross-compilation scenarios
+		case "runtime", "runtime-only", "runtimeonly":
+			runtimeOnly = true
+		case "suggest", "suggested", "optional-runtime", "runtime-optional":
+			suggest = true
 		}
 	}
 
@@ -683,10 +747,10 @@ func parseDepToken(token string) (name string, op string, ver string, optional b
 		if idx := strings.Index(pkgSpec, op); idx != -1 {
 			name := pkgSpec[:idx]
 			ver := pkgSpec[idx+len(op):]
-			return strings.TrimSpace(name), op, strings.TrimSpace(ver), optional, rebuild, makeDep || cross, cross, crossNative
+			return strings.TrimSpace(name), op, strings.TrimSpace(ver), optional, rebuild, makeDep || cross, cross, crossNative, runtimeOnly, suggest
 		}
 	}
-	return pkgSpec, "", "", optional, rebuild, makeDep || cross, cross, crossNative
+	return pkgSpec, "", "", optional, rebuild, makeDep || cross, cross, crossNative, runtimeOnly, suggest
 }
 
 // BuildPlan represents the complete build plan with proper ordering
@@ -719,6 +783,10 @@ func resolveBuildPlan(targetPackages []string, userRequestedPackages map[string]
 	processed := make(map[string]bool)
 	inProgress := make(map[string]bool)
 	alreadyInOrder := make(map[string]bool)
+	sourceBuildPackages := make(map[string]bool, len(targetPackages))
+	for _, pkgName := range targetPackages {
+		sourceBuildPackages[pkgName] = true
+	}
 
 	var processPkg func(pkgName string) error
 	processPkg = func(pkgName string) error {
@@ -741,6 +809,13 @@ func resolveBuildPlan(targetPackages []string, userRequestedPackages map[string]
 		inProgress[pkgName] = true
 		defer func() { delete(inProgress, pkgName) }()
 
+		isInstalled := isPackageInstalled(pkgName)
+		if isInstalled && !sourceBuildPackages[pkgName] && !plan.RebuildPackages[pkgName] {
+			processed[pkgName] = true
+			plan.SkippedPackages[pkgName] = "already installed"
+			return nil
+		}
+
 		pkgDir, err := findPackageMetadataDir(pkgName)
 		if err != nil {
 			if sourcePkg, ok := findSplitDependencySource(pkgName); ok {
@@ -756,6 +831,10 @@ func resolveBuildPlan(targetPackages []string, userRequestedPackages map[string]
 
 		// Process all dependencies recursively first.
 		for _, dep := range deps {
+			if dep.RuntimeOnly || dep.Suggest {
+				continue
+			}
+
 			// New filtering: skip cross dependencies if not cross-compiling
 			if dep.Cross && cfg.Values["HOKUTO_CROSS_ARCH"] == "" {
 				continue
@@ -802,7 +881,6 @@ func resolveBuildPlan(targetPackages []string, userRequestedPackages map[string]
 			// 2. A binary is available (locally or remotely) which we intend to use.
 			// AND it's not a forced rebuild.
 			hasBinary := binaryAvailable != nil && binaryAvailable[pkgName]
-			isInstalled := isPackageInstalled(pkgName)
 
 			if dep.Make {
 				skip := false
@@ -828,6 +906,15 @@ func resolveBuildPlan(targetPackages []string, userRequestedPackages map[string]
 
 			if shouldSkipMultilibMakeDep(dep, depName, cfg) {
 				continue
+			}
+
+			if dep.Optional {
+				if !isPackageInstalled(depName) {
+					plan.PostRebuilds[pkgName] = append(plan.PostRebuilds[pkgName], depName)
+				}
+				if !sourceBuildPackages[pkgName] && !plan.RebuildPackages[pkgName] {
+					continue
+				}
 			}
 
 			// CHECK VERSION CONSTRAINTS & FETCH IF NEEDED
@@ -868,15 +955,11 @@ func resolveBuildPlan(targetPackages []string, userRequestedPackages map[string]
 				// Mark this package for rebuild so its make dependencies are processed
 				plan.RebuildPackages[depName] = true
 
-			} else if dep.Optional {
-				if !isPackageInstalled(depName) {
-					// Record that pkgName needs an inline rebuild because an optional dep is missing.
-					plan.PostRebuilds[pkgName] = append(plan.PostRebuilds[pkgName], depName)
-				}
 			}
 
-			// CRITICAL: Always process the dependency to ensure it gets into the build order at least once.
-			// This covers normal deps, optional deps, and 'rebuild' deps (when withRebuilds is off).
+			// Process required dependencies so they get into the build order at least once.
+			// Optional dependencies are advisory and are handled by PostRebuilds only if they
+			// become available through another required edge in this build.
 			if err := processPkg(depName); err != nil {
 				return err
 			}
@@ -884,8 +967,8 @@ func resolveBuildPlan(targetPackages []string, userRequestedPackages map[string]
 
 		// Now, decide if the package itself needs to be in the build order.
 		shouldBuild := false
-		if userRequestedPackages[pkgName] {
-			shouldBuild = true // User explicitly asked for it.
+		if sourceBuildPackages[pkgName] {
+			shouldBuild = true // This package is scheduled to be built from source in this plan.
 		} else if plan.RebuildPackages[pkgName] {
 			shouldBuild = true // Another package marked it for rebuild.
 		} else if !isPackageInstalled(pkgName) {
@@ -912,8 +995,40 @@ func resolveBuildPlan(targetPackages []string, userRequestedPackages map[string]
 
 	// CRITICAL: Always prioritize sauzeros-base if it's in the build plan
 	plan.Order = MovePackageToFront(plan.Order, "sauzeros-base")
+	prunePostRebuilds(plan)
 
 	return plan, nil
+}
+
+func prunePostRebuilds(plan *BuildPlan) {
+	if len(plan.PostRebuilds) == 0 {
+		return
+	}
+
+	inOrder := make(map[string]bool, len(plan.Order))
+	for _, pkgName := range plan.Order {
+		inOrder[pkgName] = true
+	}
+
+	for parent, deps := range plan.PostRebuilds {
+		filtered := deps[:0]
+		for _, dep := range deps {
+			keep := inOrder[dep]
+			if !keep {
+				if sourcePkg, ok := findSplitDependencySource(dep); ok && inOrder[sourcePkg] {
+					keep = true
+				}
+			}
+			if keep {
+				filtered = append(filtered, dep)
+			}
+		}
+		if len(filtered) == 0 {
+			delete(plan.PostRebuilds, parent)
+			continue
+		}
+		plan.PostRebuilds[parent] = filtered
+	}
 }
 
 // findPackageDir locates the package source directory
@@ -1037,6 +1152,9 @@ func getPackageDependenciesForward(pkgName string, cfg *Config) ([]string, error
 
 		// --- Recursively collect dependencies in forward order ---
 		for _, dep := range dependencies {
+			if dep.RuntimeOnly || dep.Suggest {
+				continue
+			}
 			// FILTER: skip cross dependencies if not cross-compiling
 			if dep.Cross && cfg.Values["HOKUTO_CROSS_ARCH"] == "" {
 				continue
@@ -1143,7 +1261,7 @@ func getInstalledDeps(pkgName string) ([]string, error) {
 			continue
 		}
 		// Parse "pkgname>=1.0" -> "pkgname"
-		name, _, _, _, _, _, _, _ := parseDepToken(line)
+		name, _, _, _, _, _, _, _, _, _ := parseDepToken(line)
 		if name != "" && name != pkgName {
 			deps = append(deps, name)
 		}
@@ -1160,6 +1278,8 @@ type DepSpec struct {
 	Make         bool     // True if dependency is only needed at build time
 	Cross        bool     // True if dependency is only for cross-compilation
 	CrossNative  bool     // True if dependency is only for cross-compilation AND NOT cross-system
+	RuntimeOnly  bool     // True if dependency is needed after install but not for the build graph
+	Suggest      bool     // True if dependency should be suggested after install, not required
 	Alternatives []string // List of alternative package names (e.g., ["rust", "rustup"] for "rust | rustup")
 }
 
@@ -1323,6 +1443,10 @@ func installBuildDependencies(pkgName string, cfg *Config) ([]string, error) {
 
 // ensurePackageInstalled handles the "fetch binary OR build and then install" logic for a single package.
 func ensurePackageInstalled(pkgName string, cfg *Config, noRemote bool) (bool, error) {
+	if isPackageInstalled(pkgName) {
+		return false, nil
+	}
+
 	// 1. Get repo version
 	version, revision, err := getRepoVersion2(pkgName)
 	if err != nil {
@@ -1361,6 +1485,9 @@ func ensurePackageInstalled(pkgName string, cfg *Config, noRemote bool) (bool, e
 	}
 
 	if foundBinary {
+		if err := ensureBinaryRuntimeDependenciesInstalled(pkgName, cfg, noRemote, nil); err != nil {
+			return false, err
+		}
 		isCriticalAtomic.Store(1)
 		defer isCriticalAtomic.Store(0)
 		handlePreInstallUninstall(outputPkgName, cfg, RootExec, true, nil)
@@ -1386,6 +1513,79 @@ func ensurePackageInstalled(pkgName string, cfg *Config, noRemote bool) (bool, e
 	return true, nil
 }
 
+func binaryRuntimeDependencySpecs(pkgName string, cfg *Config, noRemote bool) ([]DepSpec, error) {
+	lookupName := pkgName
+	if idx := strings.Index(pkgName, "@"); idx != -1 {
+		lookupName = pkgName[:idx]
+	}
+
+	if pkgDir, err := findPackageMetadataDir(lookupName); err == nil {
+		return parseDependsFile(pkgDir)
+	}
+
+	deps, found, err := resolveBinaryDependenciesFromArchive(pkgName, cfg, nil, !noRemote)
+	if err != nil {
+		return nil, err
+	}
+	if found {
+		return deps, nil
+	}
+	return nil, nil
+}
+
+func ensureBinaryRuntimeDependenciesInstalled(pkgName string, cfg *Config, noRemote bool, seen map[string]bool) error {
+	if seen == nil {
+		seen = make(map[string]bool)
+	}
+	if seen[pkgName] {
+		return nil
+	}
+	seen[pkgName] = true
+
+	deps, err := binaryRuntimeDependencySpecs(pkgName, cfg, noRemote)
+	if err != nil {
+		return fmt.Errorf("failed to resolve runtime dependencies for %s: %w", pkgName, err)
+	}
+
+	for _, dep := range deps {
+		if dep.Make || dep.Optional || dep.Rebuild || dep.Suggest {
+			continue
+		}
+		if dep.Cross && cfg.Values["HOKUTO_CROSS_ARCH"] == "" {
+			continue
+		}
+		if dep.CrossNative && (cfg.Values["HOKUTO_CROSS_ARCH"] == "" || cfg.Values["HOKUTO_CROSS_SYSTEM"] == "1") {
+			continue
+		}
+
+		depName := dep.Name
+		if len(dep.Alternatives) > 0 {
+			resolved, err := resolveAlternativeDep(dep, true, cfg)
+			if err != nil {
+				return fmt.Errorf("failed to resolve alternative runtime dependency for %s: %w", pkgName, err)
+			}
+			depName = resolved
+		}
+		if depName == "" || depName == pkgName || shouldSkipMultilibMakeDep(dep, depName, cfg) {
+			continue
+		}
+		if findInstalledSatisfying(depName, dep.Op, dep.Version) != "" {
+			continue
+		}
+
+		if err := ensureBinaryRuntimeDependenciesInstalled(depName, cfg, noRemote, seen); err != nil {
+			return err
+		}
+		if findInstalledSatisfying(depName, dep.Op, dep.Version) != "" {
+			continue
+		}
+		if _, err := ensurePackageInstalled(depName, cfg, noRemote); err != nil {
+			return fmt.Errorf("failed to install runtime dependency %s for %s: %w", depName, pkgName, err)
+		}
+	}
+	return nil
+}
+
 func installBinaryTarball(tarballPath, pkgName string, cfg *Config) (bool, error) {
 	isCriticalAtomic.Store(1)
 	defer isCriticalAtomic.Store(0)
@@ -1398,6 +1598,9 @@ func installBinaryTarball(tarballPath, pkgName string, cfg *Config) (bool, error
 
 func ensureBinaryOnlyPackageInstalled(pkgName string, cfg *Config, noRemote bool) (bool, error) {
 	if tarballPath := findCachedBinaryTarball(pkgName, cfg); tarballPath != "" {
+		if err := ensureBinaryRuntimeDependenciesInstalled(pkgName, cfg, noRemote, nil); err != nil {
+			return false, err
+		}
 		return installBinaryTarball(tarballPath, pkgName, cfg)
 	}
 
@@ -1421,6 +1624,9 @@ func ensureBinaryOnlyPackageInstalled(pkgName string, cfg *Config, noRemote bool
 
 	arch := GetSystemArchForPackage(cfg, entry.Name)
 	tarballPath := filepath.Join(BinDir, StandardizeRemoteName(entry.Name, entry.Version, entry.Revision, arch, entry.Variant))
+	if err := ensureBinaryRuntimeDependenciesInstalled(entry.Name, cfg, noRemote, nil); err != nil {
+		return false, err
+	}
 	return installBinaryTarball(tarballPath, entry.Name, cfg)
 }
 
@@ -1466,6 +1672,9 @@ func uninstallBuildDependencies(packages []string, cfg *Config) {
 	// Uninstall in reverse order
 	for i := len(packages) - 1; i >= 0; i-- {
 		pkgName := packages[i]
+		if len(installedDependents(pkgName, cfg, nil)) > 0 {
+			continue
+		}
 		colArrow.Print("-> ")
 		colSuccess.Printf("Removing build dependency: %s\n", pkgName)
 		if err := pkgUninstall(pkgName, cfg, RootExec, false, true, nil); err != nil {

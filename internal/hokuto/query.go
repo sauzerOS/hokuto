@@ -431,7 +431,7 @@ func GetRemotePackageEntry(pkgName string, cfg *Config, remoteIndex []RepoEntry)
 
 	// 3. Multi variants fallback
 	// If we are looking for non-multi (e.g. optimized) but only multi- exists, try that.
-	if !strings.HasPrefix(variant, "multi-") {
+	if !strings.HasPrefix(variant, "multi-") && isMultilibPackage(lookupName) {
 		// Try multi- + variant (e.g. "optimized" -> "multi-optimized")
 		updateBest(searchInVariant("multi-" + variant))
 		// Try multi-generic
@@ -513,6 +513,97 @@ func showManifest(pkgName string) error {
 	if err := scanner.Err(); err != nil {
 		return fmt.Errorf("error scanning manifest: %w", err)
 	}
+	return nil
+}
+
+func manifestPathOnDisk(root, manifestPath string) string {
+	clean := filepath.Clean(manifestPath)
+	if filepath.IsAbs(clean) {
+		return filepath.Join(root, strings.TrimPrefix(clean, string(os.PathSeparator)))
+	}
+	return filepath.Join(root, clean)
+}
+
+func formatByteSize(bytes int64) string {
+	const unit = 1024
+	if bytes < unit {
+		return fmt.Sprintf("%d B", bytes)
+	}
+	div, exp := int64(unit), 0
+	for n := bytes / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.2f %ciB", float64(bytes)/float64(div), "KMGTPE"[exp])
+}
+
+func installedPackageSize(pkgName string) (int64, int, int, error) {
+	manifestPath := filepath.Join(Installed, pkgName, "manifest")
+	data, err := os.ReadFile(manifestPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, 0, 0, fmt.Errorf("package %s is not installed (manifest not found)", pkgName)
+		}
+		return 0, 0, 0, fmt.Errorf("failed to read manifest for %s: %w", pkgName, err)
+	}
+
+	root := rootDir
+	if root == "" {
+		root = "/"
+	}
+
+	var total int64
+	var counted, missing int
+	scanner := bufio.NewScanner(bytes.NewReader(data))
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasSuffix(line, "/") {
+			continue
+		}
+		manifestFilePath := parseManifestFilePath(line)
+		if manifestFilePath == "" {
+			continue
+		}
+
+		cleanNoSlash := strings.TrimPrefix(filepath.Clean(manifestFilePath), string(os.PathSeparator))
+		if strings.HasPrefix(filepath.ToSlash(cleanNoSlash), "var/db/hokuto") {
+			continue
+		}
+
+		info, err := os.Lstat(manifestPathOnDisk(root, manifestFilePath))
+		if err != nil {
+			if os.IsNotExist(err) {
+				missing++
+				continue
+			}
+			return 0, 0, 0, fmt.Errorf("failed to stat %s: %w", manifestFilePath, err)
+		}
+		if info.IsDir() {
+			continue
+		}
+		total += info.Size()
+		counted++
+	}
+	if err := scanner.Err(); err != nil {
+		return 0, 0, 0, fmt.Errorf("error scanning manifest: %w", err)
+	}
+	return total, counted, missing, nil
+}
+
+func showInstalledPackageSize(pkgName string) error {
+	total, counted, missing, err := installedPackageSize(pkgName)
+	if err != nil {
+		return err
+	}
+
+	colArrow.Print("-> ")
+	colSuccess.Printf("%s: ", pkgName)
+	colNote.Printf("%s", formatByteSize(total))
+	fmt.Printf(" (%d bytes, %d files", total, counted)
+	if missing > 0 {
+		fmt.Printf(", %d missing", missing)
+	}
+	fmt.Println(")")
 	return nil
 }
 

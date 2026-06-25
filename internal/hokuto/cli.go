@@ -46,6 +46,7 @@ func printHelp() {
 		{"uninstall, r", "<pkg>", "Uninstall package(s)"},
 		{"update, u", "[options]", "Update repositories and check for upgrades"},
 		{"manifest, m", "<pkg>", "Show the file list for an installed package"},
+		{"size", "<pkg>", "Show installed package disk usage"},
 		{"unmanaged", "", "List files in /etc and /usr not owned by installed packages"},
 		{"find, f", "<query>", "Find which package matches query string"},
 		{"new, n", "<pkg>", "Create a new package skeleton"},
@@ -217,7 +218,7 @@ func Main() {
 		// List of commands that support package name arguments and should handle @version
 		versionedSupportedCmds := map[string]bool{
 			"build": true, "b": true, "checksum": true, "c": true, "edit": true, "e": true, "cd": true,
-			"install": true, "i": true, "manifest": true, "m": true, "uninstall": true, "r": true, "remove": true,
+			"install": true, "i": true, "manifest": true, "m": true, "size": true, "uninstall": true, "r": true, "remove": true,
 		}
 
 		if versionedSupportedCmds[cmd] {
@@ -558,6 +559,7 @@ func Main() {
 		var x86_64Flag = installCmd.Bool("x86_64", false, "Install x86_64 version of the package.")
 		var multiFlag = installCmd.Bool("multi", false, "Install multilib variants of packages that support them.")
 		var remote = installCmd.Bool("remote", false, "Install from remote mirror even if not in HOKUTO_PATH.")
+		var noRemote = installCmd.Bool("no-remote", false, "Install only from local package sources and cached package files.")
 		var fast = installCmd.Bool("fast", false, "Enable fast install mode (progress bar, deferred tasks).")
 
 		if err := installCmd.Parse(os.Args[2:]); err != nil {
@@ -579,6 +581,11 @@ func Main() {
 		// Handle multilib flag or HOKUTO_MULTILIB environment variable
 		if *multiFlag || cfg.Values["HOKUTO_MULTILIB"] == "1" {
 			cfg.Values["HOKUTO_MULTILIB"] = "1"
+		}
+
+		if *remote && *noRemote {
+			fmt.Fprintln(os.Stderr, "Error: --remote and --no-remote cannot be used together.")
+			os.Exit(1)
 		}
 
 		var remoteIndex []RepoEntry
@@ -659,7 +666,7 @@ func Main() {
 				}
 			} else {
 				// Recursively find missing dependencies (always check if deps are installed, force doesn't apply to deps)
-				if err := resolveBinaryDependencies(pkgName, visited, &installPlan, false, effectiveYes, cfg, remoteIndex); err != nil {
+				if err := resolveBinaryDependencies(pkgName, visited, &installPlan, false, effectiveYes, cfg, remoteIndex, !*noRemote); err != nil {
 					fmt.Fprintf(os.Stderr, "Error resolving dependencies for %s: %v\n", pkgName, err)
 					os.Exit(1)
 				}
@@ -808,14 +815,14 @@ func Main() {
 
 				if err != nil {
 					// Fallback: If local version lookup failed, try remote index
-					if remoteIndex == nil {
+					if !*noRemote && remoteIndex == nil {
 						// Lazily fetch index
 						if idx, rErr := FetchRemoteIndex(cfg); rErr == nil {
 							remoteIndex = idx
 						}
 					}
 
-					if len(remoteIndex) > 0 {
+					if !*noRemote && len(remoteIndex) > 0 {
 						rv, rr, rerr := GetRemotePackageVersion(arg, cfg, remoteIndex)
 						if rerr == nil {
 							version = rv
@@ -860,7 +867,7 @@ func Main() {
 						foundOnMirror := false
 
 						// 2. Not in local cache? Try Mirror.
-						if BinaryMirror != "" {
+						if !*noRemote && BinaryMirror != "" {
 							// Ensure remote index is available
 							if remoteIndex == nil {
 								if idx, rErr := FetchRemoteIndex(cfg); rErr == nil {
@@ -1208,6 +1215,17 @@ func Main() {
 		}
 		pkg := os.Args[2]
 		if err := showManifest(pkg); err != nil {
+			fmt.Fprintln(os.Stderr, "Error:", err)
+			os.Exit(1)
+		}
+
+	case "size":
+		if len(os.Args) < 3 {
+			fmt.Println("Usage: hokuto size <pkgname>")
+			os.Exit(1)
+		}
+		pkg := os.Args[2]
+		if err := showInstalledPackageSize(pkg); err != nil {
 			fmt.Fprintln(os.Stderr, "Error:", err)
 			os.Exit(1)
 		}

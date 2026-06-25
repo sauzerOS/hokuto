@@ -63,6 +63,153 @@ func packageSetHasBuildOption(pkgNames []string, option string) bool {
 	return false
 }
 
+func buildPackageNames(packageSet map[string]bool) []string {
+	pkgNames := make([]string, 0, len(packageSet))
+	for pkgName := range packageSet {
+		pkgNames = append(pkgNames, pkgName)
+	}
+	sort.Strings(pkgNames)
+	return pkgNames
+}
+
+func activeBuildDependency(dep DepSpec, cfg *Config, includeOptional bool) bool {
+	if dep.RuntimeOnly || dep.Suggest {
+		return false
+	}
+	if dep.Optional && !includeOptional {
+		return false
+	}
+	if dep.Cross && cfg.Values["HOKUTO_CROSS_ARCH"] == "" {
+		return false
+	}
+	if dep.CrossNative && (cfg.Values["HOKUTO_CROSS_ARCH"] == "" || cfg.Values["HOKUTO_CROSS_SYSTEM"] == "1") {
+		return false
+	}
+	if shouldSkipMultilibMakeDep(dep, dep.Name, cfg) {
+		return false
+	}
+	return true
+}
+
+func plannedBuildDisplayOrder(plan *BuildPlan, cfg *Config, noRemote bool) []string {
+	remaining := append([]string{}, plan.Order...)
+	built := make(map[string]bool, len(plan.Order))
+	inPlan := make(map[string]bool, len(plan.Order))
+	for _, pkgName := range plan.Order {
+		inPlan[pkgName] = true
+	}
+	var display []string
+
+	postRebuilds := make(map[string][]string, len(plan.PostRebuilds))
+	for parent, deps := range plan.PostRebuilds {
+		postRebuilds[parent] = append([]string{}, deps...)
+	}
+
+	addReadyRebuilds := func() {
+		if len(postRebuilds) == 0 {
+			return
+		}
+		parents := make([]string, 0, len(postRebuilds))
+		for parent := range postRebuilds {
+			parents = append(parents, parent)
+		}
+		sort.Strings(parents)
+		for _, parent := range parents {
+			if !built[parent] {
+				continue
+			}
+			deps := postRebuilds[parent]
+			allBuilt := true
+			for _, dep := range deps {
+				depBuilt := built[dep]
+				if !depBuilt {
+					if sourcePkg, ok := findSplitDependencySource(dep); ok && built[sourcePkg] {
+						depBuilt = true
+					}
+				}
+				if !depBuilt {
+					allBuilt = false
+					break
+				}
+			}
+			if !allBuilt {
+				continue
+			}
+			display = append(display, fmt.Sprintf("%s (rebuild for %s)", parent, strings.Join(deps, ",")))
+			delete(postRebuilds, parent)
+		}
+	}
+
+	depAvailable := func(dep DepSpec) bool {
+		if len(dep.Alternatives) > 0 {
+			for _, alt := range dep.Alternatives {
+				altBuilt := built[alt]
+				if !altBuilt {
+					if sourcePkg, ok := findSplitDependencySource(alt); ok && built[sourcePkg] {
+						altBuilt = true
+					}
+				}
+				if altBuilt || findInstalledSatisfying(alt, "", "") != "" || (!inPlan[alt] && dependencyBinaryAvailable(alt, cfg, noRemote)) {
+					return true
+				}
+			}
+			return false
+		}
+		depBuilt := built[dep.Name]
+		if !depBuilt {
+			if sourcePkg, ok := findSplitDependencySource(dep.Name); ok && built[sourcePkg] {
+				depBuilt = true
+			}
+		}
+		if depBuilt || findInstalledSatisfying(dep.Name, dep.Op, dep.Version) != "" {
+			return true
+		}
+		return !inPlan[dep.Name] && dependencyBinaryAvailable(dep.Name, cfg, noRemote)
+	}
+
+	canBuild := func(pkgName string) bool {
+		pkgDir, err := findPackageDir(pkgName)
+		if err != nil {
+			return true
+		}
+		deps, err := parseDependsFile(pkgDir)
+		if err != nil {
+			return true
+		}
+		for _, dep := range deps {
+			if !activeBuildDependency(dep, cfg, false) {
+				continue
+			}
+			if !depAvailable(dep) {
+				return false
+			}
+		}
+		return true
+	}
+
+	for len(remaining) > 0 {
+		progress := false
+		var next []string
+		for _, pkgName := range remaining {
+			if !canBuild(pkgName) {
+				next = append(next, pkgName)
+				continue
+			}
+			display = append(display, pkgName)
+			built[pkgName] = true
+			addReadyRebuilds()
+			progress = true
+		}
+		if !progress {
+			display = append(display, next...)
+			break
+		}
+		remaining = next
+	}
+
+	return display
+}
+
 func addMappedSplitDependency(splitDepsBySource map[string][]string, sourcePkg, splitPkg string) {
 	if sourcePkg == "" || splitPkg == "" {
 		return
@@ -73,6 +220,25 @@ func addMappedSplitDependency(splitDepsBySource map[string][]string, sourcePkg, 
 		}
 	}
 	splitDepsBySource[sourcePkg] = append(splitDepsBySource[sourcePkg], splitPkg)
+}
+
+func addPostRebuildSplitDependencies(plan *BuildPlan, splitDepsBySource map[string][]string) {
+	if len(plan.PostRebuilds) == 0 {
+		return
+	}
+	inOrder := make(map[string]bool, len(plan.Order))
+	for _, pkgName := range plan.Order {
+		inOrder[pkgName] = true
+	}
+	for _, deps := range plan.PostRebuilds {
+		for _, dep := range deps {
+			sourcePkg, ok := findSplitDependencySource(dep)
+			if !ok || !inOrder[sourcePkg] {
+				continue
+			}
+			addMappedSplitDependency(splitDepsBySource, sourcePkg, dep)
+		}
+	}
 }
 
 func installBuiltSplitDependency(sourcePkg, splitPkg string, cfg *Config) error {
@@ -90,7 +256,7 @@ func installBuiltSplitDependency(sourcePkg, splitPkg string, cfg *Config) error 
 	options := loadBuildOptions(pkgDir)
 	isGeneric := cfg.Values["HOKUTO_GENERIC"] == "1" || options["generic"]
 	arch := GetSystemArchForPackage(cfg, sourcePkg)
-	variant := IdentifyVariant(splitPkg, isGeneric, isMultilibPackageDepName(splitPkg))
+	variant := IdentifyVariant(splitPkg, isGeneric, isMultilibPackage(splitPkg))
 	tarballPath := filepath.Join(BinDir, StandardizeRemoteName(splitPkg, version, revision, arch, variant))
 	if _, err := os.Stat(tarballPath); err != nil {
 		return fmt.Errorf("expected split package tarball missing: %s", tarballPath)
@@ -103,6 +269,41 @@ func installBuiltSplitDependency(sourcePkg, splitPkg string, cfg *Config) error 
 		return err
 	}
 	return nil
+}
+
+func installAvailableBinaryBuildDeps(plan *BuildPlan, userRequested, declined map[string]bool, cfg *Config, addTemporaryBuildDep func(string)) (bool, error) {
+	installedAny := false
+	for _, pkgName := range plan.Order {
+		if userRequested[pkgName] || declined[pkgName] || plan.RebuildPackages[pkgName] || isPackageInstalled(pkgName) {
+			continue
+		}
+
+		version, revision, err := getRepoVersion2(pkgName)
+		if err != nil {
+			continue
+		}
+		outputPkgName := getOutputPackageName(pkgName, cfg)
+		tarballPath := findCachedBinaryTarballVersion(outputPkgName, version, revision, cfg)
+		if tarballPath == "" {
+			continue
+		}
+
+		if !askForConfirmation(colInfo, "Dependency '%s' is missing. Use available binary package?", pkgName) {
+			declined[pkgName] = true
+			continue
+		}
+
+		isCriticalAtomic.Store(1)
+		handlePreInstallUninstall(outputPkgName, cfg, RootExec, false, nil)
+		if _, err := pkgInstall(tarballPath, outputPkgName, cfg, RootExec, false, false, false, nil); err != nil {
+			isCriticalAtomic.Store(0)
+			return installedAny, fmt.Errorf("fatal error installing binary %s: %w", pkgName, err)
+		}
+		isCriticalAtomic.Store(0)
+		addTemporaryBuildDep(outputPkgName)
+		installedAny = true
+	}
+	return installedAny, nil
 }
 
 // getScriptExitCode extracts the exit code from a script log file
@@ -332,6 +533,159 @@ func shellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'"
 }
 
+func writeBuildHelperScripts(helperDir string) error {
+	if err := os.MkdirAll(helperDir, 0o755); err != nil {
+		return err
+	}
+	pickPath := filepath.Join(helperDir, "_pick")
+	pickScript := `#!/bin/sh
+if [ "$#" -lt 2 ]; then
+    echo "usage: _pick [--destdir DIR] <split-package> <path>..." >&2
+    echo "       _pick <destdir> <split-package> <path>..." >&2
+    exit 2
+fi
+
+source_root=""
+case "$1" in
+    --destdir|-d)
+        if [ "$#" -lt 4 ]; then
+            echo "_pick: --destdir requires DIR, split package, and path(s)" >&2
+            exit 2
+        fi
+        source_root="$2"
+        shift 2
+        ;;
+    *)
+        if [ "$#" -ge 3 ] && [ -d "$1" ]; then
+            source_root="$1"
+            shift
+        fi
+        ;;
+esac
+
+split_name="$1"
+shift
+
+if [ -z "${HOKUTO_SPLIT_DIR:-}" ]; then
+    echo "_pick: HOKUTO_SPLIT_DIR is not set" >&2
+    exit 2
+fi
+
+if [ -n "$source_root" ]; then
+    if [ ! -d "$source_root" ]; then
+        echo "_pick: destdir does not exist: $source_root" >&2
+        exit 2
+    fi
+    source_root="$(cd "$source_root" && pwd -P)"
+fi
+
+for pattern in "$@"; do
+    if [ -n "$source_root" ]; then
+        case "$pattern" in
+            /*) search="$pattern" ;;
+            *) search="$source_root/$pattern" ;;
+        esac
+    else
+        case "$pattern" in
+            /*) search="$pattern" ;;
+            *) search="$PWD/$pattern" ;;
+        esac
+    fi
+
+    for src in $search; do
+        [ -e "$src" ] || continue
+
+        if [ -n "$source_root" ]; then
+            case "$src" in
+                "$source_root"/*) rel="${src#"$source_root"/}" ;;
+                *) rel="${src#/}" ;;
+            esac
+        elif [ -n "${HOKUTO_OUTPUT_DIR:-}" ]; then
+            case "$src" in
+                "$HOKUTO_OUTPUT_DIR"/*) rel="${src#"$HOKUTO_OUTPUT_DIR"/}" ;;
+                *) rel="${src#"$PWD"/}"; rel="${rel#/}" ;;
+            esac
+        else
+            rel="${src#"$PWD"/}"
+            rel="${rel#/}"
+        fi
+
+        d="$HOKUTO_SPLIT_DIR/$split_name/$rel"
+        mkdir -p "$(dirname "$d")"
+        mv -v "$src" "$d"
+        rmdir -p --ignore-fail-on-non-empty "$(dirname "$src")" 2>/dev/null || true
+    done
+
+done
+`
+	if err := os.WriteFile(pickPath, []byte(pickScript), 0o755); err != nil {
+		return err
+	}
+
+	mesonPath := filepath.Join(helperDir, "hokuto-meson")
+	mesonScript := `#!/bin/sh
+set -e
+
+for arg in "$@" .; do
+    case "$arg" in
+        -*) continue ;;
+    esac
+    if [ -d "$arg" ] && [ -f "$arg/meson.build" ]; then
+        if command -v hokuto-meson-check-wraps >/dev/null 2>&1; then
+            hokuto-meson-check-wraps "$arg"
+        fi
+        break
+    fi
+done
+
+set -x
+exec meson setup \
+    --prefix /usr \
+    --libexecdir lib \
+    --sbindir bin \
+    --buildtype plain \
+    --auto-features enabled \
+    --wrap-mode nodownload \
+    -D b_pie=true \
+    -D python.bytecompile=1 \
+    "$@"
+`
+	if err := os.WriteFile(mesonPath, []byte(mesonScript), 0o755); err != nil {
+		return err
+	}
+
+	meson32Path := filepath.Join(helperDir, "hokuto-meson-32")
+	meson32Script := `#!/bin/sh
+set -e
+
+for arg in "$@" .; do
+    case "$arg" in
+        -*) continue ;;
+    esac
+    if [ -d "$arg" ] && [ -f "$arg/meson.build" ]; then
+        if command -v hokuto-meson-check-wraps >/dev/null 2>&1; then
+            hokuto-meson-check-wraps "$arg"
+        fi
+        break
+    fi
+done
+
+set -x
+exec meson setup \
+    --prefix /usr \
+    --libexecdir lib32 \
+    --sbindir bin \
+    --buildtype plain \
+    --auto-features enabled \
+    --wrap-mode nodownload \
+    --cross-file lib32 \
+    -D b_pie=true \
+    -D python.bytecompile=1 \
+    "$@"
+`
+	return os.WriteFile(meson32Path, []byte(meson32Script), 0o755)
+}
+
 func runSplitScript(pkgDir, outputDir, splitDir, version, pkgName string, buildExec *Executor, env []string, opts BuildOptions) error {
 	splitScript := filepath.Join(pkgDir, "split")
 	if fi, err := os.Stat(splitScript); err != nil {
@@ -510,7 +864,7 @@ func packageSplitOutputs(parentPkgName, pkgDir, splitRoot, version, revision, ta
 
 		removeLibtoolArchives(splitOutputDir, buildExec)
 
-		isMultilib := detectMultilib(splitOutputDir)
+		isMultilib := detectMultilib(outputSplitName, splitOutputDir)
 		pkginfoExec := buildExec
 		if buildExec.ShouldRunAsRoot {
 			pkginfoExec = RootExec
@@ -529,7 +883,7 @@ func packageSplitOutputs(parentPkgName, pkgDir, splitRoot, version, revision, ta
 			return fmt.Errorf("failed to sign split package %s: %w", outputSplitName, err)
 		}
 
-		variant := IdentifyVariant(splitName, isGeneric, isMultilib)
+		variant := IdentifyVariant(outputSplitName, isGeneric, isMultilib)
 		if err := createPackageTarball(outputSplitName, version, revision, targetArch, variant, splitOutputDir, buildExec, opts.LogWriter); err != nil {
 			return fmt.Errorf("failed to package split tarball %s: %w", outputSplitName, err)
 		}
@@ -718,7 +1072,7 @@ func finalizeBuiltPackage(in builtPackageFinalization) error {
 		UpdateWebsiteStatus(in.sourcePkgName, fullVer, "success", logXZPath)
 	}
 
-	isMultilib := detectMultilib(in.outputDir)
+	isMultilib := detectMultilib(in.outputPkgName, in.outputDir)
 	pkginfoExec := in.buildExec
 	if in.buildExec.ShouldRunAsRoot {
 		pkginfoExec = RootExec
@@ -1405,6 +1759,16 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, opts BuildOptions)
 	}
 
 	// Inject HOKUTO_REAL_USER
+	helperDir := filepath.Join(buildDir, ".hokuto-tools")
+	if err := writeBuildHelperScripts(helperDir); err != nil {
+		return 0, fmt.Errorf("failed to create build helper scripts: %w", err)
+	}
+	if defaults["PATH"] != "" {
+		defaults["PATH"] = helperDir + ":" + defaults["PATH"]
+	} else {
+		defaults["PATH"] = helperDir + ":" + os.Getenv("PATH")
+	}
+
 	realUser := os.Getenv("SUDO_USER")
 	if realUser == "" {
 		realUser = os.Getenv("USER")
@@ -2187,6 +2551,16 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 	// --- END REFACTORED FLAG LOGIC ---
 
 	// Inject HOKUTO_REAL_USER
+	helperDir := filepath.Join(buildDir, ".hokuto-tools")
+	if err := writeBuildHelperScripts(helperDir); err != nil {
+		return fmt.Errorf("failed to create build helper scripts: %w", err)
+	}
+	if defaults["PATH"] != "" {
+		defaults["PATH"] = helperDir + ":" + defaults["PATH"]
+	} else {
+		defaults["PATH"] = helperDir + ":" + os.Getenv("PATH")
+	}
+
 	realUser := os.Getenv("SUDO_USER")
 	if realUser == "" {
 		realUser = os.Getenv("USER")
@@ -2774,6 +3148,7 @@ func handleBuildCommand(args []string, cfg *Config) error {
 	var totalBuildCount int
 	var builtWithoutInstallingTargets bool
 	var temporaryBuildDeps []string
+	retainedBuildDeps := make(map[string]bool)
 	addTemporaryBuildDep := func(pkgName string) {
 		for _, existing := range temporaryBuildDeps {
 			if existing == pkgName {
@@ -2782,18 +3157,31 @@ func handleBuildCommand(args []string, cfg *Config) error {
 		}
 		temporaryBuildDeps = append(temporaryBuildDeps, pkgName)
 	}
+	retainTemporaryBuildDep := func(pkgName string) {
+		if pkgName == "" {
+			return
+		}
+		retainedBuildDeps[pkgName] = true
+		retainedBuildDeps[getOutputPackageName(pkgName, cfg)] = true
+	}
 	cleanupTemporaryBuildDeps := func() {
 		if len(temporaryBuildDeps) == 0 {
 			return
 		}
-		uninstallBuildDependencies(temporaryBuildDeps, cfg)
+		var removable []string
+		for _, dep := range temporaryBuildDeps {
+			if retainedBuildDeps[dep] {
+				continue
+			}
+			removable = append(removable, dep)
+		}
+		uninstallBuildDependencies(removable, cfg)
 		temporaryBuildDeps = nil
 	}
 	defer cleanupTemporaryBuildDeps()
 
 	if !*bootstrap && !*noDevel {
-		includeMultilibDevel := packageSetHasBuildOption(packagesToProcess, "multilib")
-		installedDevelDeps, err := ensureDevelPackagesInstalled(cfg, includeMultilibDevel, *noRemote)
+		installedDevelDeps, err := ensureDevelPackagesInstalled(cfg, false, *noRemote)
 		if err != nil {
 			return fmt.Errorf("failed to prepare devel packages: %w", err)
 		}
@@ -2820,6 +3208,16 @@ func handleBuildCommand(args []string, cfg *Config) error {
 		}
 
 		fullBuildList = MovePackageToFront(fullBuildList, "sauzeros-base")
+
+		if !*bootstrap && !*noDevel && packageSetHasBuildOption(fullBuildList, "multilib") {
+			installedDevelDeps, err := ensureDevelPackagesInstalled(cfg, true, *noRemote)
+			if err != nil {
+				return fmt.Errorf("failed to prepare multilib devel packages: %w", err)
+			}
+			for _, dep := range installedDevelDeps {
+				addTemporaryBuildDep(dep)
+			}
+		}
 
 		colArrow.Print("-> ")
 		colSuccess.Printf("Build order: %s\n", strings.Join(fullBuildList, " -> "))
@@ -2891,6 +3289,7 @@ func handleBuildCommand(args []string, cfg *Config) error {
 		// ** STRATEGY 2: Normal Build Mode **
 		var packagesThatMustBeBuilt map[string]bool
 		splitDepsBySource := make(map[string][]string)
+		binaryDeclined := make(map[string]bool)
 
 		if *noDeps {
 			// Skip dependency resolution when --nodeps is set
@@ -2949,9 +3348,7 @@ func handleBuildCommand(args []string, cfg *Config) error {
 				}
 				// Use output package name for dependencies too (may be renamed for cross-system)
 				outputDepPkg := getOutputPackageName(depPkg, cfg)
-				arch := GetSystemArchForPackage(cfg, depPkg)
-				variant := GetSystemVariantForPackage(cfg, depPkg)
-				tarballPath := filepath.Join(BinDir, StandardizeRemoteName(outputDepPkg, version, revision, arch, variant))
+				tarballPath := findCachedBinaryTarballVersion(outputDepPkg, version, revision, cfg)
 				if _, err := os.Stat(tarballPath); err == nil {
 					if askForConfirmation(colInfo, "Dependency '%s' is missing. Use available binary package?", depPkg) {
 						isCriticalAtomic.Store(1)
@@ -2963,6 +3360,7 @@ func handleBuildCommand(args []string, cfg *Config) error {
 						isCriticalAtomic.Store(0)
 						addTemporaryBuildDep(outputDepPkg)
 					} else {
+						binaryDeclined[depPkg] = true
 						packagesThatMustBeBuilt[depPkg] = true
 					}
 				} else {
@@ -3007,6 +3405,7 @@ func handleBuildCommand(args []string, cfg *Config) error {
 										isCriticalAtomic.Store(0)
 										addTemporaryBuildDep(outputDepPkg)
 									} else {
+										binaryDeclined[depPkg] = true
 										packagesThatMustBeBuilt[depPkg] = true
 									}
 								}
@@ -3025,6 +3424,17 @@ func handleBuildCommand(args []string, cfg *Config) error {
 			fmt.Println("All packages and dependencies are already installed.")
 			return nil
 		}
+
+		if !*noDevel && packageSetHasBuildOption(buildPackageNames(packagesThatMustBeBuilt), "multilib") {
+			installedDevelDeps, err := ensureDevelPackagesInstalled(cfg, true, *noRemote)
+			if err != nil {
+				return fmt.Errorf("failed to prepare multilib devel packages: %w", err)
+			}
+			for _, dep := range installedDevelDeps {
+				addTemporaryBuildDep(dep)
+			}
+		}
+
 		// Set the total count for the summary.
 		totalBuildCount = len(packagesThatMustBeBuilt)
 
@@ -3057,20 +3467,31 @@ func handleBuildCommand(args []string, cfg *Config) error {
 				colArrow.Print("-> ")
 				colSuccess.Printf("Processing Top-Level Dependency %d/%d: %s \n", i+1, len(orderedTopLevelDeps), pkgName)
 
-				// ordered build mode typically builds from source
-				plan, err := resolveBuildPlan([]string{pkgName}, userRequestedMap, effectiveRebuilds, cfg, nil)
-				if err != nil {
-					return fmt.Errorf("error generating build plan for '%s': %v", pkgName, err)
+				var plan *BuildPlan
+				for {
+					// ordered build mode typically builds from source
+					plan, err = resolveBuildPlan([]string{pkgName}, userRequestedMap, effectiveRebuilds, cfg, nil)
+					if err != nil {
+						return fmt.Errorf("error generating build plan for '%s': %v", pkgName, err)
+					}
+					addPostRebuildSplitDependencies(plan, splitDepsBySource)
+					installedBinaryDeps, err := installAvailableBinaryBuildDeps(plan, userRequestedMap, binaryDeclined, cfg, addTemporaryBuildDep)
+					if err != nil {
+						return err
+					}
+					if !installedBinaryDeps {
+						break
+					}
 				}
 				if len(plan.Order) == 0 {
 					colSuccess.Printf("Package '%s' is already built and up to date. Skipping.\n\n", pkgName)
 					continue
 				}
 
-				colInfo.Printf("Build order for this group: %s\n\n", strings.Join(plan.Order, " -> "))
+				colInfo.Printf("Build order for this group: %s\n\n", strings.Join(plannedBuildDisplayOrder(plan, cfg, *noRemote), " -> "))
 
 				progressCount := 0
-				failedThisGroup, _, elapsedThisGroup, installedDepsThisGroup := executeBuildPass(plan, pkgName, true, cfg, bootstrap, userRequestedMap, nil, &progressCount)
+				failedThisGroup, _, elapsedThisGroup, installedDepsThisGroup := executeBuildPass(plan, pkgName, true, cfg, bootstrap, userRequestedMap, splitDepsBySource, *noRemote, retainTemporaryBuildDep, &progressCount)
 				totalElapsedTime += elapsedThisGroup
 				for _, dep := range installedDepsThisGroup {
 					addTemporaryBuildDep(dep)
@@ -3112,11 +3533,25 @@ func handleBuildCommand(args []string, cfg *Config) error {
 			} else {
 				colArrow.Print("-> ")
 				colSuccess.Println("Generating Build Plan")
-				initialPlan, err = resolveBuildPlan(buildListInput, userRequestedMap, effectiveRebuilds, cfg, nil)
+				for {
+					initialPlan, err = resolveBuildPlan(buildListInput, userRequestedMap, effectiveRebuilds, cfg, nil)
+					if err != nil {
+						break
+					}
+					addPostRebuildSplitDependencies(initialPlan, splitDepsBySource)
+					installedBinaryDeps, installErr := installAvailableBinaryBuildDeps(initialPlan, userRequestedMap, binaryDeclined, cfg, addTemporaryBuildDep)
+					if installErr != nil {
+						return installErr
+					}
+					if !installedBinaryDeps {
+						break
+					}
+				}
 			}
 			if err != nil {
 				return fmt.Errorf("error generating build plan: %v", err)
 			}
+			addPostRebuildSplitDependencies(initialPlan, splitDepsBySource)
 			if len(initialPlan.Order) == 0 {
 				fmt.Println("All packages are up to date. Nothing to build.")
 				return nil
@@ -3124,7 +3559,7 @@ func handleBuildCommand(args []string, cfg *Config) error {
 
 			colArrow.Print("-> ")
 			colSuccess.Printf("Build Order:")
-			colNote.Printf(" %s\n", strings.Join(initialPlan.Order, " -> "))
+			colNote.Printf(" %s\n", strings.Join(plannedBuildDisplayOrder(initialPlan, cfg, *noRemote), " -> "))
 			if len(initialPlan.Order) > 1 {
 				// Prefetch the plan list, skipping the first one which starts immediately
 				go prefetchSources(initialPlan.Order[1:])
@@ -3211,6 +3646,13 @@ func handleBuildCommand(args []string, cfg *Config) error {
 				}
 
 				// Start parallel build
+				installedBinaryDeps, err := installAvailableBinaryDependenciesForPlan(initialPlan, cfg, *noRemote)
+				if err != nil {
+					return err
+				}
+				for _, dep := range installedBinaryDeps {
+					addTemporaryBuildDep(dep)
+				}
 				if err := RunParallelBuilds(initialPlan, cfg, maxJobs, userRequestedMap, true, smartBuildBuilder); err != nil {
 					return err
 				}
@@ -3222,7 +3664,7 @@ func handleBuildCommand(args []string, cfg *Config) error {
 				return nil
 			}
 
-			failedPass1, targetsPass1, elapsedPass1, installedDepsPass1 := executeBuildPass(initialPlan, "Initial Pass", false, cfg, bootstrap, userRequestedMap, splitDepsBySource, &progressCount)
+			failedPass1, targetsPass1, elapsedPass1, installedDepsPass1 := executeBuildPass(initialPlan, "Initial Pass", false, cfg, bootstrap, userRequestedMap, splitDepsBySource, *noRemote, retainTemporaryBuildDep, &progressCount)
 			totalElapsedTime = elapsedPass1
 			failedBuilds = failedPass1
 			for _, dep := range installedDepsPass1 {
@@ -3320,19 +3762,35 @@ BuildSummary:
 
 // Helper for HandleBuildCommand to execute a single build pass based on the provided BuildPlan.
 
-func executeBuildPass(plan *BuildPlan, _ string, installAllTargets bool, cfg *Config, bootstrap *bool, userRequestedMap map[string]bool, splitDepsBySource map[string][]string, progressCount *int) (map[string]error, []string, time.Duration, []string) {
+func executeBuildPass(plan *BuildPlan, _ string, installAllTargets bool, cfg *Config, bootstrap *bool, userRequestedMap map[string]bool, splitDepsBySource map[string][]string, noRemote bool, retainBuildDep func(string), progressCount *int) (map[string]error, []string, time.Duration, []string) {
 
 	toBuild := plan.Order
 	failed := make(map[string]error)
 	var successfullyBuiltTargets []string
 	var installedBuildDeps []string
 	builtThisPass := make(map[string]bool)
+	inPlan := make(map[string]bool, len(plan.Order))
+	for _, pkgName := range plan.Order {
+		inPlan[pkgName] = true
+	}
+	binaryInstallAttempts := make(map[string]bool)
 	var totalElapsedTime time.Duration
+	depMatchesPackage := func(dep DepSpec, pkgName string) bool {
+		if len(dep.Alternatives) > 0 {
+			for _, alt := range dep.Alternatives {
+				if alt == pkgName {
+					return true
+				}
+			}
+			return false
+		}
+		return dep.Name == pkgName
+	}
 	passInProgress := true
 	for passInProgress && len(toBuild) > 0 {
 		progressThisPass := false
 		var remainingAfterPass []string
-		for i, pkgName := range toBuild {
+		for _, pkgName := range toBuild {
 			if _, isFailed := failed[pkgName]; isFailed {
 				continue
 			}
@@ -3341,30 +3799,15 @@ func executeBuildPass(plan *BuildPlan, _ string, installAllTargets bool, cfg *Co
 				pkgDir, _ := findPackageDir(pkgName)
 				deps, _ := parseDependsFile(pkgDir)
 				for _, dep := range deps {
-					if dep.Optional {
-						continue
-					}
-
-					// FILTER: Ignore cross dependencies if not cross-compiling
-					if dep.Cross && cfg.Values["HOKUTO_CROSS_ARCH"] == "" {
-						continue
-					}
-
-					// FILTER: Ignore crossnative dependencies unless we are in a cross-native build
-					if dep.CrossNative {
-						if cfg.Values["HOKUTO_CROSS_ARCH"] == "" || cfg.Values["HOKUTO_CROSS_SYSTEM"] == "1" {
-							continue
-						}
-					}
-
-					if shouldSkipMultilibMakeDep(dep, dep.Name, cfg) {
+					if !activeBuildDependency(dep, cfg, false) {
 						continue
 					}
 
 					isSatisfied := false
 
-					// Helper to check if a package is available (installed or just built)
-					isDepAvailable := func(name string, op string, ver string) bool {
+					// Helper to check if a package is available, or can be made available
+					// from a binary package without changing the active build plan.
+					isDepAvailable := func(name string, op string, ver string, dep DepSpec) bool {
 						// 1. Check if it was built this pass (using exact name)
 						if builtThisPass[name] {
 							return true
@@ -3382,19 +3825,38 @@ func executeBuildPass(plan *BuildPlan, _ string, installAllTargets bool, cfg *Co
 						// However, if it was built this pass, it was also INSTALLED,
 						// so findInstalledSatisfying should have caught it.
 						// The only edge case is if it's built but not yet installed (not possible in current sequential flow).
+						if inPlan[name] || binaryInstallAttempts[name] || !dependencyBinaryAvailable(name, cfg, noRemote) {
+							return false
+						}
 
-						return false
+						binaryInstallAttempts[name] = true
+						colArrow.Print("-> ")
+						colSuccess.Printf("Installing available binary dependency:")
+						colNote.Printf(" %s\n", name)
+						installed, err := ensurePackageInstalled(name, cfg, noRemote)
+						if err != nil {
+							colArrow.Print("-> ")
+							colWarn.Printf("Warning: failed to install available binary dependency %s: %v\n", name, err)
+							return false
+						}
+						if installed {
+							installedBuildDeps = append(installedBuildDeps, name)
+							if dep.Make {
+								addToWorldMake(name)
+							}
+						}
+						return findInstalledSatisfying(name, op, ver) != ""
 					}
 
 					if len(dep.Alternatives) > 0 {
 						for _, alt := range dep.Alternatives {
-							if isDepAvailable(alt, "", "") {
+							if isDepAvailable(alt, "", "", dep) {
 								isSatisfied = true
 								break
 							}
 						}
 					} else {
-						if isDepAvailable(dep.Name, dep.Op, dep.Version) {
+						if isDepAvailable(dep.Name, dep.Op, dep.Version, dep) {
 							isSatisfied = true
 						}
 					}
@@ -3444,16 +3906,21 @@ func executeBuildPass(plan *BuildPlan, _ string, installAllTargets bool, cfg *Co
 				progressThisPass = true
 				totalElapsedTime += duration // Accumulate the time from the successful build
 
-				// Check if this package is required by any SUBSEQUENT package in the current build pass.
-				// This ensures we only auto-install user-requested packages if absolutely necessary for the build chain.
+				// Check if this package is required by any not-yet-built package in the current build pass.
+				// This ensures we install user-requested packages immediately when another package
+				// still needs them, even if execution had to skip around the planned order.
 				isDependencyForThisPass := false
 
 				// Only check look-ahead if it's a user requested package.
 				// Implicit dependencies (!userRequestedMap) are auto-installed by default logic below.
 				if userRequestedMap[pkgName] {
-					// Look ahead in the remaining list for packages that depend on this one
-					for k := i + 1; k < len(toBuild); k++ {
-						futurePkg := toBuild[k]
+					for _, futurePkg := range plan.Order {
+						if futurePkg == pkgName || builtThisPass[futurePkg] {
+							continue
+						}
+						if _, futureFailed := failed[futurePkg]; futureFailed {
+							continue
+						}
 
 						// Check dependencies of futurePkg
 						fDir, err := findPackageDir(futurePkg)
@@ -3461,19 +3928,10 @@ func executeBuildPass(plan *BuildPlan, _ string, installAllTargets bool, cfg *Co
 							fDeps, err := parseDependsFile(fDir)
 							if err == nil {
 								for _, d := range fDeps {
-									// FILTER: skip cross dependencies if not cross-compiling
-									if d.Cross && cfg.Values["HOKUTO_CROSS_ARCH"] == "" {
+									if !activeBuildDependency(d, cfg, false) {
 										continue
 									}
-
-									// FILTER: skip crossnative dependencies unless we are in a cross-native build
-									if d.CrossNative {
-										if cfg.Values["HOKUTO_CROSS_ARCH"] == "" || cfg.Values["HOKUTO_CROSS_SYSTEM"] == "1" {
-											continue
-										}
-									}
-
-									if d.Name == pkgName {
+									if depMatchesPackage(d, pkgName) {
 										isDependencyForThisPass = true
 										break
 									}
@@ -3608,6 +4066,11 @@ func executeBuildPass(plan *BuildPlan, _ string, installAllTargets bool, cfg *Co
 						fmt.Println()
 						colArrow.Print("-> ")
 						colWarn.Printf("Optional dependency '%s' now available for '%s'. Triggering immediate rebuild.\n", strings.Join(missingDeps, ", "), parent)
+						if retainBuildDep != nil {
+							for _, dep := range missingDeps {
+								retainBuildDep(dep)
+							}
+						}
 
 						// Rebuild the parent package
 						*progressCount++
@@ -3714,23 +4177,7 @@ func executeBuildPass(plan *BuildPlan, _ string, installAllTargets bool, cfg *Co
 				deps, _ := parseDependsFile(pkgDir)
 				missingDep := "unknown"
 				for _, dep := range deps {
-					if dep.Optional {
-						continue
-					}
-
-					// New filtering: skip cross dependencies if not cross-compiling
-					if dep.Cross && cfg.Values["HOKUTO_CROSS_ARCH"] == "" {
-						continue
-					}
-
-					// New filtering: skip crossnative dependencies unless we are in a cross-native build
-					if dep.CrossNative {
-						if cfg.Values["HOKUTO_CROSS_ARCH"] == "" || cfg.Values["HOKUTO_CROSS_SYSTEM"] == "1" {
-							continue
-						}
-					}
-
-					if shouldSkipMultilibMakeDep(dep, dep.Name, cfg) {
+					if !activeBuildDependency(dep, cfg, false) {
 						continue
 					}
 

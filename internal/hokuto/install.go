@@ -67,6 +67,101 @@ func getRebuildTriggers(triggerPkg string, rootDir string) []string {
 	return packagesToRebuild
 }
 
+func printPackageSuggestions(pkgName, rootDir string, logger io.Writer) {
+	if logger == nil {
+		logger = os.Stdout
+	}
+
+	suggestsPath := filepath.Join(rootDir, "var", "db", "hokuto", "installed", pkgName, "suggests")
+	data, err := os.ReadFile(suggestsPath)
+	if err != nil {
+		data, err = readFileAsRoot(suggestsPath)
+		if err != nil {
+			return
+		}
+	}
+
+	var missing []string
+	for _, raw := range strings.Split(string(data), "\n") {
+		line := strings.TrimSpace(raw)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		name, op, ver, _, _, _, _, _, _, _ := parseDepToken(line)
+		if name == "" || findInstalledSatisfying(name, op, ver) != "" {
+			continue
+		}
+		missing = append(missing, line)
+	}
+	if len(missing) == 0 {
+		return
+	}
+
+	fmt.Fprint(logger, colArrow.Sprint("-> "))
+	fmt.Fprintln(logger, colSuccess.Sprintf("Optional runtime dependencies for %s:", pkgName))
+	for _, dep := range missing {
+		fmt.Fprint(logger, colArrow.Sprint("-> "))
+		fmt.Fprintln(logger, colNote.Sprint(dep))
+	}
+}
+
+func installMissingPackageRuntimeDependencies(pkgName string, cfg *Config, logger io.Writer, quiet bool) error {
+	dependsPath := filepath.Join(rootDir, "var", "db", "hokuto", "installed", pkgName, "depends")
+	data, err := os.ReadFile(dependsPath)
+	if err != nil {
+		data, err = readFileAsRoot(dependsPath)
+		if err != nil {
+			return nil
+		}
+	}
+
+	deps, err := parseDependsData(data)
+	if err != nil {
+		return fmt.Errorf("failed to parse installed dependencies for %s: %w", pkgName, err)
+	}
+
+	for _, dep := range deps {
+		if dep.Make || dep.Optional || dep.Rebuild || dep.Suggest {
+			continue
+		}
+		if dep.Cross && cfg.Values["HOKUTO_CROSS_ARCH"] == "" {
+			continue
+		}
+		if dep.CrossNative && (cfg.Values["HOKUTO_CROSS_ARCH"] == "" || cfg.Values["HOKUTO_CROSS_SYSTEM"] == "1") {
+			continue
+		}
+
+		depName := dep.Name
+		if len(dep.Alternatives) > 0 {
+			resolved, err := resolveAlternativeDep(dep, true, cfg)
+			if err != nil {
+				return fmt.Errorf("failed to resolve alternative runtime dependency for %s: %w", pkgName, err)
+			}
+			depName = resolved
+		}
+		if depName == "" || depName == pkgName || shouldSkipMultilibMakeDep(dep, depName, cfg) {
+			continue
+		}
+		if findInstalledSatisfying(depName, dep.Op, dep.Version) != "" {
+			continue
+		}
+
+		if !quiet {
+			if logger == nil {
+				logger = os.Stdout
+			}
+			fmt.Fprint(logger, colArrow.Sprint("-> "))
+			fmt.Fprintf(logger, "%s", colSuccess.Sprint("Installing runtime dependency: "))
+			fmt.Fprintln(logger, colNote.Sprint(depName))
+		}
+		if _, err := ensurePackageInstalled(depName, cfg, true); err != nil {
+			return fmt.Errorf("failed to install runtime dependency %s for %s: %w", depName, pkgName, err)
+		}
+	}
+
+	return nil
+}
+
 // pkgInstall installs a compiled hokuto package from a tarball.
 // If yes is true, it assumes 'yes' to all prompts.
 // If fast is true, it optimizes for speed (e.g., skip some UI/status updates).
@@ -785,10 +880,8 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 	} else {
 		// Optimization: Pre-compute lookups
 		filesToDeleteMap := make(map[string]struct{}, len(filesToDelete))
-		filesToDeleteBasenameMap := make(map[string]string, len(filesToDelete))
 		for _, f := range filesToDelete {
 			filesToDeleteMap[f] = struct{}{}
-			filesToDeleteBasenameMap[filepath.Base(f)] = f
 		}
 
 		allInstalledEntries, err := os.ReadDir(Installed)
@@ -816,25 +909,27 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 				// Check if any file in filesToDelete is a libdep of otherPkgName
 				lines := strings.SplitSeq(string(libdepsContent), "\n")
 				for line := range lines {
-					libPath := strings.TrimSpace(line)
-					if libPath == "" {
+					libDep, ok := parseLibDepRef(line)
+					if !ok {
 						continue
 					}
 
 					var matchFile string
-					if strings.HasPrefix(libPath, "/") {
+					if strings.HasPrefix(libDep.Name, "/") {
 						// Old format: absolute path
-						absLibPath := libPath
+						absLibPath := libDep.Name
 						if rootDir != "/" {
-							absLibPath = filepath.Join(rootDir, libPath[1:])
+							absLibPath = filepath.Join(rootDir, libDep.Name[1:])
 						}
 						if _, ok := filesToDeleteMap[absLibPath]; ok {
 							matchFile = absLibPath
 						}
 					} else {
-						// New format: basename only
-						if fullPath, ok := filesToDeleteBasenameMap[libPath]; ok {
-							matchFile = fullPath
+						for _, fullPath := range filesToDelete {
+							if libraryPathMatchesDep(fullPath, libDep) {
+								matchFile = fullPath
+								break
+							}
 						}
 					}
 
@@ -928,6 +1023,9 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 	}
 	if err := executePostInstall(pkgName, rootDir, execCtx, cfg, logger); err != nil {
 		fmt.Printf("warning: post-install for %s returned error: %v\n", pkgName, err)
+	}
+	if err := installMissingPackageRuntimeDependencies(pkgName, cfg, logger, fast); err != nil {
+		return nil, err
 	}
 
 	// Collected rebuilds to return in managed mode
@@ -1145,6 +1243,7 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 		if err := PostInstallTasks(RootExec, logger); err != nil {
 			fmt.Fprintf(os.Stderr, "post-install tasks completed with warnings: %v\n", err)
 		}
+		printPackageSuggestions(pkgName, rootDir, logger)
 	}
 	return parallelRebuilds, nil
 }

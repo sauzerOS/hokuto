@@ -20,6 +20,57 @@ func pkgUninstall(pkgName string, cfg *Config, execCtx *Executor, force, yes boo
 	return pkgUninstallWithRemovalSet(pkgName, cfg, execCtx, force, yes, logger, nil)
 }
 
+func installedDependents(pkgName string, cfg *Config, removing map[string]bool) []string {
+	hRoot := cfg.Values["HOKUTO_ROOT"]
+	if hRoot == "" {
+		hRoot = "/"
+	}
+
+	var dependents []string
+	dbRoot := filepath.Join(hRoot, "var", "db", "hokuto", "installed")
+	entries, err := os.ReadDir(dbRoot)
+	if err != nil {
+		return dependents
+	}
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		other := e.Name()
+		if other == pkgName || removing[other] {
+			continue
+		}
+		depFile := filepath.Join(dbRoot, other, "depends")
+		b, err := readFileAsRoot(depFile)
+		if err != nil {
+			continue
+		}
+		deps, err := parseDependsData(b)
+		if err != nil {
+			continue
+		}
+		for _, dep := range deps {
+			if dep.Name == pkgName {
+				dependents = append(dependents, other)
+				break
+			}
+			found := false
+			for _, alt := range dep.Alternatives {
+				if alt == pkgName {
+					dependents = append(dependents, other)
+					found = true
+					break
+				}
+			}
+			if found {
+				break
+			}
+		}
+	}
+	sort.Strings(dependents)
+	return dependents
+}
+
 func pkgUninstallWithRemovalSet(pkgName string, cfg *Config, execCtx *Executor, force, yes bool, logger io.Writer, removing map[string]bool) error {
 	if logger == nil {
 		logger = os.Stdout
@@ -122,41 +173,7 @@ func pkgUninstallWithRemovalSet(pkgName string, cfg *Config, execCtx *Executor, 
 	}
 
 	// 4. Check reverse dependencies (unchanged)
-	// ... (Original Step 4 code) ...
-	dependents := []string{}
-	dbRoot := filepath.Join(hRoot, "var", "db", "hokuto", "installed")
-	entries, err := os.ReadDir(dbRoot)
-	if err == nil {
-		for _, e := range entries {
-			if !e.IsDir() {
-				continue
-			}
-			other := e.Name()
-			if other == pkgName {
-				continue
-			}
-			depFile := filepath.Join(dbRoot, other, "depends")
-			b, err := readFileAsRoot(depFile)
-			if err != nil {
-				continue
-			}
-			lines := strings.Split(string(b), "\n")
-			for _, L := range lines {
-				L = strings.TrimSpace(L)
-				if L == "" {
-					continue
-				}
-				parts := strings.Fields(L)
-				if len(parts) == 0 {
-					continue
-				}
-				if parts[0] == pkgName {
-					dependents = append(dependents, other)
-					break
-				}
-			}
-		}
-	}
+	dependents := installedDependents(pkgName, cfg, removing)
 	if len(dependents) > 0 && !force {
 		return fmt.Errorf("cannot uninstall %s: other packages depend on it: %s", pkgName, strings.Join(dependents, ", "))
 	}

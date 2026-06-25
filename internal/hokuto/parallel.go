@@ -48,6 +48,11 @@ type buildResult struct {
 	skipped  bool
 }
 
+type binaryPlanDependency struct {
+	Name string
+	Make bool
+}
+
 // RunParallelBuilds executes the build plan in parallel
 func RunParallelBuilds(plan *BuildPlan, cfg *Config, maxJobs int, userRequestedMap map[string]bool, autoYes bool, customBuilder func(string, *Config, *Executor, BuildOptions) (time.Duration, error)) error {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -214,6 +219,83 @@ func RunParallelBuilds(plan *BuildPlan, cfg *Config, maxJobs int, userRequestedM
 	}
 
 	return nil
+}
+
+func collectAvailableBinaryDependenciesForPlan(plan *BuildPlan, cfg *Config, noRemote bool) []binaryPlanDependency {
+	if plan == nil || plan.NoDeps {
+		return nil
+	}
+
+	inPlan := make(map[string]bool, len(plan.Order))
+	for _, pkgName := range plan.Order {
+		inPlan[pkgName] = true
+	}
+
+	seen := make(map[string]bool)
+	var depsToInstall []binaryPlanDependency
+	for _, pkgName := range plan.Order {
+		pkgDir, err := findPackageDir(pkgName)
+		if err != nil {
+			continue
+		}
+		deps, err := parseDependsFile(pkgDir)
+		if err != nil {
+			continue
+		}
+
+		for _, dep := range deps {
+			if !activeBuildDependency(dep, cfg, false) {
+				continue
+			}
+
+			candidates := []string{dep.Name}
+			if len(dep.Alternatives) > 0 {
+				candidates = dep.Alternatives
+			}
+
+			for _, cand := range candidates {
+				if shouldSkipMultilibMakeDep(dep, cand, cfg) {
+					continue
+				}
+				if seen[cand] || inPlan[cand] || isPackageInstalled(cand) {
+					continue
+				}
+				if !dependencyBinaryAvailable(cand, cfg, noRemote) {
+					continue
+				}
+				seen[cand] = true
+				depsToInstall = append(depsToInstall, binaryPlanDependency{Name: cand, Make: dep.Make})
+				break
+			}
+		}
+	}
+	return depsToInstall
+}
+
+func installAvailableBinaryDependenciesForPlan(plan *BuildPlan, cfg *Config, noRemote bool) ([]string, error) {
+	depsToInstall := collectAvailableBinaryDependenciesForPlan(plan, cfg, noRemote)
+	if len(depsToInstall) == 0 {
+		return nil, nil
+	}
+
+	var installed []string
+	for _, dep := range depsToInstall {
+		colArrow.Print("-> ")
+		colSuccess.Printf("Installing available binary dependency:")
+		colNote.Printf(" %s\n", dep.Name)
+		ok, err := ensurePackageInstalled(dep.Name, cfg, noRemote)
+		if err != nil {
+			return installed, fmt.Errorf("failed to install binary dependency %s: %w", dep.Name, err)
+		}
+		if !ok {
+			continue
+		}
+		installed = append(installed, dep.Name)
+		if dep.Make {
+			addToWorldMake(dep.Name)
+		}
+	}
+	return installed, nil
 }
 
 func (pm *ParallelManager) isInteractive(pkgName string) bool {
@@ -559,6 +641,9 @@ func (pm *ParallelManager) canBuild(pkgName string) bool {
 	}
 
 	for _, dep := range deps {
+		if dep.RuntimeOnly || dep.Suggest {
+			continue
+		}
 		if dep.Optional {
 			continue
 		}

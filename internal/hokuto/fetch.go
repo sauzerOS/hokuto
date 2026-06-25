@@ -78,26 +78,279 @@ func simpleHTTPClient() *http.Client {
 	return &http.Client{Timeout: 30 * time.Second}
 }
 
-func checkoutGoGitRef(repo *gogit.Repository, ref string) error {
+type goGitRefCandidate struct {
+	revision plumbing.Revision
+	remote   plumbing.ReferenceName
+	local    plumbing.ReferenceName
+}
+
+func normalizeGitSourceRef(ref string) (string, string) {
+	ref = strings.TrimSpace(ref)
+	for _, prefix := range []string{"tag=", "branch=", "revision=", "rev=", "commit=", "ref="} {
+		if strings.HasPrefix(ref, prefix) {
+			return strings.TrimSuffix(prefix, "="), strings.TrimSpace(strings.TrimPrefix(ref, prefix))
+		}
+	}
+	return "", ref
+}
+
+func goGitRefCandidates(ref string) []goGitRefCandidate {
+	kind, cleanRef := normalizeGitSourceRef(ref)
+	if cleanRef == "" {
+		return nil
+	}
+
+	add := func(candidates *[]goGitRefCandidate, revision, remote, local string) {
+		candidate := goGitRefCandidate{
+			revision: plumbing.Revision(revision),
+			remote:   plumbing.ReferenceName(remote),
+			local:    plumbing.ReferenceName(local),
+		}
+		for _, existing := range *candidates {
+			if existing.revision == candidate.revision && existing.remote == candidate.remote && existing.local == candidate.local {
+				return
+			}
+		}
+		*candidates = append(*candidates, candidate)
+	}
+
+	var candidates []goGitRefCandidate
+	remoteRef := strings.TrimPrefix(cleanRef, "origin/")
+	switch kind {
+	case "tag":
+		tagName := strings.TrimPrefix(cleanRef, "refs/tags/")
+		add(&candidates, "refs/tags/"+tagName, "refs/tags/"+tagName, "refs/tags/"+tagName)
+	case "branch":
+		branchName := strings.TrimPrefix(remoteRef, "refs/heads/")
+		add(&candidates, "refs/remotes/origin/"+branchName, "refs/heads/"+branchName, "refs/remotes/origin/"+branchName)
+		add(&candidates, "refs/heads/"+branchName, "refs/heads/"+branchName, "refs/remotes/origin/"+branchName)
+	default:
+		if strings.HasPrefix(cleanRef, "refs/tags/") {
+			add(&candidates, cleanRef, cleanRef, cleanRef)
+		} else if strings.HasPrefix(cleanRef, "refs/heads/") {
+			branchName := strings.TrimPrefix(cleanRef, "refs/heads/")
+			add(&candidates, "refs/remotes/origin/"+branchName, cleanRef, "refs/remotes/origin/"+branchName)
+			add(&candidates, cleanRef, cleanRef, "refs/remotes/origin/"+branchName)
+		} else {
+			add(&candidates, "refs/remotes/origin/"+remoteRef, "refs/heads/"+remoteRef, "refs/remotes/origin/"+remoteRef)
+			add(&candidates, "refs/remotes/"+cleanRef, "refs/heads/"+remoteRef, "refs/remotes/"+cleanRef)
+			add(&candidates, "refs/heads/"+cleanRef, "refs/heads/"+remoteRef, "refs/remotes/origin/"+remoteRef)
+			add(&candidates, "refs/tags/"+cleanRef, "refs/tags/"+cleanRef, "refs/tags/"+cleanRef)
+			add(&candidates, cleanRef, cleanRef, cleanRef)
+		}
+	}
+	return candidates
+}
+
+func fetchGoGitRef(repo *gogit.Repository, ref string, quiet bool) error {
+	candidates := goGitRefCandidates(ref)
+	if len(candidates) == 0 {
+		return nil
+	}
+
+	var lastErr error
+	for _, candidate := range candidates {
+		fetchOpts := &gogit.FetchOptions{
+			RemoteName: "origin",
+			RefSpecs: []gogitconfig.RefSpec{
+				gogitconfig.RefSpec("+" + candidate.remote.String() + ":" + candidate.local.String()),
+			},
+			Tags: gogit.AllTags,
+		}
+		if !quiet || Debug {
+			fetchOpts.Progress = os.Stderr
+		}
+		if err := repo.Fetch(fetchOpts); err != nil && err != gogit.NoErrAlreadyUpToDate {
+			lastErr = err
+			debugf("go-git fetch refspec %s failed: %v\n", fetchOpts.RefSpecs[0], err)
+			continue
+		}
+		return nil
+	}
+	if tagRef, err := findGoGitSuffixTagRef(repo, ref); err == nil {
+		fetchOpts := &gogit.FetchOptions{
+			RemoteName: "origin",
+			RefSpecs: []gogitconfig.RefSpec{
+				gogitconfig.RefSpec("+" + tagRef.String() + ":" + tagRef.String()),
+			},
+			Tags: gogit.AllTags,
+		}
+		if !quiet || Debug {
+			fetchOpts.Progress = os.Stderr
+		}
+		if err := repo.Fetch(fetchOpts); err == nil || err == gogit.NoErrAlreadyUpToDate {
+			debugf("go-git resolved %s via matching remote tag %s\n", ref, tagRef.Short())
+			return nil
+		} else {
+			lastErr = err
+			debugf("go-git fetch matching tag %s failed: %v\n", tagRef, err)
+		}
+	}
+	if lastErr != nil {
+		return lastErr
+	}
+	return plumbing.ErrReferenceNotFound
+}
+
+func findGoGitSuffixTagRef(repo *gogit.Repository, ref string) (plumbing.ReferenceName, error) {
+	kind, cleanRef := normalizeGitSourceRef(ref)
+	if kind != "" && kind != "tag" {
+		return "", plumbing.ErrReferenceNotFound
+	}
+	if cleanRef == "" || strings.HasPrefix(cleanRef, "refs/") {
+		return "", plumbing.ErrReferenceNotFound
+	}
+
+	remote, err := repo.Remote("origin")
+	if err != nil {
+		return "", err
+	}
+	remoteRefs, err := remote.List(&gogit.ListOptions{})
+	if err != nil {
+		return "", err
+	}
+
+	return matchGoGitSuffixTagRef(cleanRef, remoteRefs)
+}
+
+func matchGoGitSuffixTagRef(cleanRef string, remoteRefs []*plumbing.Reference) (plumbing.ReferenceName, error) {
+	suffix := "-" + cleanRef
+	var match plumbing.ReferenceName
+	for _, remoteRef := range remoteRefs {
+		name := remoteRef.Name()
+		if !name.IsTag() {
+			continue
+		}
+		shortName := name.Short()
+		if shortName != cleanRef && !strings.HasSuffix(shortName, suffix) {
+			continue
+		}
+		if match != "" && match != name {
+			return "", fmt.Errorf("multiple remote tags match %s", cleanRef)
+		}
+		match = name
+	}
+	if match == "" {
+		return "", plumbing.ErrReferenceNotFound
+	}
+	return match, nil
+}
+
+func goGitTagCommitHash(repo *gogit.Repository, ref *plumbing.Reference) (plumbing.Hash, bool) {
+	if commit, err := repo.CommitObject(ref.Hash()); err == nil {
+		return commit.Hash, true
+	}
+	if tag, err := repo.TagObject(ref.Hash()); err == nil {
+		if commit, err := tag.Commit(); err == nil {
+			return commit.Hash, true
+		}
+	}
+	return plumbing.ZeroHash, false
+}
+
+func goGitHeadTag(repo *gogit.Repository, requestedRef string, head plumbing.Hash) (string, bool) {
+	var exact []string
+	var suffix []string
+	var other []string
+	_, cleanRef := normalizeGitSourceRef(requestedRef)
+	suffixMatch := "-" + cleanRef
+
+	iter, err := repo.Tags()
+	if err != nil {
+		return "", false
+	}
+	_ = iter.ForEach(func(ref *plumbing.Reference) error {
+		commitHash, ok := goGitTagCommitHash(repo, ref)
+		if !ok || commitHash != head {
+			return nil
+		}
+		name := ref.Name().Short()
+		switch {
+		case name == cleanRef:
+			exact = append(exact, name)
+		case cleanRef != "" && strings.HasSuffix(name, suffixMatch):
+			suffix = append(suffix, name)
+		default:
+			other = append(other, name)
+		}
+		return nil
+	})
+
+	switch {
+	case len(exact) == 1:
+		return exact[0], true
+	case len(suffix) == 1:
+		return suffix[0], true
+	case len(exact)+len(suffix) == 0 && len(other) == 1:
+		return other[0], true
+	default:
+		return "", false
+	}
+}
+
+func goGitArchivalDescribeName(tagName string, commitHash plumbing.Hash) string {
+	return fmt.Sprintf("%s-0-g%s", tagName, commitHash.String()[:7])
+}
+
+func hydrateGoGitArchivalMetadata(repo *gogit.Repository, requestedRef, worktreePath string) {
+	archivalPath := filepath.Join(worktreePath, ".git_archival.txt")
+	if _, err := os.Stat(archivalPath); err != nil {
+		return
+	}
+
+	head, err := repo.Head()
+	if err != nil {
+		return
+	}
+	commit, err := repo.CommitObject(head.Hash())
+	if err != nil {
+		return
+	}
+	describeName, ok := goGitHeadTag(repo, requestedRef, commit.Hash)
+	if !ok {
+		debugf("Skipping .git_archival.txt hydration for %s: no unambiguous tag at HEAD\n", worktreePath)
+		return
+	}
+
+	describeName = goGitArchivalDescribeName(describeName, commit.Hash)
+	content := fmt.Sprintf("node: %s\nnode-date: %s\ndescribe-name: %s\n",
+		commit.Hash.String(),
+		commit.Committer.When.Format(time.RFC3339),
+		describeName,
+	)
+	if err := os.WriteFile(archivalPath, []byte(content), 0o644); err != nil {
+		debugf("Failed to hydrate .git_archival.txt for %s: %v\n", worktreePath, err)
+	}
+}
+
+func checkoutGoGitRef(repo *gogit.Repository, ref string, quiet bool) error {
 	if strings.TrimSpace(ref) == "" {
 		return nil
 	}
 
-	remoteRef := strings.TrimPrefix(ref, "origin/")
-	candidates := []plumbing.Revision{
-		plumbing.Revision("refs/remotes/origin/" + remoteRef),
-		plumbing.Revision("refs/remotes/" + ref),
-		plumbing.Revision("refs/heads/" + ref),
-		plumbing.Revision("refs/tags/" + ref),
-		plumbing.Revision(ref),
+	resolve := func() *plumbing.Hash {
+		for _, candidate := range goGitRefCandidates(ref) {
+			resolved, err := repo.ResolveRevision(candidate.revision)
+			if err == nil && resolved != nil {
+				return resolved
+			}
+		}
+		return nil
 	}
 
-	var hash *plumbing.Hash
-	for _, candidate := range candidates {
-		resolved, err := repo.ResolveRevision(candidate)
-		if err == nil && resolved != nil {
-			hash = resolved
-			break
+	hash := resolve()
+	if hash == nil {
+		if err := fetchGoGitRef(repo, ref, quiet); err == nil {
+			hash = resolve()
+			if hash == nil {
+				if tagRef, err := findGoGitSuffixTagRef(repo, ref); err == nil {
+					if resolved, err := repo.ResolveRevision(plumbing.Revision(tagRef)); err == nil && resolved != nil {
+						hash = resolved
+					}
+				}
+			}
+		} else {
+			debugf("go-git explicit ref fetch for %s failed: %v\n", ref, err)
 		}
 	}
 	if hash == nil {
@@ -118,7 +371,8 @@ func ensureGoGitCheckout(gitURL, ref, sharedPath string, quiet bool) error {
 	var repo *gogit.Repository
 	if _, err := os.Stat(sharedPath); os.IsNotExist(err) {
 		cloneOpts := &gogit.CloneOptions{
-			URL: gitURL,
+			URL:  gitURL,
+			Tags: gogit.AllTags,
 		}
 		if !quiet || Debug {
 			cloneOpts.Progress = os.Stderr
@@ -142,6 +396,7 @@ func ensureGoGitCheckout(gitURL, ref, sharedPath string, quiet bool) error {
 				"+refs/heads/*:refs/remotes/origin/*",
 				"+refs/tags/*:refs/tags/*",
 			},
+			Tags: gogit.AllTags,
 		}
 		if !quiet || Debug {
 			fetchOpts.Progress = os.Stderr
@@ -151,9 +406,10 @@ func ensureGoGitCheckout(gitURL, ref, sharedPath string, quiet bool) error {
 		}
 	}
 
-	if err := checkoutGoGitRef(repo, ref); err != nil {
+	if err := checkoutGoGitRef(repo, ref, quiet); err != nil {
 		return err
 	}
+	hydrateGoGitArchivalMetadata(repo, ref, sharedPath)
 	return nil
 }
 

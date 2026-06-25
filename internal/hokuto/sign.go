@@ -24,9 +24,14 @@ const officialPublicKeyHex = "b30f07098a4f98ec90bb169bdd49324d5e22fc09eab79e368e
 // It is a variable so it can be overwritten in tests.
 var DefaultKeyDir = "/etc/hokuto/keys"
 
-// detectMultilib checks if the staging directory contains multilib libraries
-// (checks for /usr/lib32 or /lib32 directories)
-func detectMultilib(stagingDir string) bool {
+// detectMultilib checks if an allow-listed package contains multilib libraries.
+// Most 32-bit payloads live in split lib32-* packages and should not force the
+// parent package to use a multi-* binary variant.
+func detectMultilib(pkgName, stagingDir string) bool {
+	if !isMultilibPackage(pkgName) {
+		return false
+	}
+
 	lib32Paths := []string{
 		filepath.Join(stagingDir, "usr/lib32"),
 		filepath.Join(stagingDir, "lib32"),

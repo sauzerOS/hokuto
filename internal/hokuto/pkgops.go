@@ -340,6 +340,17 @@ func generateLibDeps(outputDir, libdepsFile string, execCtx *Executor) error {
 		return false
 	}
 
+	elfABI := func(fileDesc string) string {
+		switch {
+		case strings.Contains(fileDesc, "ELF 32-bit"):
+			return "elf32"
+		case strings.Contains(fileDesc, "ELF 64-bit"):
+			return "elf64"
+		default:
+			return ""
+		}
+	}
+
 	// --- FIX: Use a privileged 'find' command to discover executable files ---
 	var findOutput bytes.Buffer
 	// Find files (-type f) with at least one executable bit set (-perm /111)
@@ -369,7 +380,13 @@ func generateLibDeps(outputDir, libdepsFile string, execCtx *Executor) error {
 	if err := execCtx.Run(findFilesCmd); err == nil {
 		scanner := bufio.NewScanner(bytes.NewReader(findFilesOutput.Bytes()))
 		for scanner.Scan() {
-			providedFiles[filepath.Base(scanner.Text())] = struct{}{}
+			path := scanner.Text()
+			base := filepath.Base(path)
+			if pathIs32BitLibrary(path) {
+				providedFiles["elf32:"+base] = struct{}{}
+			} else {
+				providedFiles["elf64:"+base] = struct{}{}
+			}
 		}
 	}
 
@@ -395,9 +412,11 @@ func generateLibDeps(outputDir, libdepsFile string, execCtx *Executor) error {
 				continue
 			}
 
-			if !strings.Contains(fileOut.String(), "ELF") {
+			fileDesc := fileOut.String()
+			if !strings.Contains(fileDesc, "ELF") {
 				continue
 			}
+			abi := elfABI(fileDesc)
 
 			// 2. Run readelf -d to find direct dependencies (must use a privileged executor)
 			readelfCmd := exec.Command("readelf", "-d", file)
@@ -422,9 +441,13 @@ func generateLibDeps(outputDir, libdepsFile string, execCtx *Executor) error {
 				if idxStart != -1 && idxEnd != -1 && idxEnd > idxStart {
 					libName := line[idxStart+1 : idxEnd]
 					// Filter out ignored patterns and libraries provided by this package
-					_, provided := providedFiles[libName]
+					_, provided := providedFiles[abi+":"+libName]
 					if !matchesIgnore(libName) && !provided {
-						libs = append(libs, libName)
+						if abi != "" {
+							libs = append(libs, abi+":"+libName)
+						} else {
+							libs = append(libs, libName)
+						}
 					}
 				}
 			}
@@ -495,6 +518,55 @@ func generateLibDeps(outputDir, libdepsFile string, execCtx *Executor) error {
 	return nil
 }
 
+type libDepRef struct {
+	ABI  string
+	Name string
+}
+
+func parseLibDepRef(line string) (libDepRef, bool) {
+	line = strings.TrimSpace(line)
+	if line == "" || strings.HasPrefix(line, "#") {
+		return libDepRef{}, false
+	}
+	if abi, name, ok := strings.Cut(line, ":"); ok && (abi == "elf32" || abi == "elf64") && name != "" {
+		return libDepRef{ABI: abi, Name: name}, true
+	}
+	return libDepRef{Name: line}, true
+}
+
+func pathIs32BitLibrary(path string) bool {
+	path = filepath.ToSlash(path)
+	return strings.Contains(path, "/lib32/") ||
+		strings.Contains(path, "/i686-w64-mingw32/") ||
+		strings.Contains(path, "/i686-unknown-linux-gnu/")
+}
+
+func libraryPathMatchesDep(path string, dep libDepRef) bool {
+	if dep.Name == "" {
+		return false
+	}
+
+	path = filepath.ToSlash(path)
+	depName := filepath.ToSlash(dep.Name)
+
+	if strings.HasPrefix(depName, "/") {
+		if path != depName {
+			return false
+		}
+	} else if filepath.Base(path) != depName {
+		return false
+	}
+
+	switch dep.ABI {
+	case "elf32":
+		return pathIs32BitLibrary(path)
+	case "elf64":
+		return !pathIs32BitLibrary(path)
+	default:
+		return true
+	}
+}
+
 func splitMetadataCandidates(pkgName, baseName string) []string {
 	names := []string{pkgName}
 	for _, prefix := range []string{"aarch64-", "x86_64-"} {
@@ -539,11 +611,38 @@ func generateDepends(pkgName, pkgDir, outputDir, rootDir string, execCtx *Execut
 	libDepSet := make(map[string]struct{})
 	// Track repo dependencies (from depends file, preserve full specs with version constraints)
 	repoDepLines := make(map[string]string) // package name -> full dependency line
+	suggestLines := make(map[string]string)
+	formatDepLine := func(name, op, ver string) string {
+		if op == "" {
+			return name
+		}
+		return name + op + ver
+	}
+	cleanManualDepName := func(name string) string {
+		if name == "19-binutils-2" {
+			return ""
+		}
+		switch name {
+		case "08-bash":
+			return "bash"
+		case "11-file":
+			return "file"
+		case "07-ncurses":
+			return "ncurses"
+		default:
+			return name
+		}
+	}
 
 	// --- Part 1: Process automatically detected library dependencies ---
 	libdepsFile := filepath.Join(installedDir, "libdeps")
 	if libdepsData, err := os.ReadFile(libdepsFile); err == nil {
-		libdeps := strings.Fields(string(libdepsData))
+		var libdeps []libDepRef
+		for _, line := range strings.Split(string(libdepsData), "\n") {
+			if dep, ok := parseLibDepRef(line); ok {
+				libdeps = append(libdeps, dep)
+			}
+		}
 		if len(libdeps) > 0 {
 			// Scan all installed packages for matching libs
 			dbRoot := filepath.Join(rootDir, "var", "db", "hokuto", "installed")
@@ -587,8 +686,7 @@ func generateDepends(pkgName, pkgDir, outputDir, rootDir string, execCtx *Execut
 						}
 						pathInManifest := fields[0]
 
-						// Now, check the suffix of the path, not the whole line.
-						if strings.HasSuffix(pathInManifest, lib) {
+						if libraryPathMatchesDep(pathInManifest, lib) {
 							libDepSet[otherPkg] = struct{}{}
 							break // Found the owner, move to the next library
 						}
@@ -607,41 +705,30 @@ func generateDepends(pkgName, pkgDir, outputDir, rootDir string, execCtx *Execut
 			line = strings.TrimSpace(line)
 			if line != "" && !strings.HasPrefix(line, "#") {
 				// Extract package name to use as key in the map
-				name, op, ver, optional, rebuild, makeDep, _, _ := parseDepToken(line)
+				name, op, ver, optional, rebuild, makeDep, _, _, runtimeOnly, suggest := parseDepToken(line)
 				if name != "" {
-					// Skip build-time only dependencies
-					if makeDep {
+					cleanName := cleanManualDepName(name)
+					if cleanName == "" {
+						continue
+					}
+					if cleanName != name {
+						name = cleanName
+						line = formatDepLine(name, op, ver)
+					}
+
+					if suggest {
+						suggestLines[name] = formatDepLine(name, op, ver)
 						continue
 					}
 
-					// Cleanup bootstrap names
-					if name == "19-binutils-2" {
+					// Skip non-runtime dependency hints. If an optional feature is
+					// actually linked, libdeps above will add the real runtime owner.
+					if makeDep || optional || rebuild {
 						continue
 					}
 
-					newName := ""
-					switch name {
-					case "08-bash":
-						newName = "bash"
-					case "11-file":
-						newName = "file"
-					case "07-ncurses":
-						newName = "ncurses"
-
-						if newName != "" {
-							// Rebuild the line with the new name but preserve everything else
-							line = newName
-							if op != "" {
-								line += op + ver
-							}
-							if optional {
-								line += " optional"
-							}
-							if rebuild {
-								line += " rebuild"
-							}
-							name = newName // update key for the map
-						}
+					if runtimeOnly {
+						line = formatDepLine(name, op, ver)
 					}
 
 					// Store the full line to preserve version constraints
@@ -685,6 +772,28 @@ func generateDepends(pkgName, pkgDir, outputDir, rootDir string, execCtx *Execut
 			}
 		}
 		deps = append(deps, dep)
+	}
+
+	if len(suggestLines) > 0 {
+		var suggestions []string
+		for _, line := range suggestLines {
+			suggestions = append(suggestions, line)
+		}
+		sort.Strings(suggestions)
+		suggestsFile := filepath.Join(installedDir, "suggests")
+		content := strings.Join(suggestions, "\n")
+		if os.Geteuid() == 0 {
+			if err := os.WriteFile(suggestsFile, []byte(content+"\n"), 0644); err != nil {
+				return fmt.Errorf("failed to write suggests file natively: %w", err)
+			}
+		} else {
+			cmd := exec.Command("tee", suggestsFile)
+			cmd.Stdin = strings.NewReader(content + "\n")
+			cmd.Stdout = io.Discard
+			if err := execCtx.Run(cmd); err != nil {
+				return fmt.Errorf("failed to write suggests file via tee: %w", err)
+			}
+		}
 	}
 
 	// If no dependencies at all, exit early
