@@ -436,6 +436,10 @@ func (pm *ParallelManager) Run() error {
 							triggerSet[t] = true
 						}
 					}
+					for _, parent := range pm.readyOptionalRebuildsLocked() {
+						rebuilds = append(rebuilds, parent)
+						triggerSet[parent] = true
+					}
 					// Add triggers returned by installer (e.g. library updates, filesystem triggers)
 					if len(installResult.Rebuilds) > 0 {
 						rebuilds = append(rebuilds, installResult.Rebuilds...)
@@ -641,6 +645,35 @@ func (pm *ParallelManager) installPackage(pkgName string, userRequestedMap map[s
 	}
 
 	return result, err
+}
+
+func (pm *ParallelManager) readyOptionalRebuildsLocked() []string {
+	if len(pm.BuildPlan.PostRebuilds) == 0 {
+		return nil
+	}
+
+	var rebuilds []string
+	for parent, deps := range pm.BuildPlan.PostRebuilds {
+		if !pm.Completed[parent] {
+			continue
+		}
+
+		allAvailable := true
+		for _, dep := range deps {
+			if !pm.Available[dep] && !pm.Completed[dep] && !isPackageInstalled(dep) {
+				allAvailable = false
+				break
+			}
+		}
+		if !allAvailable {
+			continue
+		}
+
+		rebuilds = append(rebuilds, parent)
+		delete(pm.BuildPlan.PostRebuilds, parent)
+	}
+	sort.Strings(rebuilds)
+	return rebuilds
 }
 
 func (pm *ParallelManager) canBuild(pkgName string) bool {
