@@ -23,17 +23,19 @@ type ParallelManager struct {
 	AutoYes   bool
 
 	// State
-	mu              sync.Mutex
-	Pending         []string
-	pendingRebuilds []string
-	Running         map[string]time.Time // Package name -> Start time
-	Completed       map[string]bool      // Package name -> true
-	Failed          map[string]error
-	LogFiles        map[string]*os.File
+	mu                sync.Mutex
+	Pending           []string
+	pendingRebuilds   []string
+	Running           map[string]time.Time // Package name -> Start time
+	Completed         map[string]bool      // Package name -> true
+	Available         map[string]bool      // Installed/provided package names, including split outputs
+	Failed            map[string]error
+	LogFiles          map[string]*os.File
+	SplitDepsBySource map[string][]string
 
 	// Dep injection for testing
 	Builder   func(string, *Config, *Executor, BuildOptions) (time.Duration, error)
-	Installer func(string, io.Writer) ([]string, error)
+	Installer func(string, io.Writer) (parallelInstallResult, error)
 
 	// Channels
 	resultChan  chan buildResult
@@ -53,34 +55,41 @@ type binaryPlanDependency struct {
 	Make bool
 }
 
+type parallelInstallResult struct {
+	Rebuilds  []string
+	Available []string
+}
+
 // RunParallelBuilds executes the build plan in parallel
-func RunParallelBuilds(plan *BuildPlan, cfg *Config, maxJobs int, userRequestedMap map[string]bool, autoYes bool, customBuilder func(string, *Config, *Executor, BuildOptions) (time.Duration, error)) error {
+func RunParallelBuilds(plan *BuildPlan, cfg *Config, maxJobs int, userRequestedMap map[string]bool, autoYes bool, splitDepsBySource map[string][]string, customBuilder func(string, *Config, *Executor, BuildOptions) (time.Duration, error)) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	pm := &ParallelManager{
-		MaxJobs:     maxJobs,
-		Config:      cfg,
-		BuildPlan:   plan,
-		Context:     ctx,
-		Cancel:      cancel,
-		Pending:     make([]string, len(plan.Order)),
-		Running:     make(map[string]time.Time),
-		Completed:   make(map[string]bool),
-		Failed:      make(map[string]error),
-		LogFiles:    make(map[string]*os.File),
-		resultChan:  make(chan buildResult, maxJobs),
-		promptPause: make(chan bool),
-		promptAck:   make(chan struct{}),
-		Builder:     pkgBuild,
-		AutoYes:     autoYes,
+		MaxJobs:           maxJobs,
+		Config:            cfg,
+		BuildPlan:         plan,
+		Context:           ctx,
+		Cancel:            cancel,
+		Pending:           make([]string, len(plan.Order)),
+		Running:           make(map[string]time.Time),
+		Completed:         make(map[string]bool),
+		Available:         make(map[string]bool),
+		Failed:            make(map[string]error),
+		LogFiles:          make(map[string]*os.File),
+		SplitDepsBySource: splitDepsBySource,
+		resultChan:        make(chan buildResult, maxJobs),
+		promptPause:       make(chan bool),
+		promptAck:         make(chan struct{}),
+		Builder:           pkgBuild,
+		AutoYes:           autoYes,
 	}
 
 	if customBuilder != nil {
 		pm.Builder = customBuilder
 	}
 
-	pm.Installer = func(pkg string, logger io.Writer) ([]string, error) {
+	pm.Installer = func(pkg string, logger io.Writer) (parallelInstallResult, error) {
 		return pm.installPackage(pkg, userRequestedMap, logger)
 	}
 	copy(pm.Pending, plan.Order)
@@ -173,7 +182,7 @@ func RunParallelBuilds(plan *BuildPlan, cfg *Config, maxJobs int, userRequestedM
 							if _, f := pm.Failed[cand]; f {
 								failedDep = cand
 							}
-							if pm.Completed[cand] || isPackageInstalled(cand) {
+							if pm.Available[cand] || pm.Completed[cand] || isPackageInstalled(cand) {
 								satisfied = true
 								break
 							}
@@ -383,12 +392,12 @@ func (pm *ParallelManager) Run() error {
 				// and process prompts (which call back to UI loop).
 				pm.mu.Unlock()
 				var installErr error
-				var derivedRebuilds []string
+				installResult := parallelInstallResult{Available: []string{res.pkgName}}
 				if pm.isInteractive(res.pkgName) {
 					WithPrompt(func() {
 						UserExec.Interactive = true
 						RootExec.Interactive = true
-						derivedRebuilds, installErr = pm.Installer(res.pkgName, logger)
+						installResult, installErr = pm.Installer(res.pkgName, logger)
 						UserExec.Interactive = false
 						RootExec.Interactive = false
 					})
@@ -397,10 +406,10 @@ func (pm *ParallelManager) Run() error {
 					// Wrap in WithPrompt to pause the UI status line so modified-file
 					// prompts are visible and the user can respond.
 					WithPrompt(func() {
-						derivedRebuilds, installErr = pm.Installer(res.pkgName, logger)
+						installResult, installErr = pm.Installer(res.pkgName, logger)
 					})
 				} else {
-					derivedRebuilds, installErr = pm.Installer(res.pkgName, logger)
+					installResult, installErr = pm.Installer(res.pkgName, logger)
 				}
 				pm.mu.Lock()
 
@@ -409,6 +418,12 @@ func (pm *ParallelManager) Run() error {
 					// failed = true
 				} else {
 					pm.Completed[res.pkgName] = true
+					if len(installResult.Available) == 0 {
+						installResult.Available = []string{res.pkgName}
+					}
+					for _, availablePkg := range installResult.Available {
+						pm.Available[availablePkg] = true
+					}
 
 					// 3. Dynamic Task Addition (Post-Build Rebuilds & Triggers)
 					var rebuilds []string
@@ -422,8 +437,8 @@ func (pm *ParallelManager) Run() error {
 						}
 					}
 					// Add triggers returned by installer (e.g. library updates, filesystem triggers)
-					if len(derivedRebuilds) > 0 {
-						rebuilds = append(rebuilds, derivedRebuilds...)
+					if len(installResult.Rebuilds) > 0 {
+						rebuilds = append(rebuilds, installResult.Rebuilds...)
 					}
 
 					// Identify which ones are filesystem triggers (e.g. DKMS) to ensure force-rebuild
@@ -562,10 +577,11 @@ func (pm *ParallelManager) Run() error {
 	return nil
 }
 
-func (pm *ParallelManager) installPackage(pkgName string, userRequestedMap map[string]bool, logger io.Writer) ([]string, error) {
+func (pm *ParallelManager) installPackage(pkgName string, userRequestedMap map[string]bool, logger io.Writer) (parallelInstallResult, error) {
+	result := parallelInstallResult{Available: []string{pkgName}}
 	version, revision, err := getRepoVersion2(pkgName)
 	if err != nil {
-		return nil, err
+		return result, err
 	}
 
 	outputPkgName := getOutputPackageName(pkgName, pm.Config)
@@ -598,7 +614,7 @@ func (pm *ParallelManager) installPackage(pkgName string, userRequestedMap map[s
 			if userRequestedMap[pkgName] {
 				addToWorld(pkgName)
 			}
-			return nil, nil
+			return result, nil
 		}
 	}
 
@@ -611,9 +627,20 @@ func (pm *ParallelManager) installPackage(pkgName string, userRequestedMap map[s
 		if userRequestedMap[pkgName] {
 			addToWorld(pkgName)
 		}
+
+		for _, splitPkg := range pm.SplitDepsBySource[pkgName] {
+			if err := installBuiltSplitDependency(pkgName, splitPkg, pm.Config); err != nil {
+				return result, fmt.Errorf("split dependency install failed for %s: %w", splitPkg, err)
+			}
+			if logger != nil {
+				fmt.Fprintf(logger, "Installing split dependency: %s\n", splitPkg)
+			}
+			result.Available = append(result.Available, splitPkg)
+		}
+		result.Rebuilds = rebuilds
 	}
 
-	return rebuilds, err
+	return result, err
 }
 
 func (pm *ParallelManager) canBuild(pkgName string) bool {
@@ -700,7 +727,7 @@ func (pm *ParallelManager) canBuild(pkgName string) bool {
 			}
 
 			// 1. Check if completed in this run
-			if pm.Completed[cand] {
+			if pm.Available[cand] || pm.Completed[cand] {
 				satisfied = true
 				break
 			}

@@ -552,7 +552,7 @@ func Main() {
 		var yes = installCmd.Bool("y", false, "Assume 'yes' to all prompts and overwrite modified files.")
 		var yesLong = installCmd.Bool("yes", false, "Assume 'yes' to all prompts and overwrite modified files.")
 		var force = installCmd.Bool("force", false, "Install even if package is already installed.")
-		var nodeps = installCmd.Bool("nodeps", false, "Ignore dependencies.")
+		var noDeps = installCmd.Bool("no-deps", false, "Ignore dependencies.")
 		var genericFlag = installCmd.Bool("generic", false, "Install the generic variant of the package.")
 		var genericShortFlag = installCmd.Bool("g", false, "Install the generic variant of the package.")
 		var arm64Flag = installCmd.Bool("arm64", false, "Install arm64 version of the package.")
@@ -655,8 +655,8 @@ func Main() {
 			// Keep package name as-is, but will use multi variant in filename if multilib is enabled
 			userRequestedMap[pkgName] = true
 
-			if *nodeps {
-				// Bypass dependency resolution if -nodeps is set
+			if *noDeps {
+				// Bypass dependency resolution if --no-deps is set
 				// But still need to add the package itself if not installed, or if force is used
 				if !checkPackageExactMatch(pkgName) || *force {
 					installPlan = append(installPlan, pkgName)
@@ -1231,7 +1231,23 @@ func Main() {
 		}
 
 	case "unmanaged":
-		if err := handleUnmanagedCommand(cfg); err != nil {
+		unmanagedCmd := flag.NewFlagSet("unmanaged", flag.ExitOnError)
+		var extraPaths stringListFlag
+		checkChecksums := unmanagedCmd.Bool("checksums", false, "Also check installed manifest checksums and include modified files.")
+		backupPath := unmanagedCmd.String("backup", "", "Create a tar.zst backup archive from selected files.")
+		restorePath := unmanagedCmd.String("restore", "", "Restore selected files from a tar.zst backup archive.")
+		unmanagedCmd.Var(&extraPaths, "add", "Add a file or directory to the backup selection. Can be repeated.")
+		if err := unmanagedCmd.Parse(os.Args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, "Error:", err)
+			os.Exit(1)
+		}
+		opts := unmanagedOptions{
+			CheckChecksums: *checkChecksums,
+			BackupPath:     *backupPath,
+			RestorePath:    *restorePath,
+			ExtraPaths:     []string(extraPaths),
+		}
+		if err := handleUnmanagedCommand(cfg, opts); err != nil {
 			fmt.Fprintln(os.Stderr, "Error:", err)
 			os.Exit(1)
 		}

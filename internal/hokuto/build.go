@@ -2855,7 +2855,7 @@ func handleBuildCommand(args []string, cfg *Config) error {
 	var orderedBuild = buildCmd.Bool("ordered", false, "Force build order based on the target package's depends file.")
 	var genericBuild = buildCmd.Bool("generic", false, "Use _GEN flags and store packages in generic subfolder")
 	var crossArch = buildCmd.String("cross", "", "Enable cross-compilation for target architecture (e.g., arm64)")
-	var noDeps = buildCmd.Bool("nodeps", false, "Skip dependency checking and build only the specified package(s)")
+	var noDeps = buildCmd.Bool("no-deps", false, "Skip dependency checking and build only the specified package(s)")
 	var noDevel = buildCmd.Bool("no-devel", false, "Skip automatic base-devel dependency installation")
 	var noRemote = buildCmd.Bool("no-remote", false, "Do not use the remote binary mirror for build dependency resolution or installs")
 	var parallel = buildCmd.Int("j", 1, "Number of parallel jobs (default: 1)")
@@ -3293,9 +3293,9 @@ func handleBuildCommand(args []string, cfg *Config) error {
 		binaryDeclined := make(map[string]bool)
 
 		if *noDeps {
-			// Skip dependency resolution when --nodeps is set
+			// Skip dependency resolution when --no-deps is set
 			colArrow.Print("-> ")
-			colWarn.Println("Skipping dependency checking (--nodeps enabled)")
+			colWarn.Println("Skipping dependency checking (--no-deps enabled)")
 			packagesThatMustBeBuilt = make(map[string]bool)
 			for pkg := range userRequestedMap {
 				packagesThatMustBeBuilt[pkg] = true
@@ -3654,7 +3654,7 @@ func handleBuildCommand(args []string, cfg *Config) error {
 				for _, dep := range installedBinaryDeps {
 					addTemporaryBuildDep(dep)
 				}
-				if err := RunParallelBuilds(initialPlan, cfg, maxJobs, userRequestedMap, true, smartBuildBuilder); err != nil {
+				if err := RunParallelBuilds(initialPlan, cfg, maxJobs, userRequestedMap, true, splitDepsBySource, smartBuildBuilder); err != nil {
 					return err
 				}
 

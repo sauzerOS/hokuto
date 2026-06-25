@@ -1028,7 +1028,7 @@ func checkForUpgrades(_ context.Context, cfg *Config, maxJobs int, yes bool) err
 		if _, err := installAvailableBinaryDependenciesForPlan(updatePlan, cfg, false); err != nil {
 			return err
 		}
-		if err := RunParallelBuilds(updatePlan, cfg, maxJobs, userRequestedMap, yes, smartBuilder); err != nil {
+		if err := RunParallelBuilds(updatePlan, cfg, maxJobs, userRequestedMap, yes, nil, smartBuilder); err != nil {
 			return err
 		}
 

@@ -1,15 +1,52 @@
 package hokuto
 
 import (
+	"archive/tar"
 	"bufio"
+	"bytes"
 	"fmt"
+	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"sort"
 	"strings"
 	"sync"
+
+	"github.com/gdamore/tcell/v2"
+	"github.com/klauspost/compress/zstd"
+	"github.com/rivo/tview"
+	"golang.org/x/term"
 )
+
+type stringListFlag []string
+
+func (f *stringListFlag) String() string {
+	return strings.Join(*f, ",")
+}
+
+func (f *stringListFlag) Set(value string) error {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil
+	}
+	*f = append(*f, value)
+	return nil
+}
+
+type unmanagedOptions struct {
+	CheckChecksums bool
+	BackupPath     string
+	RestorePath    string
+	ExtraPaths     []string
+}
+
+type unmanagedEntry struct {
+	Path   string
+	Reason string
+	Size   int64
+}
 
 func normalizeTrackedPath(root, path string) (string, bool) {
 	path = strings.TrimSpace(path)
@@ -22,6 +59,18 @@ func normalizeTrackedPath(root, path string) (string, bool) {
 		return clean, true
 	}
 	return "", false
+}
+
+func manifestLineChecksum(line string) string {
+	line = strings.TrimSpace(line)
+	if line == "" || strings.HasSuffix(line, "/") {
+		return ""
+	}
+	idx := strings.LastIndexAny(line, " \t")
+	if idx == -1 {
+		return ""
+	}
+	return strings.TrimSpace(line[idx:])
 }
 
 func loadOwnedSystemFiles(root string) (map[string]struct{}, error) {
@@ -109,8 +158,8 @@ func collectOwnedManifestPaths(root, manifestPath string, owned map[string]struc
 	return nil
 }
 
-func scanUnmanagedSystemFiles(root string, owned map[string]struct{}) ([]string, error) {
-	var unmanaged []string
+func scanUnmanagedSystemFiles(root string, owned map[string]struct{}) ([]unmanagedEntry, error) {
+	var unmanaged []unmanagedEntry
 	for _, scanRoot := range []string{"etc", "usr"} {
 		absRoot := filepath.Join(root, scanRoot)
 		if _, err := os.Lstat(absRoot); err != nil {
@@ -139,7 +188,11 @@ func scanUnmanagedSystemFiles(root string, owned map[string]struct{}) ([]string,
 			trackedPath := "/" + filepath.ToSlash(rel)
 			canonicalPath := filepath.ToSlash(filepath.Clean(canonicalizePath(root, trackedPath)))
 			if _, ok := owned[canonicalPath]; !ok {
-				unmanaged = append(unmanaged, trackedPath)
+				size := int64(0)
+				if info, err := entry.Info(); err == nil {
+					size = info.Size()
+				}
+				unmanaged = append(unmanaged, unmanagedEntry{Path: trackedPath, Reason: "unmanaged", Size: size})
 			}
 			return nil
 		})
@@ -148,16 +201,525 @@ func scanUnmanagedSystemFiles(root string, owned map[string]struct{}) ([]string,
 		}
 	}
 
-	sort.Strings(unmanaged)
+	sortUnmanagedEntries(unmanaged)
 	return unmanaged, nil
 }
 
-func handleUnmanagedCommand(cfg *Config) error {
+func scanModifiedManifestFiles(root string) ([]unmanagedEntry, error) {
+	entries, err := os.ReadDir(Installed)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("failed to read installed package db: %w", err)
+	}
+
+	var modified []unmanagedEntry
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		manifestPath := filepath.Join(Installed, entry.Name(), "manifest")
+		file, err := os.Open(manifestPath)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return nil, fmt.Errorf("failed to open manifest %s: %w", manifestPath, err)
+		}
+
+		scanner := bufio.NewScanner(file)
+		buf := make([]byte, 0, 64*1024)
+		scanner.Buffer(buf, 1024*1024)
+		for scanner.Scan() {
+			line := scanner.Text()
+			manifestPath := parseManifestFilePath(line)
+			expected := manifestLineChecksum(line)
+			if manifestPath == "" || expected == "" || expected == "000000" {
+				continue
+			}
+			normalized, ok := normalizeTrackedPath(root, manifestPath)
+			if !ok {
+				continue
+			}
+			diskPath := manifestPathOnDisk(root, normalized)
+			info, err := os.Lstat(diskPath)
+			if err != nil || info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+				continue
+			}
+			got, err := ComputeChecksum(diskPath, UserExec)
+			if err != nil {
+				debugf("Skipping checksum comparison for %s: %v\n", normalized, err)
+				continue
+			}
+			if got != expected {
+				modified = append(modified, unmanagedEntry{Path: normalized, Reason: "modified:" + entry.Name(), Size: info.Size()})
+			}
+		}
+		if err := scanner.Err(); err != nil {
+			file.Close()
+			return nil, fmt.Errorf("failed to scan manifest %s: %w", manifestPath, err)
+		}
+		file.Close()
+	}
+
+	sortUnmanagedEntries(modified)
+	return modified, nil
+}
+
+func addExtraBackupPaths(root string, entries []unmanagedEntry, extraPaths []string) ([]unmanagedEntry, error) {
+	seen := make(map[string]bool, len(entries))
+	for _, entry := range entries {
+		seen[entry.Path] = true
+	}
+
+	for _, extra := range extraPaths {
+		extra = strings.TrimSpace(extra)
+		if extra == "" {
+			continue
+		}
+		abs := extra
+		if !filepath.IsAbs(abs) {
+			cwd, err := os.Getwd()
+			if err != nil {
+				return nil, err
+			}
+			abs = filepath.Join(cwd, abs)
+		}
+		if info, err := os.Lstat(abs); err != nil {
+			return nil, fmt.Errorf("failed to access extra path %s: %w", extra, err)
+		} else if !info.IsDir() {
+			entryPath, err := displayPathForDiskPath(root, abs)
+			if err != nil {
+				return nil, err
+			}
+			if !seen[entryPath] {
+				entries = append(entries, unmanagedEntry{Path: entryPath, Reason: "extra", Size: info.Size()})
+				seen[entryPath] = true
+			}
+			continue
+		}
+
+		err := filepath.WalkDir(abs, func(path string, entry os.DirEntry, err error) error {
+			if err != nil {
+				debugf("Skipping extra path %s: %v\n", path, err)
+				if entry != nil && entry.IsDir() {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			if entry.IsDir() {
+				return nil
+			}
+			entryPath, err := displayPathForDiskPath(root, path)
+			if err != nil {
+				return nil
+			}
+			if !seen[entryPath] {
+				size := int64(0)
+				if info, err := entry.Info(); err == nil {
+					size = info.Size()
+				}
+				entries = append(entries, unmanagedEntry{Path: entryPath, Reason: "extra", Size: size})
+				seen[entryPath] = true
+			}
+			return nil
+		})
+		if err != nil {
+			return nil, fmt.Errorf("failed to scan extra path %s: %w", extra, err)
+		}
+	}
+
+	sortUnmanagedEntries(entries)
+	return entries, nil
+}
+
+func displayPathForDiskPath(root, abs string) (string, error) {
+	abs = filepath.Clean(abs)
+	root = filepath.Clean(root)
+	if rel, err := filepath.Rel(root, abs); err == nil && rel != "." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator)) && rel != ".." {
+		return "/" + filepath.ToSlash(rel), nil
+	}
+	return filepath.ToSlash(abs), nil
+}
+
+func sortUnmanagedEntries(entries []unmanagedEntry) {
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].Path == entries[j].Path {
+			return entries[i].Reason < entries[j].Reason
+		}
+		return entries[i].Path < entries[j].Path
+	})
+}
+
+func unmanagedDisplayLines(entries []unmanagedEntry) []string {
+	lines := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if entry.Reason == "" || entry.Reason == "unmanaged" {
+			lines = append(lines, entry.Path)
+		} else {
+			lines = append(lines, fmt.Sprintf("%s  [%s]", entry.Path, entry.Reason))
+		}
+	}
+	return lines
+}
+
+func archiveNameForDisplayPath(path string) string {
+	return strings.TrimPrefix(filepath.ToSlash(filepath.Clean(path)), "/")
+}
+
+type commandReadCloser struct {
+	io.Reader
+	wait func() error
+}
+
+func (r *commandReadCloser) Close() error {
+	if r.wait == nil {
+		return nil
+	}
+	return r.wait()
+}
+
+func openBackupFile(path string) (io.ReadCloser, error) {
+	file, err := os.Open(path)
+	if err == nil {
+		return file, nil
+	}
+
+	if os.IsPermission(err) && os.Geteuid() != 0 {
+		if _, lookErr := exec.LookPath("run0"); lookErr != nil {
+			return nil, err
+		}
+		cmd := exec.Command("run0", "--pipe", "cat", path)
+		stdout, pipeErr := cmd.StdoutPipe()
+		if pipeErr != nil {
+			return nil, pipeErr
+		}
+		var stderr bytes.Buffer
+		cmd.Stderr = &stderr
+		if startErr := cmd.Start(); startErr != nil {
+			return nil, startErr
+		}
+		return &commandReadCloser{
+			Reader: stdout,
+			wait: func() error {
+				if waitErr := cmd.Wait(); waitErr != nil {
+					msg := strings.TrimSpace(stderr.String())
+					if msg != "" {
+						return fmt.Errorf("%w: %s", waitErr, msg)
+					}
+					return waitErr
+				}
+				return nil
+			},
+		}, nil
+	}
+
+	return nil, err
+}
+
+func writeBackupArchive(root, archivePath string, entries []unmanagedEntry) error {
+	if len(entries) == 0 {
+		return fmt.Errorf("no files selected")
+	}
+	if err := os.MkdirAll(filepath.Dir(archivePath), 0o755); err != nil && filepath.Dir(archivePath) != "." {
+		return err
+	}
+
+	out, err := os.Create(archivePath)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+
+	zw, err := zstd.NewWriter(out)
+	if err != nil {
+		return err
+	}
+	defer zw.Close()
+
+	tw := tar.NewWriter(zw)
+	defer tw.Close()
+
+	for _, entry := range entries {
+		diskPath := manifestPathOnDisk(root, entry.Path)
+		info, err := os.Lstat(diskPath)
+		if err != nil {
+			return fmt.Errorf("failed to stat %s: %w", entry.Path, err)
+		}
+
+		var link string
+		if info.Mode()&os.ModeSymlink != 0 {
+			link, err = os.Readlink(diskPath)
+			if err != nil {
+				return fmt.Errorf("failed to read symlink %s: %w", entry.Path, err)
+			}
+		}
+		header, err := tar.FileInfoHeader(info, link)
+		if err != nil {
+			return fmt.Errorf("failed to create archive header for %s: %w", entry.Path, err)
+		}
+		header.Name = archiveNameForDisplayPath(entry.Path)
+		if err := tw.WriteHeader(header); err != nil {
+			return fmt.Errorf("failed to write archive header for %s: %w", entry.Path, err)
+		}
+		if !info.Mode().IsRegular() {
+			continue
+		}
+		in, err := openBackupFile(diskPath)
+		if err != nil {
+			return fmt.Errorf("failed to open %s: %w", entry.Path, err)
+		}
+		if _, err := io.Copy(tw, in); err != nil {
+			in.Close()
+			return fmt.Errorf("failed to archive %s: %w", entry.Path, err)
+		}
+		if err := in.Close(); err != nil {
+			return fmt.Errorf("failed to archive %s: %w", entry.Path, err)
+		}
+	}
+
+	return nil
+}
+
+func listBackupArchive(archivePath string) ([]unmanagedEntry, error) {
+	f, err := os.Open(archivePath)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	zr, err := zstd.NewReader(f)
+	if err != nil {
+		return nil, err
+	}
+	defer zr.Close()
+
+	tr := tar.NewReader(zr)
+	var entries []unmanagedEntry
+	for {
+		header, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+		if header.FileInfo().IsDir() {
+			continue
+		}
+		clean := filepath.ToSlash(filepath.Clean(header.Name))
+		if clean == "." || strings.HasPrefix(clean, "../") || strings.HasPrefix(clean, "/") {
+			return nil, fmt.Errorf("unsafe archive path: %s", header.Name)
+		}
+		entries = append(entries, unmanagedEntry{Path: "/" + clean, Reason: "archive", Size: header.Size})
+	}
+	sortUnmanagedEntries(entries)
+	return entries, nil
+}
+
+func restoreBackupArchive(root, archivePath string, selected map[string]bool) error {
+	if len(selected) == 0 {
+		return fmt.Errorf("no files selected")
+	}
+
+	f, err := os.Open(archivePath)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	zr, err := zstd.NewReader(f)
+	if err != nil {
+		return err
+	}
+	defer zr.Close()
+
+	tr := tar.NewReader(zr)
+	for {
+		header, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return err
+		}
+		clean := filepath.ToSlash(filepath.Clean(header.Name))
+		displayPath := "/" + clean
+		if !selected[displayPath] {
+			continue
+		}
+		if clean == "." || strings.HasPrefix(clean, "../") || strings.HasPrefix(clean, "/") {
+			return fmt.Errorf("unsafe archive path: %s", header.Name)
+		}
+
+		dest := filepath.Join(root, filepath.FromSlash(clean))
+		if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
+			return err
+		}
+		mode := os.FileMode(header.Mode)
+		switch header.Typeflag {
+		case tar.TypeReg, tar.TypeRegA:
+			out, err := os.OpenFile(dest, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, mode.Perm())
+			if err != nil {
+				return fmt.Errorf("failed to restore %s: %w", displayPath, err)
+			}
+			if _, err := io.Copy(out, tr); err != nil {
+				out.Close()
+				return fmt.Errorf("failed to restore %s: %w", displayPath, err)
+			}
+			if err := out.Close(); err != nil {
+				return err
+			}
+			_ = os.Chmod(dest, mode.Perm())
+		case tar.TypeSymlink:
+			_ = os.Remove(dest)
+			if err := os.Symlink(header.Linkname, dest); err != nil {
+				return fmt.Errorf("failed to restore symlink %s: %w", displayPath, err)
+			}
+		default:
+			debugf("Skipping unsupported archive entry %s type %c\n", displayPath, header.Typeflag)
+		}
+	}
+	return nil
+}
+
+func selectUnmanagedEntries(title, footerText string, actionKey rune, entries []unmanagedEntry, action func([]unmanagedEntry) error) error {
+	if !term.IsTerminal(int(os.Stdout.Fd())) {
+		return fmt.Errorf("interactive selection requires a terminal")
+	}
+	if len(entries) == 0 {
+		return fmt.Errorf("no files available for selection")
+	}
+
+	selected := make([]bool, len(entries))
+	for i := range selected {
+		selected[i] = true
+	}
+
+	app := tview.NewApplication()
+	table := tview.NewTable().SetSelectable(true, false).SetFixed(0, 0)
+	table.SetBorder(true).SetTitle(" " + title + " ")
+
+	refreshRow := func(row int) {
+		mark := "[ ]"
+		if selected[row] {
+			mark = "[X]"
+		}
+		reason := entries[row].Reason
+		if reason == "" {
+			reason = "file"
+		}
+		size := humanReadableSize(entries[row].Size)
+		table.SetCell(row, 0, tview.NewTableCell(tview.Escape(mark)).SetTextColor(tcell.ColorGreen).SetExpansion(0))
+		table.SetCell(row, 1, tview.NewTableCell(entries[row].Path).SetTextColor(tcell.ColorWhite).SetExpansion(1))
+		table.SetCell(row, 2, tview.NewTableCell(size).SetTextColor(tcell.ColorYellow).SetExpansion(0).SetAlign(tview.AlignRight))
+		table.SetCell(row, 3, tview.NewTableCell(reason).SetTextColor(tcell.ColorGray).SetExpansion(0))
+	}
+	refresh := func() {
+		table.Clear()
+		for i := range entries {
+			refreshRow(i)
+		}
+	}
+	refresh()
+
+	status := tview.NewTextView().SetDynamicColors(true).SetTextAlign(tview.AlignCenter)
+	status.SetText(footerText)
+
+	var actionErr error
+	runAction := func() {
+		var chosen []unmanagedEntry
+		for i, ok := range selected {
+			if ok {
+				chosen = append(chosen, entries[i])
+			}
+		}
+		if err := action(chosen); err != nil {
+			actionErr = err
+			status.SetText("[red]" + err.Error())
+			return
+		}
+		app.Stop()
+	}
+
+	app.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		switch event.Key() {
+		case tcell.KeyEsc, tcell.KeyCtrlQ:
+			app.Stop()
+			return nil
+		case tcell.KeyRune:
+			switch event.Rune() {
+			case 'q':
+				app.Stop()
+				return nil
+			case ' ':
+				row, _ := table.GetSelection()
+				if row >= 0 && row < len(selected) {
+					selected[row] = !selected[row]
+					refreshRow(row)
+				}
+				return nil
+			case 'a':
+				for i := range selected {
+					selected[i] = true
+					refreshRow(i)
+				}
+				return nil
+			case 'n':
+				for i := range selected {
+					selected[i] = false
+					refreshRow(i)
+				}
+				return nil
+			case actionKey:
+				runAction()
+				return nil
+			}
+		}
+		return event
+	})
+
+	flex := tview.NewFlex().
+		SetDirection(tview.FlexRow).
+		AddItem(table, 0, 1, true).
+		AddItem(status, 1, 0, false)
+
+	if err := app.SetRoot(flex, true).SetFocus(table).Run(); err != nil {
+		return err
+	}
+	return actionErr
+}
+
+func handleUnmanagedCommand(cfg *Config, opts unmanagedOptions) error {
 	root := "/"
 	if cfg != nil && cfg.Values["HOKUTO_ROOT"] != "" {
 		root = cfg.Values["HOKUTO_ROOT"]
 	} else if rootDir != "" {
 		root = rootDir
+	}
+
+	if opts.BackupPath != "" && opts.RestorePath != "" {
+		return fmt.Errorf("--backup and --restore cannot be used together")
+	}
+
+	if opts.RestorePath != "" {
+		entries, err := listBackupArchive(opts.RestorePath)
+		if err != nil {
+			return err
+		}
+		return selectUnmanagedEntries("Restore Backup", "[gray]Space toggles, a selects all, n selects none, r restores, q quits.[white]", 'r', entries, func(chosen []unmanagedEntry) error {
+			selected := make(map[string]bool, len(chosen))
+			for _, entry := range chosen {
+				selected[entry.Path] = true
+			}
+			if err := restoreBackupArchive(root, opts.RestorePath, selected); err != nil {
+				return err
+			}
+			colArrow.Print("-> ")
+			colSuccess.Printf("Restored %d file(s) from %s\n", len(chosen), opts.RestorePath)
+			return nil
+		})
 	}
 
 	colArrow.Print("-> ")
@@ -169,16 +731,45 @@ func handleUnmanagedCommand(cfg *Config) error {
 
 	colArrow.Print("-> ")
 	colSuccess.Println("Scanning unmanaged files in /etc and /usr")
-	unmanaged, err := scanUnmanagedSystemFiles(root, owned)
+	entries, err := scanUnmanagedSystemFiles(root, owned)
 	if err != nil {
 		return err
 	}
 
-	if len(unmanaged) == 0 {
+	if opts.CheckChecksums {
+		colArrow.Print("-> ")
+		colSuccess.Println("Checking installed file checksums")
+		modified, err := scanModifiedManifestFiles(root)
+		if err != nil {
+			return err
+		}
+		entries = append(entries, modified...)
+		sortUnmanagedEntries(entries)
+	}
+
+	if len(opts.ExtraPaths) > 0 {
+		entries, err = addExtraBackupPaths(root, entries, opts.ExtraPaths)
+		if err != nil {
+			return err
+		}
+	}
+
+	if len(entries) == 0 {
 		colSuccess.Println("No unmanaged files found in /etc or /usr.")
 		return nil
 	}
 
-	colWarn.Printf("Found %d unmanaged file(s) in /etc and /usr.\n", len(unmanaged))
-	return RunPager("Unmanaged Files", unmanaged)
+	if opts.BackupPath != "" {
+		return selectUnmanagedEntries("Unmanaged Backup", "[gray]Space toggles, a selects all, n selects none, b backs up, q quits.[white]", 'b', entries, func(chosen []unmanagedEntry) error {
+			if err := writeBackupArchive(root, opts.BackupPath, chosen); err != nil {
+				return err
+			}
+			colArrow.Print("-> ")
+			colSuccess.Printf("Backed up %d file(s) to %s\n", len(chosen), opts.BackupPath)
+			return nil
+		})
+	}
+
+	colWarn.Printf("Found %d unmanaged/modified file(s) in /etc and /usr.\n", len(entries))
+	return RunPager("Unmanaged Files", unmanagedDisplayLines(entries))
 }
