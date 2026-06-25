@@ -36,6 +36,7 @@ var baseDevelPackages = []string{
 	"patch",
 	"pkgconf",
 	"sed",
+	"texinfo",
 	"which",
 }
 
