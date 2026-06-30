@@ -13,9 +13,26 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/gookit/color"
 )
+
+type packageSuggestion struct {
+	Package    string
+	Name       string
+	Op         string
+	Version    string
+	Dependency string
+	Text       string
+}
+
+var packageSuggestions = struct {
+	sync.Mutex
+	items map[string]map[string]packageSuggestion
+}{
+	items: make(map[string]map[string]packageSuggestion),
+}
 
 // getRebuildTriggers parses /etc/hokuto/hokuto.rebuild and returns packages that should
 // be rebuilt when the given trigger package is installed.
@@ -67,46 +84,149 @@ func getRebuildTriggers(triggerPkg string, rootDir string) []string {
 	return packagesToRebuild
 }
 
-func printPackageSuggestions(pkgName, rootDir string, logger io.Writer) {
-	if logger == nil {
-		logger = os.Stdout
-	}
-
+func readPackageSuggestions(pkgName, rootDir string) []packageSuggestion {
 	suggestsPath := filepath.Join(rootDir, "var", "db", "hokuto", "installed", pkgName, "suggests")
 	data, err := os.ReadFile(suggestsPath)
 	if err != nil {
 		data, err = readFileAsRoot(suggestsPath)
 		if err != nil {
-			return
+			return nil
 		}
 	}
 
-	var missing []string
+	var missing []packageSuggestion
 	for _, raw := range strings.Split(string(data), "\n") {
 		line := strings.TrimSpace(raw)
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
-		name, op, ver, _, _, _, _, _, _, _ := parseDepToken(line)
+		name, op, ver, _, _, _, _, _, _, _, suggestText := parseDepToken(line)
 		if name == "" || findInstalledSatisfying(name, op, ver) != "" {
 			continue
 		}
-		missing = append(missing, line)
+		dep := name
+		if op != "" {
+			dep += op + ver
+		}
+		missing = append(missing, packageSuggestion{
+			Package:    pkgName,
+			Name:       name,
+			Op:         op,
+			Version:    ver,
+			Dependency: dep,
+			Text:       suggestText,
+		})
 	}
+	return missing
+}
+
+func collectPackageSuggestions(pkgName, rootDir string) {
+	missing := readPackageSuggestions(pkgName, rootDir)
 	if len(missing) == 0 {
 		return
 	}
 
+	packageSuggestions.Lock()
+	defer packageSuggestions.Unlock()
+
+	for _, item := range missing {
+		if packageSuggestions.items[item.Package] == nil {
+			packageSuggestions.items[item.Package] = make(map[string]packageSuggestion)
+		}
+		key := item.Dependency + "\x00" + item.Text
+		packageSuggestions.items[item.Package][key] = item
+	}
+}
+
+func hasPackageSuggestions() bool {
+	packageSuggestions.Lock()
+	defer packageSuggestions.Unlock()
+	return len(packageSuggestions.items) > 0
+}
+
+func flushPackageSuggestions(logger io.Writer, cfg *Config, noRemote bool, promptInstall bool, autoYes bool) {
+	if logger == nil {
+		logger = os.Stdout
+	}
+
+	packageSuggestions.Lock()
+	items := packageSuggestions.items
+	packageSuggestions.items = make(map[string]map[string]packageSuggestion)
+	packageSuggestions.Unlock()
+
+	if len(items) == 0 {
+		return
+	}
+
+	var packages []string
+	for pkg := range items {
+		packages = append(packages, pkg)
+	}
+	sort.Strings(packages)
+
 	fmt.Fprint(logger, colArrow.Sprint("-> "))
-	fmt.Fprintln(logger, colSuccess.Sprintf("Optional runtime dependencies for %s:", pkgName))
-	for _, dep := range missing {
+	fmt.Fprintln(logger, colSuccess.Sprint("Suggested optional runtime dependencies:"))
+	var installPrompts []packageSuggestion
+	for _, pkg := range packages {
 		fmt.Fprint(logger, colArrow.Sprint("-> "))
-		fmt.Fprintln(logger, colNote.Sprint(dep))
+		fmt.Fprintln(logger, colNote.Sprintf("%s:", pkg))
+
+		var suggestions []packageSuggestion
+		for _, item := range items[pkg] {
+			suggestions = append(suggestions, item)
+		}
+		sort.Slice(suggestions, func(i, j int) bool {
+			if suggestions[i].Dependency == suggestions[j].Dependency {
+				return suggestions[i].Text < suggestions[j].Text
+			}
+			return suggestions[i].Dependency < suggestions[j].Dependency
+		})
+
+		for _, item := range suggestions {
+			fmt.Fprint(logger, colArrow.Sprint("-> "))
+			fmt.Fprint(logger, "  ")
+			fmt.Fprint(logger, colNote.Sprint(item.Dependency))
+			if item.Text != "" {
+				fmt.Fprintf(logger, " - %s", item.Text)
+			}
+			fmt.Fprintln(logger)
+			if promptInstall && cfg != nil {
+				installPrompts = append(installPrompts, item)
+			}
+		}
+	}
+
+	for _, item := range installPrompts {
+		if findInstalledSatisfying(item.Name, item.Op, item.Version) != "" {
+			continue
+		}
+
+		prompt := fmt.Sprintf("Install suggested dependency %s for %s?", colNote.Sprint(item.Dependency), colNote.Sprint(item.Package))
+		if item.Text != "" {
+			prompt = fmt.Sprintf("%s (%s)", prompt, item.Text)
+		}
+		if !autoYes && !askForConfirmation(colInfo, "%s%s", colArrow.Sprint("-> "), prompt) {
+			continue
+		}
+
+		fmt.Fprint(logger, colArrow.Sprint("-> "))
+		fmt.Fprint(logger, colSuccess.Sprint("Installing suggested dependency: "))
+		fmt.Fprintln(logger, colNote.Sprint(item.Name))
+		if _, err := ensurePackageInstalled(item.Name, cfg, noRemote); err != nil {
+			fmt.Fprintf(logger, "%s%s\n", colArrow.Sprint("-> "), colWarn.Sprintf("Warning: failed to install suggested dependency %s: %v", item.Name, err))
+		}
+	}
+
+	if promptInstall && cfg != nil && hasPackageSuggestions() {
+		flushPackageSuggestions(logger, cfg, noRemote, promptInstall, autoYes)
 	}
 }
 
 func installMissingPackageRuntimeDependencies(pkgName string, cfg *Config, logger io.Writer, quiet bool) error {
 	if cfg != nil && cfg.Values["HOKUTO_BOOTSTRAP"] == "1" {
+		return nil
+	}
+	if suppressRuntimeDependencyAutoInstall.Load() > 0 {
 		return nil
 	}
 
@@ -144,6 +264,9 @@ func installMissingPackageRuntimeDependencies(pkgName string, cfg *Config, logge
 			depName = resolved
 		}
 		if depName == "" || depName == pkgName || shouldSkipMultilibMakeDep(dep, depName, cfg) {
+			continue
+		}
+		if _, inProgress := runtimeDependencyInstallInProgress.Load(depName); inProgress {
 			continue
 		}
 		if findInstalledSatisfying(depName, dep.Op, dep.Version) != "" {
@@ -243,6 +366,7 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 			}
 		}
 
+		collectPackageSuggestions(pkgName, rootDir)
 		return nil, nil
 	}
 
@@ -1247,8 +1371,8 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 		if err := PostInstallTasks(RootExec, logger); err != nil {
 			fmt.Fprintf(os.Stderr, "post-install tasks completed with warnings: %v\n", err)
 		}
-		printPackageSuggestions(pkgName, rootDir, logger)
 	}
+	collectPackageSuggestions(pkgName, rootDir)
 	return parallelRebuilds, nil
 }
 

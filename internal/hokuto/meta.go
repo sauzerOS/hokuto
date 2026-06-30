@@ -24,13 +24,15 @@ type PackageMetadata struct {
 	Info        string   `json:"info"`
 	License     string   `json:"license"`
 	Tags        []string `json:"tags"`
+	Subpackages []string `json:"subpackages,omitempty"`
 }
 
 // PkgDBEntry represents a single package in the global database
 type PkgDBEntry struct {
-	Name     string          `json:"name"`
-	Version  string          `json:"version"`
-	Metadata PackageMetadata `json:"metadata"`
+	Name          string          `json:"name"`
+	Version       string          `json:"version"`
+	SourcePackage string          `json:"source_package,omitempty"`
+	Metadata      PackageMetadata `json:"metadata"`
 }
 
 // PkgDB represents the global package database
@@ -79,8 +81,14 @@ func HandleMetaCommand(args []string, cfg *Config) error {
 	}
 
 	pkgDir, err := findPackageDir(pkgName)
+	sourcePkg := ""
 	if err != nil {
-		return err
+		if foundSource, foundDir, ok := findSplitPackageSource(pkgName); ok {
+			pkgDir = foundDir
+			sourcePkg = foundSource
+		} else {
+			return err
+		}
 	}
 
 	metaPath := filepath.Join(pkgDir, "metadata.json")
@@ -89,6 +97,9 @@ func HandleMetaCommand(args []string, cfg *Config) error {
 	// Load existing metadata if available
 	if data, err := os.ReadFile(metaPath); err == nil {
 		_ = json.Unmarshal(data, &meta)
+	}
+	if splitNames := splitPackageNamesFromDir(pkgDir); len(splitNames) > 0 {
+		meta.Subpackages = splitNames
 	}
 
 	if editMode {
@@ -114,7 +125,7 @@ func HandleMetaCommand(args []string, cfg *Config) error {
 		}
 	}
 
-	displayMetadata(pkgName, &meta)
+	displayMetadata(pkgName, sourcePkg, &meta)
 	return nil
 }
 
@@ -260,8 +271,12 @@ func promptSelection(candidates []MetadataCandidate) *MetadataCandidate {
 	}
 }
 
-func displayMetadata(pkgName string, meta *PackageMetadata) {
+func displayMetadata(pkgName, sourcePkg string, meta *PackageMetadata) {
 	colNote.Printf("\nPackage: %s\n", pkgName)
+	if sourcePkg != "" && sourcePkg != pkgName {
+		colSuccess.Print("Source:      ")
+		fmt.Println(sourcePkg)
+	}
 	fmt.Printf("----------------------------------------\n")
 	colSuccess.Print("URL:         ")
 	fmt.Println(meta.URL)
@@ -273,6 +288,10 @@ func displayMetadata(pkgName string, meta *PackageMetadata) {
 	fmt.Println(meta.License)
 	colSuccess.Print("Tags:        ")
 	fmt.Println(strings.Join(meta.Tags, ", "))
+	if len(meta.Subpackages) > 0 {
+		colSuccess.Print("Subpackages: ")
+		fmt.Println(strings.Join(meta.Subpackages, ", "))
+	}
 	colSuccess.Print("Info:        ")
 	fmt.Println()
 	if meta.Info != "" {
@@ -447,6 +466,10 @@ func GeneratePkgDB(cfg *Config) error {
 				_ = json.Unmarshal(data, &meta)
 			}
 			sort.Strings(meta.Tags)
+			splitNames := splitPackageNamesFromDir(pkgDir)
+			if len(splitNames) > 0 {
+				meta.Subpackages = append([]string(nil), splitNames...)
+			}
 
 			db.Packages = append(db.Packages, PkgDBEntry{
 				Name:     pkgName,
@@ -454,6 +477,21 @@ func GeneratePkgDB(cfg *Config) error {
 				Metadata: meta,
 			})
 			seen[pkgName] = true
+
+			for _, splitName := range splitNames {
+				if seen[splitName] {
+					continue
+				}
+				splitMeta := meta
+				splitMeta.Subpackages = nil
+				db.Packages = append(db.Packages, PkgDBEntry{
+					Name:          splitName,
+					Version:       version,
+					SourcePackage: pkgName,
+					Metadata:      splitMeta,
+				})
+				seen[splitName] = true
+			}
 		}
 	}
 
@@ -567,6 +605,9 @@ func SearchPkgDB(args []string, cfg *Config) error {
 	for _, r := range results {
 		colSuccess.Printf("%-20s ", r.Name)
 		fmt.Printf("%-10s ", r.Version)
+		if r.SourcePackage != "" {
+			color.Yellow.Printf("(split: %s) ", r.SourcePackage)
+		}
 		if len(r.Metadata.Tags) > 0 {
 			color.Cyan.Printf("[%s]", strings.Join(r.Metadata.Tags, ", "))
 		}

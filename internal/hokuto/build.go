@@ -241,7 +241,56 @@ func addPostRebuildSplitDependencies(plan *BuildPlan, splitDepsBySource map[stri
 	}
 }
 
+func collectSplitDependenciesForPlan(plan *BuildPlan, cfg *Config) map[string][]string {
+	splitDepsBySource := make(map[string][]string)
+	if plan == nil {
+		return splitDepsBySource
+	}
+
+	inPlan := make(map[string]bool, len(plan.Order))
+	for _, pkgName := range plan.Order {
+		inPlan[pkgName] = true
+	}
+
+	for _, pkgName := range plan.Order {
+		pkgDir, err := findPackageDir(pkgName)
+		if err != nil {
+			continue
+		}
+		deps, err := parseDependsFile(pkgDir)
+		if err != nil {
+			continue
+		}
+		for _, dep := range deps {
+			if !activeBuildDependency(dep, cfg, false) {
+				continue
+			}
+			candidates := []string{dep.Name}
+			if len(dep.Alternatives) > 0 {
+				candidates = dep.Alternatives
+			}
+			for _, cand := range candidates {
+				if shouldSkipMultilibMakeDep(dep, cand, cfg) {
+					continue
+				}
+				sourcePkg, ok := findSplitDependencySource(cand)
+				if !ok || !inPlan[sourcePkg] {
+					continue
+				}
+				addMappedSplitDependency(splitDepsBySource, sourcePkg, cand)
+			}
+		}
+	}
+
+	addPostRebuildSplitDependencies(plan, splitDepsBySource)
+	return splitDepsBySource
+}
+
 func installBuiltSplitDependency(sourcePkg, splitPkg string, cfg *Config) error {
+	return installBuiltSplitDependencyWithOptions(sourcePkg, splitPkg, cfg, false)
+}
+
+func installBuiltSplitDependencyWithOptions(sourcePkg, splitPkg string, cfg *Config, quiet bool) error {
 	if isPackageInstalled(splitPkg) {
 		return nil
 	}
@@ -264,14 +313,15 @@ func installBuiltSplitDependency(sourcePkg, splitPkg string, cfg *Config) error 
 
 	isCriticalAtomic.Store(1)
 	defer isCriticalAtomic.Store(0)
-	handlePreInstallUninstall(splitPkg, cfg, RootExec, true, nil)
-	if _, err := pkgInstall(tarballPath, splitPkg, cfg, RootExec, true, false, false, nil); err != nil {
+	logger, fast := dependencyInstallLogger(quiet)
+	handlePreInstallUninstall(splitPkg, cfg, RootExec, true, logger)
+	if _, err := pkgInstall(tarballPath, splitPkg, cfg, RootExec, true, fast, false, logger); err != nil {
 		return err
 	}
 	return nil
 }
 
-func installAvailableBinaryBuildDeps(plan *BuildPlan, userRequested, declined map[string]bool, cfg *Config, addTemporaryBuildDep func(string)) (bool, error) {
+func installAvailableBinaryBuildDeps(plan *BuildPlan, userRequested, declined map[string]bool, cfg *Config, addTemporaryBuildDep func(string), quiet bool) (bool, error) {
 	installedAny := false
 	for _, pkgName := range plan.Order {
 		if userRequested[pkgName] || declined[pkgName] || plan.RebuildPackages[pkgName] || isPackageInstalled(pkgName) {
@@ -294,13 +344,15 @@ func installAvailableBinaryBuildDeps(plan *BuildPlan, userRequested, declined ma
 		}
 
 		isCriticalAtomic.Store(1)
-		handlePreInstallUninstall(outputPkgName, cfg, RootExec, false, nil)
-		if _, err := pkgInstall(tarballPath, outputPkgName, cfg, RootExec, false, false, false, nil); err != nil {
+		logger, fast := dependencyInstallLogger(quiet)
+		handlePreInstallUninstall(outputPkgName, cfg, RootExec, false, logger)
+		if _, err := pkgInstall(tarballPath, outputPkgName, cfg, RootExec, false, fast, false, logger); err != nil {
 			isCriticalAtomic.Store(0)
 			return installedAny, fmt.Errorf("fatal error installing binary %s: %w", pkgName, err)
 		}
 		isCriticalAtomic.Store(0)
 		addTemporaryBuildDep(outputPkgName)
+		declined[pkgName] = true
 		installedAny = true
 	}
 	return installedAny, nil
@@ -1947,7 +1999,9 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, opts BuildOptions)
 						}
 
 					case <-doneCh:
-						fmt.Print("\r")
+						if !opts.Quiet {
+							fmt.Print("\r")
+						}
 						return
 					case <-buildExec.Context.Done():
 						return
@@ -2858,6 +2912,7 @@ func handleBuildCommand(args []string, cfg *Config) error {
 	var noDeps = buildCmd.Bool("no-deps", false, "Skip dependency checking and build only the specified package(s)")
 	var noDevel = buildCmd.Bool("no-devel", false, "Skip automatic base-devel dependency installation")
 	var noRemote = buildCmd.Bool("no-remote", false, "Do not use the remote binary mirror for build dependency resolution or installs")
+	var wgetNoCheckCert = buildCmd.Bool("wget-no-check-certificate", false, "Pass --no-check-certificate to wget fallback for source downloads")
 	var parallel = buildCmd.Int("j", 1, "Number of parallel jobs (default: 1)")
 	var parallelLong = buildCmd.Int("parallel", 1, "Number of parallel jobs (default: 1)")
 	var updateWebsite = buildCmd.Bool("index", false, "Update the github.io status table.")
@@ -2890,6 +2945,15 @@ func handleBuildCommand(args []string, cfg *Config) error {
 	if err := buildCmd.Parse(args); err != nil {
 		return fmt.Errorf("error parsing build flags: %v", err)
 	}
+	defer flushPackageSuggestions(os.Stdout, cfg, *noRemote, true, false)
+	oldWgetNoCheckCertificate := wgetNoCheckCertificate
+	wgetNoCheckCertificate = *wgetNoCheckCert
+	defer func() { wgetNoCheckCertificate = oldWgetNoCheckCertificate }()
+	maxJobs := *parallel
+	if *parallelLong > maxJobs {
+		maxJobs = *parallelLong
+	}
+	quietDependencyInstalls := maxJobs > 1
 
 	effectiveRebuilds := *withRebuilds || *withRebuildsShort
 	// Set the global variables based on the parsed flags
@@ -3176,13 +3240,13 @@ func handleBuildCommand(args []string, cfg *Config) error {
 			}
 			removable = append(removable, dep)
 		}
-		uninstallBuildDependencies(removable, cfg)
+		uninstallBuildDependenciesWithOptions(removable, cfg, quietDependencyInstalls)
 		temporaryBuildDeps = nil
 	}
 	defer cleanupTemporaryBuildDeps()
 
 	if !*bootstrap && !*noDevel {
-		installedDevelDeps, err := ensureDevelPackagesInstalled(cfg, false, *noRemote)
+		installedDevelDeps, err := ensureDevelPackagesInstalledWithOptions(cfg, false, *noRemote, quietDependencyInstalls)
 		if err != nil {
 			return fmt.Errorf("failed to prepare devel packages: %w", err)
 		}
@@ -3211,7 +3275,7 @@ func handleBuildCommand(args []string, cfg *Config) error {
 		fullBuildList = MovePackageToFront(fullBuildList, "sauzeros-base")
 
 		if !*bootstrap && !*noDevel && packageSetHasBuildOption(fullBuildList, "multilib") {
-			installedDevelDeps, err := ensureDevelPackagesInstalled(cfg, true, *noRemote)
+			installedDevelDeps, err := ensureDevelPackagesInstalledWithOptions(cfg, true, *noRemote, quietDependencyInstalls)
 			if err != nil {
 				return fmt.Errorf("failed to prepare multilib devel packages: %w", err)
 			}
@@ -3326,22 +3390,21 @@ func handleBuildCommand(args []string, cfg *Config) error {
 					if isPackageInstalled(depPkg) {
 						continue
 					}
-					installed, installErr := ensurePackageInstalled(depPkg, cfg, *noRemote)
+					if sourcePkg, ok := findSplitDependencySource(depPkg); ok {
+						colArrow.Print("-> ")
+						colInfo.Printf("Dependency %s is a split package; scheduling %s to build it\n", depPkg, sourcePkg)
+						packagesThatMustBeBuilt[sourcePkg] = true
+						addMappedSplitDependency(splitDepsBySource, sourcePkg, depPkg)
+						continue
+					}
+					installed, installErr := ensurePackageInstalledWithOptions(depPkg, cfg, *noRemote, nil, quietDependencyInstalls)
 					if installErr == nil {
 						if installed {
 							addTemporaryBuildDep(depPkg)
 						}
 						continue
 					}
-					sourcePkg, ok := findSplitDependencySource(depPkg)
-					if !ok {
-						return fmt.Errorf("error: dependency %s has no source package and could not be installed as a binary package: %w", depPkg, installErr)
-					}
-					colArrow.Print("-> ")
-					colInfo.Printf("Dependency %s is a split package; scheduling %s to build it\n", depPkg, sourcePkg)
-					packagesThatMustBeBuilt[sourcePkg] = true
-					addMappedSplitDependency(splitDepsBySource, sourcePkg, depPkg)
-					continue
+					return fmt.Errorf("error: dependency %s has no source package and could not be installed as a binary package: %w", depPkg, installErr)
 				}
 				version, revision, err := getRepoVersion2(depPkg)
 				if err != nil {
@@ -3352,9 +3415,10 @@ func handleBuildCommand(args []string, cfg *Config) error {
 				tarballPath := findCachedBinaryTarballVersion(outputDepPkg, version, revision, cfg)
 				if _, err := os.Stat(tarballPath); err == nil {
 					if askForConfirmation(colInfo, "Dependency '%s' is missing. Use available binary package?", depPkg) {
+						logger, fast := dependencyInstallLogger(quietDependencyInstalls)
 						isCriticalAtomic.Store(1)
-						handlePreInstallUninstall(outputDepPkg, cfg, RootExec, false, nil)
-						if _, err := pkgInstall(tarballPath, outputDepPkg, cfg, RootExec, false, false, false, nil); err != nil {
+						handlePreInstallUninstall(outputDepPkg, cfg, RootExec, false, logger)
+						if _, err := pkgInstall(tarballPath, outputDepPkg, cfg, RootExec, false, fast, false, logger); err != nil {
 							isCriticalAtomic.Store(0)
 							return fmt.Errorf("fatal error installing binary %s: %v", depPkg, err)
 						}
@@ -3397,9 +3461,10 @@ func handleBuildCommand(args []string, cfg *Config) error {
 								if _, err := os.Stat(tarballPath); err == nil {
 									foundRemote = true
 									if askForConfirmation(colInfo, "Dependency '%s' found on remote mirror. Use binary?", depPkg) {
+										logger, fast := dependencyInstallLogger(quietDependencyInstalls)
 										isCriticalAtomic.Store(1)
-										handlePreInstallUninstall(outputDepPkg, cfg, RootExec, false, nil)
-										if _, err := pkgInstall(tarballPath, outputDepPkg, cfg, RootExec, false, false, false, nil); err != nil {
+										handlePreInstallUninstall(outputDepPkg, cfg, RootExec, false, logger)
+										if _, err := pkgInstall(tarballPath, outputDepPkg, cfg, RootExec, false, fast, false, logger); err != nil {
 											isCriticalAtomic.Store(0)
 											return fmt.Errorf("fatal error installing downloaded binary %s: %v", depPkg, err)
 										}
@@ -3427,7 +3492,7 @@ func handleBuildCommand(args []string, cfg *Config) error {
 		}
 
 		if !*noDevel && packageSetHasBuildOption(buildPackageNames(packagesThatMustBeBuilt), "multilib") {
-			installedDevelDeps, err := ensureDevelPackagesInstalled(cfg, true, *noRemote)
+			installedDevelDeps, err := ensureDevelPackagesInstalledWithOptions(cfg, true, *noRemote, quietDependencyInstalls)
 			if err != nil {
 				return fmt.Errorf("failed to prepare multilib devel packages: %w", err)
 			}
@@ -3476,7 +3541,7 @@ func handleBuildCommand(args []string, cfg *Config) error {
 						return fmt.Errorf("error generating build plan for '%s': %v", pkgName, err)
 					}
 					addPostRebuildSplitDependencies(plan, splitDepsBySource)
-					installedBinaryDeps, err := installAvailableBinaryBuildDeps(plan, userRequestedMap, binaryDeclined, cfg, addTemporaryBuildDep)
+					installedBinaryDeps, err := installAvailableBinaryBuildDeps(plan, userRequestedMap, binaryDeclined, cfg, addTemporaryBuildDep, quietDependencyInstalls)
 					if err != nil {
 						return err
 					}
@@ -3540,7 +3605,7 @@ func handleBuildCommand(args []string, cfg *Config) error {
 						break
 					}
 					addPostRebuildSplitDependencies(initialPlan, splitDepsBySource)
-					installedBinaryDeps, installErr := installAvailableBinaryBuildDeps(initialPlan, userRequestedMap, binaryDeclined, cfg, addTemporaryBuildDep)
+					installedBinaryDeps, installErr := installAvailableBinaryBuildDeps(initialPlan, userRequestedMap, binaryDeclined, cfg, addTemporaryBuildDep, quietDependencyInstalls)
 					if installErr != nil {
 						return installErr
 					}
@@ -3576,12 +3641,6 @@ func handleBuildCommand(args []string, cfg *Config) error {
 			}
 
 			progressCount := 0
-
-			// Determine max jobs
-			maxJobs := *parallel
-			if *parallelLong > maxJobs {
-				maxJobs = *parallelLong
-			}
 
 			if maxJobs > 1 {
 				colArrow.Print("-> ")
@@ -3647,7 +3706,7 @@ func handleBuildCommand(args []string, cfg *Config) error {
 				}
 
 				// Start parallel build
-				installedBinaryDeps, err := installAvailableBinaryDependenciesForPlan(initialPlan, cfg, *noRemote)
+				installedBinaryDeps, err := installAvailableBinaryDependenciesForPlanWithOptions(initialPlan, cfg, *noRemote, true)
 				if err != nil {
 					return err
 				}

@@ -341,7 +341,7 @@ func parseDependsData(content []byte) ([]DepSpec, error) {
 			dependencies = append(dependencies, altDeps...)
 		} else {
 			// Regular dependency parsing
-			name, op, ver, optional, rebuild, makeDep, cross, crossNative, runtimeOnly, suggest := parseDepToken(line)
+			name, op, ver, optional, rebuild, makeDep, cross, crossNative, runtimeOnly, suggest, suggestText := parseDepToken(line)
 			if name != "" {
 				dependencies = append(dependencies, DepSpec{
 					Name:         name,
@@ -354,6 +354,7 @@ func parseDependsData(content []byte) ([]DepSpec, error) {
 					CrossNative:  crossNative,
 					RuntimeOnly:  runtimeOnly,
 					Suggest:      suggest,
+					SuggestText:  suggestText,
 					Alternatives: nil,
 				})
 			}
@@ -371,10 +372,11 @@ func parseAlternativeDeps(line string) ([]DepSpec, error) {
 	var alternatives []string
 	var commonOp, commonVer string
 	var commonOptional, commonRebuild, commonMake, commonCross, commonCrossNative, commonRuntimeOnly, commonSuggest bool
+	var commonSuggestText string
 
 	for i, part := range parts {
 		part = strings.TrimSpace(part)
-		name, op, ver, optional, rebuild, makeDep, cross, crossNative, runtimeOnly, suggest := parseDepToken(part)
+		name, op, ver, optional, rebuild, makeDep, cross, crossNative, runtimeOnly, suggest, suggestText := parseDepToken(part)
 		if name != "" {
 			alternatives = append(alternatives, name)
 			// Assuming common flags for all alternatives in a single line
@@ -388,6 +390,7 @@ func parseAlternativeDeps(line string) ([]DepSpec, error) {
 				commonCrossNative = crossNative
 				commonRuntimeOnly = runtimeOnly
 				commonSuggest = suggest
+				commonSuggestText = suggestText
 			}
 		}
 	}
@@ -408,6 +411,7 @@ func parseAlternativeDeps(line string) ([]DepSpec, error) {
 		CrossNative:  commonCrossNative,
 		RuntimeOnly:  commonRuntimeOnly,
 		Suggest:      commonSuggest,
+		SuggestText:  commonSuggestText,
 		Alternatives: alternatives,
 	}}, nil
 }

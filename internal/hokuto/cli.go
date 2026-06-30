@@ -63,7 +63,7 @@ func printHelp() {
 		{"upload", "[options] [pkgname...]", "Upload local binaries to remote mirror and update index"},
 		{"depends", "[--reverse] <pkg>", "Show package dependencies or reverse dependencies"},
 		{"meta", "pkgname [-e] [-db]", "Show/edit package metadata or generate global DB"},
-		{"search", "[query | -tag <tag>]", "Search global package database"},
+		{"search, s", "[query | -tag <tag>]", "Search global package database"},
 		{"sync", "", "Manually sync global package database from mirror"},
 		{"cross-sync", "[-native] [-jN] [-i]", "Identify and build missing native cross (or aarch64 native) packages"},
 	}
@@ -1090,6 +1090,8 @@ func Main() {
 			}
 		}
 
+		flushPackageSuggestions(os.Stdout, cfg, *noRemote, true, effectiveYes)
+
 		if !allSucceeded {
 			os.Exit(1)
 		}
@@ -1463,7 +1465,7 @@ func Main() {
 			os.Exit(1)
 		}
 
-	case "search":
+	case "search", "s":
 		if err := SearchPkgDB(os.Args[2:], cfg); err != nil {
 			fmt.Fprintf(os.Stderr, "Search failed: %v\n", err)
 			os.Exit(1)

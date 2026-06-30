@@ -62,12 +62,21 @@ func listPackages(searchTerm string) error {
 	}
 
 	// Step 4: Collect the information for the final list of packages.
-	var output []string
+	var output []SortablePagerLine
 	for _, p := range pkgsToShow {
 		versionFile := filepath.Join(Installed, p, "version")
 		versionInfo := "unknown"
 		if data, err := os.ReadFile(versionFile); err == nil {
 			versionInfo = strings.TrimSpace(string(data))
+		}
+
+		sizeInfo := "?"
+		sizeBytes := int64(0)
+		hasSize := false
+		if total, _, _, err := installedPackageSize(p); err == nil {
+			sizeInfo = humanReadableSize(total)
+			sizeBytes = total
+			hasSize = true
 		}
 
 		// Read pkginfo for Arch/Variant
@@ -147,6 +156,8 @@ func listPackages(searchTerm string) error {
 			prefix,
 			colSuccess.Sprintf("%-25s", p),
 			colNote.Sprintf("%-15s", versionInfo),
+			color.Yellow.Sprintf("%10s", sizeInfo))
+		pkgStr += fmt.Sprintf(" %s",
 			color.Cyan.Sprintf("%-10s %s%s",
 				arch,
 				variantDisplay,
@@ -156,10 +167,15 @@ func listPackages(searchTerm string) error {
 			pkgStr += fmt.Sprintf(" %s", color.Yellow.Sprint(buildtimeStr))
 		}
 
-		output = append(output, pkgStr)
+		output = append(output, SortablePagerLine{
+			Line:    pkgStr,
+			Name:    p,
+			Size:    sizeBytes,
+			HasSize: hasSize,
+		})
 	}
 
-	return RunPager("Installed Packages", output)
+	return RunSortablePager("Installed Packages", output)
 }
 
 func FetchRemoteIndex(cfg *Config) ([]RepoEntry, error) {
@@ -302,7 +318,7 @@ func listRemotePackages(searchTerm string, cfg *Config) error {
 		return err
 	}
 
-	var output []string
+	var output []SortablePagerLine
 	foundAny := false
 	for _, entry := range remoteIndex {
 		if searchTerm != "" && !strings.Contains(entry.Name, searchTerm) {
@@ -323,14 +339,27 @@ func listRemotePackages(searchTerm string, cfg *Config) error {
 			variantDisplay = "native"
 		}
 
-		output = append(output, fmt.Sprintf("%s %s %s %s",
+		sizeInfo := "?"
+		hasSize := entry.Size >= 0
+		if hasSize {
+			sizeInfo = humanReadableSize(entry.Size)
+		}
+
+		line := fmt.Sprintf("%s %s %s %s %s",
 			colArrow.Sprint("->"),
 			colSuccess.Sprintf("%-25s", entry.Name),
 			colNote.Sprintf("%-15s", fmt.Sprintf("%s-%s", entry.Version, entry.Revision)),
+			color.Yellow.Sprintf("%10s", sizeInfo),
 			color.Cyan.Sprintf("%-10s %s%s",
 				entry.Arch,
 				variantDisplay,
-				multiSuffix)))
+				multiSuffix))
+		output = append(output, SortablePagerLine{
+			Line:    line,
+			Name:    entry.Name,
+			Size:    entry.Size,
+			HasSize: hasSize,
+		})
 		foundAny = true
 	}
 
@@ -340,7 +369,7 @@ func listRemotePackages(searchTerm string, cfg *Config) error {
 		return nil
 	}
 
-	return RunPager("Remote Packages", output)
+	return RunSortablePager("Remote Packages", output)
 }
 
 // GetRemotePackageEntry searches the remote index for a package matching system criteria.

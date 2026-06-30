@@ -20,6 +20,35 @@ type uploadCacheEntry struct {
 	Entry RepoEntry `json:"entry"`
 }
 
+type remoteDeleteEntry struct {
+	Key  string
+	Size int64
+	Meta string
+}
+
+type optionalStringFlag struct {
+	Value string
+	Seen  bool
+}
+
+func (f *optionalStringFlag) String() string {
+	return f.Value
+}
+
+func (f *optionalStringFlag) Set(value string) error {
+	f.Seen = true
+	if value == "true" {
+		f.Value = ""
+		return nil
+	}
+	f.Value = strings.TrimSpace(value)
+	return nil
+}
+
+func (f *optionalStringFlag) IsBoolFlag() bool {
+	return true
+}
+
 func loadUploadCache(path string) map[string]uploadCacheEntry {
 	cache := make(map[string]uploadCacheEntry)
 	data, err := os.ReadFile(path)
@@ -38,6 +67,32 @@ func saveUploadCache(path string, cache map[string]uploadCacheEntry) error {
 	return os.WriteFile(path, data, 0644)
 }
 
+func repoEntriesByFilename(entries []RepoEntry) map[string]RepoEntry {
+	byFilename := make(map[string]RepoEntry, len(entries))
+	for _, entry := range entries {
+		byFilename[entry.Filename] = entry
+	}
+	return byFilename
+}
+
+func selectRemoteDeleteEntries(entries []remoteDeleteEntry, action func([]remoteDeleteEntry) error) error {
+	displayEntries := make([]selectableEntry, len(entries))
+	for i, entry := range entries {
+		displayEntries[i] = selectableEntry{
+			Primary: entry.Key,
+			Size:    entry.Size,
+			Meta:    entry.Meta,
+		}
+	}
+	return selectEntries("Remote Delete", "[gray]Space toggles, a selects all, n selects none, d deletes, q quits.[white]", 'd', displayEntries, func(indices []int) error {
+		chosen := make([]remoteDeleteEntry, 0, len(indices))
+		for _, idx := range indices {
+			chosen = append(chosen, entries[idx])
+		}
+		return action(chosen)
+	})
+}
+
 // handleUploadCommand implements the 'hokuto upload' command.
 func handleUploadCommand(args []string, cfg *Config) error {
 	ctx := context.Background()
@@ -49,7 +104,8 @@ func handleUploadCommand(args []string, cfg *Config) error {
 	var sync = uploadCmd.Bool("sync", false, "Upload all local files missing on remote without prompt")
 	var prompt = uploadCmd.Bool("prompt", false, "Prompt for each local file missing on remote (optionally filtered by name)")
 	var syncdb = uploadCmd.Bool("syncdb", false, "Upload only the global package database (pkg-db.json.zst)")
-	var deletePkg = uploadCmd.String("delete", "", "Delete all variants of a package from remote (use --delete=all to delete everything)")
+	var deletePkg optionalStringFlag
+	uploadCmd.Var(&deletePkg, "delete", "Delete remote files with selector; optionally pass package name. Use --delete=all to delete everything immediately")
 	var migrate = uploadCmd.Bool("copy-from-r2", false, "Copy all files from Cloudflare R2 to current mirror")
 
 	// Set output to stderr to avoid polluting stdout if captured
@@ -68,9 +124,13 @@ func handleUploadCommand(args []string, cfg *Config) error {
 	}
 
 	filters := uploadCmd.Args()
+	if deletePkg.Seen && deletePkg.Value == "" && len(filters) > 0 {
+		deletePkg.Value = filters[0]
+		filters = filters[1:]
+	}
 
 	// Usage check
-	if *deletePkg == "" && !*sync && !*prompt && !*cleanup && !*reindex && !*syncdb && !*migrate {
+	if !deletePkg.Seen && !*sync && !*prompt && !*cleanup && !*reindex && !*syncdb && !*migrate {
 		fmt.Println("Usage: hk upload [options] [pkgname]")
 		fmt.Println("")
 		fmt.Println("Options:")
@@ -259,9 +319,9 @@ func handleUploadCommand(args []string, cfg *Config) error {
 
 	// Handle --delete logic explicitly
 	var deletionsOccurred bool
-	if *deletePkg != "" {
+	if deletePkg.Seen {
 		// Check if user wants to delete everything
-		if *deletePkg == "all" {
+		if deletePkg.Value == "all" {
 			colArrow.Print("-> ")
 			colError.Println("WARNING: This will delete ALL packages from the remote repository!")
 			if !askForConfirmation(colError, "Are you absolutely sure you want to delete ALL remote packages? ") {
@@ -303,9 +363,13 @@ func handleUploadCommand(args []string, cfg *Config) error {
 				colSuccess.Printf("Deleted %d packages from remote.\n", foundCount)
 			}
 		} else {
-			// Delete specific package
+			// Delete selected remote files, optionally filtered by package.
 			colArrow.Print("-> ")
-			colSuccess.Printf("Scanning remote for package: %s\n", *deletePkg)
+			if deletePkg.Value == "" {
+				colSuccess.Println("Scanning all remote packages")
+			} else {
+				colSuccess.Printf("Scanning remote for package: %s\n", deletePkg.Value)
+			}
 
 			remoteObjects, err := r2.ListObjects(ctx, "")
 			if err != nil {
@@ -317,36 +381,58 @@ func handleUploadCommand(args []string, cfg *Config) error {
 			// But verify it carefully.
 			// StandardizedRemoteName uses dashes.
 			// A stricter check: matches "{pkgName}-*.tar.zst"
-			prefix := *deletePkg + "-"
+			prefix := deletePkg.Value + "-"
+			remoteIndexByFilename := repoEntriesByFilename(remoteIndex)
 
-			var foundCount int
+			var candidates []remoteDeleteEntry
 			for _, obj := range remoteObjects {
-				if strings.HasPrefix(obj.Key, prefix) && strings.HasSuffix(obj.Key, ".tar.zst") {
-					colArrow.Print("-> ")
-					if askForConfirmation(colWarn, "Delete remote file %s? ", obj.Key) {
-						if err := r2.DeleteFile(ctx, obj.Key); err != nil {
-							fmt.Fprintf(os.Stderr, "Error deleting %s: %v\n", obj.Key, err)
-						} else {
-							foundCount++
-							colSuccess.Printf("Deleted %s\n", obj.Key)
-							// Update in-memory index
-							deletionsOccurred = true
-							for k, v := range newIndexMap {
-								if v.Filename == obj.Key {
-									delete(newIndexMap, k)
-									// Do NOT break, in case of duplicate entries or just to be safe (though keys are unique)
-								}
+				if strings.HasSuffix(obj.Key, ".tar.zst") && (deletePkg.Value == "" || strings.HasPrefix(obj.Key, prefix)) {
+					meta := "remote"
+					if entry, ok := remoteIndexByFilename[obj.Key]; ok {
+						meta = fmt.Sprintf("%s %s-%s %s/%s", entry.Name, entry.Version, entry.Revision, entry.Arch, entry.Variant)
+					}
+					candidates = append(candidates, remoteDeleteEntry{Key: obj.Key, Size: obj.Size, Meta: meta})
+				}
+			}
+			sort.Slice(candidates, func(i, j int) bool {
+				return candidates[i].Key < candidates[j].Key
+			})
+
+			if len(candidates) == 0 {
+				if deletePkg.Value == "" {
+					colWarn.Println("No remote package files found.")
+				} else {
+					colWarn.Printf("No remote files found for package '%s'.\n", deletePkg.Value)
+				}
+			} else {
+				var foundCount int
+				if err := selectRemoteDeleteEntries(candidates, func(chosen []remoteDeleteEntry) error {
+					if len(chosen) == 0 {
+						return fmt.Errorf("no remote files selected")
+					}
+					for _, item := range chosen {
+						if err := r2.DeleteFile(ctx, item.Key); err != nil {
+							fmt.Fprintf(os.Stderr, "Error deleting %s: %v\n", item.Key, err)
+							continue
+						}
+						foundCount++
+						deletionsOccurred = true
+						for k, v := range newIndexMap {
+							if v.Filename == item.Key {
+								delete(newIndexMap, k)
 							}
 						}
 					}
+					return nil
+				}); err != nil {
+					return err
 				}
-			}
-
-			if foundCount == 0 {
-				colWarn.Printf("No remote files found for package '%s'.\n", *deletePkg)
-			} else {
-				colArrow.Print("-> ")
-				colSuccess.Println("Deletions complete.")
+				if foundCount > 0 {
+					colArrow.Print("-> ")
+					colSuccess.Printf("Deleted %d remote file(s).\n", foundCount)
+				} else {
+					colWarn.Println("No remote files deleted.")
+				}
 			}
 		}
 	}

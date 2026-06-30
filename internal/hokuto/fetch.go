@@ -429,9 +429,12 @@ func linkSharedGitCheckout(pkgName, pkgLinkDir, repoName, sharedPath string) (st
 // downloadFile downloads a URL into the hokuto cache.
 
 type downloadOptions struct {
-	Quiet bool // Quiet suppresses all stdout/stderr/progress output
-	Force bool // Force re-download even if file exists
+	Quiet                  bool // Quiet suppresses all stdout/stderr/progress output
+	Force                  bool // Force re-download even if file exists
+	WgetNoCheckCertificate bool // Pass --no-check-certificate to wget fallback
 }
+
+var wgetNoCheckCertificate bool
 
 type IdleTimeoutReader struct {
 	src     io.ReadCloser
@@ -474,14 +477,14 @@ func tryRemoveCachedFile(path string) {
 }
 
 func downloadFile(originalURL, finalURL, destFile string) error {
-	return downloadFileWithOptions(originalURL, finalURL, destFile, downloadOptions{Quiet: false})
+	return downloadFileWithOptions(originalURL, finalURL, destFile, downloadOptions{Quiet: false, WgetNoCheckCertificate: wgetNoCheckCertificate})
 }
 
 func downloadFileQuiet(originalURL, finalURL, destFile string) error {
-	return downloadFileWithOptions(originalURL, finalURL, destFile, downloadOptions{Quiet: true})
+	return downloadFileWithOptions(originalURL, finalURL, destFile, downloadOptions{Quiet: true, WgetNoCheckCertificate: wgetNoCheckCertificate})
 }
 
-func downloadFileWithOptions(originalURL, finalURL, destFile string, opt downloadOptions) error {
+func downloadFileWithOptions(originalURL, finalURL, destFile string, opt downloadOptions) (retErr error) {
 	// If a GNU mirror is being used for this download, print the info message exactly once.
 	if !opt.Quiet && originalURL != finalURL {
 		gnuMirrorMessageOnce.Do(func() {
@@ -503,6 +506,9 @@ func downloadFileWithOptions(originalURL, finalURL, destFile string, opt downloa
 		}
 		absPath = filepath.Join(CacheStore, filepath.Base(destFile))
 	}
+	if strings.HasSuffix(absPath, ".lock") {
+		return fmt.Errorf("refusing to download to lock file path: %s", absPath)
+	}
 
 	// Ensure parent directory exists (critical for BinDir downloads)
 	if err := os.MkdirAll(filepath.Dir(absPath), 0o755); err != nil {
@@ -518,14 +524,25 @@ func downloadFileWithOptions(originalURL, finalURL, destFile string, opt downloa
 	if err != nil {
 		return fmt.Errorf("failed to create lock file: %w", err)
 	}
-	defer lFile.Close()
 
 	// Acquire an exclusive lock. This will block if another process/goroutine is downloading.
 	if err := unix.Flock(int(lFile.Fd()), unix.LOCK_EX); err != nil {
+		_ = lFile.Close()
 		return fmt.Errorf("failed to acquire lock for download: %w", err)
 	}
-	// Ensure we release the lock when done
-	defer unix.Flock(int(lFile.Fd()), unix.LOCK_UN)
+	defer func() {
+		_ = unix.Flock(int(lFile.Fd()), unix.LOCK_UN)
+		_ = lFile.Close()
+		// Lock files are only coordination sentinels. Keep the cache tidy and
+		// clear stale failed-download locks on the next run.
+		if retErr != nil {
+			_ = os.Remove(lockPath)
+			return
+		}
+		if _, err := os.Stat(absPath); err == nil {
+			_ = os.Remove(lockPath)
+		}
+	}()
 
 	// DOUBLE CHECK: Now that we have the lock, check if the file exists again.
 	// The background worker might have finished it while we were waiting for the lock.
@@ -718,7 +735,7 @@ func downloadFileWithOptions(originalURL, finalURL, destFile string, opt downloa
 
 	// --- Fallback: Wget ---
 	debugf("Browser download failed: %v. Falling back to wget...\n", browserErr)
-	if err := downloadViaWget(finalURL, tmpPath, opt.Quiet); err == nil {
+	if err := downloadViaWget(finalURL, tmpPath, opt.Quiet, opt.WgetNoCheckCertificate); err == nil {
 		if err := os.Rename(tmpPath, absPath); err != nil {
 			return fmt.Errorf("failed to publish wget-downloaded file %s: %w", absPath, err)
 		}
@@ -734,13 +751,17 @@ func downloadFileWithOptions(originalURL, finalURL, destFile string, opt downloa
 	}
 }
 
-func downloadViaWget(url, destPath string, quiet bool) error {
+func downloadViaWget(url, destPath string, quiet bool, noCheckCertificate bool) error {
 	// check if wget is available
 	if _, err := exec.LookPath("wget"); err != nil {
 		return fmt.Errorf("wget not found in PATH")
 	}
 
-	args := []string{"-O", destPath, url}
+	args := []string{"-O", destPath}
+	if noCheckCertificate {
+		args = append(args, "--no-check-certificate")
+	}
+	args = append(args, url)
 	if quiet {
 		args = append(args, "-q")
 	} else {

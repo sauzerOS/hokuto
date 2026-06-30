@@ -670,6 +670,8 @@ func checkDependencyBlocks(pkgName string, newVersion string, installedPackages 
 // checkForUpgrades is the main function for the upgrade logic.
 
 func checkForUpgrades(_ context.Context, cfg *Config, maxJobs int, yes bool) error {
+	defer flushPackageSuggestions(os.Stdout, cfg, false, true, yes)
+
 	colArrow.Print("-> ")
 	colSuccess.Println("Checking for Package Upgrades")
 
@@ -916,6 +918,11 @@ func checkForUpgrades(_ context.Context, cfg *Config, maxJobs int, yes bool) err
 		go prefetchSources(pkgNames[1:])
 	}
 
+	includeMultilibDevel := packageSetHasBuildOption(pkgNames, "multilib")
+	if _, err := ensureDevelPackagesInstalledWithOptions(cfg, includeMultilibDevel, false, maxJobs > 1); err != nil {
+		return fmt.Errorf("failed to prepare devel packages before update: %w", err)
+	}
+
 	// --- PARALLEL EXECUTION PATH ---
 	if maxJobs > 1 {
 		colArrow.Print("-> ")
@@ -929,6 +936,7 @@ func checkForUpgrades(_ context.Context, cfg *Config, maxJobs int, yes bool) err
 			PostBuildRebuilds: make(map[string][]string),
 			ManualPrereqs:     manualPrereqs,
 		}
+		splitDepsBySource := collectSplitDependenciesForPlan(updatePlan, cfg)
 
 		// Use a custom builder that incorporates binary checks
 		smartBuilder := func(pkgName string, cfg *Config, exec *Executor, opts BuildOptions) (time.Duration, error) {
@@ -1028,7 +1036,7 @@ func checkForUpgrades(_ context.Context, cfg *Config, maxJobs int, yes bool) err
 		if _, err := installAvailableBinaryDependenciesForPlan(updatePlan, cfg, false); err != nil {
 			return err
 		}
-		if err := RunParallelBuilds(updatePlan, cfg, maxJobs, userRequestedMap, yes, nil, smartBuilder); err != nil {
+		if err := RunParallelBuilds(updatePlan, cfg, maxJobs, userRequestedMap, yes, splitDepsBySource, smartBuilder); err != nil {
 			return err
 		}
 

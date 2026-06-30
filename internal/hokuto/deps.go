@@ -6,15 +6,26 @@ package hokuto
 import (
 	"bufio"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 )
 
 // Cache for resolved alternative dependencies to avoid prompting multiple times
 var alternativeDepCache = make(map[string]string)
+
+var dependencyBinaryVersionlessLogOnce sync.Map
+
+var runtimeDependencyInstallInProgress sync.Map
+
+var suppressRuntimeDependencyAutoInstall atomic.Int32
+
+var develInstallMu sync.Mutex
 
 var baseDevelPackages = []string{
 	"autoconf",
@@ -25,8 +36,8 @@ var baseDevelPackages = []string{
 	"findutils",
 	"flex",
 	"gawk",
-	"gcc",
 	"gcc-libs",
+	"gcc",
 	"gettext",
 	"grep",
 	"gzip",
@@ -220,7 +231,86 @@ func splitDependencySourceCandidates(pkgName string) []string {
 	return candidates
 }
 
+func splitPackageNamesFromDir(pkgDir string) []string {
+	seen := make(map[string]bool)
+	var names []string
+	add := func(name string) {
+		name = strings.TrimSpace(name)
+		if name == "" || seen[name] {
+			return
+		}
+		seen[name] = true
+		names = append(names, name)
+	}
+
+	if entries, err := os.ReadDir(pkgDir); err == nil {
+		for _, entry := range entries {
+			if entry.IsDir() {
+				continue
+			}
+			if name, ok := strings.CutPrefix(entry.Name(), "depends."); ok {
+				add(name)
+			}
+		}
+	}
+
+	splitDir := filepath.Join(pkgDir, "split")
+	if entries, err := os.ReadDir(splitDir); err == nil {
+		for _, entry := range entries {
+			if !entry.IsDir() {
+				continue
+			}
+			dependsPath := filepath.Join(splitDir, entry.Name(), "depends")
+			if fi, err := os.Stat(dependsPath); err == nil && !fi.IsDir() {
+				add(entry.Name())
+			}
+		}
+	}
+
+	sort.Strings(names)
+	return names
+}
+
+func findSplitPackageSource(pkgName string) (sourcePkg string, sourceDir string, ok bool) {
+	lookupNames := []string{pkgName}
+	for _, prefix := range []string{"aarch64-", "x86_64-"} {
+		if strings.HasPrefix(pkgName, prefix) {
+			lookupNames = append(lookupNames, strings.TrimPrefix(pkgName, prefix))
+			break
+		}
+	}
+
+	paths := filepath.SplitList(repoPaths)
+	for _, repoPath := range paths {
+		repoPath = strings.TrimSpace(repoPath)
+		if repoPath == "" {
+			continue
+		}
+		entries, err := os.ReadDir(repoPath)
+		if err != nil {
+			continue
+		}
+		for _, entry := range entries {
+			if !entry.IsDir() {
+				continue
+			}
+			pkgDir := filepath.Join(repoPath, entry.Name())
+			for _, splitName := range splitPackageNamesFromDir(pkgDir) {
+				for _, lookupName := range lookupNames {
+					if splitName == lookupName {
+						return entry.Name(), pkgDir, true
+					}
+				}
+			}
+		}
+	}
+	return "", "", false
+}
+
 func findSplitDependencySource(pkgName string) (string, bool) {
+	if sourcePkg, _, ok := findSplitPackageSource(pkgName); ok {
+		return sourcePkg, true
+	}
 	for _, candidate := range splitDependencySourceCandidates(pkgName) {
 		if _, err := findPackageMetadataDir(candidate); err == nil {
 			return candidate, true
@@ -241,7 +331,10 @@ func dependencyBinaryAvailable(pkgName string, cfg *Config, noRemote bool) bool 
 			return true
 		}
 	} else if findCachedBinaryTarball(lookupName, cfg) != "" {
-		debugf("Using versionless cached binary availability check for %s: %v\n", lookupName, err)
+		logKey := strings.Join([]string{BinDir, repoPaths, BinaryMirror, lookupName, err.Error()}, "\x00")
+		if _, loaded := dependencyBinaryVersionlessLogOnce.LoadOrStore(logKey, true); !loaded {
+			debugf("Using versionless cached binary availability check for %s: %v\n", lookupName, err)
+		}
 		return true
 	}
 	if noRemote || BinaryMirror == "" {
@@ -342,6 +435,16 @@ func resolveBinaryDependencies(pkgName string, visited map[string]bool, plan *[]
 	}
 	pkgDir, err := findPackageMetadataDir(lookupName)
 	if err != nil {
+		if sourcePkg, ok := findSplitDependencySource(pkgName); ok {
+			if err := resolveBinaryDependencies(sourcePkg, visited, plan, force, yes, cfg, remoteIndex, allowRemote); err != nil {
+				return err
+			}
+			if !force && findInstalledSatisfying(pkgName, "", "") != "" {
+				return nil
+			}
+			*plan = append(*plan, pkgName)
+			return nil
+		}
 		deps, found, depErr := resolveBinaryDependenciesFromArchive(pkgName, cfg, remoteIndex, allowRemote)
 		if depErr != nil {
 			return depErr
@@ -711,13 +814,15 @@ func resolveAlternativeDep(dep DepSpec, yes bool, cfg *Config) (string, error) {
 	return chosen, nil
 }
 
-// parseDepToken parses tokens like "pkg", "pkg<=1.2.3 optional", "pkg rebuild" and returns name, op, version, and flags.
+// parseDepToken parses tokens like "pkg", "pkg<=1.2.3 optional", "pkg rebuild",
+// and "pkg suggest Optional support" and returns name, op, version, flags, and
+// optional suggestion text.
 
-func parseDepToken(token string) (name string, op string, ver string, optional bool, rebuild bool, makeDep bool, cross bool, crossNative bool, runtimeOnly bool, suggest bool) {
+func parseDepToken(token string) (name string, op string, ver string, optional bool, rebuild bool, makeDep bool, cross bool, crossNative bool, runtimeOnly bool, suggest bool, suggestText string) {
 	// Split by whitespace to separate package spec from flags
 	parts := strings.Fields(token)
 	if len(parts) == 0 {
-		return "", "", "", false, false, false, false, false, false, false
+		return "", "", "", false, false, false, false, false, false, false, ""
 	}
 
 	pkgSpec := parts[0]
@@ -739,6 +844,14 @@ func parseDepToken(token string) (name string, op string, ver string, optional b
 			runtimeOnly = true
 		case "suggest", "suggested", "optional-runtime", "runtime-optional":
 			suggest = true
+			if i+1 < len(parts) {
+				suggestText = strings.Join(parts[i+1:], " ")
+				if unquoted, err := strconv.Unquote(suggestText); err == nil {
+					suggestText = unquoted
+				}
+				suggestText = strings.TrimSpace(suggestText)
+			}
+			i = len(parts)
 		}
 	}
 
@@ -748,10 +861,10 @@ func parseDepToken(token string) (name string, op string, ver string, optional b
 		if idx := strings.Index(pkgSpec, op); idx != -1 {
 			name := pkgSpec[:idx]
 			ver := pkgSpec[idx+len(op):]
-			return strings.TrimSpace(name), op, strings.TrimSpace(ver), optional, rebuild, makeDep || cross, cross, crossNative, runtimeOnly, suggest
+			return strings.TrimSpace(name), op, strings.TrimSpace(ver), optional, rebuild, makeDep || cross, cross, crossNative, runtimeOnly, suggest, suggestText
 		}
 	}
-	return pkgSpec, "", "", optional, rebuild, makeDep || cross, cross, crossNative, runtimeOnly, suggest
+	return pkgSpec, "", "", optional, rebuild, makeDep || cross, cross, crossNative, runtimeOnly, suggest, suggestText
 }
 
 // BuildPlan represents the complete build plan with proper ordering
@@ -820,6 +933,11 @@ func resolveBuildPlan(targetPackages []string, userRequestedPackages map[string]
 		pkgDir, err := findPackageMetadataDir(pkgName)
 		if err != nil {
 			if sourcePkg, ok := findSplitDependencySource(pkgName); ok {
+				sourceBuildPackages[sourcePkg] = true
+				if processed[sourcePkg] && !alreadyInOrder[sourcePkg] {
+					delete(processed, sourcePkg)
+					delete(plan.SkippedPackages, sourcePkg)
+				}
 				return processPkg(sourcePkg)
 			}
 			return fmt.Errorf("package source not found for '%s': %w", pkgName, err)
@@ -1262,7 +1380,7 @@ func getInstalledDeps(pkgName string) ([]string, error) {
 			continue
 		}
 		// Parse "pkgname>=1.0" -> "pkgname"
-		name, _, _, _, _, _, _, _, _, _ := parseDepToken(line)
+		name, _, _, _, _, _, _, _, _, _, _ := parseDepToken(line)
 		if name != "" && name != pkgName {
 			deps = append(deps, name)
 		}
@@ -1281,6 +1399,7 @@ type DepSpec struct {
 	CrossNative  bool     // True if dependency is only for cross-compilation AND NOT cross-system
 	RuntimeOnly  bool     // True if dependency is needed after install but not for the build graph
 	Suggest      bool     // True if dependency should be suggested after install, not required
+	SuggestText  string   // Human-readable explanation shown with suggested dependencies
 	Alternatives []string // List of alternative package names (e.g., ["rust", "rustup"] for "rust | rustup")
 }
 
@@ -1401,7 +1520,11 @@ func containsDep(dependsPath, targetPkg string) bool {
 
 // installBuildDependencies identifies and installs all missing build-time dependencies for a package.
 // It returns a list of packages that were newly installed, which can later be uninstalled.
-func installBuildDependencies(pkgName string, cfg *Config) ([]string, error) {
+func installBuildDependencies(pkgName string, cfg *Config, noRemote bool) ([]string, error) {
+	return installBuildDependenciesWithOptions(pkgName, cfg, noRemote, false)
+}
+
+func installBuildDependenciesWithOptions(pkgName string, cfg *Config, noRemote bool, quiet bool) ([]string, error) {
 	var newlyInstalled []string
 
 	// Collect ALL missing dependencies (both runtime and build-time)
@@ -1430,7 +1553,7 @@ func installBuildDependencies(pkgName string, cfg *Config) ([]string, error) {
 		}
 
 		// Try to install from binary or build
-		installed, err := ensurePackageInstalled(depPkg, cfg, false)
+		installed, err := ensurePackageInstalledWithOptions(depPkg, cfg, noRemote, nil, quiet)
 		if err != nil {
 			return newlyInstalled, err
 		}
@@ -1444,8 +1567,28 @@ func installBuildDependencies(pkgName string, cfg *Config) ([]string, error) {
 
 // ensurePackageInstalled handles the "fetch binary OR build and then install" logic for a single package.
 func ensurePackageInstalled(pkgName string, cfg *Config, noRemote bool) (bool, error) {
+	return ensurePackageInstalledWithOptions(pkgName, cfg, noRemote, nil, false)
+}
+
+func ensurePackageInstalledWithSeen(pkgName string, cfg *Config, noRemote bool, seen map[string]bool) (bool, error) {
+	return ensurePackageInstalledWithOptions(pkgName, cfg, noRemote, seen, false)
+}
+
+func ensurePackageInstalledWithOptions(pkgName string, cfg *Config, noRemote bool, seen map[string]bool, quiet bool) (bool, error) {
 	if isPackageInstalled(pkgName) {
 		return false, nil
+	}
+	if _, inProgress := runtimeDependencyInstallInProgress.Load(pkgName); inProgress {
+		debugf("Skipping recursive install for in-progress dependency %s\n", pkgName)
+		return false, nil
+	}
+	runtimeDependencyInstallInProgress.Store(pkgName, true)
+	defer runtimeDependencyInstallInProgress.Delete(pkgName)
+
+	if _, err := findPackageMetadataDir(pkgName); err != nil {
+		if sourcePkg, _, ok := findSplitPackageSource(pkgName); ok {
+			return ensureSplitPackageInstalled(sourcePkg, pkgName, cfg, noRemote, seen, quiet)
+		}
 	}
 
 	// 1. Get repo version
@@ -1486,30 +1629,107 @@ func ensurePackageInstalled(pkgName string, cfg *Config, noRemote bool) (bool, e
 	}
 
 	if foundBinary {
-		if err := ensureBinaryRuntimeDependenciesInstalled(pkgName, cfg, noRemote, nil); err != nil {
+		if err := ensureBinaryRuntimeDependenciesInstalledWithOptions(pkgName, cfg, noRemote, seen, quiet); err != nil {
 			return false, err
 		}
+		logger, fast := dependencyInstallLogger(quiet)
 		isCriticalAtomic.Store(1)
 		defer isCriticalAtomic.Store(0)
-		handlePreInstallUninstall(outputPkgName, cfg, RootExec, true, nil)
-		if _, err := pkgInstall(tarballPath, outputPkgName, cfg, RootExec, true, false, false, nil); err != nil {
+		handlePreInstallUninstall(outputPkgName, cfg, RootExec, true, logger)
+		if _, err := pkgInstall(tarballPath, outputPkgName, cfg, RootExec, true, fast, false, logger); err != nil {
 			return false, fmt.Errorf("failed to install binary %s: %v", pkgName, err)
 		}
 		return true, nil
 	}
 
 	// 2. Build from source
-	_, err = pkgBuild(pkgName, cfg, UserExec, BuildOptions{Quiet: true})
+	if err := installSourceFallbackBuildDependenciesWithOptions(pkgName, cfg, noRemote, quiet); err != nil {
+		return false, err
+	}
+	buildOpts := BuildOptions{Quiet: true}
+	if quiet {
+		buildOpts.LogWriter = io.Discard
+	}
+	_, err = pkgBuild(pkgName, cfg, UserExec, buildOpts)
 	if err != nil {
 		return false, fmt.Errorf("failed to build %s: %v", pkgName, err)
 	}
 
 	// 3. Install after build
+	logger, fast := dependencyInstallLogger(quiet)
 	isCriticalAtomic.Store(1)
 	defer isCriticalAtomic.Store(0)
-	handlePreInstallUninstall(outputPkgName, cfg, RootExec, true, nil)
-	if _, err := pkgInstall(tarballPath, outputPkgName, cfg, RootExec, true, false, false, nil); err != nil {
+	handlePreInstallUninstall(outputPkgName, cfg, RootExec, true, logger)
+	if _, err := pkgInstall(tarballPath, outputPkgName, cfg, RootExec, true, fast, false, logger); err != nil {
 		return false, fmt.Errorf("failed to install built package %s: %v", pkgName, err)
+	}
+	return true, nil
+}
+
+func ensureSplitPackageInstalled(sourcePkg, splitPkg string, cfg *Config, noRemote bool, seen map[string]bool, quiet bool) (bool, error) {
+	if isPackageInstalled(splitPkg) {
+		return false, nil
+	}
+
+	version, revision, err := getRepoVersion2(sourcePkg)
+	if err != nil {
+		return false, err
+	}
+
+	sourceDir, err := findPackageMetadataDir(sourcePkg)
+	if err != nil {
+		return false, err
+	}
+	options := loadBuildOptions(sourceDir)
+	isGeneric := cfg.Values["HOKUTO_GENERIC"] == "1" || options["generic"]
+	arch := GetSystemArchForPackage(cfg, sourcePkg)
+	variant := IdentifyVariant(splitPkg, isGeneric, isMultilibPackage(splitPkg))
+	tarballName := StandardizeRemoteName(splitPkg, version, revision, arch, variant)
+	tarballPath := filepath.Join(BinDir, tarballName)
+
+	foundBinary := false
+	if _, err := os.Stat(tarballPath); err == nil {
+		foundBinary = true
+	} else if !noRemote && BinaryMirror != "" {
+		index, _ := GetCachedRemoteIndex(cfg)
+		var expectedSum string
+		shouldTryDownload := true
+		if index != nil {
+			shouldTryDownload = false
+			for _, entry := range index {
+				if entry.Name == splitPkg && entry.Version == version && entry.Revision == revision && entry.Arch == arch && entry.Variant == variant {
+					shouldTryDownload = true
+					expectedSum = entry.B3Sum
+					break
+				}
+			}
+		}
+		if shouldTryDownload {
+			if err := fetchBinaryPackage(splitPkg, version, revision, cfg, true, expectedSum, false); err == nil {
+				foundBinary = true
+			}
+		}
+	}
+
+	if foundBinary {
+		if err := ensureBinaryRuntimeDependenciesInstalledWithOptions(splitPkg, cfg, noRemote, seen, quiet); err != nil {
+			return false, err
+		}
+		return installBinaryTarballWithOptions(tarballPath, splitPkg, cfg, quiet)
+	}
+
+	if err := installSourceFallbackBuildDependenciesWithOptions(sourcePkg, cfg, noRemote, quiet); err != nil {
+		return false, err
+	}
+	buildOpts := BuildOptions{Quiet: true}
+	if quiet {
+		buildOpts.LogWriter = io.Discard
+	}
+	if _, err := pkgBuild(sourcePkg, cfg, UserExec, buildOpts); err != nil {
+		return false, fmt.Errorf("failed to build %s for split package %s: %v", sourcePkg, splitPkg, err)
+	}
+	if err := installBuiltSplitDependencyWithOptions(sourcePkg, splitPkg, cfg, quiet); err != nil {
+		return false, fmt.Errorf("failed to install split package %s from %s: %w", splitPkg, sourcePkg, err)
 	}
 	return true, nil
 }
@@ -1535,6 +1755,10 @@ func binaryRuntimeDependencySpecs(pkgName string, cfg *Config, noRemote bool) ([
 }
 
 func ensureBinaryRuntimeDependenciesInstalled(pkgName string, cfg *Config, noRemote bool, seen map[string]bool) error {
+	return ensureBinaryRuntimeDependenciesInstalledWithOptions(pkgName, cfg, noRemote, seen, false)
+}
+
+func ensureBinaryRuntimeDependenciesInstalledWithOptions(pkgName string, cfg *Config, noRemote bool, seen map[string]bool, quiet bool) error {
 	if seen == nil {
 		seen = make(map[string]bool)
 	}
@@ -1574,24 +1798,36 @@ func ensureBinaryRuntimeDependenciesInstalled(pkgName string, cfg *Config, noRem
 			continue
 		}
 
-		if err := ensureBinaryRuntimeDependenciesInstalled(depName, cfg, noRemote, seen); err != nil {
+		if err := ensureBinaryRuntimeDependenciesInstalledWithOptions(depName, cfg, noRemote, seen, quiet); err != nil {
 			return err
 		}
 		if findInstalledSatisfying(depName, dep.Op, dep.Version) != "" {
 			continue
 		}
-		if _, err := ensurePackageInstalled(depName, cfg, noRemote); err != nil {
+		if _, err := ensurePackageInstalledWithOptions(depName, cfg, noRemote, seen, quiet); err != nil {
 			return fmt.Errorf("failed to install runtime dependency %s for %s: %w", depName, pkgName, err)
 		}
 	}
 	return nil
 }
 
+func dependencyInstallLogger(quiet bool) (io.Writer, bool) {
+	if quiet {
+		return io.Discard, true
+	}
+	return nil, false
+}
+
 func installBinaryTarball(tarballPath, pkgName string, cfg *Config) (bool, error) {
+	return installBinaryTarballWithOptions(tarballPath, pkgName, cfg, false)
+}
+
+func installBinaryTarballWithOptions(tarballPath, pkgName string, cfg *Config, quiet bool) (bool, error) {
+	logger, fast := dependencyInstallLogger(quiet)
 	isCriticalAtomic.Store(1)
 	defer isCriticalAtomic.Store(0)
-	handlePreInstallUninstall(pkgName, cfg, RootExec, true, nil)
-	if _, err := pkgInstall(tarballPath, pkgName, cfg, RootExec, true, false, false, nil); err != nil {
+	handlePreInstallUninstall(pkgName, cfg, RootExec, true, logger)
+	if _, err := pkgInstall(tarballPath, pkgName, cfg, RootExec, true, fast, false, logger); err != nil {
 		return false, fmt.Errorf("failed to install binary %s: %v", pkgName, err)
 	}
 	return true, nil
@@ -1631,6 +1867,129 @@ func ensureBinaryOnlyPackageInstalled(pkgName string, cfg *Config, noRemote bool
 	return installBinaryTarball(tarballPath, entry.Name, cfg)
 }
 
+func fetchExactBinaryTarballIfAvailable(pkgName, version, revision, variant string, cfg *Config, noRemote bool) (string, bool, error) {
+	if noRemote || BinaryMirror == "" {
+		return "", false, nil
+	}
+
+	index, err := GetCachedRemoteIndex(cfg)
+	if err != nil {
+		debugf("Skipping remote binary install check for %s: %v\n", pkgName, err)
+		return "", false, nil
+	}
+
+	arch := GetSystemArchForPackage(cfg, pkgName)
+	for _, entry := range index {
+		if entry.Name != pkgName || entry.Version != version || entry.Revision != revision || entry.Arch != arch || entry.Variant != variant {
+			continue
+		}
+		if err := fetchSpecificBinaryPackage(entry.Name, entry.Version, entry.Revision, entry.Variant, cfg, true, entry.B3Sum, false); err != nil {
+			return "", false, err
+		}
+		tarballPath := filepath.Join(BinDir, StandardizeRemoteName(entry.Name, entry.Version, entry.Revision, entry.Arch, entry.Variant))
+		return tarballPath, true, nil
+	}
+
+	return "", false, nil
+}
+
+func availableBinaryPackageTarball(pkgName string, cfg *Config, noRemote bool) (installName, tarballPath string, ok bool, err error) {
+	lookupName := pkgName
+	if idx := strings.Index(pkgName, "@"); idx != -1 {
+		lookupName = pkgName[:idx]
+	}
+
+	if _, sourceErr := findPackageMetadataDir(lookupName); sourceErr != nil {
+		if sourcePkg, sourceDir, splitOK := findSplitPackageSource(lookupName); splitOK {
+			version, revision, err := getRepoVersion2(sourcePkg)
+			if err != nil {
+				return "", "", false, err
+			}
+
+			options := loadBuildOptions(sourceDir)
+			isGeneric := options["generic"]
+			if cfg != nil && cfg.Values["HOKUTO_GENERIC"] == "1" {
+				isGeneric = true
+			}
+			arch := GetSystemArchForPackage(cfg, lookupName)
+			variant := IdentifyVariant(lookupName, isGeneric, isMultilibPackage(lookupName))
+			tarballName := StandardizeRemoteName(lookupName, version, revision, arch, variant)
+			tarballPath := filepath.Join(BinDir, tarballName)
+			if _, err := os.Stat(tarballPath); err == nil {
+				return lookupName, tarballPath, true, nil
+			}
+			tarballPath, ok, err := fetchExactBinaryTarballIfAvailable(lookupName, version, revision, variant, cfg, noRemote)
+			if err != nil || ok {
+				return lookupName, tarballPath, ok, err
+			}
+			return "", "", false, nil
+		}
+
+		if tarballPath := findCachedBinaryTarball(lookupName, cfg); tarballPath != "" {
+			return lookupName, tarballPath, true, nil
+		}
+		if noRemote || BinaryMirror == "" {
+			return "", "", false, nil
+		}
+		index, err := GetCachedRemoteIndex(cfg)
+		if err != nil {
+			debugf("Skipping remote binary install check for %s: %v\n", lookupName, err)
+			return "", "", false, nil
+		}
+		entryRef, err := GetRemotePackageEntry(lookupName, cfg, index)
+		if err != nil {
+			return "", "", false, nil
+		}
+		entry := *entryRef
+		if err := fetchSpecificBinaryPackage(entry.Name, entry.Version, entry.Revision, entry.Variant, cfg, true, entry.B3Sum, false); err != nil {
+			return "", "", false, err
+		}
+		arch := GetSystemArchForPackage(cfg, entry.Name)
+		tarballPath := filepath.Join(BinDir, StandardizeRemoteName(entry.Name, entry.Version, entry.Revision, arch, entry.Variant))
+		return entry.Name, tarballPath, true, nil
+	}
+
+	version, revision, err := getRepoVersion2(lookupName)
+	if err != nil {
+		return "", "", false, nil
+	}
+	outputName := getOutputPackageName(lookupName, cfg)
+	if tarballPath := findCachedBinaryTarballVersion(outputName, version, revision, cfg); tarballPath != "" {
+		return outputName, tarballPath, true, nil
+	}
+
+	variant := GetSystemVariantForPackage(cfg, lookupName)
+	if tarballPath, ok, err := fetchExactBinaryTarballIfAvailable(outputName, version, revision, variant, cfg, noRemote); err != nil || ok {
+		return outputName, tarballPath, ok, err
+	}
+	if outputName != lookupName {
+		if tarballPath, ok, err := fetchExactBinaryTarballIfAvailable(lookupName, version, revision, variant, cfg, noRemote); err != nil || ok {
+			return lookupName, tarballPath, ok, err
+		}
+	}
+
+	return "", "", false, nil
+}
+
+func installAvailableBinaryPackageOnly(pkgName string, cfg *Config, noRemote bool) (bool, error) {
+	return installAvailableBinaryPackageOnlyWithOptions(pkgName, cfg, noRemote, false)
+}
+
+func installAvailableBinaryPackageOnlyWithOptions(pkgName string, cfg *Config, noRemote bool, quiet bool) (bool, error) {
+	if isPackageInstalled(pkgName) {
+		return false, nil
+	}
+
+	installName, tarballPath, ok, err := availableBinaryPackageTarball(pkgName, cfg, noRemote)
+	if err != nil || !ok {
+		return false, err
+	}
+
+	suppressRuntimeDependencyAutoInstall.Add(1)
+	defer suppressRuntimeDependencyAutoInstall.Add(-1)
+	return installBinaryTarballWithOptions(tarballPath, installName, cfg, quiet)
+}
+
 func requiredDevelPackages(cfg *Config, includeMultilib bool) []string {
 	required := append([]string{}, baseDevelPackages...)
 	if includeMultilib && multilibEnabled(cfg) {
@@ -1639,7 +1998,41 @@ func requiredDevelPackages(cfg *Config, includeMultilib bool) []string {
 	return required
 }
 
+func isRequiredDevelPackage(pkgName string, cfg *Config) bool {
+	for _, develPkg := range requiredDevelPackages(cfg, true) {
+		if pkgName == develPkg || pkgName == getOutputPackageName(develPkg, cfg) {
+			return true
+		}
+	}
+	return false
+}
+
+func installSourceFallbackBuildDependencies(pkgName string, cfg *Config, noRemote bool) error {
+	return installSourceFallbackBuildDependenciesWithOptions(pkgName, cfg, noRemote, false)
+}
+
+func installSourceFallbackBuildDependenciesWithOptions(pkgName string, cfg *Config, noRemote bool, quiet bool) error {
+	if cfg != nil && cfg.Values["HOKUTO_BOOTSTRAP"] != "1" && !isRequiredDevelPackage(pkgName, cfg) {
+		includeMultilib := packageSetHasBuildOption([]string{pkgName}, "multilib")
+		if _, err := ensureDevelPackagesInstalledWithOptions(cfg, includeMultilib, noRemote, quiet); err != nil {
+			return fmt.Errorf("failed to prepare devel packages for %s: %w", pkgName, err)
+		}
+	}
+
+	if _, err := installBuildDependenciesWithOptions(pkgName, cfg, noRemote, quiet); err != nil {
+		return err
+	}
+	return nil
+}
+
 func ensureDevelPackagesInstalled(cfg *Config, includeMultilib bool, noRemote bool) ([]string, error) {
+	return ensureDevelPackagesInstalledWithOptions(cfg, includeMultilib, noRemote, false)
+}
+
+func ensureDevelPackagesInstalledWithOptions(cfg *Config, includeMultilib bool, noRemote bool, quiet bool) ([]string, error) {
+	develInstallMu.Lock()
+	defer develInstallMu.Unlock()
+
 	var missing []string
 	for _, pkgName := range requiredDevelPackages(cfg, includeMultilib) {
 		if isPackageInstalled(pkgName) {
@@ -1656,9 +2049,12 @@ func ensureDevelPackagesInstalled(cfg *Config, includeMultilib bool, noRemote bo
 
 	var newlyInstalled []string
 	for _, pkgName := range missing {
-		installed, err := ensurePackageInstalled(pkgName, cfg, noRemote)
+		installed, err := installAvailableBinaryPackageOnlyWithOptions(pkgName, cfg, noRemote, quiet)
 		if err != nil {
 			return newlyInstalled, err
+		}
+		if !installed && !isPackageInstalled(pkgName) {
+			return newlyInstalled, fmt.Errorf("required devel package %s has no available binary package; install it manually or build it in bootstrap mode", pkgName)
 		}
 		if installed {
 			newlyInstalled = append(newlyInstalled, getOutputPackageName(pkgName, cfg))
@@ -1670,16 +2066,34 @@ func ensureDevelPackagesInstalled(cfg *Config, includeMultilib bool, noRemote bo
 
 // uninstallBuildDependencies uninstalls a list of packages in reverse order.
 func uninstallBuildDependencies(packages []string, cfg *Config) {
+	uninstallBuildDependenciesWithOptions(packages, cfg, false)
+}
+
+func uninstallBuildDependenciesWithOptions(packages []string, cfg *Config, quiet bool) {
 	// Uninstall in reverse order
+	removedCount := 0
 	for i := len(packages) - 1; i >= 0; i-- {
 		pkgName := packages[i]
 		if len(installedDependents(pkgName, cfg, nil)) > 0 {
 			continue
 		}
-		colArrow.Print("-> ")
-		colSuccess.Printf("Removing build dependency: %s\n", pkgName)
-		if err := pkgUninstall(pkgName, cfg, RootExec, false, true, nil); err != nil {
-			colWarn.Printf("Warning: failed to uninstall build dependency %s: %v\n", pkgName, err)
+		logger, _ := dependencyInstallLogger(quiet)
+		if !quiet {
+			colArrow.Print("-> ")
+			colSuccess.Printf("Removing build dependency: %s\n", pkgName)
 		}
+		if err := pkgUninstall(pkgName, cfg, RootExec, false, true, logger); err != nil {
+			if quiet {
+				debugf("Warning: failed to uninstall build dependency %s: %v\n", pkgName, err)
+			} else {
+				colWarn.Printf("Warning: failed to uninstall build dependency %s: %v\n", pkgName, err)
+			}
+			continue
+		}
+		removedCount++
+	}
+	if quiet && removedCount > 0 {
+		colArrow.Print("-> ")
+		colSuccess.Printf("Removed %d temporary build dependencies\n", removedCount)
 	}
 }

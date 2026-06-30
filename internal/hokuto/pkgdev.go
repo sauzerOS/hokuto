@@ -510,7 +510,7 @@ func bumpPackage(pkgName, expectedOldVersion, newVersion string) (string, error)
 func buildBumpedPackage(pkgName string, cfg *Config) error {
 	colNote.Printf(">> [BUILDING] %s (idle mode)\n", pkgName)
 
-	installedBuildDeps, depErr := installBuildDependencies(pkgName, cfg)
+	installedBuildDeps, depErr := installBuildDependencies(pkgName, cfg, false)
 	if depErr != nil {
 		return fmt.Errorf("failed to install build dependencies: %v", depErr)
 	}

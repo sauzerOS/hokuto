@@ -48,6 +48,12 @@ type unmanagedEntry struct {
 	Size   int64
 }
 
+type selectableEntry struct {
+	Primary string
+	Size    int64
+	Meta    string
+}
+
 func normalizeTrackedPath(root, path string) (string, bool) {
 	path = strings.TrimSpace(path)
 	if path == "" || strings.HasSuffix(path, "/") {
@@ -584,12 +590,12 @@ func restoreBackupArchive(root, archivePath string, selected map[string]bool) er
 	return nil
 }
 
-func selectUnmanagedEntries(title, footerText string, actionKey rune, entries []unmanagedEntry, action func([]unmanagedEntry) error) error {
+func selectEntries(title, footerText string, actionKey rune, entries []selectableEntry, action func([]int) error) error {
 	if !term.IsTerminal(int(os.Stdout.Fd())) {
 		return fmt.Errorf("interactive selection requires a terminal")
 	}
 	if len(entries) == 0 {
-		return fmt.Errorf("no files available for selection")
+		return fmt.Errorf("no entries available for selection")
 	}
 
 	selected := make([]bool, len(entries))
@@ -606,15 +612,15 @@ func selectUnmanagedEntries(title, footerText string, actionKey rune, entries []
 		if selected[row] {
 			mark = "[X]"
 		}
-		reason := entries[row].Reason
-		if reason == "" {
-			reason = "file"
+		meta := entries[row].Meta
+		if meta == "" {
+			meta = "file"
 		}
 		size := humanReadableSize(entries[row].Size)
 		table.SetCell(row, 0, tview.NewTableCell(tview.Escape(mark)).SetTextColor(tcell.ColorGreen).SetExpansion(0))
-		table.SetCell(row, 1, tview.NewTableCell(entries[row].Path).SetTextColor(tcell.ColorWhite).SetExpansion(1))
+		table.SetCell(row, 1, tview.NewTableCell(entries[row].Primary).SetTextColor(tcell.ColorWhite).SetExpansion(1))
 		table.SetCell(row, 2, tview.NewTableCell(size).SetTextColor(tcell.ColorYellow).SetExpansion(0).SetAlign(tview.AlignRight))
-		table.SetCell(row, 3, tview.NewTableCell(reason).SetTextColor(tcell.ColorGray).SetExpansion(0))
+		table.SetCell(row, 3, tview.NewTableCell(meta).SetTextColor(tcell.ColorGray).SetExpansion(0))
 	}
 	refresh := func() {
 		table.Clear()
@@ -629,10 +635,10 @@ func selectUnmanagedEntries(title, footerText string, actionKey rune, entries []
 
 	var actionErr error
 	runAction := func() {
-		var chosen []unmanagedEntry
+		var chosen []int
 		for i, ok := range selected {
 			if ok {
-				chosen = append(chosen, entries[i])
+				chosen = append(chosen, i)
 			}
 		}
 		if err := action(chosen); err != nil {
@@ -689,6 +695,24 @@ func selectUnmanagedEntries(title, footerText string, actionKey rune, entries []
 		return err
 	}
 	return actionErr
+}
+
+func selectUnmanagedEntries(title, footerText string, actionKey rune, entries []unmanagedEntry, action func([]unmanagedEntry) error) error {
+	displayEntries := make([]selectableEntry, len(entries))
+	for i, entry := range entries {
+		displayEntries[i] = selectableEntry{
+			Primary: entry.Path,
+			Size:    entry.Size,
+			Meta:    entry.Reason,
+		}
+	}
+	return selectEntries(title, footerText, actionKey, displayEntries, func(indices []int) error {
+		chosen := make([]unmanagedEntry, 0, len(indices))
+		for _, idx := range indices {
+			chosen = append(chosen, entries[idx])
+		}
+		return action(chosen)
+	})
 }
 
 func handleUnmanagedCommand(cfg *Config, opts unmanagedOptions) error {

@@ -618,6 +618,13 @@ func generateDepends(pkgName, pkgDir, outputDir, rootDir string, execCtx *Execut
 		}
 		return name + op + ver
 	}
+	formatSuggestLine := func(name, op, ver, text string) string {
+		line := formatDepLine(name, op, ver) + " suggest"
+		if text != "" {
+			line += " " + text
+		}
+		return line
+	}
 	cleanManualDepName := func(name string) string {
 		if name == "19-binutils-2" {
 			return ""
@@ -705,7 +712,7 @@ func generateDepends(pkgName, pkgDir, outputDir, rootDir string, execCtx *Execut
 			line = strings.TrimSpace(line)
 			if line != "" && !strings.HasPrefix(line, "#") {
 				// Extract package name to use as key in the map
-				name, op, ver, optional, rebuild, makeDep, _, _, runtimeOnly, suggest := parseDepToken(line)
+				name, op, ver, optional, rebuild, makeDep, _, _, runtimeOnly, suggest, suggestText := parseDepToken(line)
 				if name != "" {
 					cleanName := cleanManualDepName(name)
 					if cleanName == "" {
@@ -717,7 +724,7 @@ func generateDepends(pkgName, pkgDir, outputDir, rootDir string, execCtx *Execut
 					}
 
 					if suggest {
-						suggestLines[name] = formatDepLine(name, op, ver)
+						suggestLines[name] = formatSuggestLine(name, op, ver, suggestText)
 						continue
 					}
 

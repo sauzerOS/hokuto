@@ -151,19 +151,7 @@ func RunParallelBuilds(plan *BuildPlan, cfg *Config, maxJobs int, userRequestedM
 			if err == nil {
 				if deps, err := parseDependsFile(pkgDir); err == nil {
 					for _, dep := range deps {
-						// Filter optional/cross
-						if dep.Optional {
-							continue
-						}
-						if dep.Cross && pm.Config.Values["HOKUTO_CROSS_ARCH"] == "" {
-							continue
-						}
-						if dep.CrossNative {
-							if pm.Config.Values["HOKUTO_CROSS_ARCH"] == "" || pm.Config.Values["HOKUTO_CROSS_SYSTEM"] == "1" {
-								continue
-							}
-						}
-						if shouldSkipMultilibMakeDep(dep, dep.Name, pm.Config) {
+						if !activeBuildDependency(dep, pm.Config, false) {
 							continue
 						}
 
@@ -282,6 +270,10 @@ func collectAvailableBinaryDependenciesForPlan(plan *BuildPlan, cfg *Config, noR
 }
 
 func installAvailableBinaryDependenciesForPlan(plan *BuildPlan, cfg *Config, noRemote bool) ([]string, error) {
+	return installAvailableBinaryDependenciesForPlanWithOptions(plan, cfg, noRemote, false)
+}
+
+func installAvailableBinaryDependenciesForPlanWithOptions(plan *BuildPlan, cfg *Config, noRemote bool, quiet bool) ([]string, error) {
 	depsToInstall := collectAvailableBinaryDependenciesForPlan(plan, cfg, noRemote)
 	if len(depsToInstall) == 0 {
 		return nil, nil
@@ -289,10 +281,12 @@ func installAvailableBinaryDependenciesForPlan(plan *BuildPlan, cfg *Config, noR
 
 	var installed []string
 	for _, dep := range depsToInstall {
-		colArrow.Print("-> ")
-		colSuccess.Printf("Installing available binary dependency:")
-		colNote.Printf(" %s\n", dep.Name)
-		ok, err := ensurePackageInstalled(dep.Name, cfg, noRemote)
+		if !quiet {
+			colArrow.Print("-> ")
+			colSuccess.Printf("Installing available binary dependency:")
+			colNote.Printf(" %s\n", dep.Name)
+		}
+		ok, err := installAvailableBinaryPackageOnlyWithOptions(dep.Name, cfg, noRemote, quiet)
 		if err != nil {
 			return installed, fmt.Errorf("failed to install binary dependency %s: %w", dep.Name, err)
 		}
@@ -377,7 +371,7 @@ func (pm *ParallelManager) Run() error {
 			pm.mu.Lock()
 			// Log file handling
 			logFile := pm.LogFiles[res.pkgName]
-			var logger io.Writer // default nil
+			var logger io.Writer = io.Discard
 			if logFile != nil {
 				logger = logFile
 			}
@@ -582,6 +576,9 @@ func (pm *ParallelManager) Run() error {
 }
 
 func (pm *ParallelManager) installPackage(pkgName string, userRequestedMap map[string]bool, logger io.Writer) (parallelInstallResult, error) {
+	if logger == nil {
+		logger = io.Discard
+	}
 	result := parallelInstallResult{Available: []string{pkgName}}
 	version, revision, err := getRepoVersion2(pkgName)
 	if err != nil {
@@ -623,8 +620,8 @@ func (pm *ParallelManager) installPackage(pkgName string, userRequestedMap map[s
 	}
 
 	// Check for conflicts before install
-	handlePreInstallUninstall(outputPkgName, pm.Config, RootExec, pm.AutoYes, logger)                             // Pass AutoYes and logger
-	rebuilds, err := pkgInstall(tarballPath, outputPkgName, pm.Config, RootExec, pm.AutoYes, false, true, logger) // Pass AutoYes, managed=true
+	handlePreInstallUninstall(outputPkgName, pm.Config, RootExec, pm.AutoYes, logger)
+	rebuilds, err := pkgInstall(tarballPath, outputPkgName, pm.Config, RootExec, pm.AutoYes, true, true, logger)
 	isCriticalAtomic.Store(0)
 
 	if err == nil {
@@ -728,9 +725,21 @@ func (pm *ParallelManager) canBuild(pkgName string) bool {
 			if shouldSkipMultilibMakeDep(dep, cand, pm.Config) {
 				continue
 			}
+			splitSource := ""
+			for sourcePkg, splitPkgs := range pm.SplitDepsBySource {
+				for _, splitPkg := range splitPkgs {
+					if splitPkg == cand {
+						splitSource = sourcePkg
+						break
+					}
+				}
+				if splitSource != "" {
+					break
+				}
+			}
 
 			// If it failed in this run, we definitely can't be satisfied by it
-			if pm.Failed[cand] != nil {
+			if pm.Failed[cand] != nil || (splitSource != "" && pm.Failed[splitSource] != nil) {
 				continue
 			}
 
@@ -744,7 +753,7 @@ func (pm *ParallelManager) canBuild(pkgName string) bool {
 			}
 			if !isBuilding {
 				for r := range pm.Running {
-					if r == cand {
+					if r == cand || (splitSource != "" && r == splitSource) {
 						isBuilding = true
 						break
 					}
@@ -752,7 +761,15 @@ func (pm *ParallelManager) canBuild(pkgName string) bool {
 			}
 			if !isBuilding {
 				for _, r := range pm.pendingRebuilds {
-					if r == cand {
+					if r == cand || (splitSource != "" && r == splitSource) {
+						isBuilding = true
+						break
+					}
+				}
+			}
+			if !isBuilding && splitSource != "" {
+				for _, p := range pm.Pending {
+					if p == splitSource {
 						isBuilding = true
 						break
 					}
@@ -760,7 +777,7 @@ func (pm *ParallelManager) canBuild(pkgName string) bool {
 			}
 
 			// 1. Check if completed in this run
-			if pm.Available[cand] || pm.Completed[cand] {
+			if pm.Available[cand] || pm.Completed[cand] || (splitSource != "" && pm.Completed[splitSource] && pm.Available[cand]) {
 				satisfied = true
 				break
 			}
