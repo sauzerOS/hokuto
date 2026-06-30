@@ -3391,6 +3391,20 @@ func handleBuildCommand(args []string, cfg *Config) error {
 						continue
 					}
 					if sourcePkg, ok := findSplitDependencySource(depPkg); ok {
+						if !binaryDeclined[depPkg] && dependencyBinaryAvailable(depPkg, cfg, *noRemote) {
+							if askForConfirmation(colInfo, "Dependency '%s' is missing. Use available binary package?", depPkg) {
+								installed, installErr := installAvailableSplitDependencyBinary(sourcePkg, depPkg, cfg, *noRemote, nil, quietDependencyInstalls)
+								if installErr == nil {
+									if installed {
+										addTemporaryBuildDep(depPkg)
+									}
+									continue
+								}
+								colWarn.Printf("Warning: failed to install available binary dependency %s: %v\n", depPkg, installErr)
+							} else {
+								binaryDeclined[depPkg] = true
+							}
+						}
 						colArrow.Print("-> ")
 						colInfo.Printf("Dependency %s is a split package; scheduling %s to build it\n", depPkg, sourcePkg)
 						packagesThatMustBeBuilt[sourcePkg] = true

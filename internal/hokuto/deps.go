@@ -1734,6 +1734,61 @@ func ensureSplitPackageInstalled(sourcePkg, splitPkg string, cfg *Config, noRemo
 	return true, nil
 }
 
+func installAvailableSplitDependencyBinary(sourcePkg, splitPkg string, cfg *Config, noRemote bool, seen map[string]bool, quiet bool) (bool, error) {
+	if isPackageInstalled(splitPkg) {
+		return false, nil
+	}
+
+	version, revision, err := getRepoVersion2(sourcePkg)
+	if err != nil {
+		return false, err
+	}
+
+	sourceDir, err := findPackageMetadataDir(sourcePkg)
+	if err != nil {
+		return false, err
+	}
+	options := loadBuildOptions(sourceDir)
+	isGeneric := cfg.Values["HOKUTO_GENERIC"] == "1" || options["generic"]
+	arch := GetSystemArchForPackage(cfg, sourcePkg)
+	variant := IdentifyVariant(splitPkg, isGeneric, isMultilibPackage(splitPkg))
+	tarballPath := filepath.Join(BinDir, StandardizeRemoteName(splitPkg, version, revision, arch, variant))
+
+	if _, err := os.Stat(tarballPath); err != nil {
+		if noRemote || BinaryMirror == "" {
+			return false, nil
+		}
+
+		index, _ := GetCachedRemoteIndex(cfg)
+		var expectedSum string
+		shouldTryDownload := true
+		if index != nil {
+			shouldTryDownload = false
+			for _, entry := range index {
+				if entry.Name == splitPkg && entry.Version == version && entry.Revision == revision && entry.Arch == arch && entry.Variant == variant {
+					shouldTryDownload = true
+					expectedSum = entry.B3Sum
+					break
+				}
+			}
+		}
+		if !shouldTryDownload {
+			return false, nil
+		}
+		if err := fetchBinaryPackage(splitPkg, version, revision, cfg, true, expectedSum, false); err != nil {
+			return false, err
+		}
+		if _, err := os.Stat(tarballPath); err != nil {
+			return false, nil
+		}
+	}
+
+	if err := ensureBinaryRuntimeDependenciesInstalledWithOptions(splitPkg, cfg, noRemote, seen, quiet); err != nil {
+		return false, err
+	}
+	return installBinaryTarballWithOptions(tarballPath, splitPkg, cfg, quiet)
+}
+
 func binaryRuntimeDependencySpecs(pkgName string, cfg *Config, noRemote bool) ([]DepSpec, error) {
 	lookupName := pkgName
 	if idx := strings.Index(pkgName, "@"); idx != -1 {
