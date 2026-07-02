@@ -3766,7 +3766,7 @@ func handleBuildCommand(args []string, cfg *Config) error {
 				for _, dep := range installedBinaryDeps {
 					addTemporaryBuildDep(dep)
 				}
-				if err := RunParallelBuilds(initialPlan, cfg, maxJobs, userRequestedMap, true, splitDepsBySource, smartBuildBuilder); err != nil {
+				if err := RunParallelBuilds(initialPlan, cfg, maxJobs, userRequestedMap, true, *autoInstall, splitDepsBySource, smartBuildBuilder); err != nil {
 					return err
 				}
 

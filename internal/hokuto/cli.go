@@ -1497,6 +1497,20 @@ func findNewestTarball(pkgName, variant string) (string, string, string) {
 		}
 
 		for _, match := range matches {
+			metadata, _, err := scanTarballMetadata(match)
+			if err != nil {
+				debugf("Skipping cached tarball %s: failed to read metadata: %v\n", match, err)
+				continue
+			}
+			if metadata["name"] != pkgName {
+				debugf("Skipping cached tarball %s: metadata name %q does not match %q\n", match, metadata["name"], pkgName)
+				continue
+			}
+			if IdentifyVariant(metadata["name"], metadata["generic"] == "1", metadata["multilib"] == "1") != variant {
+				debugf("Skipping cached tarball %s: metadata variant does not match %q\n", match, variant)
+				continue
+			}
+
 			info, err := os.Stat(match)
 			if err != nil {
 				continue
@@ -1504,33 +1518,10 @@ func findNewestTarball(pkgName, variant string) (string, string, string) {
 
 			// Check if this is newer than what we've found so far
 			if newestTarball == "" || info.ModTime().After(newestModTime) {
-				// Parse version and revision from filename
-				// Standardized format: name-version-revision-arch-variant.tar.zst
-				base := filepath.Base(match)
-				nameWithoutExt := strings.TrimSuffix(base, ".tar.zst")
-				parts := strings.Split(nameWithoutExt, "-")
-
-				// We expect at least 5 parts for the new format: name, version, revision, arch, variant
-				if len(parts) >= 5 {
-					// Search for version and revision. They are at index len-4 and len-3.
-					// But name can contain dashes. So we count from the end.
-					v := parts[len(parts)-4]
-					r := parts[len(parts)-3]
-
-					newestTarball = match
-					newestModTime = info.ModTime()
-					foundVersion = v
-					foundRevision = r
-				} else if len(parts) >= 3 {
-					// Fallback for transitional format: name-version-revision
-					v := parts[len(parts)-2]
-					r := parts[len(parts)-1]
-
-					newestTarball = match
-					newestModTime = info.ModTime()
-					foundVersion = v
-					foundRevision = r
-				}
+				newestTarball = match
+				newestModTime = info.ModTime()
+				foundVersion = metadata["version"]
+				foundRevision = metadata["revision"]
 			}
 		}
 	}
