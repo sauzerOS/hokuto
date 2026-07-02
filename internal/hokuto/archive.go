@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 
 	"github.com/klauspost/compress/zip"
@@ -479,7 +480,7 @@ func createPackageTarball(pkgName, pkgVer, pkgRev, arch, variant, outputDir stri
 			}
 		}
 
-		args := []string{"--zstd", "-cf", tarballPath, "-C", outputDir, "."}
+		args := []string{"--use-compress-program=zstd -T0 -19", "-cf", tarballPath, "-C", outputDir, "."}
 		if !execCtx.ShouldRunAsRoot {
 			args = append(args, "--owner=0", "--group=0", "--numeric-owner")
 		}
@@ -502,8 +503,12 @@ func createPackageTarball(pkgName, pkgVer, pkgRev, arch, variant, outputDir stri
 	}
 	defer outFile.Close()
 
-	// Create zstd writer
-	zw, err := zstd.NewWriter(outFile)
+	// Create zstd writer. Match the system-tar path's intent: prioritize
+	// package size over compression speed for distributable binary packages.
+	zw, err := zstd.NewWriter(outFile,
+		zstd.WithEncoderLevel(zstd.SpeedBestCompression),
+		zstd.WithEncoderConcurrency(runtime.GOMAXPROCS(0)),
+	)
 	if err != nil {
 		return fmt.Errorf("failed to create zstd writer: %v", err)
 	}

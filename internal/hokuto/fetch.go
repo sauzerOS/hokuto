@@ -484,6 +484,20 @@ func downloadFileQuiet(originalURL, finalURL, destFile string) error {
 	return downloadFileWithOptions(originalURL, finalURL, destFile, downloadOptions{Quiet: true, WgetNoCheckCertificate: wgetNoCheckCertificate})
 }
 
+func downloadDestMatchesSourceBasename(originalURL, finalURL, destPath string) bool {
+	destBase := filepath.Base(destPath)
+	for _, sourceURL := range []string{originalURL, finalURL} {
+		sourceBase := filepath.Base(sourceURL)
+		if sourceBase == "." || sourceBase == string(filepath.Separator) || sourceBase == "" {
+			continue
+		}
+		if destBase == sourceBase || strings.HasSuffix(destBase, "-"+sourceBase) {
+			return true
+		}
+	}
+	return false
+}
+
 func downloadFileWithOptions(originalURL, finalURL, destFile string, opt downloadOptions) (retErr error) {
 	// If a GNU mirror is being used for this download, print the info message exactly once.
 	if !opt.Quiet && originalURL != finalURL {
@@ -506,7 +520,7 @@ func downloadFileWithOptions(originalURL, finalURL, destFile string, opt downloa
 		}
 		absPath = filepath.Join(CacheStore, filepath.Base(destFile))
 	}
-	if strings.HasSuffix(absPath, ".lock") {
+	if strings.HasSuffix(absPath, ".lock") && !downloadDestMatchesSourceBasename(originalURL, finalURL, absPath) {
 		return fmt.Errorf("refusing to download to lock file path: %s", absPath)
 	}
 

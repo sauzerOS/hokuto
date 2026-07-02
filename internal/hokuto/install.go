@@ -1134,7 +1134,7 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 	for _, p := range filesToDelete {
 		rmCmd := exec.Command("rm", "-f", p)
 		if err := execCtx.Run(rmCmd); err != nil {
-			fmt.Printf("warning: failed to remove obsolete file %s: %v\n", p, err)
+			fmt.Fprintf(logger, "warning: failed to remove obsolete file %s: %v\n", p, err)
 		} else {
 			debugf("Removed obsolete file: %s\n", p)
 		}
@@ -1150,7 +1150,7 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 		fmt.Fprintln(logger, colSuccess.Sprint("Executing package post-install script"))
 	}
 	if err := executePostInstall(pkgName, rootDir, execCtx, cfg, logger); err != nil {
-		fmt.Printf("warning: post-install for %s returned error: %v\n", pkgName, err)
+		fmt.Fprintf(logger, "warning: post-install for %s returned error: %v\n", pkgName, err)
 	}
 	if err := installMissingPackageRuntimeDependencies(pkgName, cfg, logger, fast); err != nil {
 		return nil, err

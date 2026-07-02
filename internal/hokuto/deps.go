@@ -1879,10 +1879,20 @@ func installBinaryTarball(tarballPath, pkgName string, cfg *Config) (bool, error
 
 func installBinaryTarballWithOptions(tarballPath, pkgName string, cfg *Config, quiet bool) (bool, error) {
 	logger, fast := dependencyInstallLogger(quiet)
+	execCtx := RootExec
+	if quiet {
+		execCtx = &Executor{
+			Context:         RootExec.Context,
+			ShouldRunAsRoot: RootExec.ShouldRunAsRoot,
+			Interactive:     false,
+			Stdout:          io.Discard,
+			Stderr:          io.Discard,
+		}
+	}
 	isCriticalAtomic.Store(1)
 	defer isCriticalAtomic.Store(0)
-	handlePreInstallUninstall(pkgName, cfg, RootExec, true, logger)
-	if _, err := pkgInstall(tarballPath, pkgName, cfg, RootExec, true, fast, false, logger); err != nil {
+	handlePreInstallUninstall(pkgName, cfg, execCtx, true, logger)
+	if _, err := pkgInstall(tarballPath, pkgName, cfg, execCtx, true, fast, false, logger); err != nil {
 		return false, fmt.Errorf("failed to install binary %s: %v", pkgName, err)
 	}
 	return true, nil

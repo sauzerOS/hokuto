@@ -383,12 +383,12 @@ func verifyOrCreateChecksums(pkgName, pkgDir string, force bool, logger io.Write
 
 			masterPubKeyBytes, _ := hex.DecodeString(officialPublicKeyHex)
 			if err := VerifySignatureRaw(fileData, sigData, masterPubKeyBytes); err != nil {
-				colArrow.Print("-> ")
-				colError.Printf("SIGNATURE VERIFICATION FAILED for %s: %v\n", fname, err)
+				fmt.Fprint(logger, colArrow.Sprint("-> "))
+				fmt.Fprintf(logger, "%s", colError.Sprintf("SIGNATURE VERIFICATION FAILED for %s: %v\n", fname, err))
 				return fmt.Errorf("signature verification failed for %s", fname)
 			}
-			colArrow.Print("-> ")
-			colSuccess.Printf("Signature verified for %s\n", fname)
+			fmt.Fprint(logger, colArrow.Sprint("-> "))
+			fmt.Fprintf(logger, "%s", colSuccess.Sprintf("Signature verified for %s\n", fname))
 		}
 	}
 

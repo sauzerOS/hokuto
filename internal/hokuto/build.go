@@ -291,6 +291,11 @@ func installBuiltSplitDependency(sourcePkg, splitPkg string, cfg *Config) error 
 }
 
 func installBuiltSplitDependencyWithOptions(sourcePkg, splitPkg string, cfg *Config, quiet bool) error {
+	logger, fast := dependencyInstallLogger(quiet)
+	return installBuiltSplitDependencyWithLogger(sourcePkg, splitPkg, cfg, logger, fast)
+}
+
+func installBuiltSplitDependencyWithLogger(sourcePkg, splitPkg string, cfg *Config, logger io.Writer, fast bool) error {
 	if isPackageInstalled(splitPkg) {
 		return nil
 	}
@@ -313,15 +318,31 @@ func installBuiltSplitDependencyWithOptions(sourcePkg, splitPkg string, cfg *Con
 
 	isCriticalAtomic.Store(1)
 	defer isCriticalAtomic.Store(0)
-	logger, fast := dependencyInstallLogger(quiet)
-	handlePreInstallUninstall(splitPkg, cfg, RootExec, true, logger)
-	if _, err := pkgInstall(tarballPath, splitPkg, cfg, RootExec, true, fast, false, logger); err != nil {
+	installExec := RootExec
+	if logger != nil {
+		installExec = &Executor{
+			Context:         RootExec.Context,
+			ShouldRunAsRoot: RootExec.ShouldRunAsRoot,
+			Interactive:     false,
+			Stdout:          logger,
+			Stderr:          logger,
+		}
+	}
+	handlePreInstallUninstall(splitPkg, cfg, installExec, true, logger)
+	if _, err := pkgInstall(tarballPath, splitPkg, cfg, installExec, true, fast, false, logger); err != nil {
 		return err
 	}
 	return nil
 }
 
-func installAvailableBinaryBuildDeps(plan *BuildPlan, userRequested, declined map[string]bool, cfg *Config, addTemporaryBuildDep func(string), quiet bool) (bool, error) {
+func useAvailableBuildDependencyBinary(prompt bool, format string, args ...any) bool {
+	if !prompt {
+		return true
+	}
+	return askForConfirmation(colInfo, format, args...)
+}
+
+func installAvailableBinaryBuildDeps(plan *BuildPlan, userRequested, declined map[string]bool, cfg *Config, addTemporaryBuildDep func(string), prompt bool, quiet bool) (bool, error) {
 	installedAny := false
 	for _, pkgName := range plan.Order {
 		if userRequested[pkgName] || declined[pkgName] || plan.RebuildPackages[pkgName] || isPackageInstalled(pkgName) {
@@ -338,7 +359,7 @@ func installAvailableBinaryBuildDeps(plan *BuildPlan, userRequested, declined ma
 			continue
 		}
 
-		if !askForConfirmation(colInfo, "Dependency '%s' is missing. Use available binary package?", pkgName) {
+		if !useAvailableBuildDependencyBinary(prompt, "Dependency '%s' is missing. Use available binary package?", pkgName) {
 			declined[pkgName] = true
 			continue
 		}
@@ -696,9 +717,9 @@ exec meson setup \
     --libexecdir lib \
     --sbindir bin \
     --buildtype plain \
-    --auto-features enabled \
     --wrap-mode nodownload \
     -D b_pie=true \
+	-D b_ndebug=true \
     -D python.bytecompile=1 \
     "$@"
 `
@@ -728,10 +749,10 @@ exec meson setup \
     --libexecdir lib32 \
     --sbindir bin \
     --buildtype plain \
-    --auto-features enabled \
     --wrap-mode nodownload \
     --cross-file lib32 \
     -D b_pie=true \
+	-D b_ndebug=true \
     -D python.bytecompile=1 \
     "$@"
 `
@@ -915,6 +936,9 @@ func packageSplitOutputs(parentPkgName, pkgDir, splitRoot, version, revision, ta
 		}
 
 		removeLibtoolArchives(splitOutputDir, buildExec)
+		if !parentOptions["staticlibs"] {
+			removeStaticLibraries(splitOutputDir, buildExec)
+		}
 
 		isMultilib := detectMultilib(outputSplitName, splitOutputDir)
 		pkginfoExec := buildExec
@@ -973,13 +997,13 @@ func removePathFromOutput(outputDir, relPath string, execCtx *Executor) {
 	_ = execCtx.Run(rmCmd)
 }
 
-func removeLibtoolArchives(outputDir string, execCtx *Executor) {
+func removeFilesWithSuffix(outputDir, suffix, description string, execCtx *Executor) {
 	var matches []string
 	err := filepath.WalkDir(outputDir, func(path string, entry os.DirEntry, err error) error {
 		if err != nil {
 			return nil
 		}
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".la") {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), suffix) {
 			return nil
 		}
 		rel, err := filepath.Rel(outputDir, path)
@@ -990,19 +1014,30 @@ func removeLibtoolArchives(outputDir string, execCtx *Executor) {
 		return nil
 	})
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Warning: failed to scan for libtool archives in %s: %v\n", outputDir, err)
+		fmt.Fprintf(os.Stderr, "Warning: failed to scan for %s in %s: %v\n", description, outputDir, err)
 		return
 	}
 	for _, relPath := range matches {
 		removePathFromOutput(outputDir, relPath, execCtx)
 	}
 	if len(matches) > 0 {
-		debugf("Removed %d libtool archive (.la) file(s) from %s\n", len(matches), outputDir)
+		debugf("Removed %d %s file(s) from %s\n", len(matches), description, outputDir)
 	}
 }
 
-func cleanPackagedOutput(outputDir string, execCtx *Executor) {
+func removeLibtoolArchives(outputDir string, execCtx *Executor) {
+	removeFilesWithSuffix(outputDir, ".la", "libtool archive (.la)", execCtx)
+}
+
+func removeStaticLibraries(outputDir string, execCtx *Executor) {
+	removeFilesWithSuffix(outputDir, ".a", "static library (.a)", execCtx)
+}
+
+func cleanPackagedOutput(outputDir string, execCtx *Executor, options map[string]bool) {
 	removeLibtoolArchives(outputDir, execCtx)
+	if !options["staticlibs"] {
+		removeStaticLibraries(outputDir, execCtx)
+	}
 
 	for _, infoPath := range []string{
 		"/usr/share/info/dir",
@@ -1108,7 +1143,7 @@ func finalizeBuiltPackage(in builtPackageFinalization) error {
 		fmt.Fprintf(os.Stderr, "Warning: failed to save build time to %s: %v\n", buildTimeFile, err)
 	}
 
-	cleanPackagedOutput(in.outputDir, in.buildExec)
+	cleanPackagedOutput(in.outputDir, in.buildExec, in.options)
 
 	logXZPath := filepath.Join(installedDir, "log.xz")
 	logExec := in.buildExec
@@ -1154,6 +1189,9 @@ func finalizeBuiltPackage(in builtPackageFinalization) error {
 }
 
 func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, opts BuildOptions) (time.Duration, error) {
+	if opts.Quiet && opts.LogWriter == nil {
+		opts.LogWriter = io.Discard
+	}
 
 	// Define the ANSI escape code format for setting the terminal title.
 	// \033]0; sets the title, and \a (bell character) terminates the sequence.
@@ -2912,6 +2950,7 @@ func handleBuildCommand(args []string, cfg *Config) error {
 	var noDeps = buildCmd.Bool("no-deps", false, "Skip dependency checking and build only the specified package(s)")
 	var noDevel = buildCmd.Bool("no-devel", false, "Skip automatic base-devel dependency installation")
 	var noRemote = buildCmd.Bool("no-remote", false, "Do not use the remote binary mirror for build dependency resolution or installs")
+	var promptBinaryDeps = buildCmd.Bool("prompt", false, "Prompt before installing available binary build dependencies.")
 	var wgetNoCheckCert = buildCmd.Bool("wget-no-check-certificate", false, "Pass --no-check-certificate to wget fallback for source downloads")
 	var parallel = buildCmd.Int("j", 1, "Number of parallel jobs (default: 1)")
 	var parallelLong = buildCmd.Int("parallel", 1, "Number of parallel jobs (default: 1)")
@@ -3392,7 +3431,7 @@ func handleBuildCommand(args []string, cfg *Config) error {
 					}
 					if sourcePkg, ok := findSplitDependencySource(depPkg); ok {
 						if !binaryDeclined[depPkg] && dependencyBinaryAvailable(depPkg, cfg, *noRemote) {
-							if askForConfirmation(colInfo, "Dependency '%s' is missing. Use available binary package?", depPkg) {
+							if useAvailableBuildDependencyBinary(*promptBinaryDeps, "Dependency '%s' is missing. Use available binary package?", depPkg) {
 								installed, installErr := installAvailableSplitDependencyBinary(sourcePkg, depPkg, cfg, *noRemote, nil, quietDependencyInstalls)
 								if installErr == nil {
 									if installed {
@@ -3428,7 +3467,7 @@ func handleBuildCommand(args []string, cfg *Config) error {
 				outputDepPkg := getOutputPackageName(depPkg, cfg)
 				tarballPath := findCachedBinaryTarballVersion(outputDepPkg, version, revision, cfg)
 				if _, err := os.Stat(tarballPath); err == nil {
-					if askForConfirmation(colInfo, "Dependency '%s' is missing. Use available binary package?", depPkg) {
+					if useAvailableBuildDependencyBinary(*promptBinaryDeps, "Dependency '%s' is missing. Use available binary package?", depPkg) {
 						logger, fast := dependencyInstallLogger(quietDependencyInstalls)
 						isCriticalAtomic.Store(1)
 						handlePreInstallUninstall(outputDepPkg, cfg, RootExec, false, logger)
@@ -3474,7 +3513,7 @@ func handleBuildCommand(args []string, cfg *Config) error {
 								// Successfully fetched! Check stat again to be sure.
 								if _, err := os.Stat(tarballPath); err == nil {
 									foundRemote = true
-									if askForConfirmation(colInfo, "Dependency '%s' found on remote mirror. Use binary?", depPkg) {
+									if useAvailableBuildDependencyBinary(*promptBinaryDeps, "Dependency '%s' found on remote mirror. Use binary?", depPkg) {
 										logger, fast := dependencyInstallLogger(quietDependencyInstalls)
 										isCriticalAtomic.Store(1)
 										handlePreInstallUninstall(outputDepPkg, cfg, RootExec, false, logger)
@@ -3555,7 +3594,7 @@ func handleBuildCommand(args []string, cfg *Config) error {
 						return fmt.Errorf("error generating build plan for '%s': %v", pkgName, err)
 					}
 					addPostRebuildSplitDependencies(plan, splitDepsBySource)
-					installedBinaryDeps, err := installAvailableBinaryBuildDeps(plan, userRequestedMap, binaryDeclined, cfg, addTemporaryBuildDep, quietDependencyInstalls)
+					installedBinaryDeps, err := installAvailableBinaryBuildDeps(plan, userRequestedMap, binaryDeclined, cfg, addTemporaryBuildDep, *promptBinaryDeps, quietDependencyInstalls)
 					if err != nil {
 						return err
 					}
@@ -3619,7 +3658,7 @@ func handleBuildCommand(args []string, cfg *Config) error {
 						break
 					}
 					addPostRebuildSplitDependencies(initialPlan, splitDepsBySource)
-					installedBinaryDeps, installErr := installAvailableBinaryBuildDeps(initialPlan, userRequestedMap, binaryDeclined, cfg, addTemporaryBuildDep, quietDependencyInstalls)
+					installedBinaryDeps, installErr := installAvailableBinaryBuildDeps(initialPlan, userRequestedMap, binaryDeclined, cfg, addTemporaryBuildDep, *promptBinaryDeps, quietDependencyInstalls)
 					if installErr != nil {
 						return installErr
 					}

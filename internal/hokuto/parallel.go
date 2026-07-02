@@ -592,6 +592,13 @@ func (pm *ParallelManager) installPackage(pkgName string, userRequestedMap map[s
 
 	// We use RootExec for installation as it requires privileges
 	isCriticalAtomic.Store(1)
+	installExec := &Executor{
+		Context:         RootExec.Context,
+		ShouldRunAsRoot: RootExec.ShouldRunAsRoot,
+		Interactive:     false,
+		Stdout:          logger,
+		Stderr:          logger,
+	}
 
 	// Fix: Skip install for cross-builds as we don't want to install target binaries to host
 	// BUT, we MUST install cross-system packages (e.g. aarch64-gcc, aarch64-glibc)
@@ -620,8 +627,8 @@ func (pm *ParallelManager) installPackage(pkgName string, userRequestedMap map[s
 	}
 
 	// Check for conflicts before install
-	handlePreInstallUninstall(outputPkgName, pm.Config, RootExec, pm.AutoYes, logger)
-	rebuilds, err := pkgInstall(tarballPath, outputPkgName, pm.Config, RootExec, pm.AutoYes, true, true, logger)
+	handlePreInstallUninstall(outputPkgName, pm.Config, installExec, pm.AutoYes, logger)
+	rebuilds, err := pkgInstall(tarballPath, outputPkgName, pm.Config, installExec, pm.AutoYes, true, true, logger)
 	isCriticalAtomic.Store(0)
 
 	if err == nil {
@@ -630,7 +637,7 @@ func (pm *ParallelManager) installPackage(pkgName string, userRequestedMap map[s
 		}
 
 		for _, splitPkg := range pm.SplitDepsBySource[pkgName] {
-			if err := installBuiltSplitDependency(pkgName, splitPkg, pm.Config); err != nil {
+			if err := installBuiltSplitDependencyWithLogger(pkgName, splitPkg, pm.Config, logger, true); err != nil {
 				return result, fmt.Errorf("split dependency install failed for %s: %w", splitPkg, err)
 			}
 			if logger != nil {
