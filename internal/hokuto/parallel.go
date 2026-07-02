@@ -15,12 +15,14 @@ import (
 
 // ParallelManager handles the execution of parallel builds
 type ParallelManager struct {
-	MaxJobs   int
-	Config    *Config
-	BuildPlan *BuildPlan
-	Context   context.Context
-	Cancel    context.CancelFunc
-	AutoYes   bool
+	MaxJobs       int
+	Config        *Config
+	BuildPlan     *BuildPlan
+	Context       context.Context
+	Cancel        context.CancelFunc
+	AutoYes       bool
+	AutoInstall   bool
+	UserRequested map[string]bool
 
 	// State
 	mu                sync.Mutex
@@ -30,6 +32,7 @@ type ParallelManager struct {
 	Completed         map[string]bool      // Package name -> true
 	Available         map[string]bool      // Installed/provided package names, including split outputs
 	Failed            map[string]error
+	DeferredInstalls  map[string]bool
 	LogFiles          map[string]*os.File
 	SplitDepsBySource map[string][]string
 
@@ -61,7 +64,7 @@ type parallelInstallResult struct {
 }
 
 // RunParallelBuilds executes the build plan in parallel
-func RunParallelBuilds(plan *BuildPlan, cfg *Config, maxJobs int, userRequestedMap map[string]bool, autoYes bool, splitDepsBySource map[string][]string, customBuilder func(string, *Config, *Executor, BuildOptions) (time.Duration, error)) error {
+func RunParallelBuilds(plan *BuildPlan, cfg *Config, maxJobs int, userRequestedMap map[string]bool, autoYes bool, autoInstall bool, splitDepsBySource map[string][]string, customBuilder func(string, *Config, *Executor, BuildOptions) (time.Duration, error)) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -76,13 +79,16 @@ func RunParallelBuilds(plan *BuildPlan, cfg *Config, maxJobs int, userRequestedM
 		Completed:         make(map[string]bool),
 		Available:         make(map[string]bool),
 		Failed:            make(map[string]error),
+		DeferredInstalls:  make(map[string]bool),
 		LogFiles:          make(map[string]*os.File),
 		SplitDepsBySource: splitDepsBySource,
+		UserRequested:     userRequestedMap,
 		resultChan:        make(chan buildResult, maxJobs),
 		promptPause:       make(chan bool),
 		promptAck:         make(chan struct{}),
 		Builder:           pkgBuild,
 		AutoYes:           autoYes,
+		AutoInstall:       autoInstall,
 	}
 
 	if customBuilder != nil {
@@ -209,10 +215,79 @@ func RunParallelBuilds(plan *BuildPlan, cfg *Config, maxJobs int, userRequestedM
 
 	if len(builtPkgs) > 0 {
 		colArrow.Print("-> ")
-		colSuccess.Println("Built/Installed Packages:")
+		if len(pm.DeferredInstalls) > 0 {
+			colSuccess.Println("Built Packages:")
+		} else {
+			colSuccess.Println("Built/Installed Packages:")
+		}
 		for _, pkg := range builtPkgs {
 			fmt.Printf("  - %s\n", colNote.Sprint(pkg))
 		}
+	}
+
+	if err := pm.installDeferredTargets(); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (pm *ParallelManager) installDeferredTargets() error {
+	if len(pm.DeferredInstalls) == 0 {
+		return nil
+	}
+
+	targets := make([]string, 0, len(pm.DeferredInstalls))
+	for pkg := range pm.DeferredInstalls {
+		targets = append(targets, pkg)
+	}
+	sort.Strings(targets)
+
+	isCrossWithoutSystem := pm.Config.Values["HOKUTO_CROSS_ARCH"] != "" && pm.Config.Values["HOKUTO_CROSS_SYSTEM"] != "1"
+	if isCrossWithoutSystem {
+		return nil
+	}
+
+	shouldInstall := pm.AutoInstall
+	if !shouldInstall {
+		outputPkgNames := make([]string, len(targets))
+		for i, pkg := range targets {
+			outputPkgNames[i] = getOutputPackageName(pkg, pm.Config)
+		}
+		pkgNoun := "package"
+		if len(outputPkgNames) > 1 {
+			pkgNoun = "packages"
+		}
+		shouldInstall = askForConfirmation(colWarn, "-> Install built %s: %s", pkgNoun, colNote.Sprint(strings.Join(outputPkgNames, ", ")))
+	}
+	if !shouldInstall {
+		return nil
+	}
+
+	for i, pkgName := range targets {
+		version, revision, err := getRepoVersion2(pkgName)
+		if err != nil {
+			return fmt.Errorf("failed to determine version for %s: %w", pkgName, err)
+		}
+		outputPkgName := getOutputPackageName(pkgName, pm.Config)
+		arch := GetSystemArchForPackage(pm.Config, pkgName)
+		variant := GetSystemVariantForPackage(pm.Config, pkgName)
+		tarballPath := filepath.Join(BinDir, StandardizeRemoteName(outputPkgName, version, revision, arch, variant))
+
+		isCriticalAtomic.Store(1)
+		handlePreInstallUninstall(outputPkgName, pm.Config, RootExec, false, nil)
+		if _, err := pkgInstall(tarballPath, outputPkgName, pm.Config, RootExec, false, false, false, nil); err != nil {
+			isCriticalAtomic.Store(0)
+			return fmt.Errorf("final installation failed for %s: %w", outputPkgName, err)
+		}
+		isCriticalAtomic.Store(0)
+
+		if pm.UserRequested[pkgName] {
+			addToWorld(pkgName)
+		}
+		colArrow.Print("-> ")
+		colSuccess.Printf("Installing:")
+		colNote.Printf(" %s (%d/%d)\n", outputPkgName, i+1, len(targets))
 	}
 
 	return nil
@@ -380,126 +455,132 @@ func (pm *ParallelManager) Run() error {
 				pm.Failed[res.pkgName] = res.err
 				// failed = true // We track failures but don't stop the world
 			} else {
-				// INSTALLATION (Sequential for safety)
-				// We must install the package so that subsequent builds can find headers/libs.
-				// Release lock during installation to allow UI loop (which needs lock) to run
-				// and process prompts (which call back to UI loop).
-				pm.mu.Unlock()
-				var installErr error
-				installResult := parallelInstallResult{Available: []string{res.pkgName}}
-				if pm.isInteractive(res.pkgName) {
-					WithPrompt(func() {
-						UserExec.Interactive = true
-						RootExec.Interactive = true
-						installResult, installErr = pm.Installer(res.pkgName, logger)
-						UserExec.Interactive = false
-						RootExec.Interactive = false
-					})
-				} else if !pm.AutoYes {
-					// Non-interactive package but prompts may appear (no -y flag).
-					// Wrap in WithPrompt to pause the UI status line so modified-file
-					// prompts are visible and the user can respond.
-					WithPrompt(func() {
-						installResult, installErr = pm.Installer(res.pkgName, logger)
-					})
-				} else {
-					installResult, installErr = pm.Installer(res.pkgName, logger)
-				}
-				pm.mu.Lock()
-
-				if installErr != nil {
-					pm.Failed[res.pkgName] = fmt.Errorf("install failed: %w", installErr)
-					// failed = true
-				} else {
+				if pm.shouldDeferInstallLocked(res.pkgName) {
 					pm.Completed[res.pkgName] = true
-					if len(installResult.Available) == 0 {
-						installResult.Available = []string{res.pkgName}
+					pm.Available[res.pkgName] = true
+					pm.DeferredInstalls[res.pkgName] = true
+				} else {
+					// INSTALLATION (Sequential for safety)
+					// We must install the package so that subsequent builds can find headers/libs.
+					// Release lock during installation to allow UI loop (which needs lock) to run
+					// and process prompts (which call back to UI loop).
+					pm.mu.Unlock()
+					var installErr error
+					installResult := parallelInstallResult{Available: []string{res.pkgName}}
+					if pm.isInteractive(res.pkgName) {
+						WithPrompt(func() {
+							UserExec.Interactive = true
+							RootExec.Interactive = true
+							installResult, installErr = pm.Installer(res.pkgName, logger)
+							UserExec.Interactive = false
+							RootExec.Interactive = false
+						})
+					} else if !pm.AutoYes {
+						// Non-interactive package but prompts may appear (no -y flag).
+						// Wrap in WithPrompt to pause the UI status line so modified-file
+						// prompts are visible and the user can respond.
+						WithPrompt(func() {
+							installResult, installErr = pm.Installer(res.pkgName, logger)
+						})
+					} else {
+						installResult, installErr = pm.Installer(res.pkgName, logger)
 					}
-					for _, availablePkg := range installResult.Available {
-						pm.Available[availablePkg] = true
-					}
+					pm.mu.Lock()
 
-					// 3. Dynamic Task Addition (Post-Build Rebuilds & Triggers)
-					var rebuilds []string
-					triggerSet := make(map[string]bool)
-
-					// Add post-build rebuilds which are essentially triggers (force rebuild)
-					if rbs, ok := pm.BuildPlan.PostBuildRebuilds[res.pkgName]; ok {
-						rebuilds = append(rebuilds, rbs...)
-						for _, t := range rbs {
-							triggerSet[t] = true
+					if installErr != nil {
+						pm.Failed[res.pkgName] = fmt.Errorf("install failed: %w", installErr)
+						// failed = true
+					} else {
+						pm.Completed[res.pkgName] = true
+						if len(installResult.Available) == 0 {
+							installResult.Available = []string{res.pkgName}
 						}
-					}
-					for _, parent := range pm.readyOptionalRebuildsLocked() {
-						rebuilds = append(rebuilds, parent)
-						triggerSet[parent] = true
-					}
-					// Add triggers returned by installer (e.g. library updates, filesystem triggers)
-					if len(installResult.Rebuilds) > 0 {
-						rebuilds = append(rebuilds, installResult.Rebuilds...)
-					}
+						for _, availablePkg := range installResult.Available {
+							pm.Available[availablePkg] = true
+						}
 
-					// Identify which ones are filesystem triggers (e.g. DKMS) to ensure force-rebuild
-					targetRoot := pm.Config.Values["HOKUTO_ROOT"]
-					if targetRoot == "" {
-						targetRoot = "/"
-					}
-					triggers := getRebuildTriggers(res.pkgName, targetRoot)
-					for _, t := range triggers {
-						triggerSet[t] = true
-						// We don't append triggers to rebuilds again because they are already
-						// included in derivedRebuilds from pm.Installer
-					}
+						// 3. Dynamic Task Addition (Post-Build Rebuilds & Triggers)
+						var rebuilds []string
+						triggerSet := make(map[string]bool)
 
-					if len(rebuilds) > 0 {
-						var uniqueRebuilds []string
-						seen := make(map[string]bool)
+						// Add post-build rebuilds which are essentially triggers (force rebuild)
+						if rbs, ok := pm.BuildPlan.PostBuildRebuilds[res.pkgName]; ok {
+							rebuilds = append(rebuilds, rbs...)
+							for _, t := range rbs {
+								triggerSet[t] = true
+							}
+						}
+						for _, parent := range pm.readyOptionalRebuildsLocked() {
+							rebuilds = append(rebuilds, parent)
+							triggerSet[parent] = true
+						}
+						// Add triggers returned by installer (e.g. library updates, filesystem triggers)
+						if len(installResult.Rebuilds) > 0 {
+							rebuilds = append(rebuilds, installResult.Rebuilds...)
+						}
 
-						// First pass: filter already completed/pending/duplicate packages
-						for _, rPkg := range rebuilds {
-							// Filesystem triggers (e.g. DKMS) must override the completed
-							// status. If nvidia-modules was already installed from binary
-							// earlier in this update, but a kernel update now triggers a
-							// rebuild, the old binary is stale (wrong kernel modules).
-							// Remove from Completed so it gets rebuilt from source.
-							isTrigger := triggerSet[rPkg]
-							if pm.Completed[rPkg] {
-								if isTrigger {
-									// Force re-queue: the previously installed binary is
-									// stale (e.g. built against old kernel headers).
-									delete(pm.Completed, rPkg)
-								} else {
+						// Identify which ones are filesystem triggers (e.g. DKMS) to ensure force-rebuild
+						targetRoot := pm.Config.Values["HOKUTO_ROOT"]
+						if targetRoot == "" {
+							targetRoot = "/"
+						}
+						triggers := getRebuildTriggers(res.pkgName, targetRoot)
+						for _, t := range triggers {
+							triggerSet[t] = true
+							// We don't append triggers to rebuilds again because they are already
+							// included in derivedRebuilds from pm.Installer
+						}
+
+						if len(rebuilds) > 0 {
+							var uniqueRebuilds []string
+							seen := make(map[string]bool)
+
+							// First pass: filter already completed/pending/duplicate packages
+							for _, rPkg := range rebuilds {
+								// Filesystem triggers (e.g. DKMS) must override the completed
+								// status. If nvidia-modules was already installed from binary
+								// earlier in this update, but a kernel update now triggers a
+								// rebuild, the old binary is stale (wrong kernel modules).
+								// Remove from Completed so it gets rebuilt from source.
+								isTrigger := triggerSet[rPkg]
+								if pm.Completed[rPkg] {
+									if isTrigger {
+										// Force re-queue: the previously installed binary is
+										// stale (e.g. built against old kernel headers).
+										delete(pm.Completed, rPkg)
+									} else {
+										continue
+									}
+								}
+								if seen[rPkg] {
 									continue
 								}
-							}
-							if seen[rPkg] {
-								continue
-							}
-							isPending := false
-							for _, p := range pm.Pending {
-								if p == rPkg {
-									isPending = true
-									break
+								isPending := false
+								for _, p := range pm.Pending {
+									if p == rPkg {
+										isPending = true
+										break
+									}
 								}
-							}
-							if isPending {
-								continue
-							}
-							for _, p := range pm.pendingRebuilds {
-								if p == rPkg {
-									isPending = true
-									break
+								if isPending {
+									continue
 								}
+								for _, p := range pm.pendingRebuilds {
+									if p == rPkg {
+										isPending = true
+										break
+									}
+								}
+								if isPending {
+									continue
+								}
+								uniqueRebuilds = append(uniqueRebuilds, rPkg)
+								seen[rPkg] = true
 							}
-							if isPending {
-								continue
-							}
-							uniqueRebuilds = append(uniqueRebuilds, rPkg)
-							seen[rPkg] = true
-						}
 
-						if len(uniqueRebuilds) > 0 {
-							pm.pendingRebuilds = append(pm.pendingRebuilds, uniqueRebuilds...)
+							if len(uniqueRebuilds) > 0 {
+								pm.pendingRebuilds = append(pm.pendingRebuilds, uniqueRebuilds...)
+							}
 						}
 					}
 				}
@@ -573,6 +654,63 @@ func (pm *ParallelManager) Run() error {
 		}
 	}
 	return nil
+}
+
+func (pm *ParallelManager) shouldDeferInstallLocked(pkgName string) bool {
+	if pm.AutoInstall || !pm.UserRequested[pkgName] {
+		return false
+	}
+	if len(pm.SplitDepsBySource[pkgName]) > 0 || len(pm.BuildPlan.PostBuildRebuilds[pkgName]) > 0 {
+		return false
+	}
+	for _, depPkg := range append([]string{}, pm.Pending...) {
+		if pm.packageDependsOn(depPkg, pkgName) {
+			return false
+		}
+	}
+	for depPkg := range pm.Running {
+		if depPkg != pkgName && pm.packageDependsOn(depPkg, pkgName) {
+			return false
+		}
+	}
+	for _, depPkg := range pm.pendingRebuilds {
+		if pm.packageDependsOn(depPkg, pkgName) {
+			return false
+		}
+	}
+	return true
+}
+
+func (pm *ParallelManager) packageDependsOn(pkgName, dependency string) bool {
+	pkgDir, err := findPackageDir(pkgName)
+	if err != nil {
+		return false
+	}
+	deps, err := parseDependsFile(pkgDir)
+	if err != nil {
+		return false
+	}
+	for _, dep := range deps {
+		if !activeBuildDependency(dep, pm.Config, false) {
+			continue
+		}
+		if parallelDepMatchesPackage(dep, dependency) {
+			return true
+		}
+	}
+	return false
+}
+
+func parallelDepMatchesPackage(dep DepSpec, pkgName string) bool {
+	if len(dep.Alternatives) > 0 {
+		for _, alt := range dep.Alternatives {
+			if alt == pkgName {
+				return true
+			}
+		}
+		return false
+	}
+	return dep.Name == pkgName
 }
 
 func (pm *ParallelManager) installPackage(pkgName string, userRequestedMap map[string]bool, logger io.Writer) (parallelInstallResult, error) {
