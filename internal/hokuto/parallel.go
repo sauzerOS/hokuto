@@ -138,6 +138,7 @@ func RunParallelBuilds(plan *BuildPlan, cfg *Config, maxJobs int, userRequestedM
 	close(uiDone)
 	// Clear the final status line
 	fmt.Print("\r\033[K")
+	SetPromptHooks(nil, nil)
 
 	// Check for failures OR blocked packages (left in pending)
 	if len(pm.Failed) > 0 || len(pm.Pending) > 0 {
