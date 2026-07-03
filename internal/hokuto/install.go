@@ -160,7 +160,13 @@ func flushPackageSuggestions(logger io.Writer, cfg *Config, noRemote bool, promp
 
 	var packages []string
 	for pkg := range items {
+		if !isPackageInstalled(pkg) {
+			continue
+		}
 		packages = append(packages, pkg)
+	}
+	if len(packages) == 0 {
+		return
 	}
 	sort.Strings(packages)
 
