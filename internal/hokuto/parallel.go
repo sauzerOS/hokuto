@@ -33,6 +33,7 @@ type ParallelManager struct {
 	Available         map[string]bool      // Installed/provided package names, including split outputs
 	Failed            map[string]error
 	DeferredInstalls  map[string]bool
+	TemporaryInstalls map[string]bool
 	LogFiles          map[string]*os.File
 	SplitDepsBySource map[string][]string
 
@@ -63,8 +64,22 @@ type parallelInstallResult struct {
 	Available []string
 }
 
+func snapshotInstalledPackageNames() map[string]bool {
+	snapshot := make(map[string]bool)
+	entries, err := os.ReadDir(Installed)
+	if err != nil {
+		return snapshot
+	}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			snapshot[entry.Name()] = true
+		}
+	}
+	return snapshot
+}
+
 // RunParallelBuilds executes the build plan in parallel
-func RunParallelBuilds(plan *BuildPlan, cfg *Config, maxJobs int, userRequestedMap map[string]bool, autoYes bool, autoInstall bool, splitDepsBySource map[string][]string, customBuilder func(string, *Config, *Executor, BuildOptions) (time.Duration, error)) error {
+func RunParallelBuilds(plan *BuildPlan, cfg *Config, maxJobs int, userRequestedMap map[string]bool, autoYes bool, autoInstall bool, splitDepsBySource map[string][]string, customBuilder func(string, *Config, *Executor, BuildOptions) (time.Duration, error)) ([]string, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -80,6 +95,7 @@ func RunParallelBuilds(plan *BuildPlan, cfg *Config, maxJobs int, userRequestedM
 		Available:         make(map[string]bool),
 		Failed:            make(map[string]error),
 		DeferredInstalls:  make(map[string]bool),
+		TemporaryInstalls: make(map[string]bool),
 		LogFiles:          make(map[string]*os.File),
 		SplitDepsBySource: splitDepsBySource,
 		UserRequested:     userRequestedMap,
@@ -200,7 +216,7 @@ func RunParallelBuilds(plan *BuildPlan, cfg *Config, maxJobs int, userRequestedM
 		if err == nil {
 			err = fmt.Errorf("parallel build incomplete: %d failed, %d blocked", len(pm.Failed), len(pm.Pending))
 		}
-		return err
+		return nil, err
 	}
 
 	// colSuccess.Printf("All packages built successfully in %s\n", time.Since(time.Now()).Round(time.Second))
@@ -227,10 +243,15 @@ func RunParallelBuilds(plan *BuildPlan, cfg *Config, maxJobs int, userRequestedM
 	}
 
 	if err := pm.installDeferredTargets(); err != nil {
-		return err
+		return nil, err
 	}
 
-	return nil
+	temporaryInstalls := make([]string, 0, len(pm.TemporaryInstalls))
+	for pkgName := range pm.TemporaryInstalls {
+		temporaryInstalls = append(temporaryInstalls, pkgName)
+	}
+	sort.Strings(temporaryInstalls)
+	return temporaryInstalls, nil
 }
 
 func (pm *ParallelManager) installDeferredTargets() error {
@@ -765,6 +786,8 @@ func (pm *ParallelManager) installPackage(pkgName string, userRequestedMap map[s
 		}
 	}
 
+	beforeInstall := snapshotInstalledPackageNames()
+
 	// Check for conflicts before install
 	handlePreInstallUninstall(outputPkgName, pm.Config, installExec, pm.AutoYes, logger)
 	rebuilds, err := pkgInstall(tarballPath, outputPkgName, pm.Config, installExec, pm.AutoYes, true, true, logger)
@@ -785,6 +808,13 @@ func (pm *ParallelManager) installPackage(pkgName string, userRequestedMap map[s
 			result.Available = append(result.Available, splitPkg)
 		}
 		result.Rebuilds = rebuilds
+
+		for installedPkg := range snapshotInstalledPackageNames() {
+			if beforeInstall[installedPkg] || userRequestedMap[installedPkg] {
+				continue
+			}
+			pm.TemporaryInstalls[installedPkg] = true
+		}
 	}
 
 	return result, err

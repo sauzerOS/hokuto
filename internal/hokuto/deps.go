@@ -2135,28 +2135,44 @@ func uninstallBuildDependencies(packages []string, cfg *Config) {
 }
 
 func uninstallBuildDependenciesWithOptions(packages []string, cfg *Config, quiet bool) {
-	// Uninstall in reverse order
 	removedCount := 0
-	for i := len(packages) - 1; i >= 0; i-- {
-		pkgName := packages[i]
-		if len(installedDependents(pkgName, cfg, nil)) > 0 {
-			continue
-		}
-		logger, _ := dependencyInstallLogger(quiet)
-		if !quiet {
-			colArrow.Print("-> ")
-			colSuccess.Printf("Removing build dependency: %s\n", pkgName)
-		}
-		if err := pkgUninstall(pkgName, cfg, RootExec, false, true, logger); err != nil {
-			if quiet {
-				debugf("Warning: failed to uninstall build dependency %s: %v\n", pkgName, err)
-			} else {
-				colWarn.Printf("Warning: failed to uninstall build dependency %s: %v\n", pkgName, err)
+	remaining := append([]string(nil), packages...)
+
+	for len(remaining) > 0 {
+		removedThisPass := false
+		var stillNeeded []string
+
+		// Uninstall in reverse order, then retry skipped packages after their
+		// temporary dependents may have been removed.
+		for i := len(remaining) - 1; i >= 0; i-- {
+			pkgName := remaining[i]
+			if len(installedDependents(pkgName, cfg, nil)) > 0 {
+				stillNeeded = append(stillNeeded, pkgName)
+				continue
 			}
-			continue
+			logger, _ := dependencyInstallLogger(quiet)
+			if !quiet {
+				colArrow.Print("-> ")
+				colSuccess.Printf("Removing build dependency: %s\n", pkgName)
+			}
+			if err := pkgUninstall(pkgName, cfg, RootExec, false, true, logger); err != nil {
+				if quiet {
+					debugf("Warning: failed to uninstall build dependency %s: %v\n", pkgName, err)
+				} else {
+					colWarn.Printf("Warning: failed to uninstall build dependency %s: %v\n", pkgName, err)
+				}
+				continue
+			}
+			removedCount++
+			removedThisPass = true
 		}
-		removedCount++
+
+		if !removedThisPass {
+			break
+		}
+		remaining = stillNeeded
 	}
+
 	if quiet && removedCount > 0 {
 		colArrow.Print("-> ")
 		colSuccess.Printf("Removed %d temporary build dependencies\n", removedCount)
