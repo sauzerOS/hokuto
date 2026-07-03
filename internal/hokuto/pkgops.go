@@ -324,22 +324,6 @@ func prepareSources(pkgName, pkgDir, buildDir string, execCtx *Executor) error {
 }
 
 func generateLibDeps(outputDir, libdepsFile string, execCtx *Executor) error {
-	ignorePatterns := []string{
-		"ld-*", "libc.so*", "libm.so*", "libpthread.so*", "libdl.so*",
-		"libgcc_s.so*", "libstdc++.so*", "libcrypt.so*", "libc++.so*",
-		"libc++abi.so*", "libmvec.so*", "libresolv.so*", "librt.so*",
-		"libtrace.so*", "libunwind.so*", "libutil.so*", "libxnet.so*", "ldd",
-	}
-
-	matchesIgnore := func(lib string) bool {
-		for _, pat := range ignorePatterns {
-			if ok, _ := filepath.Match(pat, filepath.Base(lib)); ok {
-				return true
-			}
-		}
-		return false
-	}
-
 	elfABI := func(fileDesc string) string {
 		switch {
 		case strings.Contains(fileDesc, "ELF 32-bit"):
@@ -440,9 +424,9 @@ func generateLibDeps(outputDir, libdepsFile string, execCtx *Executor) error {
 				idxEnd := strings.Index(line, "]")
 				if idxStart != -1 && idxEnd != -1 && idxEnd > idxStart {
 					libName := line[idxStart+1 : idxEnd]
-					// Filter out ignored patterns and libraries provided by this package
+					// Filter out libraries provided by this package.
 					_, provided := providedFiles[abi+":"+libName]
-					if !matchesIgnore(libName) && !provided {
+					if !provided {
 						if abi != "" {
 							libs = append(libs, abi+":"+libName)
 						} else {
