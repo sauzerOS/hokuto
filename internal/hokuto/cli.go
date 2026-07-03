@@ -1375,27 +1375,14 @@ func Main() {
 		os.Exit(0)
 
 	case "edit", "e":
-		if len(os.Args) < 3 {
-			fmt.Println("Usage: hokuto edit <pkgname> [-a]")
+		if len(os.Args) != 3 {
+			fmt.Println("Usage: hokuto edit <pkgname>")
 			os.Exit(1)
 		}
 
 		pkg := os.Args[2]
-		openAll := false
 
-		if len(os.Args) == 4 {
-			if os.Args[3] == "-a" {
-				openAll = true
-			} else {
-				fmt.Println("Usage: hokuto edit <pkgname> [-a]")
-				os.Exit(1)
-			}
-		} else if len(os.Args) > 4 {
-			fmt.Println("Usage: hokuto edit <pkgname> [-a]")
-			os.Exit(1)
-		}
-
-		if err := editPackage(pkg, openAll); err != nil {
+		if err := editPackage(pkg); err != nil {
 			fmt.Fprintln(os.Stderr, "Error:", err)
 			os.Exit(1)
 		}

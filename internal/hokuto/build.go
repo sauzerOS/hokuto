@@ -3242,6 +3242,11 @@ func handleBuildCommand(args []string, cfg *Config) error {
 	for _, pkg := range packagesToProcess {
 		userRequestedMap[pkg] = true
 	}
+	for _, pkg := range packagesToProcess {
+		if _, err := findPackageDir(pkg); err != nil {
+			return fmt.Errorf("cannot build %s: %w", pkg, err)
+		}
+	}
 
 	// --- SELECT DEPENDENCY STRATEGY and EXECUTE BUILD ---
 	var failedBuilds = make(map[string]error)
@@ -3280,18 +3285,23 @@ func handleBuildCommand(args []string, cfg *Config) error {
 		temporaryBuildDeps = nil
 	}
 	defer cleanupTemporaryBuildDeps()
-
-	if !*bootstrap && !*noDevel {
-		installedDevelDeps, err := ensureDevelPackagesInstalledWithOptions(cfg, false, *noRemote, quietDependencyInstalls)
+	prepareDevelPackages := func(includeMultilib bool) error {
+		if *bootstrap {
+			return nil
+		}
+		if *noDevel {
+			colArrow.Print("-> ")
+			colWarn.Println("Skipping devel package check (--no-devel enabled)")
+			return nil
+		}
+		installedDevelDeps, err := ensureDevelPackagesInstalledWithOptions(cfg, includeMultilib, *noRemote, quietDependencyInstalls)
 		if err != nil {
 			return fmt.Errorf("failed to prepare devel packages: %w", err)
 		}
 		for _, dep := range installedDevelDeps {
 			addTemporaryBuildDep(dep)
 		}
-	} else if *noDevel {
-		colArrow.Print("-> ")
-		colWarn.Println("Skipping devel package check (--no-devel enabled)")
+		return nil
 	}
 
 	// ** STRATEGY 1: Bootstrap or --alldeps mode **
@@ -3310,14 +3320,8 @@ func handleBuildCommand(args []string, cfg *Config) error {
 
 		fullBuildList = MovePackageToFront(fullBuildList, "sauzeros-base")
 
-		if !*bootstrap && !*noDevel && packageSetHasBuildOption(fullBuildList, "multilib") {
-			installedDevelDeps, err := ensureDevelPackagesInstalledWithOptions(cfg, true, *noRemote, quietDependencyInstalls)
-			if err != nil {
-				return fmt.Errorf("failed to prepare multilib devel packages: %w", err)
-			}
-			for _, dep := range installedDevelDeps {
-				addTemporaryBuildDep(dep)
-			}
+		if err := prepareDevelPackages(packageSetHasBuildOption(fullBuildList, "multilib")); err != nil {
+			return err
 		}
 
 		colArrow.Print("-> ")
@@ -3541,14 +3545,8 @@ func handleBuildCommand(args []string, cfg *Config) error {
 			return nil
 		}
 
-		if !*noDevel && packageSetHasBuildOption(buildPackageNames(packagesThatMustBeBuilt), "multilib") {
-			installedDevelDeps, err := ensureDevelPackagesInstalledWithOptions(cfg, true, *noRemote, quietDependencyInstalls)
-			if err != nil {
-				return fmt.Errorf("failed to prepare multilib devel packages: %w", err)
-			}
-			for _, dep := range installedDevelDeps {
-				addTemporaryBuildDep(dep)
-			}
+		if err := prepareDevelPackages(packageSetHasBuildOption(buildPackageNames(packagesThatMustBeBuilt), "multilib")); err != nil {
+			return err
 		}
 
 		// Set the total count for the summary.

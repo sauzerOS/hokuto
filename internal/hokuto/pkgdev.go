@@ -255,7 +255,7 @@ func newPackage(pkgName string, targetDir string) error {
 // editPackage searches for pkgName under the colon-separated repoPaths
 // and opens version, sources, build, depends in the user's editor.
 
-func editPackage(pkgName string, openAll bool) error {
+func editPackage(pkgName string) error {
 	// Determine editor
 	editor := os.Getenv("EDITOR")
 	if editor == "" {
@@ -360,13 +360,8 @@ func editPackage(pkgName string, openAll bool) error {
 		}
 	}
 
-	// 4. Open sources file in editor for review (and others if openAll)
-	var filesToOpen []string
-	if openAll {
-		filesToOpen = []string{sourcesPath, filepath.Join(pkgDirEd, "build"), filepath.Join(pkgDirEd, "depends")}
-	} else {
-		filesToOpen = []string{sourcesPath}
-	}
+	// 4. Open sources file in editor for review, along with the build and depends files.
+	filesToOpen := []string{sourcesPath, filepath.Join(pkgDirEd, "build"), filepath.Join(pkgDirEd, "depends")}
 
 	// Ensure files exist
 	for _, f := range filesToOpen {
