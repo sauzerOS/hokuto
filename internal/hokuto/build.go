@@ -864,6 +864,15 @@ func copyOptionalMetadataFile(src, dst string, execCtx *Executor) error {
 	return execCtx.Run(cpCmd)
 }
 
+func copyPackageRecipeMetadata(pkgDir, installedDir string, execCtx *Executor) error {
+	for _, name := range []string{"version", "sources", "build", "options"} {
+		if err := copyOptionalMetadataFile(filepath.Join(pkgDir, name), filepath.Join(installedDir, name), execCtx); err != nil {
+			return fmt.Errorf("failed to copy %s file: %w", name, err)
+		}
+	}
+	return nil
+}
+
 func packageSplitOutputs(parentPkgName, pkgDir, splitRoot, version, revision, targetArch, cflagsVal string, isGeneric bool, shouldStrip bool, buildExec *Executor, cfg *Config, opts BuildOptions, elapsed time.Duration) error {
 	splitNames, err := discoverSplitOutputDirs(splitRoot)
 	if err != nil {
@@ -914,14 +923,8 @@ func packageSplitOutputs(parentPkgName, pkgDir, splitRoot, version, revision, ta
 			}
 		}
 
-		if err := copyOptionalMetadataFile(filepath.Join(pkgDir, "version"), filepath.Join(installedDir, "version"), buildExec); err != nil {
-			return fmt.Errorf("failed to copy version file for split package %s: %w", outputSplitName, err)
-		}
-		if err := copyOptionalMetadataFile(filepath.Join(pkgDir, "build"), filepath.Join(installedDir, "build"), buildExec); err != nil {
-			return fmt.Errorf("failed to copy build file for split package %s: %w", outputSplitName, err)
-		}
-		if err := copyOptionalMetadataFile(filepath.Join(pkgDir, "options"), filepath.Join(installedDir, "options"), buildExec); err != nil {
-			return fmt.Errorf("failed to copy options file for split package %s: %w", outputSplitName, err)
+		if err := copyPackageRecipeMetadata(pkgDir, installedDir, buildExec); err != nil {
+			return fmt.Errorf("failed to copy recipe metadata for split package %s: %w", outputSplitName, err)
 		}
 		postInstallSrc := findPackageMetadataFile(pkgDir, outputSplitName, "post-install")
 		if postInstallSrc != filepath.Join(pkgDir, "post-install") {
@@ -1117,14 +1120,8 @@ func finalizeBuiltPackage(in builtPackageFinalization) error {
 		debugf("Skipping binary stripping for %s (NoStrip is true).\n", in.sourcePkgName)
 	}
 
-	if err := copyOptionalMetadataFile(filepath.Join(in.pkgDir, "version"), filepath.Join(installedDir, "version"), in.buildExec); err != nil {
-		return fmt.Errorf("failed to copy version file: %w", err)
-	}
-	if err := copyOptionalMetadataFile(filepath.Join(in.pkgDir, "build"), filepath.Join(installedDir, "build"), in.buildExec); err != nil {
-		return fmt.Errorf("failed to copy build file: %w", err)
-	}
-	if err := copyOptionalMetadataFile(filepath.Join(in.pkgDir, "options"), filepath.Join(installedDir, "options"), in.buildExec); err != nil {
-		return fmt.Errorf("failed to copy options file: %w", err)
+	if err := copyPackageRecipeMetadata(in.pkgDir, installedDir, in.buildExec); err != nil {
+		return err
 	}
 	if err := copyOptionalMetadataFile(filepath.Join(in.pkgDir, "post-install"), filepath.Join(installedDir, "post-install"), in.buildExec); err != nil {
 		return fmt.Errorf("failed to copy post-install file: %w", err)
