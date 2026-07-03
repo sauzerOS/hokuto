@@ -1,3 +1,3 @@
 /hokuto
 .gemini
-internal/hokuto/pkgdev_test.go
+*_test.go
