@@ -293,7 +293,7 @@ func installMissingPackageRuntimeDependencies(pkgName string, cfg *Config, logge
 			fmt.Fprintf(logger, "%s", colSuccess.Sprint("Installing runtime dependency: "))
 			fmt.Fprintln(logger, colNote.Sprint(depName))
 		}
-		if _, err := ensurePackageInstalled(depName, cfg, true); err != nil {
+		if _, err := ensurePackageInstalledWithOptions(depName, cfg, true, nil, quiet); err != nil {
 			return fmt.Errorf("failed to install runtime dependency %s for %s: %w", depName, pkgName, err)
 		}
 	}

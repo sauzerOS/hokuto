@@ -382,7 +382,13 @@ func findInstalledSatisfying(name, op, refVersion string) string {
 		}
 	}
 
-	// 2. Scan for name-MAJOR versions
+	// 2. Scan for name-MAJOR versions only when a dependency has an explicit
+	// version constraint. An unconstrained dependency on "foo" means the current
+	// package, not any installed ABI-suffixed historical package like "foo-2".
+	if op == "" || refVersion == "" {
+		return ""
+	}
+
 	entries, err := os.ReadDir(Installed)
 	if err != nil {
 		return ""
@@ -399,13 +405,39 @@ func findInstalledSatisfying(name, op, refVersion string) string {
 			suffix := strings.TrimPrefix(pkgName, prefix)
 			if _, err := strconv.Atoi(suffix); err == nil {
 				ver, ok := getInstalledVersion(pkgName)
-				if ok && (op == "" || refVersion == "" || versionSatisfies(ver, op, refVersion)) {
+				if ok && versionSatisfies(ver, op, refVersion) {
 					return pkgName
 				}
 			}
 		}
 	}
 
+	return ""
+}
+
+func findInstalledPackageVariant(name string) string {
+	if checkPackageExactMatch(name) {
+		return name
+	}
+
+	entries, err := os.ReadDir(Installed)
+	if err != nil {
+		return ""
+	}
+
+	prefix := name + "-"
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		pkgName := e.Name()
+		if strings.HasPrefix(pkgName, prefix) {
+			suffix := strings.TrimPrefix(pkgName, prefix)
+			if _, err := strconv.Atoi(suffix); err == nil {
+				return pkgName
+			}
+		}
+	}
 	return ""
 }
 

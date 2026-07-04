@@ -1321,8 +1321,8 @@ func applyUpdateOrder(pkgNames []string) ([]string, map[string][]string) {
 // It assumes cfg is passed in, as it's needed for the recursive call.
 
 func isPackageInstalled(pkgName string) bool {
-	// Use findInstalledSatisfying to support renamed packages (pkg-MAJOR)
-	// If it's already a renamed name, findInstalledSatisfying will catch it.
-	// If it's a base name, findInstalledSatisfying will find ANY version of it.
+	// Exact package names still work for ABI-suffixed packages such as pkg-MAJOR,
+	// but a base name only matches the base package unless a caller supplies an
+	// explicit version constraint through findInstalledSatisfying.
 	return findInstalledSatisfying(pkgName, "", "") != ""
 }

@@ -723,7 +723,7 @@ func Main() {
 		// Iterate through the calculated plan
 		var bar *progressbar.ProgressBar
 		if effectiveFast && len(installPlan) > 0 {
-			bar = progressbar.Default(int64(len(installPlan)), "Installing Packages")
+			bar = progressbar.Default(int64(len(installPlan)), colSuccess.Sprint("Installing Packages"))
 		}
 
 		for i, arg := range installPlan {
@@ -1041,7 +1041,7 @@ func Main() {
 			handlePreInstallUninstall(pkgName, cfg, RootExec, effectiveYes, nil)
 
 			if effectiveFast && bar != nil {
-				bar.Describe(fmt.Sprintf("Installing %s", pkgName))
+				bar.Describe(colSuccess.Sprint("Installing ") + colNote.Sprint(pkgName))
 			} else {
 				colArrow.Print("-> ")
 				colSuccess.Printf("Installing:")

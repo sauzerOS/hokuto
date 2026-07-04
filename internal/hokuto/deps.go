@@ -14,6 +14,8 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+
+	"github.com/schollz/progressbar/v3"
 )
 
 // Cache for resolved alternative dependencies to avoid prompting multiple times
@@ -27,55 +29,10 @@ var suppressRuntimeDependencyAutoInstall atomic.Int32
 
 var develInstallMu sync.Mutex
 
-var temporaryBuildDepTracker = struct {
+var dependencyInstallProgress = struct {
 	sync.Mutex
-	active bool
-	deps   []string
-	seen   map[string]bool
-}{
-	seen: make(map[string]bool),
-}
-
-func beginTemporaryBuildDepTracking() func() {
-	temporaryBuildDepTracker.Lock()
-	temporaryBuildDepTracker.active = true
-	temporaryBuildDepTracker.deps = nil
-	temporaryBuildDepTracker.seen = make(map[string]bool)
-	temporaryBuildDepTracker.Unlock()
-
-	return func() {
-		temporaryBuildDepTracker.Lock()
-		temporaryBuildDepTracker.active = false
-		temporaryBuildDepTracker.deps = nil
-		temporaryBuildDepTracker.seen = make(map[string]bool)
-		temporaryBuildDepTracker.Unlock()
-	}
-}
-
-func registerTemporaryBuildDep(pkgName string) {
-	if pkgName == "" {
-		return
-	}
-	temporaryBuildDepTracker.Lock()
-	defer temporaryBuildDepTracker.Unlock()
-	if !temporaryBuildDepTracker.active {
-		return
-	}
-	if temporaryBuildDepTracker.seen[pkgName] {
-		return
-	}
-	temporaryBuildDepTracker.seen[pkgName] = true
-	temporaryBuildDepTracker.deps = append(temporaryBuildDepTracker.deps, pkgName)
-}
-
-func drainTemporaryBuildDeps() []string {
-	temporaryBuildDepTracker.Lock()
-	defer temporaryBuildDepTracker.Unlock()
-	deps := append([]string(nil), temporaryBuildDepTracker.deps...)
-	temporaryBuildDepTracker.deps = nil
-	temporaryBuildDepTracker.seen = make(map[string]bool)
-	return deps
-}
+	bars []*progressbar.ProgressBar
+}{}
 
 var baseDevelPackages = []string{
 	"autoconf",
@@ -868,9 +825,10 @@ func resolveAlternativeDep(dep DepSpec, yes bool, cfg *Config) (string, error) {
 			continue
 		}
 
-		// Check if installed first (prioritize installed)
-		// Alternatives currently don't support version constraints, but we check if ANY version is installed
-		if sat := findInstalledSatisfying(altName, "", ""); sat != "" {
+		// Check if installed first (prioritize installed).
+		// Alternatives currently don't support version constraints, but for this
+		// explicit alternative selection any installed ABI-suffixed variant counts.
+		if sat := findInstalledPackageVariant(altName); sat != "" {
 			installed = append(installed, sat)
 			available = append(available, sat)
 			continue
@@ -1711,24 +1669,28 @@ func installBuildDependenciesWithOptions(pkgName string, cfg *Config, noRemote b
 	// Ensure base is first
 	missing = MovePackageToFront(missing, "sauzeros-base")
 
+	var installQueue []string
 	for _, depPkg := range missing {
-		// Skip the target package itself
-		if depPkg == pkgName {
+		if depPkg == pkgName || isPackageInstalled(depPkg) {
 			continue
 		}
-		if isPackageInstalled(depPkg) {
-			continue
-		}
+		installQueue = append(installQueue, depPkg)
+	}
 
+	bar := newDependencyInstallProgress(len(installQueue), "Installing Build Dependencies", quiet)
+	deactivateProgress := activateDependencyInstallProgress(bar)
+	defer deactivateProgress()
+	for _, depPkg := range installQueue {
 		// Try to install from binary or build
+		describeDependencyInstallProgress(bar, depPkg)
 		installed, err := ensurePackageInstalledWithOptions(depPkg, cfg, noRemote, nil, quiet)
 		if err != nil {
 			return newlyInstalled, err
 		}
+		advanceDependencyInstallProgress(bar)
 		if installed {
 			outputName := getOutputPackageName(depPkg, cfg)
 			newlyInstalled = append(newlyInstalled, outputName)
-			registerTemporaryBuildDep(outputName)
 		}
 	}
 
@@ -1747,6 +1709,9 @@ func ensurePackageInstalledWithSeen(pkgName string, cfg *Config, noRemote bool, 
 func ensurePackageInstalledWithOptions(pkgName string, cfg *Config, noRemote bool, seen map[string]bool, quiet bool) (bool, error) {
 	if isPackageInstalled(pkgName) {
 		return false, nil
+	}
+	if quiet {
+		describeActiveDependencyInstallProgress(pkgName)
 	}
 	if _, inProgress := runtimeDependencyInstallInProgress.Load(pkgName); inProgress {
 		debugf("Skipping recursive install for in-progress dependency %s\n", pkgName)
@@ -1842,7 +1807,6 @@ func ensurePackageInstalledWithOptions(pkgName string, cfg *Config, noRemote boo
 	if _, err := pkgInstall(tarballPath, outputPkgName, cfg, RootExec, true, fast, false, logger); err != nil {
 		return false, fmt.Errorf("failed to install built package %s: %v", pkgName, err)
 	}
-	registerTemporaryBuildDep(outputPkgName)
 	return true, nil
 }
 
@@ -1911,7 +1875,6 @@ func ensureSplitPackageInstalled(sourcePkg, splitPkg string, cfg *Config, noRemo
 	if err := installBuiltSplitDependencyWithOptions(sourcePkg, splitPkg, cfg, quiet); err != nil {
 		return false, fmt.Errorf("failed to install split package %s from %s: %w", splitPkg, sourcePkg, err)
 	}
-	registerTemporaryBuildDep(splitPkg)
 	return true, nil
 }
 
@@ -2034,6 +1997,9 @@ func ensureBinaryRuntimeDependenciesInstalledWithOptions(pkgName string, cfg *Co
 			continue
 		}
 
+		if quiet {
+			describeActiveDependencyInstallProgress(depName)
+		}
 		if err := ensureBinaryRuntimeDependenciesInstalledWithOptions(depName, cfg, noRemote, seen, quiet); err != nil {
 			return err
 		}
@@ -2054,11 +2020,59 @@ func dependencyInstallLogger(quiet bool) (io.Writer, bool) {
 	return nil, false
 }
 
+func newDependencyInstallProgress(total int, description string, quiet bool) *progressbar.ProgressBar {
+	if !quiet || total <= 0 {
+		return nil
+	}
+	return progressbar.Default(int64(total), colSuccess.Sprint(description))
+}
+
+func activateDependencyInstallProgress(bar *progressbar.ProgressBar) func() {
+	if bar == nil {
+		return func() {}
+	}
+	dependencyInstallProgress.Lock()
+	dependencyInstallProgress.bars = append(dependencyInstallProgress.bars, bar)
+	dependencyInstallProgress.Unlock()
+	return func() {
+		dependencyInstallProgress.Lock()
+		if len(dependencyInstallProgress.bars) > 0 {
+			dependencyInstallProgress.bars = dependencyInstallProgress.bars[:len(dependencyInstallProgress.bars)-1]
+		}
+		dependencyInstallProgress.Unlock()
+	}
+}
+
+func describeDependencyInstallProgress(bar *progressbar.ProgressBar, pkgName string) {
+	if bar != nil {
+		bar.Describe(colSuccess.Sprint("Installing ") + colNote.Sprint(pkgName))
+	}
+}
+
+func describeActiveDependencyInstallProgress(pkgName string) {
+	dependencyInstallProgress.Lock()
+	var bar *progressbar.ProgressBar
+	if len(dependencyInstallProgress.bars) > 0 {
+		bar = dependencyInstallProgress.bars[len(dependencyInstallProgress.bars)-1]
+	}
+	dependencyInstallProgress.Unlock()
+	describeDependencyInstallProgress(bar, pkgName)
+}
+
+func advanceDependencyInstallProgress(bar *progressbar.ProgressBar) {
+	if bar != nil {
+		_ = bar.Add(1)
+	}
+}
+
 func installBinaryTarball(tarballPath, pkgName string, cfg *Config) (bool, error) {
 	return installBinaryTarballWithOptions(tarballPath, pkgName, cfg, false)
 }
 
 func installBinaryTarballWithOptions(tarballPath, pkgName string, cfg *Config, quiet bool) (bool, error) {
+	if quiet {
+		describeActiveDependencyInstallProgress(pkgName)
+	}
 	logger, fast := dependencyInstallLogger(quiet)
 	execCtx := RootExec
 	if quiet {
@@ -2076,7 +2090,6 @@ func installBinaryTarballWithOptions(tarballPath, pkgName string, cfg *Config, q
 	if _, err := pkgInstall(tarballPath, pkgName, cfg, execCtx, true, fast, false, logger); err != nil {
 		return false, fmt.Errorf("failed to install binary %s: %v", pkgName, err)
 	}
-	registerTemporaryBuildDep(pkgName)
 	return true, nil
 }
 
@@ -2299,7 +2312,11 @@ func ensureDevelPackagesInstalledWithOptions(cfg *Config, includeMultilib bool, 
 	colSuccess.Printf("Installing missing devel packages: %s\n", strings.Join(missing, ", "))
 
 	var newlyInstalled []string
+	bar := newDependencyInstallProgress(len(missing), "Installing Build Dependencies", quiet)
+	deactivateProgress := activateDependencyInstallProgress(bar)
+	defer deactivateProgress()
 	for _, pkgName := range missing {
+		describeDependencyInstallProgress(bar, pkgName)
 		installed, err := installAvailableBinaryPackageOnlyWithOptions(pkgName, cfg, noRemote, quiet)
 		if err != nil {
 			return newlyInstalled, err
@@ -2307,10 +2324,10 @@ func ensureDevelPackagesInstalledWithOptions(cfg *Config, includeMultilib bool, 
 		if !installed && !isPackageInstalled(pkgName) {
 			return newlyInstalled, fmt.Errorf("required devel package %s has no available binary package; install it manually or build it in bootstrap mode", pkgName)
 		}
+		advanceDependencyInstallProgress(bar)
 		if installed {
 			outputName := getOutputPackageName(pkgName, cfg)
 			newlyInstalled = append(newlyInstalled, outputName)
-			registerTemporaryBuildDep(outputName)
 		}
 	}
 
@@ -2322,19 +2339,23 @@ func uninstallBuildDependencies(packages []string, cfg *Config) {
 	uninstallBuildDependenciesWithOptions(packages, cfg, false)
 }
 
-func uninstallBuildDependenciesWithOptions(packages []string, cfg *Config, quiet bool) {
+func uninstallBuildDependenciesWithOptions(packages []string, cfg *Config, quiet bool) int {
 	removedCount := 0
 	remaining := append([]string(nil), packages...)
 
 	for len(remaining) > 0 {
 		removedThisPass := false
 		var stillNeeded []string
+		removing := make(map[string]bool, len(remaining))
+		for _, pkgName := range remaining {
+			removing[pkgName] = true
+		}
 
 		// Uninstall in reverse order, then retry skipped packages after their
 		// temporary dependents may have been removed.
 		for i := len(remaining) - 1; i >= 0; i-- {
 			pkgName := remaining[i]
-			if len(installedDependents(pkgName, cfg, nil)) > 0 {
+			if len(installedDependents(pkgName, cfg, removing)) > 0 {
 				stillNeeded = append(stillNeeded, pkgName)
 				continue
 			}
@@ -2344,7 +2365,7 @@ func uninstallBuildDependenciesWithOptions(packages []string, cfg *Config, quiet
 				colSuccess.Print("Removing build dependency: ")
 				colNote.Println(pkgName)
 			}
-			if err := pkgUninstall(pkgName, cfg, RootExec, false, true, logger); err != nil {
+			if err := pkgUninstallWithRemovalSet(pkgName, cfg, RootExec, false, true, logger, removing); err != nil {
 				if quiet {
 					debugf("Warning: failed to uninstall build dependency %s: %v\n", pkgName, err)
 				} else {
@@ -2353,6 +2374,8 @@ func uninstallBuildDependenciesWithOptions(packages []string, cfg *Config, quiet
 				continue
 			}
 			removedCount++
+			removeFromWorld(pkgName)
+			removeFromWorldMake(pkgName)
 			removedThisPass = true
 		}
 
@@ -2366,4 +2389,5 @@ func uninstallBuildDependenciesWithOptions(packages []string, cfg *Config, quiet
 		colArrow.Print("-> ")
 		colSuccess.Printf("Removed %d temporary build dependencies\n", removedCount)
 	}
+	return removedCount
 }
