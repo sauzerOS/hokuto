@@ -28,24 +28,46 @@ import (
 // and returns a map of enabled tweaks.
 func loadBuildOptions(pkgDir string) map[string]bool {
 	options := make(map[string]bool)
+	loadOptionsFile(filepath.Join(pkgDir, "options"), options, nil)
+	return options
+}
 
-	// Load from centralized 'options' file if it exists
-	optionsFile := filepath.Join(pkgDir, "options")
-	if data, err := os.ReadFile(optionsFile); err == nil {
-		scanner := bufio.NewScanner(strings.NewReader(string(data)))
-		for scanner.Scan() {
-			line := strings.TrimSpace(scanner.Text())
-			if line == "" || strings.HasPrefix(line, "#") {
+func loadOptionsFile(path string, options map[string]bool, allow map[string]bool) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	scanner := bufio.NewScanner(strings.NewReader(string(data)))
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		// Split line into fields (allow multiple options per line)
+		fields := strings.Fields(line)
+		for _, f := range fields {
+			if allow != nil && !allow[f] {
 				continue
 			}
-			// Split line into fields (allow multiple options per line)
-			fields := strings.Fields(line)
-			for _, f := range fields {
-				options[f] = true
-			}
+			options[f] = true
 		}
 	}
+}
 
+var splitPostBuildOptions = map[string]bool{
+	"nostrip":    true,
+	"staticlibs": true,
+}
+
+func loadSplitPackagePostBuildOptions(pkgDir, splitName, outputSplitName string, parentOptions map[string]bool) map[string]bool {
+	options := maps.Clone(parentOptions)
+	candidates := []string{splitName}
+	if outputSplitName != "" && outputSplitName != splitName {
+		candidates = append(candidates, outputSplitName)
+	}
+	for _, name := range candidates {
+		loadOptionsFile(filepath.Join(pkgDir, "options."+name), options, splitPostBuildOptions)
+	}
 	return options
 }
 
@@ -882,6 +904,7 @@ func packageSplitOutputs(parentPkgName, pkgDir, splitRoot, version, revision, ta
 		return nil
 	}
 
+	parentOptions := loadBuildOptions(pkgDir)
 	for _, splitName := range splitNames {
 		splitOutputDir := filepath.Join(splitRoot, splitName)
 		hasPayload, err := hasPackagePayload(splitOutputDir)
@@ -898,6 +921,7 @@ func packageSplitOutputs(parentPkgName, pkgDir, splitRoot, version, revision, ta
 			colArrow.Print("-> ")
 			colSuccess.Printf("Packaging split package %s from %s\n", outputSplitName, parentPkgName)
 		}
+		splitOptions := loadSplitPackagePostBuildOptions(pkgDir, splitName, outputSplitName, parentOptions)
 
 		installedDir := filepath.Join(splitOutputDir, "var", "db", "hokuto", "installed", outputSplitName)
 		mkdirCmd := exec.Command("mkdir", "-p", installedDir)
@@ -905,8 +929,7 @@ func packageSplitOutputs(parentPkgName, pkgDir, splitRoot, version, revision, ta
 			return fmt.Errorf("failed to create installed dir for split package %s: %w", outputSplitName, err)
 		}
 
-		parentOptions := loadBuildOptions(pkgDir)
-		if !parentOptions["binary"] {
+		if !splitOptions["binary"] {
 			libdepsFile := filepath.Join(installedDir, "libdeps")
 			if err := generateLibDeps(splitOutputDir, libdepsFile, buildExec); err != nil {
 				fmt.Printf("Warning: failed to generate libdeps for split package %s: %v\n", outputSplitName, err)
@@ -917,10 +940,13 @@ func packageSplitOutputs(parentPkgName, pkgDir, splitRoot, version, revision, ta
 			return fmt.Errorf("failed to generate depends for split package %s: %w", outputSplitName, err)
 		}
 
-		if shouldStrip {
+		splitShouldStrip := shouldStrip && !splitOptions["nostrip"]
+		if splitShouldStrip {
 			if err := stripPackage(splitOutputDir, buildExec, opts.LogWriter); err != nil {
 				return fmt.Errorf("split package %s failed during stripping phase: %w", outputSplitName, err)
 			}
+		} else {
+			debugf("Skipping binary stripping for split package %s.\n", outputSplitName)
 		}
 
 		if err := copyPackageRecipeMetadata(pkgDir, installedDir, buildExec); err != nil {
@@ -939,7 +965,7 @@ func packageSplitOutputs(parentPkgName, pkgDir, splitRoot, version, revision, ta
 		}
 
 		removeLibtoolArchives(splitOutputDir, buildExec)
-		if !parentOptions["staticlibs"] {
+		if !splitOptions["staticlibs"] {
 			removeStaticLibraries(splitOutputDir, buildExec)
 		}
 
