@@ -357,6 +357,9 @@ func installBuiltSplitPackageWithLogger(sourcePkg, splitPkg string, cfg *Config,
 	if _, err := pkgInstall(tarballPath, splitPkg, cfg, installExec, true, fast, false, logger); err != nil {
 		return err
 	}
+	if !force {
+		registerTemporaryBuildDep(splitPkg)
+	}
 	return nil
 }
 

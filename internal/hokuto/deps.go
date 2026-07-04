@@ -1842,6 +1842,7 @@ func ensurePackageInstalledWithOptions(pkgName string, cfg *Config, noRemote boo
 	if _, err := pkgInstall(tarballPath, outputPkgName, cfg, RootExec, true, fast, false, logger); err != nil {
 		return false, fmt.Errorf("failed to install built package %s: %v", pkgName, err)
 	}
+	registerTemporaryBuildDep(outputPkgName)
 	return true, nil
 }
 
@@ -1910,6 +1911,7 @@ func ensureSplitPackageInstalled(sourcePkg, splitPkg string, cfg *Config, noRemo
 	if err := installBuiltSplitDependencyWithOptions(sourcePkg, splitPkg, cfg, quiet); err != nil {
 		return false, fmt.Errorf("failed to install split package %s from %s: %w", splitPkg, sourcePkg, err)
 	}
+	registerTemporaryBuildDep(splitPkg)
 	return true, nil
 }
 
@@ -2074,6 +2076,7 @@ func installBinaryTarballWithOptions(tarballPath, pkgName string, cfg *Config, q
 	if _, err := pkgInstall(tarballPath, pkgName, cfg, execCtx, true, fast, false, logger); err != nil {
 		return false, fmt.Errorf("failed to install binary %s: %v", pkgName, err)
 	}
+	registerTemporaryBuildDep(pkgName)
 	return true, nil
 }
 
