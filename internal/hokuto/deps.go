@@ -147,6 +147,94 @@ func findCachedBinaryTarballVersion(pkgName, version, revision string, cfg *Conf
 	return ""
 }
 
+func splitVersionedPackageName(pkgName string) (baseName, major string, ok bool) {
+	lastDash := strings.LastIndex(pkgName, "-")
+	if lastDash == -1 || lastDash == len(pkgName)-1 {
+		return "", "", false
+	}
+	major = pkgName[lastDash+1:]
+	if _, err := strconv.Atoi(major); err != nil {
+		return "", "", false
+	}
+	return pkgName[:lastDash], major, true
+}
+
+func revisionCompare(a, b string) int {
+	ai, aerr := strconv.Atoi(a)
+	bi, berr := strconv.Atoi(b)
+	if aerr == nil && berr == nil {
+		switch {
+		case ai < bi:
+			return -1
+		case ai > bi:
+			return 1
+		default:
+			return 0
+		}
+	}
+	switch {
+	case a < b:
+		return -1
+	case a > b:
+		return 1
+	default:
+		return 0
+	}
+}
+
+func findCachedVersionedBinaryTarball(pkgName string, cfg *Config) (string, bool) {
+	_, major, ok := splitVersionedPackageName(pkgName)
+	if !ok {
+		return "", false
+	}
+
+	arch := GetSystemArchForPackage(cfg, pkgName)
+	for _, variant := range dependencyVariantCandidates(pkgName, cfg) {
+		pattern := filepath.Join(BinDir, fmt.Sprintf("%s-*-*-*-%s.tar.zst", pkgName, variant))
+		matches, err := filepath.Glob(pattern)
+		if err != nil {
+			continue
+		}
+
+		var bestPath, bestVersion, bestRevision string
+		for _, match := range matches {
+			metadata, _, err := scanTarballMetadata(match)
+			if err != nil {
+				debugf("Skipping cached tarball %s: failed to read metadata: %v\n", match, err)
+				continue
+			}
+			if metadata["name"] != pkgName {
+				continue
+			}
+			if metadata["arch"] != "" && metadata["arch"] != arch {
+				continue
+			}
+			if IdentifyVariant(metadata["name"], metadata["generic"] == "1", metadata["multilib"] == "1") != variant {
+				continue
+			}
+			version := metadata["version"]
+			if strings.Split(version, ".")[0] != major {
+				continue
+			}
+			revision := metadata["revision"]
+			if revision == "" {
+				revision = "1"
+			}
+			if bestPath == "" || compareVersions(version, bestVersion) > 0 ||
+				(compareVersions(version, bestVersion) == 0 && revisionCompare(revision, bestRevision) > 0) {
+				bestPath = match
+				bestVersion = version
+				bestRevision = revision
+			}
+		}
+		if bestPath != "" {
+			return bestPath, true
+		}
+	}
+
+	return "", false
+}
+
 func depSpecsFromNames(names []string) []DepSpec {
 	deps := make([]DepSpec, 0, len(names))
 	for _, name := range names {
@@ -323,6 +411,10 @@ func dependencyBinaryAvailable(pkgName string, cfg *Config, noRemote bool) bool 
 	lookupName := pkgName
 	if idx := strings.Index(pkgName, "@"); idx != -1 {
 		lookupName = pkgName[:idx]
+	}
+
+	if _, ok := findCachedVersionedBinaryTarball(lookupName, cfg); ok {
+		return true
 	}
 
 	if version, revision, err := getRepoVersion2(lookupName); err == nil {
@@ -1617,6 +1709,15 @@ func ensurePackageInstalledWithOptions(pkgName string, cfg *Config, noRemote boo
 		}
 	}
 
+	if installName, tarballPath, ok, err := availableBinaryPackageTarball(pkgName, cfg, noRemote); err != nil {
+		return false, err
+	} else if ok {
+		if err := ensureBinaryRuntimeDependenciesInstalledWithOptions(installName, cfg, noRemote, seen, quiet); err != nil {
+			return false, err
+		}
+		return installBinaryTarballWithOptions(tarballPath, installName, cfg, quiet)
+	}
+
 	// 1. Get repo version
 	version, revision, err := getRepoVersion2(pkgName)
 	if err != nil {
@@ -1988,6 +2089,10 @@ func availableBinaryPackageTarball(pkgName string, cfg *Config, noRemote bool) (
 	lookupName := pkgName
 	if idx := strings.Index(pkgName, "@"); idx != -1 {
 		lookupName = pkgName[:idx]
+	}
+
+	if tarballPath, ok := findCachedVersionedBinaryTarball(lookupName, cfg); ok {
+		return lookupName, tarballPath, true, nil
 	}
 
 	if _, sourceErr := findPackageMetadataDir(lookupName); sourceErr != nil {
