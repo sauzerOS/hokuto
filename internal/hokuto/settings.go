@@ -423,6 +423,7 @@ func handleSettingsCommand(cfg *Config) error {
 				} else {
 					BinaryMirror = newMirror // Update global
 					GlobalRemoteIndexLoaded = false
+					GlobalRemoteIndexErr = nil
 					colSuccess.Println("Download mirror updated successfully.")
 				}
 			} else {

@@ -182,6 +182,7 @@ func FetchRemoteIndex(cfg *Config) ([]RepoEntry, error) {
 	ctx := context.Background()
 	var data []byte
 	var err error
+	mirrorAttempted := false
 
 	// Check for R2 credentials before attempting to initialize client
 	hasCreds := cfg.Values["R2_ACCESS_KEY_ID"] != "" && cfg.Values["R2_SECRET_ACCESS_KEY"] != ""
@@ -192,29 +193,33 @@ func FetchRemoteIndex(cfg *Config) ([]RepoEntry, error) {
 	var sigData []byte
 	// 1. Try public Binary Mirror first (high priority for most users)
 	if BinaryMirror != "" {
+		mirrorAttempted = true
 		colArrow.Print("-> ")
 		colSuccess.Println("Fetching remote index via Binary Mirror")
 		url := fmt.Sprintf("%s/repo-index.json", BinaryMirror)
 		dest := filepath.Join(os.TempDir(), "hokuto-index.json")
-		if dlErr := downloadFileQuiet(url, url, dest); dlErr == nil {
+		indexDownloadOpt := downloadOptions{Quiet: true, NativeAttempts: 2, NativeOnly: true}
+		if dlErr := downloadFileWithOptions(url, url, dest, indexDownloadOpt); dlErr == nil {
 			data, err = os.ReadFile(dest)
 			os.Remove(dest)
 
 			// Also try to fetch sig from mirror
 			sigUrl := url + ".sig"
 			sigDest := dest + ".sig"
-			if dlErr := downloadFileQuiet(sigUrl, sigUrl, sigDest); dlErr == nil {
+			if dlErr := downloadFileWithOptions(sigUrl, sigUrl, sigDest, indexDownloadOpt); dlErr == nil {
 				sigData, _ = os.ReadFile(sigDest)
 				os.Remove(sigDest)
 			}
 		} else {
-			debugf("Mirror fetch failed: %v, falling back to R2 if available\n", dlErr)
+			debugf("Mirror fetch failed: %v, continuing in local mode\n", dlErr)
 			err = dlErr
 		}
 	}
 
-	// 2. Fallback to R2 if Mirror failed or not configured
-	if len(data) == 0 && hasCreds {
+	// 2. Fallback to R2 only when no public mirror was configured. If the
+	// configured mirror is unreachable, treat that as remote unavailable and
+	// let callers continue with local repositories/caches.
+	if len(data) == 0 && !mirrorAttempted && hasCreds {
 		r2, r2Err := NewR2Client(cfg)
 		if r2Err == nil {
 			colArrow.Print("-> ")
@@ -261,15 +266,18 @@ func GetCachedRemoteIndex(cfg *Config) ([]RepoEntry, error) {
 	defer GlobalRemoteIndexMu.Unlock()
 
 	if GlobalRemoteIndexLoaded {
-		return GlobalRemoteIndex, nil
+		return GlobalRemoteIndex, GlobalRemoteIndexErr
 	}
 
 	index, err := FetchRemoteIndex(cfg)
 	if err != nil {
+		GlobalRemoteIndexErr = err
+		GlobalRemoteIndexLoaded = true
 		return nil, err
 	}
 
 	GlobalRemoteIndex = index
+	GlobalRemoteIndexErr = nil
 	GlobalRemoteIndexLoaded = true
 	return GlobalRemoteIndex, nil
 }

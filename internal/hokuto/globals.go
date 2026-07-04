@@ -71,6 +71,7 @@ var (
 	// Cache for remote index to avoid multiple fetches
 	GlobalRemoteIndex       []RepoEntry
 	GlobalRemoteIndexLoaded bool
+	GlobalRemoteIndexErr    error
 	GlobalRemoteIndexMu     sync.Mutex
 )
 

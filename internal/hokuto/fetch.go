@@ -432,6 +432,8 @@ type downloadOptions struct {
 	Quiet                  bool // Quiet suppresses all stdout/stderr/progress output
 	Force                  bool // Force re-download even if file exists
 	WgetNoCheckCertificate bool // Pass --no-check-certificate to wget fallback
+	NativeAttempts         int  // Number of native HTTP attempts; zero uses the default
+	NativeOnly             bool // Disable browser/wget fallbacks
 }
 
 var wgetNoCheckCertificate bool
@@ -574,6 +576,9 @@ func downloadFileWithOptions(originalURL, finalURL, destFile string, opt downloa
 
 	// Retry loop for download
 	maxRetries := 3
+	if opt.NativeAttempts > 0 {
+		maxRetries = opt.NativeAttempts - 1
+	}
 	for i := 0; i <= maxRetries; i++ {
 		client, err := newHttpClient()
 		if err != nil {
@@ -729,6 +734,10 @@ func downloadFileWithOptions(originalURL, finalURL, destFile string, opt downloa
 		nativeErr = fmt.Errorf("native download failed with status: %s", resp.Status)
 		debugf("Native download failed with status: %s. Falling back to browser.\n", resp.Status)
 		break
+	}
+
+	if opt.NativeOnly {
+		return nativeErr
 	}
 
 	// --- Fallback: Browser Download (chromedp) ---
