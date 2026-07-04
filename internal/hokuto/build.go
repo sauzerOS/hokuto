@@ -2954,7 +2954,7 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 
 // handleBuildCommand orchestrates the entire build process, intelligently selecting the
 // correct dependency resolution strategy based on the build mode (normal, bootstrap, or alldeps).
-func handleBuildCommand(args []string, cfg *Config) error {
+func handleBuildCommand(args []string, cfg *Config) (err error) {
 	// Preprocess arguments to handle custom flag formats (e.g. -j4)
 	args = PreprocessBuildArgs(args)
 
@@ -3010,7 +3010,13 @@ func handleBuildCommand(args []string, cfg *Config) error {
 	if err := buildCmd.Parse(args); err != nil {
 		return fmt.Errorf("error parsing build flags: %v", err)
 	}
-	defer flushPackageSuggestions(os.Stdout, cfg, *noRemote, true, false)
+	defer func() {
+		if err == nil {
+			flushPackageSuggestions(os.Stdout, cfg, *noRemote, true, false)
+			return
+		}
+		discardPackageSuggestions()
+	}()
 	oldWgetNoCheckCertificate := wgetNoCheckCertificate
 	wgetNoCheckCertificate = *wgetNoCheckCert
 	defer func() { wgetNoCheckCertificate = oldWgetNoCheckCertificate }()
@@ -3310,6 +3316,8 @@ func handleBuildCommand(args []string, cfg *Config) error {
 	var builtWithoutInstallingTargets bool
 	var temporaryBuildDeps []string
 	retainedBuildDeps := make(map[string]bool)
+	stopTemporaryBuildDepTracking := beginTemporaryBuildDepTracking()
+	defer stopTemporaryBuildDepTracking()
 	addTemporaryBuildDep := func(pkgName string) {
 		for _, existing := range temporaryBuildDeps {
 			if existing == pkgName {
@@ -3326,14 +3334,22 @@ func handleBuildCommand(args []string, cfg *Config) error {
 		retainedBuildDeps[getOutputPackageName(pkgName, cfg)] = true
 	}
 	cleanupTemporaryBuildDeps := func() {
+		for _, dep := range drainTemporaryBuildDeps() {
+			addTemporaryBuildDep(dep)
+		}
 		if len(temporaryBuildDeps) == 0 {
 			return
 		}
 		var removable []string
+		seenRemovable := make(map[string]bool)
 		for _, dep := range temporaryBuildDeps {
 			if retainedBuildDeps[dep] {
 				continue
 			}
+			if seenRemovable[dep] {
+				continue
+			}
+			seenRemovable[dep] = true
 			removable = append(removable, dep)
 		}
 		uninstallBuildDependenciesWithOptions(removable, cfg, quietDependencyInstalls)

@@ -144,6 +144,12 @@ func hasPackageSuggestions() bool {
 	return len(packageSuggestions.items) > 0
 }
 
+func discardPackageSuggestions() {
+	packageSuggestions.Lock()
+	packageSuggestions.items = make(map[string]map[string]packageSuggestion)
+	packageSuggestions.Unlock()
+}
+
 func flushPackageSuggestions(logger io.Writer, cfg *Config, noRemote bool, promptInstall bool, autoYes bool) {
 	if logger == nil {
 		logger = os.Stdout

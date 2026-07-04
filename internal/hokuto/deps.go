@@ -27,6 +27,56 @@ var suppressRuntimeDependencyAutoInstall atomic.Int32
 
 var develInstallMu sync.Mutex
 
+var temporaryBuildDepTracker = struct {
+	sync.Mutex
+	active bool
+	deps   []string
+	seen   map[string]bool
+}{
+	seen: make(map[string]bool),
+}
+
+func beginTemporaryBuildDepTracking() func() {
+	temporaryBuildDepTracker.Lock()
+	temporaryBuildDepTracker.active = true
+	temporaryBuildDepTracker.deps = nil
+	temporaryBuildDepTracker.seen = make(map[string]bool)
+	temporaryBuildDepTracker.Unlock()
+
+	return func() {
+		temporaryBuildDepTracker.Lock()
+		temporaryBuildDepTracker.active = false
+		temporaryBuildDepTracker.deps = nil
+		temporaryBuildDepTracker.seen = make(map[string]bool)
+		temporaryBuildDepTracker.Unlock()
+	}
+}
+
+func registerTemporaryBuildDep(pkgName string) {
+	if pkgName == "" {
+		return
+	}
+	temporaryBuildDepTracker.Lock()
+	defer temporaryBuildDepTracker.Unlock()
+	if !temporaryBuildDepTracker.active {
+		return
+	}
+	if temporaryBuildDepTracker.seen[pkgName] {
+		return
+	}
+	temporaryBuildDepTracker.seen[pkgName] = true
+	temporaryBuildDepTracker.deps = append(temporaryBuildDepTracker.deps, pkgName)
+}
+
+func drainTemporaryBuildDeps() []string {
+	temporaryBuildDepTracker.Lock()
+	defer temporaryBuildDepTracker.Unlock()
+	deps := append([]string(nil), temporaryBuildDepTracker.deps...)
+	temporaryBuildDepTracker.deps = nil
+	temporaryBuildDepTracker.seen = make(map[string]bool)
+	return deps
+}
+
 var baseDevelPackages = []string{
 	"autoconf",
 	"automake",
@@ -1676,7 +1726,9 @@ func installBuildDependenciesWithOptions(pkgName string, cfg *Config, noRemote b
 			return newlyInstalled, err
 		}
 		if installed {
-			newlyInstalled = append(newlyInstalled, depPkg)
+			outputName := getOutputPackageName(depPkg, cfg)
+			newlyInstalled = append(newlyInstalled, outputName)
+			registerTemporaryBuildDep(outputName)
 		}
 	}
 
@@ -2253,7 +2305,9 @@ func ensureDevelPackagesInstalledWithOptions(cfg *Config, includeMultilib bool, 
 			return newlyInstalled, fmt.Errorf("required devel package %s has no available binary package; install it manually or build it in bootstrap mode", pkgName)
 		}
 		if installed {
-			newlyInstalled = append(newlyInstalled, getOutputPackageName(pkgName, cfg))
+			outputName := getOutputPackageName(pkgName, cfg)
+			newlyInstalled = append(newlyInstalled, outputName)
+			registerTemporaryBuildDep(outputName)
 		}
 	}
 
