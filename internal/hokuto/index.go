@@ -374,22 +374,23 @@ func parseAlternativeDeps(line string) ([]DepSpec, error) {
 	var commonOptional, commonRebuild, commonMake, commonCross, commonCrossNative, commonRuntimeOnly, commonSuggest bool
 	var commonSuggestText string
 
-	for i, part := range parts {
+	for _, part := range parts {
 		part = strings.TrimSpace(part)
 		name, op, ver, optional, rebuild, makeDep, cross, crossNative, runtimeOnly, suggest, suggestText := parseDepToken(part)
 		if name != "" {
 			alternatives = append(alternatives, name)
-			// Assuming common flags for all alternatives in a single line
-			if i == 0 {
+			if commonOp == "" && op != "" {
 				commonOp = op
 				commonVer = ver
-				commonOptional = optional
-				commonRebuild = rebuild
-				commonMake = makeDep
-				commonCross = cross
-				commonCrossNative = crossNative
-				commonRuntimeOnly = runtimeOnly
-				commonSuggest = suggest
+			}
+			commonOptional = commonOptional || optional
+			commonRebuild = commonRebuild || rebuild
+			commonMake = commonMake || makeDep
+			commonCross = commonCross || cross
+			commonCrossNative = commonCrossNative || crossNative
+			commonRuntimeOnly = commonRuntimeOnly || runtimeOnly
+			commonSuggest = commonSuggest || suggest
+			if commonSuggestText == "" && suggestText != "" {
 				commonSuggestText = suggestText
 			}
 		}

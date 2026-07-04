@@ -710,25 +710,11 @@ func resolveAlternativeDep(dep DepSpec, yes bool, cfg *Config) (string, error) {
 		return dep.Name, nil
 	}
 
-	// Create a cache key from the sorted alternatives
-	// This ensures the same set of alternatives always maps to the same key
-	sortedAlts := make([]string, len(dep.Alternatives))
-	copy(sortedAlts, dep.Alternatives)
-	sort.Strings(sortedAlts)
-	cacheKey := strings.Join(sortedAlts, "|")
+	cacheKey := alternativeDepCacheKey(dep)
 
 	// Check cache first
-	if cached, ok := alternativeDepCache[cacheKey]; ok {
-		// Verify the cached choice is still available
-		if isPackageInstalled(cached) {
-			return cached, nil
-		}
-		// Check if can be found in repos
-		if _, err := findPackageMetadataDir(cached); err == nil {
-			return cached, nil
-		}
-		// Cached choice is no longer available, remove from cache and continue
-		delete(alternativeDepCache, cacheKey)
+	if cached, ok := cachedAlternativeDep(dep); ok {
+		return cached, nil
 	}
 
 	// Check which alternatives are available (installed or can be found in repos)
@@ -812,6 +798,46 @@ func resolveAlternativeDep(dep DepSpec, yes bool, cfg *Config) (string, error) {
 	chosen := available[choice-1]
 	alternativeDepCache[cacheKey] = chosen
 	return chosen, nil
+}
+
+func alternativeDepCacheKey(dep DepSpec) string {
+	sortedAlts := make([]string, len(dep.Alternatives))
+	copy(sortedAlts, dep.Alternatives)
+	sort.Strings(sortedAlts)
+	return strings.Join(sortedAlts, "|")
+}
+
+func cachedAlternativeDep(dep DepSpec) (string, bool) {
+	if len(dep.Alternatives) < 2 {
+		return dep.Name, true
+	}
+	cacheKey := alternativeDepCacheKey(dep)
+	cached, ok := alternativeDepCache[cacheKey]
+	if !ok {
+		return "", false
+	}
+	if isPackageInstalled(cached) {
+		return cached, true
+	}
+	if _, err := findPackageMetadataDir(cached); err == nil {
+		return cached, true
+	}
+	delete(alternativeDepCache, cacheKey)
+	return "", false
+}
+
+func resolvedBuildDependencyCandidates(dep DepSpec, yes bool, cfg *Config) ([]string, error) {
+	if len(dep.Alternatives) == 0 {
+		return []string{dep.Name}, nil
+	}
+	if cached, ok := cachedAlternativeDep(dep); ok {
+		return []string{cached}, nil
+	}
+	resolved, err := resolveAlternativeDep(dep, yes, cfg)
+	if err != nil {
+		return nil, err
+	}
+	return []string{resolved}, nil
 }
 
 // parseDepToken parses tokens like "pkg", "pkg<=1.2.3 optional", "pkg rebuild",

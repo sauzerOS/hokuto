@@ -163,30 +163,25 @@ func plannedBuildDisplayOrder(plan *BuildPlan, cfg *Config, noRemote bool) []str
 	}
 
 	depAvailable := func(dep DepSpec) bool {
-		if len(dep.Alternatives) > 0 {
-			for _, alt := range dep.Alternatives {
-				altBuilt := built[alt]
-				if !altBuilt {
-					if sourcePkg, ok := findSplitDependencySource(alt); ok && built[sourcePkg] {
-						altBuilt = true
-					}
-				}
-				if altBuilt || findInstalledSatisfying(alt, "", "") != "" || (!inPlan[alt] && dependencyBinaryAvailable(alt, cfg, noRemote)) {
-					return true
-				}
-			}
+		candidates, err := resolvedBuildDependencyCandidates(dep, false, cfg)
+		if err != nil {
 			return false
 		}
-		depBuilt := built[dep.Name]
-		if !depBuilt {
-			if sourcePkg, ok := findSplitDependencySource(dep.Name); ok && built[sourcePkg] {
-				depBuilt = true
+		for _, name := range candidates {
+			depBuilt := built[name]
+			if !depBuilt {
+				if sourcePkg, ok := findSplitDependencySource(name); ok && built[sourcePkg] {
+					depBuilt = true
+				}
+			}
+			if depBuilt || findInstalledSatisfying(name, dep.Op, dep.Version) != "" {
+				return true
+			}
+			if !inPlan[name] && dependencyBinaryAvailable(name, cfg, noRemote) {
+				return true
 			}
 		}
-		if depBuilt || findInstalledSatisfying(dep.Name, dep.Op, dep.Version) != "" {
-			return true
-		}
-		return !inPlan[dep.Name] && dependencyBinaryAvailable(dep.Name, cfg, noRemote)
+		return false
 	}
 
 	canBuild := func(pkgName string) bool {
@@ -287,9 +282,9 @@ func collectSplitDependenciesForPlan(plan *BuildPlan, cfg *Config) map[string][]
 			if !activeBuildDependency(dep, cfg, false) {
 				continue
 			}
-			candidates := []string{dep.Name}
-			if len(dep.Alternatives) > 0 {
-				candidates = dep.Alternatives
+			candidates, err := resolvedBuildDependencyCandidates(dep, false, cfg)
+			if err != nil {
+				continue
 			}
 			for _, cand := range candidates {
 				if shouldSkipMultilibMakeDep(dep, cand, cfg) {
@@ -318,7 +313,15 @@ func installBuiltSplitDependencyWithOptions(sourcePkg, splitPkg string, cfg *Con
 }
 
 func installBuiltSplitDependencyWithLogger(sourcePkg, splitPkg string, cfg *Config, logger io.Writer, fast bool) error {
-	if isPackageInstalled(splitPkg) {
+	return installBuiltSplitPackageWithLogger(sourcePkg, splitPkg, cfg, logger, fast, false)
+}
+
+func installBuiltSplitTargetWithLogger(sourcePkg, splitPkg string, cfg *Config, logger io.Writer, fast bool) error {
+	return installBuiltSplitPackageWithLogger(sourcePkg, splitPkg, cfg, logger, fast, true)
+}
+
+func installBuiltSplitPackageWithLogger(sourcePkg, splitPkg string, cfg *Config, logger io.Writer, fast bool, force bool) error {
+	if !force && isPackageInstalled(splitPkg) {
 		return nil
 	}
 	version, revision, err := getRepoVersion2(sourcePkg)
@@ -3259,14 +3262,40 @@ func handleBuildCommand(args []string, cfg *Config) error {
 		initConfig(cfg)
 	}
 
-	packagesToProcess := buildCmd.Args()
-	if len(packagesToProcess) == 0 {
+	requestedPackages := buildCmd.Args()
+	if len(requestedPackages) == 0 {
 		buildCmd.Usage()
 		return fmt.Errorf("no packages specified")
 	}
 	userRequestedMap := make(map[string]bool)
-	for _, pkg := range packagesToProcess {
-		userRequestedMap[pkg] = true
+	forceBuildMap := make(map[string]bool)
+	directSplitTargetsBySource := make(map[string][]string)
+	var packagesToProcess []string
+	addPackageToProcess := func(pkgName string) {
+		for _, existing := range packagesToProcess {
+			if existing == pkgName {
+				return
+			}
+		}
+		packagesToProcess = append(packagesToProcess, pkgName)
+	}
+	for _, pkg := range requestedPackages {
+		if _, err := findPackageDir(pkg); err == nil {
+			userRequestedMap[pkg] = true
+			forceBuildMap[pkg] = true
+			addPackageToProcess(pkg)
+			continue
+		}
+		if sourcePkg, _, ok := findSplitPackageSource(pkg); ok {
+			userRequestedMap[pkg] = true
+			forceBuildMap[sourcePkg] = true
+			addPackageToProcess(sourcePkg)
+			addMappedSplitDependency(directSplitTargetsBySource, sourcePkg, pkg)
+			colArrow.Print("-> ")
+			colInfo.Printf("Target %s is a split package; scheduling %s to build it\n", pkg, sourcePkg)
+			continue
+		}
+		return fmt.Errorf("cannot build %s: package not found in any repository", pkg)
 	}
 	for _, pkg := range packagesToProcess {
 		if _, err := findPackageDir(pkg); err != nil {
@@ -3413,6 +3442,21 @@ func handleBuildCommand(args []string, cfg *Config) error {
 			if userRequestedMap[pkgName] {
 				addToWorld(pkgName)
 			}
+			for _, splitPkg := range directSplitTargetsBySource[pkgName] {
+				if err := installBuiltSplitTargetWithLogger(pkgName, splitPkg, cfg, nil, false); err != nil {
+					isCriticalAtomic.Store(0)
+					colArrow.Print("-> ")
+					color.Danger.Printf("Installation failed for split target %s: %v\n", splitPkg, err)
+					failedBuilds[pkgName] = fmt.Errorf("split target installation failed for %s: %w", splitPkg, err)
+					goto BuildSummary
+				}
+				if userRequestedMap[splitPkg] {
+					addToWorld(splitPkg)
+				}
+				colArrow.Print("-> ")
+				colSuccess.Printf("Installing split target:")
+				colNote.Printf(" %s\n", splitPkg)
+			}
 			isCriticalAtomic.Store(0)
 		}
 
@@ -3420,6 +3464,11 @@ func handleBuildCommand(args []string, cfg *Config) error {
 		// ** STRATEGY 2: Normal Build Mode **
 		var packagesThatMustBeBuilt map[string]bool
 		splitDepsBySource := make(map[string][]string)
+		for sourcePkg, splitPkgs := range directSplitTargetsBySource {
+			for _, splitPkg := range splitPkgs {
+				addMappedSplitDependency(splitDepsBySource, sourcePkg, splitPkg)
+			}
+		}
 		binaryDeclined := make(map[string]bool)
 
 		if *noDeps {
@@ -3427,7 +3476,7 @@ func handleBuildCommand(args []string, cfg *Config) error {
 			colArrow.Print("-> ")
 			colWarn.Println("Skipping dependency checking (--no-deps enabled)")
 			packagesThatMustBeBuilt = make(map[string]bool)
-			for pkg := range userRequestedMap {
+			for pkg := range forceBuildMap {
 				packagesThatMustBeBuilt[pkg] = true
 			}
 		} else {
@@ -3437,14 +3486,14 @@ func handleBuildCommand(args []string, cfg *Config) error {
 			masterProcessed := make(map[string]bool)
 			var missingDeps []string
 			for _, pkgName := range packagesToProcess {
-				if err := resolveMissingDeps(pkgName, masterProcessed, &missingDeps, userRequestedMap, cfg, *noRemote); err != nil {
+				if err := resolveMissingDeps(pkgName, masterProcessed, &missingDeps, forceBuildMap, cfg, *noRemote); err != nil {
 					return fmt.Errorf("error resolving dependencies for %s: %v", pkgName, err)
 				}
 			}
 			missingDeps = MovePackageToFront(missingDeps, "sauzeros-base")
 
 			packagesThatMustBeBuilt = make(map[string]bool)
-			for pkg := range userRequestedMap {
+			for pkg := range forceBuildMap {
 				packagesThatMustBeBuilt[pkg] = true
 			}
 
@@ -3915,6 +3964,9 @@ func executeBuildPass(plan *BuildPlan, _ string, installAllTargets bool, cfg *Co
 	var totalElapsedTime time.Duration
 	depMatchesPackage := func(dep DepSpec, pkgName string) bool {
 		if len(dep.Alternatives) > 0 {
+			if cached, ok := cachedAlternativeDep(dep); ok {
+				return cached == pkgName
+			}
 			for _, alt := range dep.Alternatives {
 				if alt == pkgName {
 					return true
@@ -3986,14 +4038,19 @@ func executeBuildPass(plan *BuildPlan, _ string, installAllTargets bool, cfg *Co
 						return findInstalledSatisfying(name, op, ver) != ""
 					}
 
-					if len(dep.Alternatives) > 0 {
-						for _, alt := range dep.Alternatives {
-							if isDepAvailable(alt, "", "", dep) {
+					candidates, err := resolvedBuildDependencyCandidates(dep, false, cfg)
+					if err != nil {
+						isSatisfied = false
+					} else {
+						for _, cand := range candidates {
+							if isDepAvailable(cand, dep.Op, dep.Version, dep) {
 								isSatisfied = true
 								break
 							}
 						}
-					} else {
+					}
+
+					if len(candidates) == 0 && len(dep.Alternatives) == 0 {
 						if isDepAvailable(dep.Name, dep.Op, dep.Version, dep) {
 							isSatisfied = true
 						}
@@ -4002,10 +4059,20 @@ func executeBuildPass(plan *BuildPlan, _ string, installAllTargets bool, cfg *Co
 					if !isSatisfied {
 						// Check if we are blocked by a SPECIFIC failure in the alternatives
 						if len(dep.Alternatives) > 0 {
-							for _, alt := range dep.Alternatives {
-								if _, hasFailed := failed[alt]; hasFailed {
-									failed[pkgName] = fmt.Errorf("blocked by failed dependency '%s'", alt)
-									break
+							candidates, err := resolvedBuildDependencyCandidates(dep, false, cfg)
+							if err == nil {
+								for _, cand := range candidates {
+									if _, hasFailed := failed[cand]; hasFailed {
+										failed[pkgName] = fmt.Errorf("blocked by failed dependency '%s'", cand)
+										break
+									}
+								}
+							} else {
+								for _, alt := range dep.Alternatives {
+									if _, hasFailed := failed[alt]; hasFailed {
+										failed[pkgName] = fmt.Errorf("blocked by failed dependency '%s'", alt)
+										break
+									}
 								}
 							}
 						} else {
@@ -4097,6 +4164,7 @@ func executeBuildPass(plan *BuildPlan, _ string, installAllTargets bool, cfg *Co
 					// Install the package immediately.
 					version, revision, _ := getRepoVersion2(pkgName)
 					outputPkgName := getOutputPackageName(pkgName, cfg)
+					wasInstalledBefore := isPackageInstalled(outputPkgName)
 					arch := GetSystemArchForPackage(cfg, pkgName)
 					variant := GetSystemVariantForPackage(cfg, pkgName)
 					tarballPath := filepath.Join(BinDir, StandardizeRemoteName(outputPkgName, version, revision, arch, variant))
@@ -4122,7 +4190,7 @@ func executeBuildPass(plan *BuildPlan, _ string, installAllTargets bool, cfg *Co
 					// Check if it's a Make Dependency
 					// If the user did NOT request it explicitly, check if it was pulled in
 					// as a 'make' dependency by any other package in the toBuild list.
-					if !userRequestedMap[pkgName] {
+					if !userRequestedMap[pkgName] && !wasInstalledBefore {
 						installedBuildDeps = append(installedBuildDeps, outputPkgName)
 						isMakeDep := false
 						// Scan all packages in the plan (including those already built or waiting)
@@ -4165,16 +4233,30 @@ func executeBuildPass(plan *BuildPlan, _ string, installAllTargets bool, cfg *Co
 					isCriticalAtomic.Store(0)
 
 					for _, splitPkg := range requiredSplitDeps {
-						if err := installBuiltSplitDependency(pkgName, splitPkg, cfg); err != nil {
+						wasSplitInstalledBefore := isPackageInstalled(splitPkg)
+						var err error
+						if userRequestedMap[splitPkg] {
+							err = installBuiltSplitTargetWithLogger(pkgName, splitPkg, cfg, nil, false)
+						} else {
+							err = installBuiltSplitDependency(pkgName, splitPkg, cfg)
+						}
+						if err != nil {
 							colArrow.Print("-> ")
 							color.Danger.Printf("Installation failed for split dependency %s: %v\n", splitPkg, err)
 							failed[pkgName] = fmt.Errorf("split dependency install failed for %s: %w", splitPkg, err)
 							return failed, successfullyBuiltTargets, totalElapsedTime, installedBuildDeps
 						}
 						colArrow.Print("-> ")
-						colSuccess.Printf("Installing split dependency:")
+						if userRequestedMap[splitPkg] {
+							addToWorld(splitPkg)
+							colSuccess.Printf("Installing split target:")
+						} else {
+							colSuccess.Printf("Installing split dependency:")
+							if !wasSplitInstalledBefore {
+								installedBuildDeps = append(installedBuildDeps, splitPkg)
+							}
+						}
 						colNote.Printf(" %s\n", splitPkg)
-						installedBuildDeps = append(installedBuildDeps, splitPkg)
 						builtThisPass[splitPkg] = true
 					}
 				} else {
@@ -4320,14 +4402,16 @@ func executeBuildPass(plan *BuildPlan, _ string, installAllTargets bool, cfg *Co
 					}
 
 					isSatisfied := false
-					if len(dep.Alternatives) > 0 {
-						for _, alt := range dep.Alternatives {
-							if builtThisPass[alt] || findInstalledSatisfying(alt, "", "") != "" {
+					candidates, err := resolvedBuildDependencyCandidates(dep, false, cfg)
+					if err == nil {
+						for _, cand := range candidates {
+							if builtThisPass[cand] || findInstalledSatisfying(cand, dep.Op, dep.Version) != "" {
 								isSatisfied = true
 								break
 							}
 						}
-					} else {
+					}
+					if len(candidates) == 0 && len(dep.Alternatives) == 0 {
 						if builtThisPass[dep.Name] || findInstalledSatisfying(dep.Name, dep.Op, dep.Version) != "" {
 							isSatisfied = true
 						}

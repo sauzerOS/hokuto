@@ -178,10 +178,11 @@ func RunParallelBuilds(plan *BuildPlan, cfg *Config, maxJobs int, userRequestedM
 							continue
 						}
 
-						// Check status involving alternatives
-						candidates := []string{dep.Name}
-						if len(dep.Alternatives) > 0 {
-							candidates = dep.Alternatives
+						// Check status for the selected alternative, when this dep has alternatives.
+						candidates, err := resolvedBuildDependencyCandidates(dep, false, pm.Config)
+						if err != nil {
+							reason = fmt.Sprintf("dependency not satisfied: %s", dep.Name)
+							break
 						}
 
 						satisfied := false
@@ -342,9 +343,9 @@ func collectAvailableBinaryDependenciesForPlan(plan *BuildPlan, cfg *Config, noR
 				continue
 			}
 
-			candidates := []string{dep.Name}
-			if len(dep.Alternatives) > 0 {
-				candidates = dep.Alternatives
+			candidates, err := resolvedBuildDependencyCandidates(dep, false, cfg)
+			if err != nil {
+				continue
 			}
 
 			for _, cand := range candidates {
@@ -725,6 +726,9 @@ func (pm *ParallelManager) packageDependsOn(pkgName, dependency string) bool {
 
 func parallelDepMatchesPackage(dep DepSpec, pkgName string) bool {
 	if len(dep.Alternatives) > 0 {
+		if cached, ok := cachedAlternativeDep(dep); ok {
+			return cached == pkgName
+		}
 		for _, alt := range dep.Alternatives {
 			if alt == pkgName {
 				return true
@@ -799,8 +803,17 @@ func (pm *ParallelManager) installPackage(pkgName string, userRequestedMap map[s
 		}
 
 		for _, splitPkg := range pm.SplitDepsBySource[pkgName] {
-			if err := installBuiltSplitDependencyWithLogger(pkgName, splitPkg, pm.Config, logger, true); err != nil {
+			var err error
+			if userRequestedMap[splitPkg] {
+				err = installBuiltSplitTargetWithLogger(pkgName, splitPkg, pm.Config, logger, true)
+			} else {
+				err = installBuiltSplitDependencyWithLogger(pkgName, splitPkg, pm.Config, logger, true)
+			}
+			if err != nil {
 				return result, fmt.Errorf("split dependency install failed for %s: %w", splitPkg, err)
+			}
+			if userRequestedMap[splitPkg] {
+				addToWorld(splitPkg)
 			}
 			if logger != nil {
 				fmt.Fprintf(logger, "Installing split dependency: %s\n", splitPkg)
@@ -889,13 +902,11 @@ func (pm *ParallelManager) canBuild(pkgName string) bool {
 			}
 		}
 
-		// Determine candidates: either the alternatives or just the single name
-		candidates := []string{dep.Name}
-		if len(dep.Alternatives) > 0 {
-			candidates = dep.Alternatives
+		candidates, err := resolvedBuildDependencyCandidates(dep, false, pm.Config)
+		if err != nil {
+			return false
 		}
 
-		// Check if satisfied by ANY candidate
 		satisfied := false
 		for _, cand := range candidates {
 			if shouldSkipMultilibMakeDep(dep, cand, pm.Config) {

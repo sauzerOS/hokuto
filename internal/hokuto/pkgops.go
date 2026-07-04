@@ -507,6 +507,13 @@ type libDepRef struct {
 	Name string
 }
 
+func (d libDepRef) String() string {
+	if d.ABI != "" {
+		return d.ABI + ":" + d.Name
+	}
+	return d.Name
+}
+
 func parseLibDepRef(line string) (libDepRef, bool) {
 	line = strings.TrimSpace(line)
 	if line == "" || strings.HasPrefix(line, "#") {
@@ -516,6 +523,50 @@ func parseLibDepRef(line string) (libDepRef, bool) {
 		return libDepRef{ABI: abi, Name: name}, true
 	}
 	return libDepRef{Name: line}, true
+}
+
+type libDepIgnores struct {
+	packages map[string]struct{}
+	libs     map[string]struct{}
+}
+
+func loadLibDepIgnores(path string) libDepIgnores {
+	ignores := libDepIgnores{
+		packages: make(map[string]struct{}),
+		libs:     make(map[string]struct{}),
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ignores
+	}
+
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if cut, _, ok := strings.Cut(line, "#"); ok {
+			line = strings.TrimSpace(cut)
+		}
+		if line == "" {
+			continue
+		}
+		if dep, ok := parseLibDepRef(line); ok && (dep.ABI != "" || strings.Contains(dep.Name, ".so")) {
+			ignores.libs[dep.String()] = struct{}{}
+			continue
+		}
+		ignores.packages[line] = struct{}{}
+	}
+
+	return ignores
+}
+
+func (i libDepIgnores) ignoresPackage(pkgName string) bool {
+	_, ok := i.packages[pkgName]
+	return ok
+}
+
+func (i libDepIgnores) ignoresLib(dep libDepRef) bool {
+	_, ok := i.libs[dep.String()]
+	return ok
 }
 
 func pathIs32BitLibrary(path string) bool {
@@ -590,6 +641,7 @@ func findPackageMetadataFile(pkgDir, pkgName, baseName string) string {
 func generateDepends(pkgName, pkgDir, outputDir, rootDir string, execCtx *Executor, bootstrap bool) error {
 	installedDir := filepath.Join(outputDir, "var", "db", "hokuto", "installed", pkgName)
 	dependsFile := filepath.Join(installedDir, "depends")
+	libDepIgnores := loadLibDepIgnores(findPackageMetadataFile(pkgDir, pkgName, "libdeps.ignore"))
 
 	// Track library dependencies (auto-detected, just package names)
 	libDepSet := make(map[string]struct{})
@@ -631,6 +683,9 @@ func generateDepends(pkgName, pkgDir, outputDir, rootDir string, execCtx *Execut
 		var libdeps []libDepRef
 		for _, line := range strings.Split(string(libdepsData), "\n") {
 			if dep, ok := parseLibDepRef(line); ok {
+				if libDepIgnores.ignoresLib(dep) {
+					continue
+				}
 				libdeps = append(libdeps, dep)
 			}
 		}
@@ -678,6 +733,9 @@ func generateDepends(pkgName, pkgDir, outputDir, rootDir string, execCtx *Execut
 						pathInManifest := fields[0]
 
 						if libraryPathMatchesDep(pathInManifest, lib) {
+							if libDepIgnores.ignoresPackage(otherPkg) {
+								break
+							}
 							libDepSet[otherPkg] = struct{}{}
 							break // Found the owner, move to the next library
 						}
