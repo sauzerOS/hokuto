@@ -707,7 +707,9 @@ func VerifyPackageSignature(stagingDir, pkgName string, cfg *Config, execCtx *Ex
 
 	if ed25519.Verify(publicKey, dataToVerify, signature) {
 		fmt.Fprint(logger, colArrow.Sprint("-> "))
-		fmt.Fprintf(logger, "%s", colSuccess.Sprintf("Package %s signature OK\n", pkgName))
+		fmt.Fprint(logger, colSuccess.Sprint("Package "))
+		fmt.Fprint(logger, colNote.Sprint(pkgName))
+		fmt.Fprintln(logger, colSuccess.Sprint(" signature OK"))
 
 		// 4. Verify integrity of all files against the signed manifest
 		if err := VerifyPackageIntegrity(stagingDir, pkgName, manifestPath, execCtx); err != nil {

@@ -2284,7 +2284,8 @@ func uninstallBuildDependenciesWithOptions(packages []string, cfg *Config, quiet
 			logger, _ := dependencyInstallLogger(quiet)
 			if !quiet {
 				colArrow.Print("-> ")
-				colSuccess.Printf("Removing build dependency: %s\n", pkgName)
+				colSuccess.Print("Removing build dependency: ")
+				colNote.Println(pkgName)
 			}
 			if err := pkgUninstall(pkgName, cfg, RootExec, false, true, logger); err != nil {
 				if quiet {
