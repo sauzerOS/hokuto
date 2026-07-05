@@ -3026,6 +3026,8 @@ func handleBuildCommand(args []string, cfg *Config) (err error) {
 	if err := buildCmd.Parse(args); err != nil {
 		return fmt.Errorf("error parsing build flags: %v", err)
 	}
+	endBuildSession := registerHokutoBuildSession()
+	defer endBuildSession()
 	defer func() {
 		if err == nil {
 			flushPackageSuggestions(os.Stdout, cfg, *noRemote, true, false)

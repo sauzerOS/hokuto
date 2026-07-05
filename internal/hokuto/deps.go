@@ -534,6 +534,20 @@ func resolveBinaryDependencies(pkgName string, visited map[string]bool, plan *[]
 	}
 	pkgDir, err := findPackageMetadataDir(lookupName)
 	if err != nil {
+		if _, sourceDir, ok := findSplitPackageSource(lookupName); ok {
+			deps, err := parsePackageDependsFile(sourceDir, lookupName)
+			if err != nil {
+				return fmt.Errorf("failed to parse depends for split package %s: %w", pkgName, err)
+			}
+			if err := resolveDependencyList(pkgName, deps, visited, plan, force, yes, cfg, remoteIndex, allowRemote); err != nil {
+				return err
+			}
+			if !force && findInstalledSatisfying(pkgName, "", "") != "" {
+				return nil
+			}
+			*plan = append(*plan, pkgName)
+			return nil
+		}
 		if sourcePkg, ok := findSplitDependencySource(pkgName); ok {
 			if err := resolveBinaryDependencies(sourcePkg, visited, plan, force, yes, cfg, remoteIndex, allowRemote); err != nil {
 				return err
@@ -736,6 +750,18 @@ func parseDependsFile(pkgDir string) ([]DepSpec, error) {
 	if err != nil {
 		if os.IsNotExist(err) {
 			return []DepSpec{}, nil // No depends file is valid.
+		}
+		return nil, fmt.Errorf("failed to read depends file: %w", err)
+	}
+	return parseDependsData(content)
+}
+
+func parsePackageDependsFile(pkgDir, pkgName string) ([]DepSpec, error) {
+	dependsPath := findPackageMetadataFile(pkgDir, pkgName, "depends")
+	content, err := os.ReadFile(dependsPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return []DepSpec{}, nil
 		}
 		return nil, fmt.Errorf("failed to read depends file: %w", err)
 	}
@@ -2024,7 +2050,7 @@ func newDependencyInstallProgress(total int, description string, quiet bool) *pr
 	if !quiet || total <= 0 {
 		return nil
 	}
-	return progressbar.Default(int64(total), colSuccess.Sprint(description))
+	return progressbar.Default(int64(total), colArrow.Sprint("-> ")+colSuccess.Sprint(description))
 }
 
 func activateDependencyInstallProgress(bar *progressbar.ProgressBar) func() {
@@ -2045,7 +2071,7 @@ func activateDependencyInstallProgress(bar *progressbar.ProgressBar) func() {
 
 func describeDependencyInstallProgress(bar *progressbar.ProgressBar, pkgName string) {
 	if bar != nil {
-		bar.Describe(colSuccess.Sprint("Installing ") + colNote.Sprint(pkgName))
+		bar.Describe(colArrow.Sprint("-> ") + colSuccess.Sprint("Installing ") + colNote.Sprint(pkgName))
 	}
 }
 
@@ -2340,6 +2366,15 @@ func uninstallBuildDependencies(packages []string, cfg *Config) {
 }
 
 func uninstallBuildDependenciesWithOptions(packages []string, cfg *Config, quiet bool) int {
+	if len(packages) == 0 {
+		return 0
+	}
+	if activeSessions := otherActiveHokutoBuildSessions(); len(activeSessions) > 0 {
+		colArrow.Print("-> ")
+		colWarn.Printf("Skipping temporary build dependency cleanup; another Hokuto build is active (pid %s)\n", joinPIDs(activeSessions))
+		return 0
+	}
+
 	removedCount := 0
 	remaining := append([]string(nil), packages...)
 
