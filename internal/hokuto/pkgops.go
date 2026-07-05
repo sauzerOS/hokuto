@@ -576,6 +576,16 @@ func pathIs32BitLibrary(path string) bool {
 		strings.Contains(path, "/i686-unknown-linux-gnu/")
 }
 
+func isSharedObjectName(name string) bool {
+	base := filepath.Base(filepath.ToSlash(name))
+	idx := strings.Index(base, ".so")
+	if idx == -1 {
+		return false
+	}
+	tail := base[idx+len(".so"):]
+	return tail == "" || strings.HasPrefix(tail, ".")
+}
+
 func libraryPathMatchesDep(path string, dep libDepRef) bool {
 	if dep.Name == "" {
 		return false
@@ -589,6 +599,10 @@ func libraryPathMatchesDep(path string, dep libDepRef) bool {
 			return false
 		}
 	} else if filepath.Base(path) != depName {
+		return false
+	}
+
+	if isSharedObjectName(depName) && !isSharedObjectName(filepath.Base(path)) {
 		return false
 	}
 
