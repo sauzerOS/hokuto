@@ -675,6 +675,16 @@ func generateDepends(pkgName, pkgDir, outputDir, rootDir string, execCtx *Execut
 		}
 		return line
 	}
+	formatSuggestDep := func(dep DepSpec) string {
+		if len(dep.Alternatives) > 1 {
+			line := strings.Join(dep.Alternatives, " | ") + " suggest"
+			if dep.SuggestText != "" {
+				line += " " + dep.SuggestText
+			}
+			return line
+		}
+		return formatSuggestLine(dep.Name, dep.Op, dep.Version, dep.SuggestText)
+	}
 	cleanManualDepName := func(name string) string {
 		if name == "19-binutils-2" {
 			return ""
@@ -767,6 +777,17 @@ func generateDepends(pkgName, pkgDir, outputDir, rootDir string, execCtx *Execut
 		for _, line := range strings.Split(string(data), "\n") {
 			line = strings.TrimSpace(line)
 			if line != "" && !strings.HasPrefix(line, "#") {
+				if strings.Contains(line, "|") {
+					deps, err := parseDependsData([]byte(line))
+					if err != nil {
+						return fmt.Errorf("failed to parse dependencies for %s: %w", pkgName, err)
+					}
+					if len(deps) > 0 && deps[0].Suggest {
+						suggestLines[strings.Join(deps[0].Alternatives, "|")] = formatSuggestDep(deps[0])
+						continue
+					}
+				}
+
 				// Extract package name to use as key in the map
 				name, op, ver, optional, rebuild, makeDep, _, _, runtimeOnly, suggest, suggestText := parseDepToken(line)
 				if name != "" {

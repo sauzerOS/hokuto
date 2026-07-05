@@ -23,6 +23,7 @@ type packageSuggestion struct {
 	Name       string
 	Op         string
 	Version    string
+	Alternates []string
 	Dependency string
 	Text       string
 }
@@ -100,24 +101,64 @@ func readPackageSuggestions(pkgName, rootDir string) []packageSuggestion {
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
-		name, op, ver, _, _, _, _, _, _, _, suggestText := parseDepToken(line)
-		if name == "" || findInstalledSatisfying(name, op, ver) != "" {
+		deps, err := parseDependsData([]byte(line))
+		if err != nil || len(deps) == 0 {
 			continue
 		}
-		dep := name
-		if op != "" {
-			dep += op + ver
+		depSpec := deps[0]
+		if !depSpec.Suggest {
+			continue
+		}
+
+		alternates := append([]string(nil), depSpec.Alternatives...)
+		if len(alternates) == 0 && depSpec.Name != "" {
+			alternates = []string{depSpec.Name}
+		}
+		if len(alternates) == 0 || suggestionSatisfied(depSpec) {
+			continue
+		}
+
+		dep := depSpec.Name
+		if len(alternates) > 1 {
+			dep = strings.Join(alternates, " | ")
+		} else if depSpec.Op != "" {
+			dep += depSpec.Op + depSpec.Version
 		}
 		missing = append(missing, packageSuggestion{
 			Package:    pkgName,
-			Name:       name,
-			Op:         op,
-			Version:    ver,
+			Name:       depSpec.Name,
+			Op:         depSpec.Op,
+			Version:    depSpec.Version,
+			Alternates: alternates,
 			Dependency: dep,
-			Text:       suggestText,
+			Text:       depSpec.SuggestText,
 		})
 	}
 	return missing
+}
+
+func suggestionSatisfied(dep DepSpec) bool {
+	if len(dep.Alternatives) > 1 {
+		for _, name := range dep.Alternatives {
+			if name != "" && isPackageInstalled(name) {
+				return true
+			}
+		}
+		return false
+	}
+	return dep.Name != "" && findInstalledSatisfying(dep.Name, dep.Op, dep.Version) != ""
+}
+
+func suggestionAlternativesInstalled(item packageSuggestion) bool {
+	if len(item.Alternates) == 1 {
+		return findInstalledSatisfying(item.Alternates[0], item.Op, item.Version) != ""
+	}
+	for _, name := range item.Alternates {
+		if name != "" && isPackageInstalled(name) {
+			return true
+		}
+	}
+	return false
 }
 
 func collectPackageSuggestions(pkgName, rootDir string) {
@@ -209,23 +250,30 @@ func flushPackageSuggestions(logger io.Writer, cfg *Config, noRemote bool, promp
 	}
 
 	for _, item := range installPrompts {
-		if findInstalledSatisfying(item.Name, item.Op, item.Version) != "" {
+		if suggestionAlternativesInstalled(item) {
 			continue
 		}
 
-		prompt := fmt.Sprintf("Install suggested dependency %s for %s?", colNote.Sprint(item.Dependency), colNote.Sprint(item.Package))
-		if item.Text != "" {
-			prompt = fmt.Sprintf("%s (%s)", prompt, item.Text)
-		}
-		if !autoYes && !askForConfirmation(colInfo, "%s%s", colArrow.Sprint("-> "), prompt) {
-			continue
-		}
+		for _, altName := range item.Alternates {
+			if altName == "" || isPackageInstalled(altName) {
+				continue
+			}
+			prompt := fmt.Sprintf("Install suggested dependency %s for %s?", colNote.Sprint(altName), colNote.Sprint(item.Package))
+			if item.Text != "" {
+				prompt = fmt.Sprintf("%s (%s)", prompt, item.Text)
+			}
+			if !autoYes && !askForConfirmation(colInfo, "%s%s", colArrow.Sprint("-> "), prompt) {
+				continue
+			}
 
-		fmt.Fprint(logger, colArrow.Sprint("-> "))
-		fmt.Fprint(logger, colSuccess.Sprint("Installing suggested dependency: "))
-		fmt.Fprintln(logger, colNote.Sprint(item.Name))
-		if _, err := ensurePackageInstalled(item.Name, cfg, noRemote); err != nil {
-			fmt.Fprintf(logger, "%s%s\n", colArrow.Sprint("-> "), colWarn.Sprintf("Warning: failed to install suggested dependency %s: %v", item.Name, err))
+			fmt.Fprint(logger, colArrow.Sprint("-> "))
+			fmt.Fprint(logger, colSuccess.Sprint("Installing suggested dependency: "))
+			fmt.Fprintln(logger, colNote.Sprint(altName))
+			if _, err := ensurePackageInstalled(altName, cfg, noRemote); err != nil {
+				fmt.Fprintf(logger, "%s%s\n", colArrow.Sprint("-> "), colWarn.Sprintf("Warning: failed to install suggested dependency %s: %v", altName, err))
+				continue
+			}
+			break
 		}
 	}
 
