@@ -262,7 +262,7 @@ func flushPackageSuggestions(logger io.Writer, cfg *Config, noRemote bool, promp
 			if item.Text != "" {
 				prompt = fmt.Sprintf("%s (%s)", prompt, item.Text)
 			}
-			if !autoYes && !askForConfirmation(colInfo, "%s%s", colArrow.Sprint("-> "), prompt) {
+			if !autoYes && !askForConfirmationDefaultNo(colInfo, "%s%s", colArrow.Sprint("-> "), prompt) {
 				continue
 			}
 

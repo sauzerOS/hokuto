@@ -29,6 +29,14 @@ func SetPromptHooks(onStart, onEnd func()) {
 }
 
 func askForConfirmation(p colorPrinter, format string, a ...any) bool {
+	return askForConfirmationWithDefault(p, true, format, a...)
+}
+
+func askForConfirmationDefaultNo(p colorPrinter, format string, a ...any) bool {
+	return askForConfirmationWithDefault(p, false, format, a...)
+}
+
+func askForConfirmationWithDefault(p colorPrinter, defaultYes bool, format string, a ...any) bool {
 	if GlobalAssumeYes {
 		return true
 	}
@@ -50,7 +58,11 @@ func askForConfirmation(p colorPrinter, format string, a ...any) bool {
 		// We print mainPrompt and the suffix separately to ensure the suffix keeps
 		// the color 'p' even if mainPrompt contains internal color resets (like colNote).
 		cPrintf(p, "%s", mainPrompt)
-		cPrintf(p, " [Y/n]: ")
+		if defaultYes {
+			cPrintf(p, " [Y/n]: ")
+		} else {
+			cPrintf(p, " [y/N]: ")
+		}
 
 		response, err := reader.ReadString('\n')
 
@@ -59,7 +71,10 @@ func askForConfirmation(p colorPrinter, format string, a ...any) bool {
 		}
 		response = strings.ToLower(strings.TrimSpace(response))
 
-		if response == "y" || response == "yes" || response == "" {
+		if response == "" {
+			return defaultYes
+		}
+		if response == "y" || response == "yes" {
 			return true
 		}
 		if response == "n" || response == "no" {
