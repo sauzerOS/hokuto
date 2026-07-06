@@ -2,10 +2,12 @@ package hokuto
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -30,6 +32,7 @@ type PackageMetadata struct {
 // PkgDBEntry represents a single package in the global database
 type PkgDBEntry struct {
 	Name          string          `json:"name"`
+	Type          string          `json:"type,omitempty"`
 	Version       string          `json:"version"`
 	SourcePackage string          `json:"source_package,omitempty"`
 	Metadata      PackageMetadata `json:"metadata"`
@@ -495,28 +498,51 @@ func GeneratePkgDB(cfg *Config) error {
 		}
 	}
 
-	// Ensure directory exists
+	for _, metaEntry := range localMetaPackageIndexEntries() {
+		if seen[metaEntry.Name] {
+			continue
+		}
+		db.Packages = append(db.Packages, PkgDBEntry{
+			Name:    metaEntry.Name,
+			Type:    "meta",
+			Version: "meta",
+			Metadata: PackageMetadata{
+				Category:    "meta",
+				Description: metaEntry.Description,
+				Tags:        []string{"meta"},
+			},
+		})
+		seen[metaEntry.Name] = true
+	}
+
 	dbDir := filepath.Dir(PkgDBPath)
 	if err := os.MkdirAll(dbDir, 0755); err != nil {
-		return fmt.Errorf("failed to create database directory: %w", err)
+		if os.IsPermission(err) && os.Geteuid() != 0 && RootExec != nil {
+			if runErr := RootExec.Run(exec.Command("mkdir", "-p", dbDir)); runErr != nil {
+				return fmt.Errorf("failed to create database directory: %w", runErr)
+			}
+		} else {
+			return fmt.Errorf("failed to create database directory: %w", err)
+		}
 	}
 
-	// Write and compress
-	f, err := os.Create(PkgDBPath)
-	if err != nil {
-		return fmt.Errorf("failed to create database file: %w", err)
-	}
-	defer f.Close()
-
-	zw, err := zstd.NewWriter(f)
+	var compressed bytes.Buffer
+	zw, err := zstd.NewWriter(&compressed)
 	if err != nil {
 		return fmt.Errorf("failed to create zstd writer: %w", err)
 	}
-	defer zw.Close()
 
 	enc := json.NewEncoder(zw)
 	if err := enc.Encode(db); err != nil {
+		zw.Close()
 		return fmt.Errorf("failed to encode database: %w", err)
+	}
+	if err := zw.Close(); err != nil {
+		return fmt.Errorf("failed to finalize database compression: %w", err)
+	}
+
+	if err := writeFileAsRoot(PkgDBPath, compressed.Bytes(), 0644, RootExec); err != nil {
+		return fmt.Errorf("failed to write database file: %w", err)
 	}
 
 	colArrow.Print("-> ")
@@ -605,6 +631,9 @@ func SearchPkgDB(args []string, cfg *Config) error {
 	for _, r := range results {
 		colSuccess.Printf("%-20s ", r.Name)
 		fmt.Printf("%-10s ", r.Version)
+		if r.Type == "meta" {
+			color.Magenta.Print("(meta) ")
+		}
 		if r.SourcePackage != "" {
 			color.Yellow.Printf("(split: %s) ", r.SourcePackage)
 		}
