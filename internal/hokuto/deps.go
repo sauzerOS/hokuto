@@ -496,6 +496,16 @@ func resolveBinaryDependencies(pkgName string, visited map[string]bool, plan *[]
 	if !force && checkPackageExactMatch(pkgName) {
 		return nil
 	}
+	if !force && isMetaPackageInstalled(pkgName) {
+		return nil
+	}
+
+	if meta, ok := findMetaPackage(pkgName); ok {
+		if err := resolveDependencyList(pkgName, meta.Depends, visited, plan, force, yes, cfg, remoteIndex, allowRemote); err != nil {
+			return err
+		}
+		return nil
+	}
 
 	// 3. Remote Resolution (Priority if remoteIndex is provided)
 	// If the user requested --remote (implied by non-empty remoteIndex), we prioritize
@@ -602,6 +612,29 @@ func resolveMissingDeps(pkgName string, processed map[string]bool, missing *[]st
 	processed[pkgName] = true
 
 	if !forceBuild[pkgName] && isPackageInstalled(pkgName) {
+		return nil
+	}
+	if !forceBuild[pkgName] && isMetaPackageInstalled(pkgName) {
+		return nil
+	}
+
+	if meta, ok := findMetaPackage(pkgName); ok {
+		for _, dep := range meta.Depends {
+			if dep.Make || dep.Optional || dep.Rebuild || dep.Suggest {
+				continue
+			}
+			depName := dep.Name
+			if len(dep.Alternatives) > 0 {
+				resolved, err := resolveAlternativeDep(dep, false, cfg)
+				if err != nil {
+					return fmt.Errorf("failed to resolve alternative dependency: %w", err)
+				}
+				depName = resolved
+			}
+			if err := resolveMissingDeps(depName, processed, missing, forceBuild, cfg, noRemote); err != nil {
+				return err
+			}
+		}
 		return nil
 	}
 
@@ -1563,6 +1596,21 @@ func ShowPackageDependencies(pkgName string, reverse bool, cfg *Config) error {
 }
 
 func showForwardDependencies(pkgName string) error {
+	if meta, ok := findMetaPackage(pkgName); ok {
+		lines := metaPackageDependsLines(meta)
+		if len(lines) == 0 {
+			fmt.Printf("Meta package %s has no dependencies.\n", pkgName)
+			return nil
+		}
+		colArrow.Printf("-> ")
+		colSuccess.Printf("Dependencies for meta package %s:\n", pkgName)
+		for _, line := range lines {
+			colArrow.Printf("-> ")
+			fmt.Println(line)
+		}
+		return nil
+	}
+
 	// Try installed first
 	dependsPath := filepath.Join(Installed, pkgName, "depends")
 	data, err := os.ReadFile(dependsPath)

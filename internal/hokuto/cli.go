@@ -13,6 +13,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"slices"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -606,7 +607,7 @@ func Main() {
 		}
 
 		// Ensure 'sauzeros-base' is installed first if missing
-		if !checkPackageExactMatch("sauzeros-base") {
+		if !packageOrMetaInstalled("sauzeros-base") {
 			alreadyRequested := slices.Contains(packagesToInstall, "sauzeros-base")
 			if !alreadyRequested {
 				colArrow.Print("-> ")
@@ -626,6 +627,7 @@ func Main() {
 		// Map to track which packages were explicitly requested by the user
 		// so we only add those to the World file later.
 		userRequestedMap := make(map[string]bool)
+		requestedMetas := make(map[string]MetaPackage)
 
 		for _, arg := range packagesToInstall {
 			// If argument is a tarball file (ends in .tar.zst), we just add it to the plan directly.
@@ -654,10 +656,17 @@ func Main() {
 			pkgName := arg
 			// Keep package name as-is, but will use multi variant in filename if multilib is enabled
 			userRequestedMap[pkgName] = true
+			meta, isMeta := findMetaPackage(pkgName)
+			if isMeta {
+				requestedMetas[pkgName] = meta
+			}
 
 			if *noDeps {
 				// Bypass dependency resolution if --no-deps is set
 				// But still need to add the package itself if not installed, or if force is used
+				if isMeta {
+					continue
+				}
 				if !checkPackageExactMatch(pkgName) || *force {
 					installPlan = append(installPlan, pkgName)
 				} else {
@@ -675,6 +684,9 @@ func Main() {
 			// If force is enabled, add the user-requested package even if it's already installed
 			// (dependencies are handled above and won't be added if already installed)
 			if *force {
+				if isMeta {
+					continue
+				}
 				// Check if package is already in plan (from dependency resolution)
 				alreadyInPlan := false
 				for _, pkg := range installPlan {
@@ -691,26 +703,30 @@ func Main() {
 		}
 		installPlan = MovePackageToFront(installPlan, "sauzeros-base")
 
-		if len(installPlan) == 0 && !*force {
+		if len(installPlan) == 0 && len(requestedMetas) == 0 && !*force {
 			colArrow.Print("-> ")
 			colSuccess.Println("All packages and dependencies are already installed.")
 			os.Exit(0)
 		}
 
 		// Notify user if extra dependencies were pulled in
-		if len(installPlan) > len(packagesToInstall) {
-			var extraDeps []string
-			for _, pkg := range installPlan {
-				// Only add if it wasn't explicitly asked for by the user
-				if !userRequestedMap[pkg] {
-					extraDeps = append(extraDeps, pkg)
-				}
+		var extraDeps []string
+		for _, pkg := range installPlan {
+			// Only add if it wasn't explicitly asked for by the user
+			if !userRequestedMap[pkg] {
+				extraDeps = append(extraDeps, pkg)
 			}
+		}
 
-			if len(extraDeps) > 0 {
-				colArrow.Print("-> ")
-				colWarn.Printf("The following extra dependencies will be installed: %v\n", extraDeps)
-			}
+		if len(extraDeps) > 0 {
+			colArrow.Print("-> ")
+			colWarn.Printf("The following extra dependencies will be installed: %v\n", extraDeps)
+		}
+
+		if len(installPlan) == 0 && len(requestedMetas) == 0 && *force {
+			colArrow.Print("-> ")
+			colSuccess.Println("All packages and dependencies are already installed.")
+			os.Exit(0)
 		}
 
 		// Set to CRITICAL (1) for the entire installation process
@@ -1077,6 +1093,26 @@ func Main() {
 			}
 		}
 
+		if allSucceeded {
+			metaNames := make([]string, 0, len(requestedMetas))
+			for name := range requestedMetas {
+				metaNames = append(metaNames, name)
+			}
+			sort.Strings(metaNames)
+			for _, name := range metaNames {
+				meta := requestedMetas[name]
+				if err := installMetaPackageMarker(meta); err != nil {
+					fmt.Fprintf(os.Stderr, "Warning: failed to mark meta package %s as installed: %v\n", name, err)
+					allSucceeded = false
+					continue
+				}
+				colArrow.Print("-> ")
+				colSuccess.Printf("Meta package ")
+				colNote.Printf("%s", name)
+				colSuccess.Printf(" installed successfully.\n")
+			}
+		}
+
 		if effectiveFast && allSucceeded {
 			if bar != nil {
 				bar.Finish()
@@ -1130,6 +1166,19 @@ func Main() {
 		for _, pkgName := range packagesToUninstall {
 			colArrow.Print("-> ")
 			colSuccess.Printf("Attempting to uninstall package: %s\n", pkgName)
+
+			if isMetaPackageInstalled(pkgName) {
+				if err := removeMetaPackageMarker(pkgName); err != nil {
+					colArrow.Print("-> ")
+					color.Light.Printf("Error uninstalling meta package %s: %v\n", pkgName, err)
+					allSucceeded = false
+				} else {
+					colArrow.Print("-> ")
+					colSuccess.Printf("Meta package %s removed\n", pkgName)
+					removeFromWorld(pkgName)
+				}
+				continue
+			}
 
 			if err := pkgUninstall(pkgName, cfg, RootExec, effectiveForce, effectiveYes, nil); err != nil {
 				colArrow.Print("-> ")

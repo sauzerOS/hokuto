@@ -211,6 +211,7 @@ func findMakeOrphans() ([]string, error) {
 			}
 		}
 	}
+	addInstalledMetaRuntimeRequirements(requiredRuntime)
 
 	// 4. Filter Candidates
 	var orphans []string
@@ -222,6 +223,47 @@ func findMakeOrphans() ([]string, error) {
 	}
 
 	return orphans, nil
+}
+
+func addInstalledMetaRuntimeRequirements(required map[string]bool) {
+	seen := make(map[string]bool)
+	for _, meta := range installedMetaPackages() {
+		addMetaRuntimeRequirements(meta, required, seen)
+	}
+}
+
+func addMetaRuntimeRequirements(meta MetaPackage, required map[string]bool, seen map[string]bool) {
+	if seen[meta.Name] {
+		return
+	}
+	seen[meta.Name] = true
+	for _, dep := range meta.Depends {
+		if dep.Make || dep.Optional || dep.Rebuild || dep.Suggest {
+			continue
+		}
+		names := []string{dep.Name}
+		if len(dep.Alternatives) > 0 {
+			names = nil
+			for _, alt := range dep.Alternatives {
+				if isPackageInstalled(alt) {
+					names = append(names, alt)
+				}
+			}
+			if len(names) == 0 {
+				names = append(names, dep.Name)
+			}
+		}
+		for _, name := range names {
+			if name == "" {
+				continue
+			}
+			if nested, ok := findMetaPackage(name); ok {
+				addMetaRuntimeRequirements(nested, required, seen)
+				continue
+			}
+			required[name] = true
+		}
+	}
 }
 
 // getInstalledDeps returns the list of dependencies for an *installed* package
@@ -249,6 +291,14 @@ func findOrphans() ([]string, error) {
 	// Initialize with World packages that are actually installed
 	for pkg := range worldPkgs {
 		if checkPackageExactMatch(pkg) {
+			keepSet[pkg] = true
+			queue = append(queue, pkg)
+		}
+	}
+	metaRequired := make(map[string]bool)
+	addInstalledMetaRuntimeRequirements(metaRequired)
+	for pkg := range metaRequired {
+		if checkPackageExactMatch(pkg) && !keepSet[pkg] {
 			keepSet[pkg] = true
 			queue = append(queue, pkg)
 		}
