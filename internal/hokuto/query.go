@@ -295,6 +295,9 @@ func IsPackageInIndex(index []RepoEntry, name, version, revision string, cfg *Co
 
 	// Check preferred variant first
 	for _, entry := range index {
+		if entry.Type == "meta" {
+			continue
+		}
 		if entry.Name == name && entry.Arch == arch && entry.Variant == variant && entry.Version == version && entry.Revision == revision {
 			return true
 		}
@@ -311,6 +314,9 @@ func IsPackageInIndex(index []RepoEntry, name, version, revision string, cfg *Co
 
 	if fallbackVariant != "" {
 		for _, entry := range index {
+			if entry.Type == "meta" {
+				continue
+			}
 			if entry.Name == name && entry.Arch == arch && entry.Variant == fallbackVariant && entry.Version == version && entry.Revision == revision {
 				return true
 			}
@@ -412,6 +418,9 @@ func GetRemotePackageEntry(pkgName string, cfg *Config, remoteIndex []RepoEntry)
 		var localBest *RepoEntry
 		for i := range remoteIndex {
 			entry := &remoteIndex[i]
+			if entry.Type == "meta" {
+				continue
+			}
 			// Match logic: exact name or versioned name (pkg-MAJOR)
 			match := entry.Name == lookupName
 			if !match && targetVersion != "" {

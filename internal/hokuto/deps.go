@@ -506,6 +506,12 @@ func resolveBinaryDependencies(pkgName string, visited map[string]bool, plan *[]
 		}
 		return nil
 	}
+	if meta, ok := findRemoteMetaPackage(pkgName, cfg, remoteIndex, allowRemote); ok {
+		if err := resolveDependencyList(pkgName, meta.Depends, visited, plan, force, yes, cfg, remoteIndex, allowRemote); err != nil {
+			return err
+		}
+		return nil
+	}
 
 	// 3. Remote Resolution (Priority if remoteIndex is provided)
 	// If the user requested --remote (implied by non-empty remoteIndex), we prioritize
@@ -519,6 +525,9 @@ func resolveBinaryDependencies(pkgName string, visited map[string]bool, plan *[]
 		}
 
 		for _, entry := range remoteIndex {
+			if entry.Type == "meta" {
+				continue
+			}
 			if entry.Name == lookupName {
 				found = true
 				break

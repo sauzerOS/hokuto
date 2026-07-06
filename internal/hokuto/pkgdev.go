@@ -253,7 +253,7 @@ func newPackage(pkgName string, targetDir string) error {
 }
 
 // editPackage searches for pkgName under the colon-separated repoPaths
-// and opens version, sources, build, depends in the user's editor.
+// and opens version, sources, build, depends, and depends.* files in the user's editor.
 
 func editPackage(pkgName string) error {
 	// Determine editor
@@ -362,6 +362,12 @@ func editPackage(pkgName string) error {
 
 	// 4. Open sources file in editor for review, along with the build and depends files.
 	filesToOpen := []string{sourcesPath, filepath.Join(pkgDirEd, "build"), filepath.Join(pkgDirEd, "depends")}
+	splitDepends, err := filepath.Glob(filepath.Join(pkgDirEd, "depends.*"))
+	if err != nil {
+		return fmt.Errorf("failed to list split depends files: %v", err)
+	}
+	sort.Strings(splitDepends)
+	filesToOpen = append(filesToOpen, splitDepends...)
 
 	// Ensure files exist
 	for _, f := range filesToOpen {

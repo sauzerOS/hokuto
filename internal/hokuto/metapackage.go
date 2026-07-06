@@ -101,6 +101,136 @@ func installedMetaPackages() []MetaPackage {
 	return metas
 }
 
+func findInstallMetaPackage(name string, cfg *Config, remoteIndex []RepoEntry, allowRemote bool) (MetaPackage, bool) {
+	if meta, ok := findMetaPackage(name); ok {
+		return meta, true
+	}
+	return findRemoteMetaPackage(name, cfg, remoteIndex, allowRemote)
+}
+
+func findRemoteMetaPackage(name string, cfg *Config, remoteIndex []RepoEntry, allowRemote bool) (MetaPackage, bool) {
+	if !allowRemote {
+		return MetaPackage{}, false
+	}
+	if len(remoteIndex) == 0 && BinaryMirror != "" {
+		if idx, err := GetCachedRemoteIndex(cfg); err == nil {
+			remoteIndex = idx
+		}
+	}
+	for _, entry := range remoteIndex {
+		if entry.Type != "meta" || entry.Name != name {
+			continue
+		}
+		deps, err := parseDependsData([]byte(strings.Join(entry.Depends, "\n")))
+		if err != nil {
+			debugf("Warning: failed to parse remote meta package %s dependencies: %v\n", name, err)
+			return MetaPackage{}, false
+		}
+		return MetaPackage{
+			Name:        entry.Name,
+			Description: entry.Description,
+			Depends:     deps,
+		}, true
+	}
+	return MetaPackage{}, false
+}
+
+func localMetaPackageIndexEntries() []RepoEntry {
+	metasByName := make(map[string]MetaPackage)
+	for _, root := range metaPackageSearchRoots() {
+		for _, rel := range []string{
+			filepath.Join(".hokuto", "metapackages.toml"),
+			filepath.Join(".hokuto", "metapackages"),
+		} {
+			metas, err := parseMetaPackageFile(filepath.Join(root, rel))
+			if err != nil {
+				debugf("Warning: failed to parse meta package manifest %s: %v\n", filepath.Join(root, rel), err)
+				continue
+			}
+			for name, meta := range metas {
+				if _, exists := metasByName[name]; !exists {
+					metasByName[name] = meta
+				}
+			}
+		}
+	}
+
+	names := make([]string, 0, len(metasByName))
+	for name := range metasByName {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	entries := make([]RepoEntry, 0, len(names))
+	for _, name := range names {
+		meta := metasByName[name]
+		entries = append(entries, RepoEntry{
+			Name:        meta.Name,
+			Type:        "meta",
+			Version:     "0",
+			Revision:    "0",
+			Arch:        "meta",
+			Variant:     "meta",
+			Depends:     metaPackageDependsLines(meta),
+			Description: meta.Description,
+		})
+	}
+	return entries
+}
+
+func syncMetaPackageIndexEntries(index map[string]RepoEntry) bool {
+	changed := false
+
+	desired := make(map[string]RepoEntry)
+	for _, entry := range localMetaPackageIndexEntries() {
+		desired[metaRepoEntryKey(entry)] = entry
+	}
+
+	for key, entry := range index {
+		if entry.Type != "meta" {
+			continue
+		}
+		if desiredEntry, ok := desired[key]; !ok || !repoEntriesEqual(entry, desiredEntry) {
+			changed = true
+		}
+		delete(index, key)
+	}
+
+	for key, entry := range desired {
+		if existing, ok := index[key]; !ok || !repoEntriesEqual(existing, entry) {
+			changed = true
+		}
+		index[key] = entry
+	}
+	return changed
+}
+
+func repoEntriesEqual(a, b RepoEntry) bool {
+	if a.Name != b.Name ||
+		a.Type != b.Type ||
+		a.Version != b.Version ||
+		a.Revision != b.Revision ||
+		a.Arch != b.Arch ||
+		a.Variant != b.Variant ||
+		a.Filename != b.Filename ||
+		a.Size != b.Size ||
+		a.B3Sum != b.B3Sum ||
+		a.Description != b.Description ||
+		len(a.Depends) != len(b.Depends) {
+		return false
+	}
+	for i := range a.Depends {
+		if a.Depends[i] != b.Depends[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func metaRepoEntryKey(entry RepoEntry) string {
+	return fmt.Sprintf("%s-%s-%s-%s-%s", entry.Name, entry.Version, entry.Revision, entry.Arch, entry.Variant)
+}
+
 func readInstalledMetaPackageMarker(name string) (MetaPackage, bool) {
 	data, err := os.ReadFile(metaPackageMarkerPath(name))
 	if err != nil {
@@ -132,11 +262,7 @@ func readInstalledMetaPackageMarker(name string) (MetaPackage, bool) {
 }
 
 func findMetaPackage(name string) (MetaPackage, bool) {
-	for _, repoPath := range filepath.SplitList(repoPaths) {
-		repoPath = strings.TrimSpace(repoPath)
-		if repoPath == "" {
-			continue
-		}
+	for _, repoPath := range metaPackageSearchRoots() {
 		for _, rel := range []string{
 			filepath.Join(".hokuto", "metapackages.toml"),
 			filepath.Join(".hokuto", "metapackages"),
@@ -152,6 +278,31 @@ func findMetaPackage(name string) (MetaPackage, bool) {
 		}
 	}
 	return MetaPackage{}, false
+}
+
+func metaPackageSearchRoots() []string {
+	var roots []string
+	seen := make(map[string]bool)
+	add := func(path string) {
+		path = strings.TrimSpace(path)
+		if path == "" {
+			return
+		}
+		clean := filepath.Clean(path)
+		if seen[clean] {
+			return
+		}
+		seen[clean] = true
+		roots = append(roots, clean)
+	}
+
+	for _, repoPath := range filepath.SplitList(repoPaths) {
+		add(repoPath)
+		if parent := filepath.Dir(strings.TrimSpace(repoPath)); parent != "." && parent != "" {
+			add(parent)
+		}
+	}
+	return roots
 }
 
 func parseMetaPackageFile(path string) (map[string]MetaPackage, error) {

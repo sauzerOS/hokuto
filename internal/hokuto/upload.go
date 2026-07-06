@@ -70,6 +70,9 @@ func saveUploadCache(path string, cache map[string]uploadCacheEntry) error {
 func repoEntriesByFilename(entries []RepoEntry) map[string]RepoEntry {
 	byFilename := make(map[string]RepoEntry, len(entries))
 	for _, entry := range entries {
+		if entry.Type == "meta" || entry.Filename == "" {
+			continue
+		}
 		byFilename[entry.Filename] = entry
 	}
 	return byFilename
@@ -450,13 +453,13 @@ func handleUploadCommand(args []string, cfg *Config) error {
 		reconciledMap := make(map[string]RepoEntry)
 
 		// Index current remoteIndex by filename for fast reconciliation
-		oldByFilename := make(map[string]RepoEntry)
-		for _, e := range remoteIndex {
-			oldByFilename[e.Filename] = e
-		}
+		oldByFilename := repoEntriesByFilename(remoteIndex)
 
 		localByFilename := make(map[string]RepoEntry)
 		for _, entry := range latestLocals {
+			if entry.Filename == "" {
+				continue
+			}
 			localByFilename[entry.Filename] = entry
 		}
 
@@ -620,6 +623,9 @@ func handleUploadCommand(args []string, cfg *Config) error {
 		}
 		groupedPkgs := make(map[pkgGroupKey][]RepoEntry)
 		for _, entry := range newIndexMap {
+			if entry.Type == "meta" || entry.Filename == "" {
+				continue
+			}
 			k := pkgGroupKey{Name: entry.Name, Arch: entry.Arch, Variant: entry.Variant}
 			groupedPkgs[k] = append(groupedPkgs[k], entry)
 		}
@@ -696,7 +702,8 @@ func handleUploadCommand(args []string, cfg *Config) error {
 	}
 
 	// 8. Finalize Index
-	if uploadedCount > 0 || *cleanup || (*reindex && reindexedCount > 0) || deletionsOccurred {
+	metaIndexChanged := syncMetaPackageIndexEntries(newIndexMap)
+	if uploadedCount > 0 || *cleanup || (*reindex && reindexedCount > 0) || deletionsOccurred || metaIndexChanged {
 		colArrow.Print("-> ")
 		colSuccess.Println("Updating remote index")
 

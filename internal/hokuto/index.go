@@ -107,15 +107,17 @@ func GetSystemVariantForPackage(cfg *Config, pkgName string) string {
 
 // RepoEntry represents a single package in the repository index.
 type RepoEntry struct {
-	Name     string   `json:"name"`
-	Version  string   `json:"version"`
-	Revision string   `json:"revision"`
-	Arch     string   `json:"arch"`
-	Variant  string   `json:"variant"` // generic or optimized
-	Filename string   `json:"filename"`
-	Size     int64    `json:"size"`
-	B3Sum    string   `json:"b3sum"`
-	Depends  []string `json:"depends,omitempty"`
+	Name        string   `json:"name"`
+	Type        string   `json:"type,omitempty"`
+	Version     string   `json:"version"`
+	Revision    string   `json:"revision"`
+	Arch        string   `json:"arch"`
+	Variant     string   `json:"variant"` // generic or optimized
+	Filename    string   `json:"filename"`
+	Size        int64    `json:"size"`
+	B3Sum       string   `json:"b3sum"`
+	Depends     []string `json:"depends,omitempty"`
+	Description string   `json:"description,omitempty"`
 }
 
 // ReadPackageMetadata extracts pkginfo and computes checksum for a local tarball.

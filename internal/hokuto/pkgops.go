@@ -652,6 +652,13 @@ func findPackageMetadataFile(pkgDir, pkgName, baseName string) string {
 	return filepath.Join(pkgDir, baseName)
 }
 
+func isBootstrapOnlyPackageName(name string) bool {
+	return len(name) > 3 &&
+		name[0] >= '0' && name[0] <= '9' &&
+		name[1] >= '0' && name[1] <= '9' &&
+		name[2] == '-'
+}
+
 func generateDepends(pkgName, pkgDir, outputDir, rootDir string, execCtx *Executor, bootstrap bool) error {
 	installedDir := filepath.Join(outputDir, "var", "db", "hokuto", "installed", pkgName)
 	dependsFile := filepath.Join(installedDir, "depends")
@@ -686,19 +693,10 @@ func generateDepends(pkgName, pkgDir, outputDir, rootDir string, execCtx *Execut
 		return formatSuggestLine(dep.Name, dep.Op, dep.Version, dep.SuggestText)
 	}
 	cleanManualDepName := func(name string) string {
-		if name == "19-binutils-2" {
+		if isBootstrapOnlyPackageName(name) {
 			return ""
 		}
-		switch name {
-		case "08-bash":
-			return "bash"
-		case "11-file":
-			return "file"
-		case "07-ncurses":
-			return "ncurses"
-		default:
-			return name
-		}
+		return name
 	}
 
 	// --- Part 1: Process automatically detected library dependencies ---
@@ -728,6 +726,9 @@ func generateDepends(pkgName, pkgDir, outputDir, rootDir string, execCtx *Execut
 				}
 				otherPkg := e.Name()
 				if otherPkg == pkgName {
+					continue
+				}
+				if isBootstrapOnlyPackageName(otherPkg) {
 					continue
 				}
 
@@ -834,26 +835,11 @@ func generateDepends(pkgName, pkgDir, outputDir, rootDir string, execCtx *Execut
 
 	// Then, add library-only dependencies (just package names)
 	for dep := range libDepSet {
-		// Ignore aarch64- packages in auto-detected dependencies (Part 1/libdeps)
+		// Ignore aarch64- and bootstrap-only packages in auto-detected dependencies (Part 1/libdeps)
 		// unless they were explicitly listed in the repo depends file (Part 2).
 		// repoDepLines packages have already been removed from libDepSet at this point.
-		if strings.HasPrefix(dep, "aarch64-") {
+		if strings.HasPrefix(dep, "aarch64-") || isBootstrapOnlyPackageName(dep) {
 			continue
-		}
-
-		// Also apply cleanup to auto-detected library dependencies if in normal mode
-		if !bootstrap {
-			if dep == "19-binutils-2" {
-				continue
-			}
-			switch dep {
-			case "08-bash":
-				dep = "bash"
-			case "11-file":
-				dep = "file"
-			case "07-ncurses":
-				dep = "ncurses"
-			}
 		}
 		deps = append(deps, dep)
 	}

@@ -656,7 +656,7 @@ func Main() {
 			pkgName := arg
 			// Keep package name as-is, but will use multi variant in filename if multilib is enabled
 			userRequestedMap[pkgName] = true
-			meta, isMeta := findMetaPackage(pkgName)
+			meta, isMeta := findInstallMetaPackage(pkgName, cfg, remoteIndex, !*noRemote)
 			if isMeta {
 				requestedMetas[pkgName] = meta
 			}
