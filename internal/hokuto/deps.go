@@ -43,7 +43,6 @@ var baseDevelPackages = []string{
 	"findutils",
 	"flex",
 	"gawk",
-	"gcc-libs",
 	"gcc",
 	"gettext",
 	"grep",
