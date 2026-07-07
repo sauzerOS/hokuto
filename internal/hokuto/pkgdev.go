@@ -855,6 +855,10 @@ func HandleAutoBumpCommand(cfg *Config, autoBuild bool, assumeYes bool) error {
 			pkgName = "libelf"
 		case "webkitgtk":
 			pkgName = "webkit2gtk-4.1"
+		case "tiff":
+			pkgName = "libtiff"
+		case "catch":
+			pkgName = "catch2"
 		}
 
 		var newestVer string
