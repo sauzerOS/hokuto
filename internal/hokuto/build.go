@@ -1485,6 +1485,9 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, opts BuildOptions)
 		if strings.HasPrefix(e, "CFLAGS=") || strings.HasPrefix(e, "CXXFLAGS=") || strings.HasPrefix(e, "LDFLAGS=") {
 			continue
 		}
+		if opts.Bootstrap && strings.HasPrefix(e, "CONFIG_SITE=") {
+			continue
+		}
 		env = append(env, e)
 	}
 	var defaults = map[string]string{}
@@ -1542,7 +1545,6 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, opts BuildOptions)
 			// Crucial: Put LFS tools first in PATH
 			"PATH":              filepath.Join(lfsRoot, "tools/bin") + ":/usr/bin:/bin",
 			"MAKEFLAGS":         fmt.Sprintf("-j%d", numCores),
-			"CONFIG_SITE":       filepath.Join(lfsRoot, "usr/share/config.site"),
 			"HOKUTO_ROOT":       lfsRoot,
 			"TMPDIR":            currentTmpDir,
 			"XDG_CACHE_HOME":    filepath.Join(buildDir, ".cache"), // Prevent g-ir-scanner from using ~/.cache
@@ -3367,6 +3369,9 @@ func handleBuildCommand(args []string, cfg *Config) (err error) {
 		retainedBuildDeps[getOutputPackageName(pkgName, cfg)] = true
 	}
 	cleanupTemporaryBuildDeps := func() {
+		if *bootstrap {
+			return
+		}
 		cleanupAfterFailure := err != nil
 		buildSessionRemovable := func(dep string, seen map[string]bool, removable *[]string, allowPreexisting bool) {
 			if dep == "" {
@@ -4096,6 +4101,10 @@ func executeBuildPass(plan *BuildPlan, _ string, installAllTargets bool, cfg *Co
 							return true
 						}
 
+						if *bootstrap {
+							return false
+						}
+
 						// 3. Fallback: if it was built this pass under a renamed name,
 						// we need to check if that renamed name satisfies the constraint.
 						// This is complex, but for now we can check if any key in builtThisPass
@@ -4284,7 +4293,7 @@ func executeBuildPass(plan *BuildPlan, _ string, installAllTargets bool, cfg *Co
 					// Check if it's a Make Dependency
 					// If the user did NOT request it explicitly, check if it was pulled in
 					// as a 'make' dependency by any other package in the toBuild list.
-					if !userRequestedMap[pkgName] && !wasInstalledBefore {
+					if !*bootstrap && !userRequestedMap[pkgName] && !wasInstalledBefore {
 						installedBuildDeps = append(installedBuildDeps, outputPkgName)
 						isMakeDep := false
 						// Scan all packages in the plan (including those already built or waiting)
@@ -4346,7 +4355,7 @@ func executeBuildPass(plan *BuildPlan, _ string, installAllTargets bool, cfg *Co
 							colSuccess.Printf("Installing split target:")
 						} else {
 							colSuccess.Printf("Installing split dependency:")
-							if !wasSplitInstalledBefore {
+							if !*bootstrap && !wasSplitInstalledBefore {
 								installedBuildDeps = append(installedBuildDeps, splitPkg)
 							}
 						}
