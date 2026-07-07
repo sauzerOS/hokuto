@@ -65,6 +65,7 @@ var (
 	versionedPkgDirs = make(map[string]string) // pkgName@version -> tmpDir
 	PkgDBPath        = "/var/db/hokuto/pkg-db.json.zst"
 	BumpLogFile      = "/var/log/hokuto-bump.log"
+	BumpIgnoreFile   = "/var/db/hokuto/bump-ignore.json"
 	//go:embed assets/MIRROR
 	embeddedMirrorList string
 

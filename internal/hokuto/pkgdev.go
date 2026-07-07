@@ -4,6 +4,7 @@ package hokuto
 // No behavior changes intended.
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -721,6 +722,202 @@ type AutoBumpCandidate struct {
 	IsPkgSet        bool
 }
 
+type bumpIgnoreEntry struct {
+	Package         string    `json:"package"`
+	Version         string    `json:"version"`
+	RepologyCurrent string    `json:"repology_current,omitempty"`
+	AddedAt         time.Time `json:"added_at"`
+}
+
+func loadBumpIgnoreList() (map[string]bumpIgnoreEntry, error) {
+	ignores := make(map[string]bumpIgnoreEntry)
+	data, err := os.ReadFile(BumpIgnoreFile)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return ignores, nil
+		}
+		return ignores, err
+	}
+	if len(strings.TrimSpace(string(data))) == 0 {
+		return ignores, nil
+	}
+
+	var entries []bumpIgnoreEntry
+	if err := json.Unmarshal(data, &entries); err != nil {
+		return ignores, err
+	}
+	for _, entry := range entries {
+		if entry.Package == "" || entry.Version == "" {
+			continue
+		}
+		ignores[entry.Package] = entry
+	}
+	return ignores, nil
+}
+
+func saveBumpIgnoreList(ignores map[string]bumpIgnoreEntry) error {
+	entries := make([]bumpIgnoreEntry, 0, len(ignores))
+	for _, entry := range ignores {
+		entries = append(entries, entry)
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		return entries[i].Package < entries[j].Package
+	})
+
+	data, err := json.MarshalIndent(entries, "", "  ")
+	if err != nil {
+		return err
+	}
+	data = append(data, '\n')
+
+	if os.Geteuid() == 0 {
+		if err := os.MkdirAll(filepath.Dir(BumpIgnoreFile), 0o755); err != nil {
+			return err
+		}
+		return os.WriteFile(BumpIgnoreFile, data, 0o644)
+	}
+
+	tmp, err := os.CreateTemp("", "hokuto-bump-ignore-*.json")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+
+	if err := RootExec.Run(exec.Command("mkdir", "-p", filepath.Dir(BumpIgnoreFile))); err != nil {
+		return err
+	}
+	if err := RootExec.Run(exec.Command("cp", tmpPath, BumpIgnoreFile)); err != nil {
+		return err
+	}
+	return RootExec.Run(exec.Command("chmod", "644", BumpIgnoreFile))
+}
+
+type autoBumpSelection struct {
+	Selected  []int
+	Blacklist []int
+}
+
+func parseAutoBumpSelection(input string, count int) (autoBumpSelection, error) {
+	var result autoBumpSelection
+	if strings.TrimSpace(input) == "" {
+		for i := 0; i < count; i++ {
+			result.Selected = append(result.Selected, i)
+		}
+		return result, nil
+	}
+
+	selected := make(map[int]bool)
+	blacklisted := make(map[int]bool)
+	var selectionParts []string
+
+	for _, part := range strings.Split(input, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+
+		isBlacklist := strings.HasPrefix(part, "!")
+		if isBlacklist {
+			part = strings.TrimSpace(strings.TrimPrefix(part, "!"))
+			if part == "" {
+				return result, fmt.Errorf("missing number after !")
+			}
+		}
+
+		if isBlacklist {
+			idx, err := strconv.Atoi(part)
+			if err != nil {
+				return result, fmt.Errorf("invalid blacklist number: !%s", part)
+			}
+			if idx <= 0 || idx > count {
+				return result, fmt.Errorf("number out of range (1-%d): %d", count, idx)
+			}
+			blacklisted[idx-1] = true
+			continue
+		}
+
+		selectionParts = append(selectionParts, part)
+	}
+
+	if len(selectionParts) > 0 {
+		indices, _, err := ParseSelectionIndices(strings.Join(selectionParts, ","), count)
+		if err != nil {
+			return result, err
+		}
+		for _, idx := range indices {
+			selected[idx] = true
+		}
+	} else if len(blacklisted) > 0 {
+		for i := 0; i < count; i++ {
+			if !blacklisted[i] {
+				selected[i] = true
+			}
+		}
+	}
+
+	for idx := range blacklisted {
+		delete(selected, idx)
+		result.Blacklist = append(result.Blacklist, idx)
+	}
+
+	for idx := range selected {
+		result.Selected = append(result.Selected, idx)
+	}
+	sort.Ints(result.Selected)
+	sort.Ints(result.Blacklist)
+	return result, nil
+}
+
+func askForAutoBumpSelection(prompt string, count int) (autoBumpSelection, bool) {
+	interactiveMu.Lock()
+	defer interactiveMu.Unlock()
+
+	scanner := bufio.NewScanner(os.Stdin)
+	for {
+		colArrow.Print("-> ")
+		colNote.Print(prompt + " ")
+
+		if !scanner.Scan() {
+			return autoBumpSelection{}, false
+		}
+
+		input := strings.TrimSpace(scanner.Text())
+		lower := strings.ToLower(input)
+		if lower == "" || lower == "y" || lower == "yes" || lower == "a" || lower == "all" {
+			selection := autoBumpSelection{}
+			for i := 0; i < count; i++ {
+				selection.Selected = append(selection.Selected, i)
+			}
+			return selection, true
+		}
+		if lower == "n" || lower == "no" || lower == "c" || lower == "cancel" {
+			return autoBumpSelection{}, false
+		}
+		if lower == "q" || lower == "quit" {
+			os.Exit(0)
+		}
+
+		selection, err := parseAutoBumpSelection(input, count)
+		if err != nil {
+			colError.Printf("Error: %v\n", err)
+			continue
+		}
+		if len(selection.Selected) == 0 && len(selection.Blacklist) == 0 {
+			colWarn.Println("No items selected.")
+			continue
+		}
+		return selection, true
+	}
+}
+
 // HandleAutoBumpCommand implements the logic of the automagic bump script.
 func HandleAutoBumpCommand(cfg *Config, autoBuild bool, assumeYes bool) error {
 	GlobalAssumeYes = true
@@ -794,6 +991,12 @@ func HandleAutoBumpCommand(cfg *Config, autoBuild bool, assumeYes bool) error {
 		return nil
 	}
 
+	bumpIgnores, err := loadBumpIgnoreList()
+	if err != nil {
+		colWarn.Printf("Warning: failed to read bump ignore list %s: %v\n", BumpIgnoreFile, err)
+		bumpIgnores = make(map[string]bumpIgnoreEntry)
+	}
+	ignoreListChanged := false
 	var candidates []AutoBumpCandidate
 
 	// Sort project names to scan deterministically
@@ -920,6 +1123,15 @@ func HandleAutoBumpCommand(cfg *Config, autoBuild bool, assumeYes bool) error {
 			continue
 		}
 
+		if ignored, ok := bumpIgnores[pkgName]; ok {
+			if ignored.Version == newVer {
+				colNote.Printf(">> [SKIP] %s %s is blacklisted until Repology changes.\n", pkgName, newVer)
+				continue
+			}
+			delete(bumpIgnores, pkgName)
+			ignoreListChanged = true
+		}
+
 		candidates = append(candidates, AutoBumpCandidate{
 			PkgName:         pkgName,
 			CurVersion:      curVer,
@@ -930,6 +1142,11 @@ func HandleAutoBumpCommand(cfg *Config, autoBuild bool, assumeYes bool) error {
 	}
 
 	if len(candidates) == 0 {
+		if ignoreListChanged {
+			if err := saveBumpIgnoreList(bumpIgnores); err != nil {
+				colWarn.Printf("Warning: failed to save bump ignore list %s: %v\n", BumpIgnoreFile, err)
+			}
+		}
 		colSuccess.Println("No packages need to be bumped.")
 		return nil
 	}
@@ -957,11 +1174,38 @@ func HandleAutoBumpCommand(cfg *Config, autoBuild bool, assumeYes bool) error {
 		}
 		ok = true
 	} else {
-		indices, ok = AskForSelection("Bump (a)ll, (q)uit, or pick packages to bump/ignore (numbers or -numbers):", len(candidates))
+		var selection autoBumpSelection
+		selection, ok = askForAutoBumpSelection("Bump (a)ll, (q)uit, pick packages (numbers or -numbers), or blacklist versions (!numbers):", len(candidates))
+		indices = selection.Selected
+		if ok && len(selection.Blacklist) > 0 {
+			now := time.Now()
+			for _, idx := range selection.Blacklist {
+				cand := candidates[idx]
+				bumpIgnores[cand.PkgName] = bumpIgnoreEntry{
+					Package:         cand.PkgName,
+					Version:         cand.NewVersion,
+					RepologyCurrent: cand.RepologyCurrent,
+					AddedAt:         now,
+				}
+				colNote.Printf(">> [BLACKLIST] %s %s ignored until Repology changes.\n", cand.PkgName, cand.NewVersion)
+			}
+			ignoreListChanged = true
+		}
 	}
 
 	if !ok {
 		colNote.Println("Bump canceled by user.")
+		return nil
+	}
+
+	if ignoreListChanged {
+		if err := saveBumpIgnoreList(bumpIgnores); err != nil {
+			colWarn.Printf("Warning: failed to save bump ignore list %s: %v\n", BumpIgnoreFile, err)
+		}
+	}
+
+	if len(indices) == 0 {
+		colSuccess.Println("No packages selected to bump.")
 		return nil
 	}
 
@@ -1071,8 +1315,13 @@ func tweakVersion(pkgName, ver string) string {
 		// while the actual version used by openssh and our repo is 10.3p1.
 		return strings.ReplaceAll(ver, "_p", "p")
 	case "imagemagick":
-		// repology version 7.1.2.21 -> local verion scheme: 7.1.2-21
-		if lastDot := strings.LastIndex(ver, "."); lastDot != -1 {
+		// Keep upstream's GitHub tag scheme when Repology already reports it:
+		// 7.1.2-27 -> 7.1.2-27. Older Repology variants used 7.1.2.27.
+		if strings.Contains(ver, "-") {
+			return ver
+		}
+		if regexp.MustCompile(`^\d+\.\d+\.\d+\.\d+$`).MatchString(ver) {
+			lastDot := strings.LastIndex(ver, ".")
 			return ver[:lastDot] + "-" + ver[lastDot+1:]
 		}
 	}
