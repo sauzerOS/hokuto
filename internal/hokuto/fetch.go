@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/chromedp/cdproto/browser"
@@ -57,7 +58,6 @@ func newHttpClient() (*http.Client, error) {
 
 	return &http.Client{
 		Transport: transport,
-		Timeout:   5 * time.Minute, // User requested 5m global timeout
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			if len(via) >= 10 {
 				return fmt.Errorf("stopped after 10 redirects")
@@ -438,27 +438,87 @@ type downloadOptions struct {
 
 var wgetNoCheckCertificate bool
 
-type IdleTimeoutReader struct {
-	src     io.ReadCloser
-	timeout time.Duration
-	timer   *time.Timer
-	cancel  context.CancelFunc
+const (
+	downloadMinSpeedWindow         = 10 * time.Second
+	downloadMinSpeedBytesPerSecond = 100 * 1024
+)
+
+type throughputTimeoutReader struct {
+	src               io.ReadCloser
+	window            time.Duration
+	minBytesPerWindow int64
+	cancel            context.CancelFunc
+
+	bytes     atomic.Int64
+	startOnce sync.Once
+	closeOnce sync.Once
+	done      chan struct{}
+	stallErr  atomic.Value
 }
 
-func (r *IdleTimeoutReader) Read(p []byte) (int, error) {
-	if r.timer == nil {
-		r.timer = time.AfterFunc(r.timeout, r.cancel)
-	} else {
-		r.timer.Reset(r.timeout)
+func newThroughputTimeoutReader(src io.ReadCloser, window time.Duration, minBytesPerWindow int64, cancel context.CancelFunc) *throughputTimeoutReader {
+	return &throughputTimeoutReader{
+		src:               src,
+		window:            window,
+		minBytesPerWindow: minBytesPerWindow,
+		cancel:            cancel,
+		done:              make(chan struct{}),
 	}
-	return r.src.Read(p)
 }
 
-func (r *IdleTimeoutReader) Close() error {
-	if r.timer != nil {
-		r.timer.Stop()
+func minDownloadBytesForWindow(bytesPerSecond int64, window time.Duration) int64 {
+	return bytesPerSecond * int64(window) / int64(time.Second)
+}
+
+func (r *throughputTimeoutReader) Read(p []byte) (int, error) {
+	r.startOnce.Do(r.start)
+	n, err := r.src.Read(p)
+	if n > 0 {
+		r.bytes.Add(int64(n))
 	}
+	return n, err
+}
+
+func (r *throughputTimeoutReader) Close() error {
+	r.closeOnce.Do(func() {
+		close(r.done)
+	})
 	return r.src.Close()
+}
+
+func (r *throughputTimeoutReader) Err() error {
+	if err, ok := r.stallErr.Load().(error); ok {
+		return err
+	}
+	return nil
+}
+
+func (r *throughputTimeoutReader) start() {
+	go func() {
+		ticker := time.NewTicker(r.window)
+		defer ticker.Stop()
+
+		var lastBytes int64
+		for {
+			select {
+			case <-ticker.C:
+				totalBytes := r.bytes.Load()
+				windowBytes := totalBytes - lastBytes
+				if windowBytes < r.minBytesPerWindow {
+					r.stallErr.Store(fmt.Errorf("download stalled: received %s in the last %s, below minimum %s",
+						humanReadableSize(windowBytes),
+						r.window,
+						humanReadableSize(r.minBytesPerWindow),
+					))
+					r.cancel()
+					return
+				}
+				lastBytes = totalBytes
+			case <-r.done:
+				return
+			}
+		}
+	}()
 }
 
 func tryRemoveCachedFile(path string) {
@@ -673,12 +733,12 @@ func downloadFileWithOptions(originalURL, finalURL, destFile string, opt downloa
 				writer = io.MultiWriter(out, bar)
 			}
 
-			// Wrap response body with idle timeout reader
-			wrappedBody := &IdleTimeoutReader{
-				src:     resp.Body,
-				timeout: 15 * time.Second,
-				cancel:  cancel,
-			}
+			wrappedBody := newThroughputTimeoutReader(
+				resp.Body,
+				downloadMinSpeedWindow,
+				minDownloadBytesForWindow(downloadMinSpeedBytesPerSecond, downloadMinSpeedWindow),
+				cancel,
+			)
 
 			_, err = io.Copy(writer, wrappedBody)
 			wrappedBody.Close() // Close response body and stop timer
@@ -687,6 +747,9 @@ func downloadFileWithOptions(originalURL, finalURL, destFile string, opt downloa
 			}
 			if err != nil {
 				_ = out.Close()
+				if stallErr := wrappedBody.Err(); stallErr != nil {
+					return fmt.Errorf("failed to write to destination file: %w", stallErr)
+				}
 				// Write failed
 				return fmt.Errorf("failed to write to destination file: %w", err)
 			}
