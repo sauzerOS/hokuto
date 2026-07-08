@@ -3756,7 +3756,7 @@ func handleBuildCommand(args []string, cfg *Config) (err error) {
 			missingDepBar := newDependencyInstallProgress(len(missingDeps), "Installing Build Dependencies", quietDependencyInstalls && !*promptBinaryDeps)
 			deactivateMissingDepProgress := activateDependencyInstallProgress(missingDepBar)
 			for _, depPkg := range missingDeps {
-				describeDependencyInstallProgress(missingDepBar, depPkg)
+				describeDependencyCheckProgress(missingDepBar, depPkg)
 				if err := func() error {
 					defer advanceDependencyInstallProgress(missingDepBar)
 					if packagesThatMustBeBuilt[depPkg] {

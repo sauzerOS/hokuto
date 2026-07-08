@@ -486,10 +486,16 @@ func createPackageTarball(pkgName, pkgVer, pkgRev, arch, variant, outputDir stri
 		}
 		tarCmd := exec.Command("tar", args...)
 		debugf("Creating package tarball with system tar: %s\n", tarballPath)
+		if !Debug {
+			tarCmd.Stdout = io.Discard
+			tarCmd.Stderr = io.Discard
+		}
 		if err := execCtx.Run(tarCmd); err == nil {
 			fmt.Fprint(logger, colArrow.Sprint("-> "))
 			fmt.Fprintln(logger, colSuccess.Sprint("Package tarball created successfully"))
 			return nil
+		} else {
+			debugf("System tar failed for %s, falling back to internal tar+zstd: %v\n", tarballPath, err)
 		}
 		// fall through to internal if tar fails
 	}
