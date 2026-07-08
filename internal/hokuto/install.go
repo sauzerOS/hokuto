@@ -386,13 +386,20 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 		if _, err := exec.LookPath("tar"); err == nil {
 			args := []string{"xf", tarballPath, "-C", rootDir}
 			tarCmd := exec.Command("tar", args...)
-			tarCmd.Stdout = os.Stdout
-			tarCmd.Stderr = os.Stderr
+			if Debug {
+				tarCmd.Stdout = os.Stdout
+				tarCmd.Stderr = os.Stderr
+			} else {
+				tarCmd.Stdout = io.Discard
+				tarCmd.Stderr = io.Discard
+			}
 
 			if err := execCtx.Run(tarCmd); err == nil {
 				tarSuccess = true
 				colArrow.Print("-> ")
 				colSuccess.Println("glibc installed successfully via direct extraction")
+			} else {
+				debugf("System tar failed for %s, falling back to internal tar+zstd: %v\n", tarballPath, err)
 			}
 		}
 
@@ -448,8 +455,14 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 	tarSuccess := false
 	if _, err := exec.LookPath("tar"); err == nil {
 		untarCmd := exec.Command("tar", "--zstd", "-xf", tarballPath, "-C", stagingDir)
+		if !Debug {
+			untarCmd.Stdout = io.Discard
+			untarCmd.Stderr = io.Discard
+		}
 		if err := execCtx.Run(untarCmd); err == nil {
 			tarSuccess = true
+		} else {
+			debugf("System tar failed for %s, falling back to internal tar+zstd: %v\n", tarballPath, err)
 		}
 	}
 
