@@ -3474,6 +3474,7 @@ func handleBuildCommand(args []string, cfg *Config) (err error) {
 	var builtWithoutInstallingTargets bool
 	var temporaryBuildDeps []string
 	retainedBuildDeps := make(map[string]bool)
+	buildWorkStarted := false
 	orphansAtBuildStart := make(map[string]bool)
 	if runtimeOrphans, err := findOrphans(); err == nil {
 		for _, pkgName := range runtimeOrphans {
@@ -3505,7 +3506,7 @@ func handleBuildCommand(args []string, cfg *Config) (err error) {
 		retainedBuildDeps[getOutputPackageName(pkgName, cfg)] = true
 	}
 	cleanupTemporaryBuildDeps := func() {
-		if *bootstrap {
+		if *bootstrap || *noDevel || !buildWorkStarted {
 			return
 		}
 		cleanupAfterFailure := err != nil
@@ -3601,6 +3602,7 @@ func handleBuildCommand(args []string, cfg *Config) (err error) {
 			}
 		}
 
+		buildWorkStarted = true
 		if err := prepareDevelPackages(packageSetHasBuildOption(fullBuildList, "multilib")); err != nil {
 			return err
 		}
@@ -3745,6 +3747,7 @@ func handleBuildCommand(args []string, cfg *Config) (err error) {
 				}
 			}
 
+			buildWorkStarted = true
 			packagesThatMustBeBuilt = make(map[string]bool)
 			for pkg := range forceBuildMap {
 				packagesThatMustBeBuilt[pkg] = true
@@ -3896,6 +3899,7 @@ func handleBuildCommand(args []string, cfg *Config) (err error) {
 			}
 		}
 
+		buildWorkStarted = true
 		if err := prepareDevelPackages(packageSetHasBuildOption(buildPackageNames(packagesThatMustBeBuilt), "multilib")); err != nil {
 			return err
 		}
