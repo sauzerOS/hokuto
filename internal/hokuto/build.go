@@ -94,6 +94,141 @@ func buildPackageNames(packageSet map[string]bool) []string {
 	return pkgNames
 }
 
+func missingDevelPackagesForBuild(cfg *Config, includeMultilib bool) []string {
+	var missing []string
+	for _, pkgName := range requiredDevelPackages(cfg, includeMultilib) {
+		if !isPackageInstalled(pkgName) {
+			missing = append(missing, getOutputPackageName(pkgName, cfg))
+		}
+	}
+	sort.Strings(missing)
+	return missing
+}
+
+func appendUniquePackage(pkgNames []string, seen map[string]bool, pkgName string) []string {
+	if pkgName == "" || seen[pkgName] {
+		return pkgNames
+	}
+	seen[pkgName] = true
+	return append(pkgNames, pkgName)
+}
+
+func plannedBinaryInstallsForMissingDeps(missingDeps []string, forceBuildMap map[string]bool, cfg *Config, noRemote bool) []string {
+	seen := make(map[string]bool)
+	var installs []string
+	for _, depPkg := range missingDeps {
+		if forceBuildMap[depPkg] {
+			continue
+		}
+		if _, err := findPackageMetadataDir(depPkg); err != nil {
+			if isPackageInstalled(depPkg) {
+				continue
+			}
+			if _, ok := findSplitDependencySource(depPkg); ok && dependencyBinaryAvailable(depPkg, cfg, noRemote) {
+				installs = appendUniquePackage(installs, seen, depPkg)
+				continue
+			}
+			if dependencyBinaryAvailable(depPkg, cfg, noRemote) {
+				installs = appendUniquePackage(installs, seen, getOutputPackageName(depPkg, cfg))
+			}
+			continue
+		}
+
+		version, revision, err := getRepoVersion2(depPkg)
+		if err != nil {
+			continue
+		}
+		outputDepPkg := getOutputPackageName(depPkg, cfg)
+		if tarballPath := findCachedBinaryTarballVersion(outputDepPkg, version, revision, cfg); tarballPath != "" {
+			installs = appendUniquePackage(installs, seen, outputDepPkg)
+			continue
+		}
+		if dependencyBinaryAvailable(depPkg, cfg, noRemote) {
+			installs = appendUniquePackage(installs, seen, outputDepPkg)
+		}
+	}
+	sort.Strings(installs)
+	return installs
+}
+
+func previewBuildSetForMissingDeps(missingDeps []string, forceBuildMap map[string]bool, cfg *Config, noRemote bool) map[string]bool {
+	buildSet := make(map[string]bool)
+	for pkgName := range forceBuildMap {
+		buildSet[pkgName] = true
+	}
+	for _, depPkg := range missingDeps {
+		if buildSet[depPkg] {
+			continue
+		}
+		if _, err := findPackageMetadataDir(depPkg); err != nil {
+			if isPackageInstalled(depPkg) {
+				continue
+			}
+			if sourcePkg, ok := findSplitDependencySource(depPkg); ok {
+				if !dependencyBinaryAvailable(depPkg, cfg, noRemote) {
+					buildSet[sourcePkg] = true
+				}
+				continue
+			}
+			if !dependencyBinaryAvailable(depPkg, cfg, noRemote) {
+				buildSet[depPkg] = true
+			}
+			continue
+		}
+
+		version, revision, err := getRepoVersion2(depPkg)
+		if err == nil {
+			outputDepPkg := getOutputPackageName(depPkg, cfg)
+			if tarballPath := findCachedBinaryTarballVersion(outputDepPkg, version, revision, cfg); tarballPath != "" {
+				continue
+			}
+		}
+		if !dependencyBinaryAvailable(depPkg, cfg, noRemote) {
+			buildSet[depPkg] = true
+		}
+	}
+	return buildSet
+}
+
+func confirmBuildPlanWithAsk(buildOrder []string, depsToInstall []string, postRebuilds map[string][]string) bool {
+	colArrow.Print("-> ")
+	colSuccess.Println("Build preview (--ask)")
+
+	if len(buildOrder) == 0 {
+		colArrow.Print("-> ")
+		colNote.Println("Packages to build: none")
+	} else {
+		colArrow.Print("-> ")
+		colNote.Printf("Packages to build (%d): %s\n", len(buildOrder), strings.Join(buildOrder, " -> "))
+	}
+
+	if len(depsToInstall) == 0 {
+		colArrow.Print("-> ")
+		colNote.Println("Dependencies to install: none")
+	} else {
+		seenDeps := make(map[string]bool)
+		sortedDeps := make([]string, 0, len(depsToInstall))
+		for _, dep := range depsToInstall {
+			sortedDeps = appendUniquePackage(sortedDeps, seenDeps, dep)
+		}
+		sort.Strings(sortedDeps)
+		colArrow.Print("-> ")
+		colNote.Printf("Dependencies to install (%d): %s\n", len(sortedDeps), strings.Join(sortedDeps, ", "))
+	}
+
+	if len(postRebuilds) > 0 {
+		var rebuilds []string
+		for parent, deps := range postRebuilds {
+			rebuilds = append(rebuilds, fmt.Sprintf("%s (for %s)", parent, strings.Join(deps, ",")))
+		}
+		sort.Strings(rebuilds)
+		colArrow.Print("-> ")
+		colWarn.Printf("Inline rebuilds: %s\n", strings.Join(rebuilds, ", "))
+	}
+
+	return askForConfirmationDefaultNo(colWarn, "Proceed with build?")
+}
+
 func activeBuildDependency(dep DepSpec, cfg *Config, includeOptional bool) bool {
 	if dep.RuntimeOnly || dep.Suggest {
 		return false
@@ -2988,6 +3123,7 @@ func handleBuildCommand(args []string, cfg *Config) (err error) {
 	var allDeps = buildCmd.Bool("alldeps", false, "Force rebuild of all dependencies")
 	var withRebuilds = buildCmd.Bool("rebuilds", false, "Enable post-build actions for dependencies marked with 'rebuild'.")
 	var withRebuildsShort = buildCmd.Bool("r", false, "Alias for -rebuilds.")
+	var ask = buildCmd.Bool("ask", false, "Show the build plan and ask before building or installing build dependencies.")
 	var orderedBuild = buildCmd.Bool("ordered", false, "Force build order based on the target package's depends file.")
 	var genericBuild = buildCmd.Bool("generic", false, "Use _GEN flags and store packages in generic subfolder")
 	var crossArch = buildCmd.String("cross", "", "Enable cross-compilation for target architecture (e.g., arm64)")
@@ -3456,6 +3592,15 @@ func handleBuildCommand(args []string, cfg *Config) (err error) {
 
 		fullBuildList = MovePackageToFront(fullBuildList, "sauzeros-base")
 
+		if *ask {
+			depsToInstall := missingDevelPackagesForBuild(cfg, packageSetHasBuildOption(fullBuildList, "multilib"))
+			if !confirmBuildPlanWithAsk(fullBuildList, depsToInstall, nil) {
+				colArrow.Print("-> ")
+				colWarn.Println("Build canceled.")
+				return nil
+			}
+		}
+
 		if err := prepareDevelPackages(packageSetHasBuildOption(fullBuildList, "multilib")); err != nil {
 			return err
 		}
@@ -3572,6 +3717,33 @@ func handleBuildCommand(args []string, cfg *Config) (err error) {
 				}
 			}
 			missingDeps = MovePackageToFront(missingDeps, "sauzeros-base")
+
+			if *ask {
+				previewBuildSet := previewBuildSetForMissingDeps(missingDeps, forceBuildMap, cfg, *noRemote)
+				previewBuildList := buildPackageNames(previewBuildSet)
+				var previewPlan *BuildPlan
+				if len(previewBuildList) > 0 {
+					previewPlan, err = resolveBuildPlan(previewBuildList, userRequestedMap, effectiveRebuilds, cfg, nil)
+					if err != nil {
+						return fmt.Errorf("error generating build preview: %v", err)
+					}
+					addPostRebuildSplitDependencies(previewPlan, splitDepsBySource)
+				}
+
+				buildOrder := previewBuildList
+				postRebuilds := map[string][]string(nil)
+				if previewPlan != nil {
+					buildOrder = plannedBuildDisplayOrder(previewPlan, cfg, *noRemote)
+					postRebuilds = previewPlan.PostRebuilds
+				}
+				includeMultilib := packageSetHasBuildOption(buildPackageNames(previewBuildSet), "multilib")
+				depsToInstall := append(plannedBinaryInstallsForMissingDeps(missingDeps, forceBuildMap, cfg, *noRemote), missingDevelPackagesForBuild(cfg, includeMultilib)...)
+				if !confirmBuildPlanWithAsk(buildOrder, depsToInstall, postRebuilds) {
+					colArrow.Print("-> ")
+					colWarn.Println("Build canceled.")
+					return nil
+				}
+			}
 
 			packagesThatMustBeBuilt = make(map[string]bool)
 			for pkg := range forceBuildMap {
@@ -3711,6 +3883,17 @@ func handleBuildCommand(args []string, cfg *Config) (err error) {
 		if len(packagesThatMustBeBuilt) == 0 {
 			fmt.Println("All packages and dependencies are already installed.")
 			return nil
+		}
+
+		if *ask && *noDeps {
+			buildList := buildPackageNames(packagesThatMustBeBuilt)
+			buildList = MovePackageToFront(buildList, "sauzeros-base")
+			depsToInstall := missingDevelPackagesForBuild(cfg, packageSetHasBuildOption(buildList, "multilib"))
+			if !confirmBuildPlanWithAsk(buildList, depsToInstall, nil) {
+				colArrow.Print("-> ")
+				colWarn.Println("Build canceled.")
+				return nil
+			}
 		}
 
 		if err := prepareDevelPackages(packageSetHasBuildOption(buildPackageNames(packagesThatMustBeBuilt), "multilib")); err != nil {
