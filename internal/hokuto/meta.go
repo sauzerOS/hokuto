@@ -20,13 +20,25 @@ import (
 
 // PackageMetadata represents the structure of metadata.json
 type PackageMetadata struct {
-	URL         string   `json:"url"`
-	Category    string   `json:"category"`
-	Description string   `json:"description"`
-	Info        string   `json:"info"`
-	License     string   `json:"license"`
-	Tags        []string `json:"tags"`
-	Subpackages []string `json:"subpackages,omitempty"`
+	URL           string                      `json:"url"`
+	Category      string                      `json:"category"`
+	Description   string                      `json:"description"`
+	Info          string                      `json:"info"`
+	License       string                      `json:"license"`
+	Tags          []string                    `json:"tags"`
+	Subpackages   []string                    `json:"subpackages,omitempty"`
+	SplitMetadata map[string]SplitPkgMetadata `json:"split_metadata,omitempty"`
+}
+
+// SplitPkgMetadata contains per-split metadata overrides in metadata.json.
+// Empty fields inherit from the source package metadata.
+type SplitPkgMetadata struct {
+	URL         string   `json:"url,omitempty"`
+	Category    string   `json:"category,omitempty"`
+	Description string   `json:"description,omitempty"`
+	Info        string   `json:"info,omitempty"`
+	License     string   `json:"license,omitempty"`
+	Tags        []string `json:"tags,omitempty"`
 }
 
 // PkgDBEntry represents a single package in the global database
@@ -96,39 +108,37 @@ func HandleMetaCommand(args []string, cfg *Config) error {
 
 	metaPath := filepath.Join(pkgDir, "metadata.json")
 	var meta PackageMetadata
+	metadataExists := false
 
 	// Load existing metadata if available
 	if data, err := os.ReadFile(metaPath); err == nil {
 		_ = json.Unmarshal(data, &meta)
+		metadataExists = true
 	}
 	if splitNames := splitPackageNamesFromDir(pkgDir); len(splitNames) > 0 {
 		meta.Subpackages = splitNames
 	}
 
 	if editMode {
-		return editMetadata(pkgName, pkgDir, &meta, cfg)
-	}
-
-	// If essential metadata is missing, try to fetch it
-	if meta.URL == "" || meta.Category == "" || meta.Description == "" {
-		colArrow.Print("-> ")
-		colNote.Printf("Metadata missing. Searching Arch/AUR for '%s'\n", pkgName)
-		candidates, err := searchMetadata(pkgName)
-		if err != nil {
-			colWarn.Printf("Search failed: %v\n", err)
-		} else if len(candidates) == 1 {
-			applyCandidate(&meta, &candidates[0])
-		} else if len(candidates) > 1 {
-			selected := promptSelection(candidates)
-			if selected != nil {
-				applyCandidate(&meta, selected)
+		if sourcePkg != "" && sourcePkg != pkgName {
+			if err := editSplitMetadata(pkgName, sourcePkg, pkgDir, &meta, cfg); err != nil {
+				return err
 			}
-		} else {
-			colWarn.Printf("No matches found for '%s'.\n", pkgName)
+			return regeneratePkgDBAfterMetadataEdit(cfg)
 		}
+		if err := editMetadata(pkgName, pkgDir, &meta, cfg); err != nil {
+			return err
+		}
+		return regeneratePkgDBAfterMetadataEdit(cfg)
 	}
 
-	displayMetadata(pkgName, sourcePkg, &meta)
+	displayMeta := effectiveMetadataForPackage(pkgName, sourcePkg, &meta)
+	if !metadataExists || !hasMetadataEntry(&displayMeta) {
+		colWarn.Printf("No metadata entry found for '%s'. Run 'hokuto meta %s -e' to create one.\n", pkgName, pkgName)
+		return nil
+	}
+
+	displayMetadata(pkgName, sourcePkg, &displayMeta)
 	return nil
 }
 
@@ -146,6 +156,98 @@ func applyCandidate(meta *PackageMetadata, cand *MetadataCandidate) {
 	meta.Description = cand.Description
 	meta.License = cand.License
 	meta.Category = cand.Category
+}
+
+func effectiveMetadataForPackage(pkgName, sourcePkg string, meta *PackageMetadata) PackageMetadata {
+	effective := *meta
+	effective.SplitMetadata = nil
+	if sourcePkg == "" || sourcePkg == pkgName || meta.SplitMetadata == nil {
+		return effective
+	}
+
+	override, ok := meta.SplitMetadata[pkgName]
+	if !ok {
+		return effective
+	}
+	if override.URL != "" {
+		effective.URL = override.URL
+	}
+	if override.Category != "" {
+		effective.Category = override.Category
+	}
+	if override.Description != "" {
+		effective.Description = override.Description
+	}
+	if override.Info != "" {
+		effective.Info = override.Info
+	}
+	if override.License != "" {
+		effective.License = override.License
+	}
+	if override.Tags != nil {
+		effective.Tags = append([]string(nil), override.Tags...)
+	}
+	effective.Subpackages = nil
+	return effective
+}
+
+func splitMetadataOverride(parent, split PackageMetadata) SplitPkgMetadata {
+	override := SplitPkgMetadata{}
+	if split.URL != parent.URL {
+		override.URL = split.URL
+	}
+	if split.Category != parent.Category {
+		override.Category = split.Category
+	}
+	if split.Description != parent.Description {
+		override.Description = split.Description
+	}
+	if split.Info != parent.Info {
+		override.Info = split.Info
+	}
+	if split.License != parent.License {
+		override.License = split.License
+	}
+	if !stringSlicesEqual(split.Tags, parent.Tags) {
+		override.Tags = append([]string(nil), split.Tags...)
+	}
+	return override
+}
+
+func splitMetadataOverrideEmpty(override SplitPkgMetadata) bool {
+	return override.URL == "" &&
+		override.Category == "" &&
+		override.Description == "" &&
+		override.Info == "" &&
+		override.License == "" &&
+		override.Tags == nil
+}
+
+func stringSlicesEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func hasMetadataEntry(meta *PackageMetadata) bool {
+	return meta.URL != "" ||
+		meta.Category != "" ||
+		meta.Description != "" ||
+		meta.Info != "" ||
+		meta.License != "" ||
+		len(meta.Tags) > 0
+}
+
+func regeneratePkgDBAfterMetadataEdit(cfg *Config) error {
+	colArrow.Print("-> ")
+	colNote.Println("Updating package database")
+	return GeneratePkgDB(cfg)
 }
 
 func searchMetadata(pkgName string) ([]MetadataCandidate, error) {
@@ -398,6 +500,101 @@ func editMetadata(pkgName, pkgDir string, meta *PackageMetadata, cfg *Config) er
 	return nil
 }
 
+func editSplitMetadata(pkgName, sourcePkg, pkgDir string, parent *PackageMetadata, cfg *Config) error {
+	reader := bufio.NewReader(os.Stdin)
+	effective := effectiveMetadataForPackage(pkgName, sourcePkg, parent)
+
+	fmt.Printf("Editing split metadata for %s\n", pkgName)
+
+	if effective.URL == "" || effective.Category == "" || effective.Description == "" {
+		candidates, _ := searchMetadata(pkgName)
+		if len(candidates) == 1 {
+			applyCandidate(&effective, &candidates[0])
+		} else if len(candidates) > 1 {
+			selected := promptSelection(candidates)
+			if selected != nil {
+				applyCandidate(&effective, selected)
+			}
+		}
+	}
+
+	effective.URL = promptInput("URL", effective.URL, reader)
+	effective.Category = promptInput("Category (base/extra)", effective.Category, reader)
+	effective.Description = promptInput("Description", effective.Description, reader)
+	effective.License = promptInput("License", effective.License, reader)
+
+	fmt.Printf("Available tags: %s\n", strings.Join(validTags, ", "))
+	fmt.Printf("Current tags: %s\n", strings.Join(effective.Tags, ", "))
+	tagsInput := promptInput("Enter tags (comma separated)", strings.Join(effective.Tags, ", "), reader)
+	effective.Tags = []string{}
+	for _, t := range strings.Split(tagsInput, ",") {
+		t = strings.TrimSpace(t)
+		if t != "" {
+			effective.Tags = append(effective.Tags, t)
+		}
+	}
+	sort.Strings(effective.Tags)
+
+	fmt.Printf("\nAdditional Info/Comments:\n")
+	if effective.Info != "" {
+		fmt.Printf("Current info exists (%d chars).\n", len(effective.Info))
+	} else {
+		fmt.Println("(none)")
+	}
+
+	editInfo := promptYesNo("Do you want to edit/set Info?", false)
+	if editInfo {
+		tmpFile, err := os.CreateTemp("", "hokuto-meta-info-*.txt")
+		if err == nil {
+			tmpPath := tmpFile.Name()
+			_ = os.WriteFile(tmpPath, []byte(effective.Info), 0644)
+			tmpFile.Close()
+
+			editor := os.Getenv("EDITOR")
+			if editor == "" {
+				editor = "nano"
+			}
+			if err := runEditor(editor, tmpPath); err == nil {
+				if newData, err := os.ReadFile(tmpPath); err == nil {
+					effective.Info = string(newData)
+				}
+			}
+			os.Remove(tmpPath)
+		}
+	}
+
+	parentComparable := *parent
+	parentComparable.Subpackages = nil
+	parentComparable.SplitMetadata = nil
+	override := splitMetadataOverride(parentComparable, effective)
+	if splitMetadataOverrideEmpty(override) {
+		if parent.SplitMetadata != nil {
+			delete(parent.SplitMetadata, pkgName)
+			if len(parent.SplitMetadata) == 0 {
+				parent.SplitMetadata = nil
+			}
+		}
+	} else {
+		if parent.SplitMetadata == nil {
+			parent.SplitMetadata = make(map[string]SplitPkgMetadata)
+		}
+		parent.SplitMetadata[pkgName] = override
+	}
+
+	metaPath := filepath.Join(pkgDir, "metadata.json")
+	data, err := json.MarshalIndent(parent, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(metaPath, data, 0644); err != nil {
+		return err
+	}
+
+	colArrow.Print("-> ")
+	colSuccess.Printf("Split metadata saved to %s\n", metaPath)
+	return nil
+}
+
 func promptInput(label, defaultValue string, reader *bufio.Reader) string {
 	fmt.Printf("%s [%s]: ", label, defaultValue)
 	input, _ := reader.ReadString('\n')
@@ -473,11 +670,13 @@ func GeneratePkgDB(cfg *Config) error {
 			if len(splitNames) > 0 {
 				meta.Subpackages = append([]string(nil), splitNames...)
 			}
+			parentDBMeta := meta
+			parentDBMeta.SplitMetadata = nil
 
 			db.Packages = append(db.Packages, PkgDBEntry{
 				Name:     pkgName,
 				Version:  version,
-				Metadata: meta,
+				Metadata: parentDBMeta,
 			})
 			seen[pkgName] = true
 
@@ -485,8 +684,8 @@ func GeneratePkgDB(cfg *Config) error {
 				if seen[splitName] {
 					continue
 				}
-				splitMeta := meta
-				splitMeta.Subpackages = nil
+				splitMeta := effectiveMetadataForPackage(splitName, pkgName, &meta)
+				sort.Strings(splitMeta.Tags)
 				db.Packages = append(db.Packages, PkgDBEntry{
 					Name:          splitName,
 					Version:       version,
