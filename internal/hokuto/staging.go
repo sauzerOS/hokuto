@@ -281,6 +281,9 @@ func removeObsoleteFiles(pkgName, stagingDir, rootDir string) ([]string, error) 
 		}
 		parts := strings.SplitN(line, "  ", 2)
 		path := strings.Fields(parts[0])[0]
+		if isPreservedKernelUpgradePath(path) {
+			continue
+		}
 
 		// Check if canonical path matches
 		canonicalPath := canonicalizePath(rootDir, path)
@@ -320,6 +323,30 @@ func removeObsoleteFiles(pkgName, stagingDir, rootDir string) ([]string, error) 
 	}
 
 	return filesToDelete, nil
+}
+
+func isPreservedKernelUpgradePath(path string) bool {
+	clean := strings.TrimPrefix(filepath.ToSlash(path), "/")
+	if strings.HasPrefix(clean, "boot/vmlinuz-") ||
+		strings.HasPrefix(clean, "boot/initramfs-") ||
+		strings.HasPrefix(clean, "boot/System.map-") ||
+		strings.HasPrefix(clean, "boot/config-") {
+		return strings.Contains(clean, "-sauzerOS")
+	}
+	for _, prefix := range []string{"usr/lib/modules/", "lib/modules/"} {
+		if !strings.HasPrefix(clean, prefix) {
+			continue
+		}
+		rest := strings.TrimPrefix(clean, prefix)
+		release := rest
+		if idx := strings.IndexByte(rest, '/'); idx >= 0 {
+			release = rest[:idx]
+		}
+		if isSauzerosKernelRelease(release) {
+			return true
+		}
+	}
+	return false
 }
 
 // buildFileOwnerIndex builds a map of file paths (normalized) to package names
