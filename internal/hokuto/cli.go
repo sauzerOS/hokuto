@@ -588,6 +588,9 @@ func Main() {
 			fmt.Fprintln(os.Stderr, "Error: --remote and --no-remote cannot be used together.")
 			os.Exit(1)
 		}
+		if *noDeps {
+			defer suppressRuntimeDependencyAutoInstallScope()()
+		}
 
 		var remoteIndex []RepoEntry
 		if *remote {

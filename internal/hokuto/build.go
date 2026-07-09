@@ -3164,6 +3164,9 @@ func handleBuildCommand(args []string, cfg *Config) (err error) {
 	if err := buildCmd.Parse(args); err != nil {
 		return fmt.Errorf("error parsing build flags: %v", err)
 	}
+	if *noDeps {
+		defer suppressRuntimeDependencyAutoInstallScope()()
+	}
 	endBuildSession := registerHokutoBuildSession()
 	defer endBuildSession()
 	defer func() {

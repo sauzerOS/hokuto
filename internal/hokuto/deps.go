@@ -27,6 +27,13 @@ var runtimeDependencyInstallInProgress sync.Map
 
 var suppressRuntimeDependencyAutoInstall atomic.Int32
 
+func suppressRuntimeDependencyAutoInstallScope() func() {
+	suppressRuntimeDependencyAutoInstall.Add(1)
+	return func() {
+		suppressRuntimeDependencyAutoInstall.Add(-1)
+	}
+}
+
 var develInstallMu sync.Mutex
 
 var dependencyInstallProgress = struct {
