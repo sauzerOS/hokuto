@@ -1166,6 +1166,7 @@ func Main() {
 		defer isCriticalAtomic.Store(0)
 
 		allSucceeded := true
+		removedMetaPackage := false
 		for _, pkgName := range packagesToUninstall {
 			colArrow.Print("-> ")
 			colSuccess.Printf("Attempting to uninstall package: %s\n", pkgName)
@@ -1179,6 +1180,7 @@ func Main() {
 					colArrow.Print("-> ")
 					colSuccess.Printf("Meta package %s removed\n", pkgName)
 					removeFromWorld(pkgName)
+					removedMetaPackage = true
 				}
 				continue
 			}
@@ -1196,6 +1198,9 @@ func Main() {
 
 		if !allSucceeded {
 			os.Exit(1)
+		}
+		if removedMetaPackage {
+			handleOrphanCleanup(cfg, "")
 		}
 
 	case "update", "u":
