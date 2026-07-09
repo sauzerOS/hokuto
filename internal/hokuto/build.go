@@ -3880,10 +3880,12 @@ func handleBuildCommand(args []string, cfg *Config) (err error) {
 					}
 					return nil
 				}(); err != nil {
+					clearDependencyInstallProgress(missingDepBar)
 					deactivateMissingDepProgress()
 					return err
 				}
 			}
+			clearDependencyInstallProgress(missingDepBar)
 			deactivateMissingDepProgress()
 		}
 
