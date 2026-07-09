@@ -2144,6 +2144,12 @@ func describeDependencyCheckProgress(bar *progressbar.ProgressBar, pkgName strin
 	}
 }
 
+func clearDependencyInstallProgress(bar *progressbar.ProgressBar) {
+	if bar != nil {
+		_ = bar.Clear()
+	}
+}
+
 func describeActiveDependencyInstallProgress(pkgName string) {
 	dependencyInstallProgress.Lock()
 	var bar *progressbar.ProgressBar

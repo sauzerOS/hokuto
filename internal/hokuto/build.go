@@ -3784,6 +3784,7 @@ func handleBuildCommand(args []string, cfg *Config) (err error) {
 									binaryDeclined[depPkg] = true
 								}
 							}
+							clearDependencyInstallProgress(missingDepBar)
 							colArrow.Print("-> ")
 							colInfo.Printf("Dependency %s is a split package; scheduling %s to build it\n", depPkg, sourcePkg)
 							packagesThatMustBeBuilt[sourcePkg] = true
@@ -4245,6 +4246,20 @@ func executeBuildPass(plan *BuildPlan, _ string, installAllTargets bool, cfg *Co
 	}
 	binaryInstallAttempts := make(map[string]bool)
 	var totalElapsedTime time.Duration
+	postRebuildDepsAvailable := func(deps []string) bool {
+		for _, dep := range deps {
+			if builtThisPass[dep] || isPackageInstalled(dep) {
+				continue
+			}
+			if sourcePkg, ok := findSplitDependencySource(dep); ok && builtThisPass[sourcePkg] {
+				if isPackageInstalled(dep) {
+					continue
+				}
+			}
+			return false
+		}
+		return true
+	}
 	depMatchesPackage := func(dep DepSpec, pkgName string) bool {
 		if len(dep.Alternatives) > 0 {
 			if cached, ok := cachedAlternativeDep(dep); ok {
@@ -4376,6 +4391,9 @@ func executeBuildPass(plan *BuildPlan, _ string, installAllTargets bool, cfg *Co
 			if !canBuild {
 				remainingAfterPass = append(remainingAfterPass, pkgName)
 				continue
+			}
+			if missingDeps, ok := plan.PostRebuilds[pkgName]; ok && postRebuildDepsAvailable(missingDeps) {
+				delete(plan.PostRebuilds, pkgName)
 			}
 			totalInPlan := len(plan.Order) // Get the original total count
 			*progressCount++
