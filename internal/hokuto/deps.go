@@ -2342,6 +2342,10 @@ func installAvailableBinaryPackageOnly(pkgName string, cfg *Config, noRemote boo
 }
 
 func installAvailableBinaryPackageOnlyWithOptions(pkgName string, cfg *Config, noRemote bool, quiet bool) (bool, error) {
+	return installAvailableBinaryPackageWithRuntimeDepsOption(pkgName, cfg, noRemote, quiet, false)
+}
+
+func installAvailableBinaryPackageWithRuntimeDepsOption(pkgName string, cfg *Config, noRemote bool, quiet bool, installRuntimeDeps bool) (bool, error) {
 	if isPackageInstalled(pkgName) {
 		return false, nil
 	}
@@ -2351,8 +2355,9 @@ func installAvailableBinaryPackageOnlyWithOptions(pkgName string, cfg *Config, n
 		return false, err
 	}
 
-	suppressRuntimeDependencyAutoInstall.Add(1)
-	defer suppressRuntimeDependencyAutoInstall.Add(-1)
+	if !installRuntimeDeps {
+		defer suppressRuntimeDependencyAutoInstallScope()()
+	}
 	return installBinaryTarballWithOptions(tarballPath, installName, cfg, quiet)
 }
 
@@ -2419,7 +2424,7 @@ func ensureDevelPackagesInstalledWithOptions(cfg *Config, includeMultilib bool, 
 	defer deactivateProgress()
 	for _, pkgName := range missing {
 		describeDependencyInstallProgress(bar, pkgName)
-		installed, err := installAvailableBinaryPackageOnlyWithOptions(pkgName, cfg, noRemote, quiet)
+		installed, err := installAvailableBinaryPackageWithRuntimeDepsOption(pkgName, cfg, noRemote, quiet, true)
 		if err != nil {
 			return newlyInstalled, err
 		}
