@@ -3129,6 +3129,7 @@ func handleBuildCommand(args []string, cfg *Config) (err error) {
 	var crossArch = buildCmd.String("cross", "", "Enable cross-compilation for target architecture (e.g., arm64)")
 	var noDeps = buildCmd.Bool("no-deps", false, "Skip dependency checking and build only the specified package(s)")
 	var noDevel = buildCmd.Bool("no-devel", false, "Skip automatic base-devel dependency installation")
+	var noCleanup = buildCmd.Bool("no-cleanup", false, "Keep temporary build dependencies installed after the build")
 	var noRemote = buildCmd.Bool("no-remote", false, "Do not use the remote binary mirror for build dependency resolution or installs")
 	var promptBinaryDeps = buildCmd.Bool("prompt", false, "Prompt before installing available binary build dependencies.")
 	var wgetNoCheckCert = buildCmd.Bool("wget-no-check-certificate", false, "Pass --no-check-certificate to wget fallback for source downloads")
@@ -3510,7 +3511,7 @@ func handleBuildCommand(args []string, cfg *Config) (err error) {
 		retainedBuildDeps[getOutputPackageName(pkgName, cfg)] = true
 	}
 	cleanupTemporaryBuildDeps := func() {
-		if *bootstrap || *noDevel || !buildWorkStarted {
+		if *noCleanup || *bootstrap || *noDevel || !buildWorkStarted {
 			return
 		}
 		cleanupAfterFailure := err != nil
