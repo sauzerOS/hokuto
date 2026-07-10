@@ -333,6 +333,23 @@ func installMissingPackageRuntimeDependencies(pkgName string, cfg *Config, logge
 			continue
 		}
 
+		if binaryOnlyRuntimeDependencyInstall.Load() > 0 {
+			installed, err := installRuntimeDependencyBinaryOnly(depName, cfg, true, nil, quiet)
+			if err != nil {
+				return fmt.Errorf("failed to install binary runtime dependency %s for %s: %w", depName, pkgName, err)
+			}
+			if !installed {
+				debugf("Skipping runtime dependency %s for %s during build: no binary available\n", depName, pkgName)
+			} else if !quiet {
+				if logger == nil {
+					logger = os.Stdout
+				}
+				fmt.Fprint(logger, colArrow.Sprint("-> "))
+				fmt.Fprintf(logger, "%s", colSuccess.Sprint("Installed binary runtime dependency: "))
+				fmt.Fprintln(logger, colNote.Sprint(depName))
+			}
+			continue
+		}
 		if !quiet {
 			if logger == nil {
 				logger = os.Stdout

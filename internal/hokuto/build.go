@@ -3167,6 +3167,7 @@ func handleBuildCommand(args []string, cfg *Config) (err error) {
 	if *noDeps {
 		defer suppressRuntimeDependencyAutoInstallScope()()
 	}
+	defer binaryOnlyRuntimeDependencyInstallScope()()
 	endBuildSession := registerHokutoBuildSession()
 	defer endBuildSession()
 	defer func() {

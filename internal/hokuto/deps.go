@@ -27,10 +27,23 @@ var runtimeDependencyInstallInProgress sync.Map
 
 var suppressRuntimeDependencyAutoInstall atomic.Int32
 
+// binaryOnlyRuntimeDependencyInstall is enabled while handling a build command.
+// Runtime dependencies are useful when a freshly built package is installed, but
+// they must never expand the source build graph. In this mode we install an
+// available binary and otherwise leave the runtime dependency unresolved.
+var binaryOnlyRuntimeDependencyInstall atomic.Int32
+
 func suppressRuntimeDependencyAutoInstallScope() func() {
 	suppressRuntimeDependencyAutoInstall.Add(1)
 	return func() {
 		suppressRuntimeDependencyAutoInstall.Add(-1)
+	}
+}
+
+func binaryOnlyRuntimeDependencyInstallScope() func() {
+	binaryOnlyRuntimeDependencyInstall.Add(1)
+	return func() {
+		binaryOnlyRuntimeDependencyInstall.Add(-1)
 	}
 }
 
@@ -2085,6 +2098,16 @@ func ensureBinaryRuntimeDependenciesInstalledWithOptions(pkgName string, cfg *Co
 		if findInstalledSatisfying(depName, dep.Op, dep.Version) != "" {
 			continue
 		}
+		if binaryOnlyRuntimeDependencyInstall.Load() > 0 {
+			installed, err := installRuntimeDependencyBinaryOnly(depName, cfg, noRemote, seen, quiet)
+			if err != nil {
+				return fmt.Errorf("failed to install binary runtime dependency %s for %s: %w", depName, pkgName, err)
+			}
+			if !installed {
+				debugf("Skipping runtime dependency %s for %s during build: no binary available\n", depName, pkgName)
+			}
+			continue
+		}
 
 		if quiet {
 			describeActiveDependencyInstallProgress(depName)
@@ -2100,6 +2123,34 @@ func ensureBinaryRuntimeDependenciesInstalledWithOptions(pkgName string, cfg *Co
 		}
 	}
 	return nil
+}
+
+// installRuntimeDependencyBinaryOnly installs pkgName only when a binary is
+// available. It deliberately has no source-build fallback. Runtime dependencies
+// of that binary are handled recursively under the same policy.
+func installRuntimeDependencyBinaryOnly(pkgName string, cfg *Config, noRemote bool, seen map[string]bool, quiet bool) (bool, error) {
+	if isPackageInstalled(pkgName) {
+		return false, nil
+	}
+	if seen == nil {
+		seen = make(map[string]bool)
+	}
+	if seen[pkgName] {
+		return false, nil
+	}
+
+	installName, tarballPath, ok, err := availableBinaryPackageTarball(pkgName, cfg, noRemote)
+	if err != nil || !ok {
+		return false, err
+	}
+	if err := ensureBinaryRuntimeDependenciesInstalledWithOptions(installName, cfg, noRemote, seen, quiet); err != nil {
+		return false, err
+	}
+
+	// pkgInstall also scans the installed depends file. Suppress that second pass;
+	// the recursive binary-only pass above has already handled it.
+	defer suppressRuntimeDependencyAutoInstallScope()()
+	return installBinaryTarballWithOptions(tarballPath, installName, cfg, quiet)
 }
 
 func dependencyInstallLogger(quiet bool) (io.Writer, bool) {
