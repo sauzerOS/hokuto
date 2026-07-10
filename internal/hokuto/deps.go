@@ -185,6 +185,76 @@ func splitVersionedPackageName(pkgName string) (baseName, major string, ok bool)
 	return pkgName[:lastDash], major, true
 }
 
+// findSourcePackageSatisfying resolves a constrained logical package name to a
+// source package in the repositories. Besides the exact name, it recognizes the
+// pkg-MAJOR layout used for parallel-installable ABI versions (for example,
+// webrtc-audio-processing-1 satisfying webrtc-audio-processing<2.0).
+func findSourcePackageSatisfying(name, op, refVersion string) string {
+	if op == "" || refVersion == "" {
+		return ""
+	}
+
+	type sourceCandidate struct {
+		name    string
+		version string
+	}
+	seen := make(map[string]bool)
+	var candidates []sourceCandidate
+	consider := func(candidate, pkgDir string) {
+		if candidate == "" || seen[candidate] {
+			return
+		}
+		if candidate != name {
+			base, _, ok := splitVersionedPackageName(candidate)
+			if !ok || base != name {
+				return
+			}
+		}
+		data, err := os.ReadFile(filepath.Join(pkgDir, "version"))
+		if err != nil {
+			return
+		}
+		fields := strings.Fields(string(data))
+		if len(fields) == 0 || !versionSatisfies(fields[0], op, refVersion) {
+			return
+		}
+		seen[candidate] = true
+		candidates = append(candidates, sourceCandidate{name: candidate, version: fields[0]})
+	}
+
+	for pkgName, pkgDir := range versionedPkgDirs {
+		consider(pkgName, pkgDir)
+	}
+	for _, repoPath := range filepath.SplitList(repoPaths) {
+		repoPath = strings.TrimSpace(repoPath)
+		if repoPath == "" {
+			continue
+		}
+		consider(name, filepath.Join(repoPath, name))
+		entries, err := os.ReadDir(repoPath)
+		if err != nil {
+			continue
+		}
+		prefix := name + "-"
+		for _, entry := range entries {
+			if entry.IsDir() && strings.HasPrefix(entry.Name(), prefix) {
+				consider(entry.Name(), filepath.Join(repoPath, entry.Name()))
+			}
+		}
+	}
+
+	best := ""
+	bestVersion := ""
+	for _, candidate := range candidates {
+		if best == "" || compareVersions(candidate.version, bestVersion) > 0 ||
+			(compareVersions(candidate.version, bestVersion) == 0 && candidate.name == name) {
+			best = candidate.name
+			bestVersion = candidate.version
+		}
+	}
+	return best
+}
+
 func revisionCompare(a, b string) int {
 	ai, aerr := strconv.Atoi(a)
 	bi, berr := strconv.Atoi(b)
@@ -767,6 +837,8 @@ func resolveMissingDeps(pkgName string, processed map[string]bool, missing *[]st
 			if satisfyingPkg != "" {
 				// Great, a satisfying version is already installed (maybe it's depName-MAJOR)
 				depName = satisfyingPkg
+			} else if satisfyingSource := findSourcePackageSatisfying(depName, dep.Op, dep.Version); satisfyingSource != "" {
+				depName = satisfyingSource
 			} else {
 				// 2. Not installed or doesn't satisfy. Check the current repository version.
 				repoVer, _, err := getRepoVersion2(depName)
@@ -1014,15 +1086,25 @@ func cachedAlternativeDep(dep DepSpec) (string, bool) {
 }
 
 func resolvedBuildDependencyCandidates(dep DepSpec, yes bool, cfg *Config) ([]string, error) {
-	if len(dep.Alternatives) == 0 {
-		return []string{dep.Name}, nil
+	resolved := dep.Name
+	if len(dep.Alternatives) > 0 {
+		if cached, ok := cachedAlternativeDep(dep); ok {
+			resolved = cached
+		} else {
+			var err error
+			resolved, err = resolveAlternativeDep(dep, yes, cfg)
+			if err != nil {
+				return nil, err
+			}
+		}
 	}
-	if cached, ok := cachedAlternativeDep(dep); ok {
-		return []string{cached}, nil
-	}
-	resolved, err := resolveAlternativeDep(dep, yes, cfg)
-	if err != nil {
-		return nil, err
+	if dep.Op != "" && dep.Version != "" {
+		if installed := findInstalledSatisfying(resolved, dep.Op, dep.Version); installed != "" {
+			return []string{installed}, nil
+		}
+		if source := findSourcePackageSatisfying(resolved, dep.Op, dep.Version); source != "" {
+			return []string{source}, nil
+		}
 	}
 	return []string{resolved}, nil
 }
@@ -1258,6 +1340,8 @@ func resolveBuildPlan(targetPackages []string, userRequestedPackages map[string]
 				if satisfyingPkg != "" {
 					// Great, a satisfying version is already installed (maybe it's depName-MAJOR)
 					depName = satisfyingPkg
+				} else if satisfyingSource := findSourcePackageSatisfying(depName, dep.Op, dep.Version); satisfyingSource != "" {
+					depName = satisfyingSource
 				} else {
 					// 2. Not installed. Check the current repository version.
 					// We now support all standard operators (==, <=, >=, <, >)
