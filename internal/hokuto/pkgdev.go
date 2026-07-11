@@ -1030,8 +1030,6 @@ func HandleAutoBumpCommand(cfg *Config, autoBuild bool, assumeYes bool) error {
 			pkgName = "libaom"
 		case "intel-microcode":
 			pkgName = "intel-ucode"
-		case "gstreamer":
-			pkgName = "gst"
 		case "openal-soft":
 			pkgName = "openal"
 		case "maturin":
@@ -1062,6 +1060,16 @@ func HandleAutoBumpCommand(cfg *Config, autoBuild bool, assumeYes bool) error {
 			pkgName = "libtiff"
 		case "catch":
 			pkgName = "catch2"
+		case "xrdb":
+			pkgName = "xorg-xrdb"
+		case "xset":
+			pkgName	= "xorg-xset"
+		case "xsetroot":
+			pgkName = "xorg-xsetroot"
+		case "tcl-lang":
+			pkgName = "tcl"
+		case "adventuregamestudio":
+			pkgName = "ags"
 		}
 
 		var newestVer string
