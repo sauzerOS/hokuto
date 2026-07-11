@@ -374,9 +374,13 @@ func findPackageDir(pkgName string) (string, error) {
 }
 
 func findInstalledSatisfying(name, op, refVersion string) string {
+	return findInstalledSatisfyingIn(Installed, name, op, refVersion)
+}
+
+func findInstalledSatisfyingIn(installedRoot, name, op, refVersion string) string {
 	// 1. Check the exact package name
-	if checkPackageExactMatch(name) {
-		ver, ok := getInstalledVersion(name)
+	if info, err := os.Stat(filepath.Join(installedRoot, name)); err == nil && info.IsDir() {
+		ver, ok := getInstalledVersionFromRoot(installedRoot, name)
 		if ok && (op == "" || refVersion == "" || versionSatisfies(ver, op, refVersion)) {
 			return name
 		}
@@ -389,7 +393,7 @@ func findInstalledSatisfying(name, op, refVersion string) string {
 		return ""
 	}
 
-	entries, err := os.ReadDir(Installed)
+	entries, err := os.ReadDir(installedRoot)
 	if err != nil {
 		return ""
 	}
@@ -404,7 +408,7 @@ func findInstalledSatisfying(name, op, refVersion string) string {
 			// Check if the suffix is a major version (integer)
 			suffix := strings.TrimPrefix(pkgName, prefix)
 			if _, err := strconv.Atoi(suffix); err == nil {
-				ver, ok := getInstalledVersion(pkgName)
+				ver, ok := getInstalledVersionFromRoot(installedRoot, pkgName)
 				if ok && versionSatisfies(ver, op, refVersion) {
 					return pkgName
 				}
@@ -413,6 +417,18 @@ func findInstalledSatisfying(name, op, refVersion string) string {
 	}
 
 	return ""
+}
+
+func getInstalledVersionFromRoot(installedRoot, pkgName string) (string, bool) {
+	data, err := os.ReadFile(filepath.Join(installedRoot, pkgName, "version"))
+	if err != nil {
+		return "", false
+	}
+	fields := strings.Fields(string(data))
+	if len(fields) == 0 {
+		return "", false
+	}
+	return fields[0], true
 }
 
 func findInstalledPackageVariant(name string) string {

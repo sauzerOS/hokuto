@@ -662,6 +662,7 @@ func isBootstrapOnlyPackageName(name string) bool {
 func generateDepends(pkgName, pkgDir, outputDir, rootDir string, execCtx *Executor, bootstrap bool) error {
 	installedDir := filepath.Join(outputDir, "var", "db", "hokuto", "installed", pkgName)
 	dependsFile := filepath.Join(installedDir, "depends")
+	runtimeDBRoot := filepath.Join(rootDir, "var", "db", "hokuto", "installed")
 	libDepIgnores := loadLibDepIgnores(findPackageMetadataFile(pkgDir, pkgName, "libdeps.ignore"))
 
 	// Track library dependencies (auto-detected, just package names)
@@ -713,7 +714,7 @@ func generateDepends(pkgName, pkgDir, outputDir, rootDir string, execCtx *Execut
 		}
 		if len(libdeps) > 0 {
 			// Scan all installed packages for matching libs
-			dbRoot := filepath.Join(rootDir, "var", "db", "hokuto", "installed")
+			dbRoot := runtimeDBRoot
 
 			entries, err := os.ReadDir(dbRoot)
 			if err != nil {
@@ -814,6 +815,17 @@ func generateDepends(pkgName, pkgDir, outputDir, rootDir string, execCtx *Execut
 
 					if runtimeOnly {
 						line = formatDepLine(name, op, ver)
+					}
+
+					// Constrained dependencies may resolve to a parallel-installable
+					// ABI package (foo-1 satisfying foo<2). Store that real runtime
+					// identity so it deduplicates an auto-detected library owner and
+					// does not later request the repository's current foo release.
+					if op != "" && ver != "" {
+						if resolved := findInstalledSatisfyingIn(runtimeDBRoot, name, op, ver); resolved != "" && resolved != name {
+							name = resolved
+							line = resolved
+						}
 					}
 
 					// Store the full line to preserve version constraints
