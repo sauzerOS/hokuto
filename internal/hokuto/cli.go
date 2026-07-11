@@ -1151,6 +1151,7 @@ func Main() {
 		uninstallCmd := flag.NewFlagSet("uninstall", flag.ExitOnError)
 		var force = uninstallCmd.Bool("f", false, "Force uninstallation, ignoring dependency checks.")
 		var yes = uninstallCmd.Bool("y", false, "Assume 'yes' to all prompts.")
+		var list = uninstallCmd.Bool("list", false, "Select installed packages to uninstall in an interactive interface.")
 		// Also support long flags for consistency
 		var forceLong = uninstallCmd.Bool("force", false, "Force uninstallation, ignoring dependency checks.")
 		var yesLong = uninstallCmd.Bool("yes", false, "Assume 'yes' to all prompts.")
@@ -1161,6 +1162,33 @@ func Main() {
 		}
 
 		packagesToUninstall := uninstallCmd.Args()
+		effectiveForce := *force || *forceLong
+		effectiveYes := *yes || *yesLong
+		if *list {
+			if len(packagesToUninstall) > 0 {
+				fmt.Fprintln(os.Stderr, "Error: --list cannot be combined with package arguments.")
+				os.Exit(1)
+			}
+			entries, err := installedUninstallListEntries()
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "Error listing installed packages:", err)
+				os.Exit(1)
+			}
+			selected, selectedForce, confirmed, err := selectPackagesToUninstall(entries, effectiveForce)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "Error selecting packages:", err)
+				os.Exit(1)
+			}
+			if !confirmed {
+				colNote.Println("Uninstall canceled by user.")
+				break
+			}
+			packagesToUninstall = selected
+			effectiveForce = selectedForce
+			// Pressing 'u' confirms the selected transaction; do not prompt once
+			// more for every package after leaving the interface.
+			effectiveYes = true
+		}
 
 		if len(packagesToUninstall) == 0 {
 			fmt.Println("Usage: hokuto uninstall [options] <pkgname> [pkgname...]")
@@ -1169,15 +1197,17 @@ func Main() {
 			os.Exit(1)
 		}
 
-		effectiveForce := *force || *forceLong
-		effectiveYes := *yes || *yesLong
-
 		// critical section for the entire operation
 		isCriticalAtomic.Store(1)
 		defer isCriticalAtomic.Store(0)
+		packagesToUninstall = orderPackagesForUninstall(packagesToUninstall)
 
 		allSucceeded := true
 		removedMetaPackage := false
+		removingSet := make(map[string]bool, len(packagesToUninstall))
+		for _, pkgName := range packagesToUninstall {
+			removingSet[pkgName] = true
+		}
 		for _, pkgName := range packagesToUninstall {
 			colArrow.Print("-> ")
 			colSuccess.Printf("Attempting to uninstall package: %s\n", pkgName)
@@ -1196,9 +1226,14 @@ func Main() {
 				continue
 			}
 
-			if err := pkgUninstall(pkgName, cfg, RootExec, effectiveForce, effectiveYes, nil); err != nil {
+			uninstallErr := pkgUninstallWithRemovalSet(pkgName, cfg, RootExec, effectiveForce, effectiveYes, nil, removingSet)
+			// Only packages still pending remain exempt from reverse-dependency
+			// checks. If this removal failed, later packages must see it as an
+			// installed dependent and remain protected in normal mode.
+			delete(removingSet, pkgName)
+			if uninstallErr != nil {
 				colArrow.Print("-> ")
-				color.Light.Printf("Error uninstalling %s: %v\n", pkgName, err)
+				color.Light.Printf("Error uninstalling %s: %v\n", pkgName, uninstallErr)
 				allSucceeded = false
 			} else {
 				colArrow.Print("-> ")
