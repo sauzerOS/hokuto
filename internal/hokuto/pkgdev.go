@@ -1065,7 +1065,7 @@ func HandleAutoBumpCommand(cfg *Config, autoBuild bool, assumeYes bool) error {
 		case "xset":
 			pkgName	= "xorg-xset"
 		case "xsetroot":
-			pgkName = "xorg-xsetroot"
+			pkgName = "xorg-xsetroot"
 		case "tcl-lang":
 			pkgName = "tcl"
 		case "adventuregamestudio":
