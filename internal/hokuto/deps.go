@@ -2289,6 +2289,21 @@ func clearDependencyInstallProgress(bar *progressbar.ProgressBar) {
 	}
 }
 
+// prepareDependencyProgressLogOutput moves ordinary log output off an active
+// progress-bar line. The bar will be redrawn by the next dependency update.
+func prepareDependencyProgressLogOutput() {
+	dependencyInstallProgress.Lock()
+	var bar *progressbar.ProgressBar
+	if len(dependencyInstallProgress.bars) > 0 {
+		bar = dependencyInstallProgress.bars[len(dependencyInstallProgress.bars)-1]
+	}
+	dependencyInstallProgress.Unlock()
+	if bar != nil {
+		_ = bar.Clear()
+		fmt.Fprintln(os.Stderr)
+	}
+}
+
 func describeActiveDependencyInstallProgress(pkgName string) {
 	dependencyInstallProgress.Lock()
 	var bar *progressbar.ProgressBar

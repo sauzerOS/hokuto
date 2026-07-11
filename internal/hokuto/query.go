@@ -194,6 +194,7 @@ func FetchRemoteIndex(cfg *Config) ([]RepoEntry, error) {
 	// 1. Try public Binary Mirror first (high priority for most users)
 	if BinaryMirror != "" {
 		mirrorAttempted = true
+		prepareDependencyProgressLogOutput()
 		colArrow.Print("-> ")
 		colSuccess.Println("Fetching remote index via Binary Mirror")
 		url := fmt.Sprintf("%s/repo-index.json", BinaryMirror)
@@ -222,6 +223,7 @@ func FetchRemoteIndex(cfg *Config) ([]RepoEntry, error) {
 	if len(data) == 0 && !mirrorAttempted && hasCreds {
 		r2, r2Err := NewR2Client(cfg)
 		if r2Err == nil {
+			prepareDependencyProgressLogOutput()
 			colArrow.Print("-> ")
 			colSuccess.Printf("Fetching remote index from %s (R2 fallback)\n", getMirrorDisplayName(cfg))
 			data, err = r2.DownloadFile(ctx, "repo-index.json")

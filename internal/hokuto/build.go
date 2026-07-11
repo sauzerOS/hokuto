@@ -498,16 +498,43 @@ func useAvailableBuildDependencyBinary(prompt bool, format string, args ...any) 
 	return askForConfirmation(colInfo, format, args...)
 }
 
+func packageHasSelfBuildDependency(pkgName string, cfg *Config) bool {
+	pkgDir, err := findPackageDir(pkgName)
+	if err != nil {
+		return false
+	}
+	deps, err := parseDependsFile(pkgDir)
+	if err != nil {
+		return false
+	}
+	for _, dep := range deps {
+		if !dep.Make || !activeBuildDependency(dep, cfg, false) {
+			continue
+		}
+		if dep.Name == pkgName {
+			return true
+		}
+		for _, alt := range dep.Alternatives {
+			if alt == pkgName {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func installAvailableBinaryBuildDeps(plan *BuildPlan, userRequested, declined map[string]bool, cfg *Config, addTemporaryBuildDep func(string), noRemote bool, prompt bool, quiet bool) (bool, error) {
 	installedAny := false
 	type binaryBuildDep struct {
 		name          string
 		outputPkgName string
 		tarballPath   string
+		selfBootstrap bool
 	}
 	var candidates []binaryBuildDep
 	for _, pkgName := range plan.Order {
-		if userRequested[pkgName] || declined[pkgName] || plan.RebuildPackages[pkgName] || isPackageInstalled(pkgName) {
+		selfBuildDependency := userRequested[pkgName] && packageHasSelfBuildDependency(pkgName, cfg)
+		if (userRequested[pkgName] && !selfBuildDependency) || declined[pkgName] || plan.RebuildPackages[pkgName] || isPackageInstalled(pkgName) {
 			continue
 		}
 
@@ -520,6 +547,7 @@ func installAvailableBinaryBuildDeps(plan *BuildPlan, userRequested, declined ma
 			name:          pkgName,
 			outputPkgName: outputPkgName,
 			tarballPath:   tarballPath,
+			selfBootstrap: selfBuildDependency,
 		})
 	}
 
@@ -543,7 +571,9 @@ func installAvailableBinaryBuildDeps(plan *BuildPlan, userRequested, declined ma
 		}
 		isCriticalAtomic.Store(0)
 		advanceDependencyInstallProgress(bar)
-		addTemporaryBuildDep(cand.outputPkgName)
+		if !cand.selfBootstrap {
+			addTemporaryBuildDep(cand.outputPkgName)
+		}
 		declined[cand.name] = true
 		installedAny = true
 	}
