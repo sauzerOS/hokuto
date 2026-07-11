@@ -329,26 +329,45 @@ func pkgUninstallWithRemovalSet(pkgName string, cfg *Config, execCtx *Executor, 
 			fcPrintf(logger, colArrow, "-> ")
 			fcPrintf(logger, colSuccess, "Removed %d files natively\n", removedCount)
 		} else {
-			// Use rm with multiple files for better performance
-			rmCmd := exec.Command("rm", "-f")
-			rmCmd.Args = append(rmCmd.Args, filesToRemove...)
+			// Keep argument lists comfortably below ARG_MAX. rm attempts every path
+			// even when one removal fails, so inspect only paths left behind instead
+			// of spawning a privileged process for every file.
+			const removalBatchSize = 512
+			const removalBatchBytes = 128 * 1024
+			removedCount := 0
+			for start := 0; start < len(filesToRemove); {
+				end, argBytes := start, 0
+				for end < len(filesToRemove) && end-start < removalBatchSize {
+					nextBytes := len(filesToRemove[end]) + 1
+					if end > start && argBytes+nextBytes > removalBatchBytes {
+						break
+					}
+					argBytes += nextBytes
+					end++
+				}
+				batch := filesToRemove[start:end]
+				rmCmd := exec.Command("rm", "-f", "--")
+				rmCmd.Args = append(rmCmd.Args, batch...)
+				batchErr := execCtx.Run(rmCmd)
+				if batchErr == nil {
+					removedCount += len(batch)
+					continue
+				}
 
-			if err := execCtx.Run(rmCmd); err != nil {
-				// If batch removal fails, try individual removals
-				colArrow.Print("-> ")
-				colSuccess.Println("Batch removal failed, trying individual removals")
-				for _, file := range filesToRemove {
-					rmCmd := exec.Command("rm", "-f", file)
-					if err := execCtx.Run(rmCmd); err != nil {
-						failed = append(failed, fmt.Sprintf("%s: %v", file, err))
+				debugf("Batch removal returned an error; checking %d paths that may remain: %v\n", len(batch), batchErr)
+				for _, file := range batch {
+					if _, statErr := os.Lstat(file); os.IsNotExist(statErr) {
+						removedCount++
+					} else if statErr != nil {
+						failed = append(failed, fmt.Sprintf("%s: removal failed (%v); unable to inspect path: %v", file, batchErr, statErr))
 					} else {
-						debugf("Removed %s\n", file)
+						failed = append(failed, fmt.Sprintf("%s: %v", file, batchErr))
 					}
 				}
-			} else {
-				fcPrintf(logger, colArrow, "-> ")
-				fcPrintf(logger, colSuccess, "Removed %d files\n", len(filesToRemove))
+				start = end
 			}
+			fcPrintf(logger, colArrow, "-> ")
+			fcPrintf(logger, colSuccess, "Removed %d files\n", removedCount)
 		}
 	}
 
