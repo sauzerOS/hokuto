@@ -830,7 +830,10 @@ func checkForUpgrades(_ context.Context, cfg *Config, maxJobs int, yes bool) err
 	// Fetch remote index once for all checks (pre-check, sequential, parallel)
 	var remoteIndex []RepoEntry
 	if BinaryMirror != "" {
-		if idx, err := FetchRemoteIndex(cfg); err == nil {
+		// Use the shared cache here because build-dependency fallback lookups also
+		// call GetCachedRemoteIndex. A direct fetch left the cache uninitialized,
+		// causing a second fetch to print in the middle of the progress bar.
+		if idx, err := GetCachedRemoteIndex(cfg); err == nil {
 			remoteIndex = idx
 		}
 	}
