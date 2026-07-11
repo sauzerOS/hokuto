@@ -118,6 +118,122 @@ func currentBinaryOutputAvailable(sourcePkg, outputPkg, version, revision string
 	return false
 }
 
+type repositoryBinaryStatus struct {
+	Missing         []string
+	PreviousVersion string
+	PreviousRev     string
+}
+
+func newerBinaryRelease(version, revision, bestVersion, bestRevision string) bool {
+	return bestVersion == "" || compareVersions(version, bestVersion) > 0 ||
+		(compareVersions(version, bestVersion) == 0 && revisionCompare(revision, bestRevision) > 0)
+}
+
+func newestAvailableBinaryRelease(sourcePkg string, outputPkgs []string, cfg *Config, remoteIndex []RepoEntry) (string, string) {
+	arch := GetSystemArchForPackage(cfg, sourcePkg)
+	outputs := make(map[string]bool, len(outputPkgs))
+	variants := make(map[string]bool)
+	for _, outputPkg := range outputPkgs {
+		outputs[outputPkg] = true
+		for _, variant := range currentBinaryOutputVariants(sourcePkg, outputPkg, cfg) {
+			variants[variant] = true
+		}
+	}
+
+	bestVersion, bestRevision := "", ""
+	for _, entry := range remoteIndex {
+		if entry.Type == "meta" || !outputs[entry.Name] || entry.Arch != arch || !variants[entry.Variant] {
+			continue
+		}
+		if newerBinaryRelease(entry.Version, entry.Revision, bestVersion, bestRevision) {
+			bestVersion, bestRevision = entry.Version, entry.Revision
+		}
+	}
+
+	return bestVersion, bestRevision
+}
+
+func cachedBinaryIndex() []RepoEntry {
+	entries, err := os.ReadDir(BinDir)
+	if err != nil {
+		return nil
+	}
+	index := make([]RepoEntry, 0, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".tar.zst") {
+			continue
+		}
+		metadata, _, err := scanTarballMetadata(filepath.Join(BinDir, entry.Name()))
+		if err != nil || metadata["name"] == "" || metadata["version"] == "" {
+			continue
+		}
+		revision := metadata["revision"]
+		if revision == "" {
+			revision = "1"
+		}
+		index = append(index, RepoEntry{
+			Name: metadata["name"], Version: metadata["version"], Revision: revision,
+			Arch:    metadata["arch"],
+			Variant: IdentifyVariant(metadata["name"], metadata["generic"] == "1", metadata["multilib"] == "1"),
+		})
+	}
+	return index
+}
+
+func repositoryBinaryStatuses(cfg *Config, remoteIndex []RepoEntry) (map[string]repositoryBinaryStatus, error) {
+	missing, err := missingRepositoryBinaryPackages(cfg, remoteIndex)
+	if err != nil {
+		return nil, err
+	}
+	statuses := make(map[string]repositoryBinaryStatus, len(missing))
+	availableIndex := append([]RepoEntry(nil), remoteIndex...)
+	availableIndex = append(availableIndex, cachedBinaryIndex()...)
+	for sourcePkg, missingOutputs := range missing {
+		pkgDir, err := findPackageMetadataDir(sourcePkg)
+		if err != nil {
+			return nil, err
+		}
+		outputs := []string{getOutputPackageName(sourcePkg, cfg)}
+		outputs = append(outputs, splitPackageNamesFromDir(pkgDir)...)
+		version, revision := newestAvailableBinaryRelease(sourcePkg, outputs, cfg, availableIndex)
+		statuses[sourcePkg] = repositoryBinaryStatus{Missing: missingOutputs, PreviousVersion: version, PreviousRev: revision}
+	}
+	return statuses, nil
+}
+
+func askMissingBinaryScope() (bool, bool) {
+	interactiveMu.Lock()
+	defer interactiveMu.Unlock()
+	scanner := bufio.NewScanner(os.Stdin)
+	for {
+		colArrow.Print("-> ")
+		colNote.Print("Check (a)ll repository packages or only packages with an existing binary? [E/a]: ")
+		if !scanner.Scan() {
+			return false, false
+		}
+		switch strings.ToLower(strings.TrimSpace(scanner.Text())) {
+		case "", "e", "existing":
+			return false, true
+		case "a", "all":
+			return true, true
+		default:
+			colWarn.Println("Please enter 'e' for existing binaries or 'a' for all packages.")
+		}
+	}
+}
+
+func binaryVersionTransition(status repositoryBinaryStatus, currentVersion, currentRevision string) string {
+	if status.PreviousVersion == "" {
+		return ""
+	}
+	oldRelease, newRelease := status.PreviousVersion, currentVersion
+	if status.PreviousVersion == currentVersion && status.PreviousRev != currentRevision {
+		oldRelease += "-" + status.PreviousRev
+		newRelease += "-" + currentRevision
+	}
+	return oldRelease + " -> " + newRelease
+}
+
 func missingRepositoryBinaryPackages(cfg *Config, remoteIndex []RepoEntry) (map[string][]string, error) {
 	missing := make(map[string][]string)
 	seen := make(map[string]bool)
@@ -168,30 +284,57 @@ func buildMissingRepositoryBinaries(cfg *Config, buildArgs []string, yes bool) e
 
 	colArrow.Print("-> ")
 	colSuccess.Println("Checking repository packages for missing current binaries")
-	missing, err := missingRepositoryBinaryPackages(cfg, remoteIndex)
+	statuses, err := repositoryBinaryStatuses(cfg, remoteIndex)
 	if err != nil {
 		return err
 	}
-	if len(missing) == 0 {
+	if len(statuses) == 0 {
 		colArrow.Print("-> ")
 		colSuccess.Println("All current repository packages have an available binary.")
 		return nil
 	}
 
-	packages := make([]string, 0, len(missing))
-	for pkgName := range missing {
+	includeNeverBuilt := false
+	if !yes {
+		var ok bool
+		includeNeverBuilt, ok = askMissingBinaryScope()
+		if !ok {
+			colNote.Println("Missing binary check canceled by user.")
+			return nil
+		}
+	}
+
+	packages := make([]string, 0, len(statuses))
+	for pkgName, status := range statuses {
+		if !includeNeverBuilt && status.PreviousVersion == "" {
+			continue
+		}
 		packages = append(packages, pkgName)
 	}
 	sort.Strings(packages)
+	if len(packages) == 0 {
+		colArrow.Print("-> ")
+		colSuccess.Println("All packages with existing binaries are current.")
+		return nil
+	}
 	colArrow.Print("-> ")
 	colWarn.Printf("Found %d source package(s) with missing binaries:\n", len(packages))
 	for i, pkgName := range packages {
-		sort.Strings(missing[pkgName])
+		status := statuses[pkgName]
+		sort.Strings(status.Missing)
 		colArrow.Print("-> ")
 		fmt.Printf("%2d) ", i+1)
 		color.Bold.Printf("%s", pkgName)
 		fmt.Print(": ")
-		colNote.Printf("%s\n", strings.Join(missing[pkgName], ", "))
+		currentVersion, currentRevision, _ := getRepoVersion2(pkgName)
+		if transition := binaryVersionTransition(status, currentVersion, currentRevision); transition != "" {
+			colNote.Printf("%s", transition)
+			fmt.Print(" (")
+			colNote.Printf("%s", strings.Join(status.Missing, ", "))
+			fmt.Println(")")
+		} else {
+			colNote.Printf("%s\n", strings.Join(status.Missing, ", "))
+		}
 	}
 
 	var selected []string
