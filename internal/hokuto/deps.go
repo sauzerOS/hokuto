@@ -993,6 +993,12 @@ func resolveAlternativeDep(dep DepSpec, yes bool, cfg *Config) (string, error) {
 			available = append(available, sat)
 			continue
 		}
+		// A split output may have no standalone source directory while still
+		// being directly installable from the local binary cache.
+		if findCachedBinaryTarball(altName, cfg) != "" {
+			available = append(available, altName)
+			continue
+		}
 		// Check if can be found in repos
 		if _, err := findPackageMetadataDir(altName); err == nil {
 			available = append(available, altName)
