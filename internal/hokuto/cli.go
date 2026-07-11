@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -1232,6 +1233,7 @@ func Main() {
 
 		var verboseLong = updateCmd.Bool("verbose", false, "Enable verbose output.")
 		var remote = updateCmd.Bool("remote", false, "Check for updates from remote binary mirror only.")
+		var buildMissingBinaries = updateCmd.Bool("build-missing-binaries", false, "Build current repository packages missing from the binary cache and remote mirror.")
 		var yes = updateCmd.Bool("y", false, "Assume 'yes' to all prompts.")
 		var yesLong = updateCmd.Bool("yes", false, "Assume 'yes' to all prompts.")
 
@@ -1250,6 +1252,10 @@ func Main() {
 		}
 		Verbose = *verbose || *verboseLong
 
+		if *remote && *buildMissingBinaries {
+			fmt.Fprintln(os.Stderr, "Error: --remote and --build-missing-binaries cannot be used together.")
+			os.Exit(1)
+		}
 		if *remote {
 			if err := checkForRemoteUpgrades(ctx, cfg); err != nil {
 				fmt.Fprintf(os.Stderr, "Remote upgrade process failed: %v\n", err)
@@ -1271,6 +1277,22 @@ func Main() {
 		}
 
 		effectiveYes := *yes || *yesLong
+		if *buildMissingBinaries {
+			buildArgs := []string{"--no-install", "--parallel", strconv.Itoa(maxJobs)}
+			if *superidleBuild || *superidleBuildLong {
+				buildArgs = append(buildArgs, "--superidle")
+			} else if *idleBuild || *idleBuildLong {
+				buildArgs = append(buildArgs, "--idle")
+			}
+			if *verbose || *verboseLong {
+				buildArgs = append(buildArgs, "--verbose")
+			}
+			if err := buildMissingRepositoryBinaries(cfg, buildArgs, effectiveYes); err != nil {
+				fmt.Fprintf(os.Stderr, "Missing binary build failed: %v\n", err)
+				os.Exit(1)
+			}
+			break
+		}
 		if err := checkForUpgrades(ctx, cfg, maxJobs, effectiveYes); err != nil {
 			fmt.Fprintf(os.Stderr, "Upgrade process failed: %v\n", err)
 			os.Exit(1)

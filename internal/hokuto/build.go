@@ -3164,6 +3164,7 @@ func handleBuildCommand(args []string, cfg *Config) (err error) {
 	var noDeps = buildCmd.Bool("no-deps", false, "Skip dependency checking and build only the specified package(s)")
 	var noDevel = buildCmd.Bool("no-devel", false, "Skip automatic base-devel dependency installation")
 	var noCleanup = buildCmd.Bool("no-cleanup", false, "Keep temporary build dependencies installed after the build")
+	var noInstall = buildCmd.Bool("no-install", false, "Build packages without installing final user targets")
 	var noRemote = buildCmd.Bool("no-remote", false, "Do not use the remote binary mirror for build dependency resolution or installs")
 	var promptBinaryDeps = buildCmd.Bool("prompt", false, "Prompt before installing available binary build dependencies.")
 	var wgetNoCheckCert = buildCmd.Bool("wget-no-check-certificate", false, "Pass --no-check-certificate to wget fallback for source downloads")
@@ -3198,6 +3199,9 @@ func handleBuildCommand(args []string, cfg *Config) (err error) {
 
 	if err := buildCmd.Parse(args); err != nil {
 		return fmt.Errorf("error parsing build flags: %v", err)
+	}
+	if *noInstall && *autoInstall {
+		return fmt.Errorf("--no-install and -a cannot be used together")
 	}
 	if *noDeps {
 		defer suppressRuntimeDependencyAutoInstallScope()()
@@ -4063,6 +4067,7 @@ func handleBuildCommand(args []string, cfg *Config) (err error) {
 				return fmt.Errorf("error generating build plan: %v", err)
 			}
 			addPostRebuildSplitDependencies(initialPlan, splitDepsBySource)
+			initialPlan.NoInstall = *noInstall
 			if len(initialPlan.Order) == 0 {
 				fmt.Println("All packages are up to date. Nothing to build.")
 				return nil
@@ -4186,7 +4191,7 @@ func handleBuildCommand(args []string, cfg *Config) (err error) {
 				isCrossWithoutSystem := cfg.Values["HOKUTO_CROSS_ARCH"] != "" && cfg.Values["HOKUTO_CROSS_SYSTEM"] != "1"
 
 				shouldInstall := *autoInstall
-				if !shouldInstall && !isCrossWithoutSystem {
+				if !*noInstall && !shouldInstall && !isCrossWithoutSystem {
 					sort.Strings(targetsPass1)
 					// Convert to output package names for display (may be renamed for cross-system)
 					outputPkgNames := make([]string, len(targetsPass1))

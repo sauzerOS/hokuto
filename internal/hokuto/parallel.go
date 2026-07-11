@@ -259,6 +259,9 @@ func (pm *ParallelManager) installDeferredTargets() error {
 	if len(pm.DeferredInstalls) == 0 {
 		return nil
 	}
+	if pm.BuildPlan.NoInstall {
+		return nil
+	}
 
 	targets := make([]string, 0, len(pm.DeferredInstalls))
 	for pkg := range pm.DeferredInstalls {

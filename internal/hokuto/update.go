@@ -82,6 +82,140 @@ func getRepoVersion2(pkgName string) (version string, revision string, err error
 	return pkgVersion, pkgRevision, nil
 }
 
+func currentBinaryOutputVariants(sourcePkg, outputPkg string, cfg *Config) []string {
+	variant := ""
+	if outputPkg == getOutputPackageName(sourcePkg, cfg) {
+		variant = GetSystemVariantForPackage(cfg, sourcePkg)
+	} else {
+		pkgDir, _ := findPackageMetadataDir(sourcePkg)
+		options := loadBuildOptions(pkgDir)
+		isGeneric := cfg.Values["HOKUTO_GENERIC"] == "1" || options["generic"]
+		variant = IdentifyVariant(outputPkg, isGeneric, isMultilibPackage(outputPkg))
+	}
+	variants := []string{variant}
+	if variant == "optimized" {
+		variants = append(variants, "generic")
+	} else if variant == "multi-optimized" {
+		variants = append(variants, "multi-generic")
+	}
+	return variants
+}
+
+func currentBinaryOutputAvailable(sourcePkg, outputPkg, version, revision string, cfg *Config, remoteIndex []RepoEntry) bool {
+	arch := GetSystemArchForPackage(cfg, sourcePkg)
+	for _, variant := range currentBinaryOutputVariants(sourcePkg, outputPkg, cfg) {
+		tarballPath := filepath.Join(BinDir, StandardizeRemoteName(outputPkg, version, revision, arch, variant))
+		if _, err := os.Stat(tarballPath); err == nil {
+			return true
+		}
+		for _, entry := range remoteIndex {
+			if entry.Type != "meta" && entry.Name == outputPkg && entry.Version == version &&
+				entry.Revision == revision && entry.Arch == arch && entry.Variant == variant {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func missingRepositoryBinaryPackages(cfg *Config, remoteIndex []RepoEntry) (map[string][]string, error) {
+	missing := make(map[string][]string)
+	seen := make(map[string]bool)
+	for _, repoPath := range filepath.SplitList(repoPaths) {
+		entries, err := os.ReadDir(repoPath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read repository %s: %w", repoPath, err)
+		}
+		for _, entry := range entries {
+			if !entry.IsDir() || strings.HasPrefix(entry.Name(), ".") || seen[entry.Name()] {
+				continue
+			}
+			pkgName := entry.Name()
+			pkgDir := filepath.Join(repoPath, pkgName)
+			if _, err := os.Stat(filepath.Join(pkgDir, "build")); err != nil {
+				continue
+			}
+			if _, err := os.Stat(filepath.Join(pkgDir, "version")); err != nil {
+				continue
+			}
+			seen[pkgName] = true
+
+			version, revision, err := getRepoVersion2(pkgName)
+			if err != nil {
+				return nil, err
+			}
+			outputs := []string{getOutputPackageName(pkgName, cfg)}
+			outputs = append(outputs, splitPackageNamesFromDir(pkgDir)...)
+			for _, outputPkg := range outputs {
+				if !currentBinaryOutputAvailable(pkgName, outputPkg, version, revision, cfg, remoteIndex) {
+					missing[pkgName] = append(missing[pkgName], outputPkg)
+				}
+			}
+		}
+	}
+	return missing, nil
+}
+
+func buildMissingRepositoryBinaries(cfg *Config, buildArgs []string, yes bool) error {
+	var remoteIndex []RepoEntry
+	if BinaryMirror != "" {
+		index, err := GetCachedRemoteIndex(cfg)
+		if err != nil {
+			return fmt.Errorf("cannot determine remote binary availability: %w", err)
+		}
+		remoteIndex = index
+	}
+
+	colArrow.Print("-> ")
+	colSuccess.Println("Checking repository packages for missing current binaries")
+	missing, err := missingRepositoryBinaryPackages(cfg, remoteIndex)
+	if err != nil {
+		return err
+	}
+	if len(missing) == 0 {
+		colArrow.Print("-> ")
+		colSuccess.Println("All current repository packages have an available binary.")
+		return nil
+	}
+
+	packages := make([]string, 0, len(missing))
+	for pkgName := range missing {
+		packages = append(packages, pkgName)
+	}
+	sort.Strings(packages)
+	colArrow.Print("-> ")
+	colWarn.Printf("Found %d source package(s) with missing binaries:\n", len(packages))
+	for i, pkgName := range packages {
+		sort.Strings(missing[pkgName])
+		colArrow.Print("-> ")
+		fmt.Printf("%2d) ", i+1)
+		color.Bold.Printf("%s", pkgName)
+		fmt.Print(": ")
+		colNote.Printf("%s\n", strings.Join(missing[pkgName], ", "))
+	}
+
+	var selected []string
+	if yes {
+		selected = packages
+	} else {
+		indices, ok := AskForSelection("Build (a)ll, (q)uit, or select missing binary packages (numbers or -numbers):", len(packages))
+		if !ok {
+			colNote.Println("Missing binary build canceled by user.")
+			return nil
+		}
+		for _, index := range indices {
+			selected = append(selected, packages[index])
+		}
+	}
+	if len(selected) == 0 {
+		colNote.Println("No packages selected for building.")
+		return nil
+	}
+
+	buildArgs = append(buildArgs, selected...)
+	return handleBuildCommand(buildArgs, cfg)
+}
+
 // getBaseRepoPath extracts the base repository path (e.g., "/repo/reponame1")
 // from a longer path (e.g., "/repo/reponame1/one").
 

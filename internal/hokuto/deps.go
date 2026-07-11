@@ -1172,6 +1172,7 @@ type BuildPlan struct {
 	PostBuildRebuilds map[string][]string // Stores post-build actions
 	ManualPrereqs     map[string][]string // pkgs that MUST be completed before this one (from /etc/hokuto/hokuto.update)
 	NoDeps            bool                // Skip dependency checking during execution
+	NoInstall         bool                // Do not install deferred/final user targets
 }
 
 // resolveBuildPlan creates a dynamic, context-aware build plan.
