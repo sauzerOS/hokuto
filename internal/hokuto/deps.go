@@ -2271,15 +2271,25 @@ func activateDependencyInstallProgress(bar *progressbar.ProgressBar) func() {
 	}
 }
 
+const dependencyProgressPackageWidth = 36
+
+func formatDependencyProgressPackageName(pkgName string) string {
+	runes := []rune(pkgName)
+	if len(runes) > dependencyProgressPackageWidth {
+		runes = append(runes[:dependencyProgressPackageWidth-1], '…')
+	}
+	return fmt.Sprintf("%-*s", dependencyProgressPackageWidth, string(runes))
+}
+
 func describeDependencyInstallProgress(bar *progressbar.ProgressBar, pkgName string) {
 	if bar != nil {
-		bar.Describe(colArrow.Sprint("-> ") + colSuccess.Sprint("Installing ") + colNote.Sprint(pkgName))
+		bar.Describe(colArrow.Sprint("-> ") + colSuccess.Sprint("Installing ") + colNote.Sprint(formatDependencyProgressPackageName(pkgName)))
 	}
 }
 
 func describeDependencyCheckProgress(bar *progressbar.ProgressBar, pkgName string) {
 	if bar != nil {
-		bar.Describe(colArrow.Sprint("-> ") + colSuccess.Sprint("Checking ") + colNote.Sprint(pkgName))
+		bar.Describe(colArrow.Sprint("-> ") + colSuccess.Sprint("Checking ") + colNote.Sprint(formatDependencyProgressPackageName(pkgName)))
 	}
 }
 
