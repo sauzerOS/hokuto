@@ -356,7 +356,9 @@ func collectAvailableBinaryDependenciesForPlan(plan *BuildPlan, cfg *Config, noR
 					continue
 				}
 				if !dependencyBinaryAvailable(cand, cfg, noRemote) {
-					continue
+					if _, _, fallbackOK, _ := availableBuildDependencyBinaryTarball(cand, cfg, noRemote); !fallbackOK {
+						continue
+					}
 				}
 				seen[cand] = true
 				depsToInstall = append(depsToInstall, binaryPlanDependency{Name: cand, Make: dep.Make})
@@ -377,17 +379,23 @@ func installAvailableBinaryDependenciesForPlanWithOptions(plan *BuildPlan, cfg *
 		return nil, nil
 	}
 
+	bar := newDependencyInstallProgress(len(depsToInstall), "Installing Build Dependencies", quiet)
+	deactivateProgress := activateDependencyInstallProgress(bar)
+	defer deactivateProgress()
+
 	var installed []string
 	for _, dep := range depsToInstall {
+		describeDependencyInstallProgress(bar, dep.Name)
 		if !quiet {
 			colArrow.Print("-> ")
 			colSuccess.Printf("Installing available binary dependency:")
 			colNote.Printf(" %s\n", dep.Name)
 		}
-		ok, err := installAvailableBinaryPackageOnlyWithOptions(dep.Name, cfg, noRemote, quiet)
+		ok, err := installAvailableBuildDependencyBinaryWithOptions(dep.Name, cfg, noRemote, quiet, false)
 		if err != nil {
 			return installed, fmt.Errorf("failed to install binary dependency %s: %w", dep.Name, err)
 		}
+		advanceDependencyInstallProgress(bar)
 		if !ok {
 			continue
 		}

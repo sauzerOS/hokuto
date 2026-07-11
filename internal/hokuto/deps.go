@@ -1869,7 +1869,10 @@ func installBuildDependenciesWithOptions(pkgName string, cfg *Config, noRemote b
 	for _, depPkg := range installQueue {
 		// Try to install from binary or build
 		describeDependencyInstallProgress(bar, depPkg)
-		installed, err := ensurePackageInstalledWithOptions(depPkg, cfg, noRemote, nil, quiet)
+		installed, err := installAvailableBuildDependencyBinaryWithOptions(depPkg, cfg, noRemote, quiet, false)
+		if err == nil && !installed {
+			installed, err = ensurePackageInstalledWithOptions(depPkg, cfg, noRemote, nil, quiet)
+		}
 		if err != nil {
 			return newlyInstalled, err
 		}
@@ -2472,6 +2475,131 @@ func availableBinaryPackageTarball(pkgName string, cfg *Config, noRemote bool) (
 	return "", "", false, nil
 }
 
+func releaseIsOlder(version, revision, currentVersion, currentRevision string) bool {
+	if cmp := compareVersions(version, currentVersion); cmp != 0 {
+		return cmp < 0
+	}
+	return revisionCompare(revision, currentRevision) < 0
+}
+
+// availableBuildDependencyBinaryTarball first uses the normal exact-version
+// lookup. If the source repository has moved ahead of the binary repository, it
+// falls back to the newest older binary. This policy is intentionally limited to
+// temporary build dependencies; requested packages still require an exact build.
+func availableBuildDependencyBinaryTarball(pkgName string, cfg *Config, noRemote bool) (installName, tarballPath string, ok bool, err error) {
+	if installName, tarballPath, ok, err = availableBinaryPackageTarball(pkgName, cfg, noRemote); err != nil || ok {
+		return installName, tarballPath, ok, err
+	}
+
+	lookupName := pkgName
+	if idx := strings.Index(lookupName, "@"); idx != -1 {
+		lookupName = lookupName[:idx]
+	}
+	currentVersion, currentRevision, versionErr := getRepoVersion2(lookupName)
+	if versionErr != nil {
+		if sourcePkg, _, splitOK := findSplitPackageSource(lookupName); splitOK {
+			currentVersion, currentRevision, versionErr = getRepoVersion2(sourcePkg)
+		}
+	}
+	if versionErr != nil {
+		return "", "", false, nil
+	}
+
+	outputName := getOutputPackageName(lookupName, cfg)
+	names := []string{outputName}
+	if outputName != lookupName {
+		names = append(names, lookupName)
+	}
+	arch := GetSystemArchForPackage(cfg, lookupName)
+	variantRank := make(map[string]int)
+	for i, variant := range dependencyVariantCandidates(lookupName, cfg) {
+		variantRank[variant] = i
+	}
+
+	type candidate struct {
+		name, path, version, revision, variant string
+		entry                                  *RepoEntry
+	}
+	var best *candidate
+	consider := func(c candidate) {
+		if !releaseIsOlder(c.version, c.revision, currentVersion, currentRevision) {
+			return
+		}
+		if _, accepted := variantRank[c.variant]; !accepted {
+			return
+		}
+		if best == nil || compareVersions(c.version, best.version) > 0 ||
+			(compareVersions(c.version, best.version) == 0 && revisionCompare(c.revision, best.revision) > 0) ||
+			(compareVersions(c.version, best.version) == 0 && revisionCompare(c.revision, best.revision) == 0 && variantRank[c.variant] < variantRank[best.variant]) {
+			copy := c
+			best = &copy
+		}
+	}
+
+	for _, name := range names {
+		for variant := range variantRank {
+			pattern := filepath.Join(BinDir, fmt.Sprintf("%s-*-*-*-%s.tar.zst", name, variant))
+			matches, _ := filepath.Glob(pattern)
+			for _, match := range matches {
+				metadata, _, scanErr := scanTarballMetadata(match)
+				if scanErr != nil || metadata["name"] != name {
+					continue
+				}
+				if metadata["arch"] != "" && metadata["arch"] != arch {
+					continue
+				}
+				consider(candidate{name: name, path: match, version: metadata["version"], revision: metadata["revision"], variant: variant})
+			}
+		}
+	}
+
+	if !noRemote && BinaryMirror != "" {
+		if index, indexErr := GetCachedRemoteIndex(cfg); indexErr == nil {
+			for i := range index {
+				entry := &index[i]
+				nameMatch := false
+				for _, name := range names {
+					if entry.Name == name {
+						nameMatch = true
+						break
+					}
+				}
+				if entry.Type == "meta" || !nameMatch || entry.Arch != arch {
+					continue
+				}
+				consider(candidate{name: entry.Name, version: entry.Version, revision: entry.Revision, variant: entry.Variant, entry: entry})
+			}
+		}
+	}
+
+	if best == nil {
+		return "", "", false, nil
+	}
+	if best.entry != nil {
+		entry := best.entry
+		if err := fetchSpecificBinaryPackage(entry.Name, entry.Version, entry.Revision, entry.Variant, cfg, true, entry.B3Sum, false); err != nil {
+			return "", "", false, err
+		}
+		best.path = filepath.Join(BinDir, StandardizeRemoteName(entry.Name, entry.Version, entry.Revision, entry.Arch, entry.Variant))
+	}
+	debugf("Using older binary %s %s-%s as build dependency; repository version is %s-%s\n", best.name, best.version, best.revision, currentVersion, currentRevision)
+	return best.name, best.path, true, nil
+}
+
+func installAvailableBuildDependencyBinaryWithOptions(pkgName string, cfg *Config, noRemote bool, quiet bool, installRuntimeDeps bool) (bool, error) {
+	if isPackageInstalled(pkgName) {
+		return false, nil
+	}
+	installName, tarballPath, ok, err := availableBuildDependencyBinaryTarball(pkgName, cfg, noRemote)
+	if err != nil || !ok {
+		return false, err
+	}
+	if !installRuntimeDeps {
+		defer suppressRuntimeDependencyAutoInstallScope()()
+	}
+	return installBinaryTarballWithOptions(tarballPath, installName, cfg, quiet)
+}
+
 func installAvailableBinaryPackageOnly(pkgName string, cfg *Config, noRemote bool) (bool, error) {
 	return installAvailableBinaryPackageOnlyWithOptions(pkgName, cfg, noRemote, false)
 }
@@ -2559,7 +2687,7 @@ func ensureDevelPackagesInstalledWithOptions(cfg *Config, includeMultilib bool, 
 	defer deactivateProgress()
 	for _, pkgName := range missing {
 		describeDependencyInstallProgress(bar, pkgName)
-		installed, err := installAvailableBinaryPackageWithRuntimeDepsOption(pkgName, cfg, noRemote, quiet, true)
+		installed, err := installAvailableBuildDependencyBinaryWithOptions(pkgName, cfg, noRemote, quiet, true)
 		if err != nil {
 			return newlyInstalled, err
 		}

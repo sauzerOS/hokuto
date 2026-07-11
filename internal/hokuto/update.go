@@ -671,6 +671,7 @@ func checkDependencyBlocks(pkgName string, newVersion string, installedPackages 
 
 func checkForUpgrades(_ context.Context, cfg *Config, maxJobs int, yes bool) error {
 	defer flushPackageSuggestions(os.Stdout, cfg, false, true, yes)
+	defer binaryOnlyRuntimeDependencyInstallScope()()
 
 	colArrow.Print("-> ")
 	colSuccess.Println("Checking for Package Upgrades")
@@ -902,9 +903,35 @@ func checkForUpgrades(_ context.Context, cfg *Config, maxJobs int, yes bool) err
 		}
 	}
 
+	// Snapshot before any update build dependency is installed. Cleanup happens
+	// once at function exit, after every selected update has finished or failed.
+	installedAtUpdateStart := snapshotInstalledPackageNames()
+	endBuildSession := registerHokutoBuildSession()
+	defer endBuildSession()
+	defer func() {
+		installedAfterUpdate := snapshotInstalledPackageNames()
+		temporaryBuildDeps := temporaryUpdatePackages(installedAtUpdateStart, installedAfterUpdate, userRequestedMap)
+		uninstallBuildDependenciesWithOptions(temporaryBuildDeps, cfg, maxJobs > 1)
+	}()
+
 	plan, err := resolveBuildPlan(pkgNames, userRequestedMap, false, cfg, binaryAvailable)
 	if err != nil {
 		return fmt.Errorf("failed to resolve upgrade plan: %w", err)
+	}
+	updateTargets := append([]string(nil), pkgNames...)
+	acceptedBinaryDeps := make(map[string]bool)
+	for {
+		installedBinaryDeps, installErr := installAvailableBinaryBuildDeps(plan, userRequestedMap, acceptedBinaryDeps, cfg, func(string) {}, false, false, maxJobs > 1)
+		if installErr != nil {
+			return fmt.Errorf("failed to install update build dependencies: %w", installErr)
+		}
+		if !installedBinaryDeps {
+			break
+		}
+		plan, err = resolveBuildPlan(updateTargets, userRequestedMap, false, cfg, binaryAvailable)
+		if err != nil {
+			return fmt.Errorf("failed to refresh upgrade plan after installing build dependencies: %w", err)
+		}
 	}
 	// Use the ordered plan instead of the unordered list
 	pkgNames = plan.Order
@@ -912,6 +939,7 @@ func checkForUpgrades(_ context.Context, cfg *Config, maxJobs int, yes bool) err
 	// Apply user-specified update order from /etc/hokuto/hokuto.update
 	var manualPrereqs map[string][]string
 	pkgNames, manualPrereqs = applyUpdateOrder(pkgNames)
+	splitDepsBySource := prepareUpdateBuildPlan(plan, pkgNames, manualPrereqs, cfg)
 
 	// Launch background prefetcher for SUBSEQUENT packages.
 	if len(pkgNames) > 1 {
@@ -928,15 +956,9 @@ func checkForUpgrades(_ context.Context, cfg *Config, maxJobs int, yes bool) err
 		colArrow.Print("-> ")
 		colSuccess.Printf("Executing parallel update (jobs: %d)\n", maxJobs)
 
-		// Create a temporary plan for parallel execution
-		updatePlan := &BuildPlan{
-			Order: pkgNames,
-			// PostBuildRebuilds isn't typically used in updates, and we don't calculate them here.
-			// The update logic is simpler than a full world rebuild.
-			PostBuildRebuilds: make(map[string][]string),
-			ManualPrereqs:     manualPrereqs,
-		}
-		splitDepsBySource := collectSplitDependenciesForPlan(updatePlan, cfg)
+		// Retain the complete dependency metadata from resolution. In particular,
+		// PostRebuilds carries optional split dependencies such as lib32-* outputs.
+		updatePlan := plan
 
 		// Use a custom builder that incorporates binary checks
 		smartBuilder := func(pkgName string, cfg *Config, exec *Executor, opts BuildOptions) (time.Duration, error) {
@@ -1033,7 +1055,7 @@ func checkForUpgrades(_ context.Context, cfg *Config, maxJobs int, yes bool) err
 			return pkgBuild(pkgName, cfg, exec, opts)
 		}
 
-		if _, err := installAvailableBinaryDependenciesForPlan(updatePlan, cfg, false); err != nil {
+		if _, err := installAvailableBinaryDependenciesForPlanWithOptions(updatePlan, cfg, false, true); err != nil {
 			return err
 		}
 		if _, err := RunParallelBuilds(updatePlan, cfg, maxJobs, userRequestedMap, yes, true, splitDepsBySource, smartBuilder); err != nil {
@@ -1315,6 +1337,26 @@ func applyUpdateOrder(pkgNames []string) ([]string, map[string][]string) {
 	}
 
 	return result, manualPrereqs
+}
+
+func prepareUpdateBuildPlan(plan *BuildPlan, order []string, manualPrereqs map[string][]string, cfg *Config) map[string][]string {
+	plan.Order = order
+	plan.ManualPrereqs = manualPrereqs
+	splitDepsBySource := collectSplitDependenciesForPlan(plan, cfg)
+	addPostRebuildSplitDependencies(plan, splitDepsBySource)
+	return splitDepsBySource
+}
+
+func temporaryUpdatePackages(installedBefore, installedAfter, userRequested map[string]bool) []string {
+	var temporary []string
+	for pkgName := range installedAfter {
+		if installedBefore[pkgName] || userRequested[pkgName] {
+			continue
+		}
+		temporary = append(temporary, pkgName)
+	}
+	sort.Strings(temporary)
+	return temporary
 }
 
 // resolveMissingDeps recursively finds all missing dependencies for a package.

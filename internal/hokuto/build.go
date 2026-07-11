@@ -498,7 +498,7 @@ func useAvailableBuildDependencyBinary(prompt bool, format string, args ...any) 
 	return askForConfirmation(colInfo, format, args...)
 }
 
-func installAvailableBinaryBuildDeps(plan *BuildPlan, userRequested, declined map[string]bool, cfg *Config, addTemporaryBuildDep func(string), prompt bool, quiet bool) (bool, error) {
+func installAvailableBinaryBuildDeps(plan *BuildPlan, userRequested, declined map[string]bool, cfg *Config, addTemporaryBuildDep func(string), noRemote bool, prompt bool, quiet bool) (bool, error) {
 	installedAny := false
 	type binaryBuildDep struct {
 		name          string
@@ -511,13 +511,8 @@ func installAvailableBinaryBuildDeps(plan *BuildPlan, userRequested, declined ma
 			continue
 		}
 
-		version, revision, err := getRepoVersion2(pkgName)
-		if err != nil {
-			continue
-		}
-		outputPkgName := getOutputPackageName(pkgName, cfg)
-		tarballPath := findCachedBinaryTarballVersion(outputPkgName, version, revision, cfg)
-		if tarballPath == "" {
+		outputPkgName, tarballPath, ok, err := availableBuildDependencyBinaryTarball(pkgName, cfg, noRemote)
+		if err != nil || !ok {
 			continue
 		}
 
@@ -3952,7 +3947,7 @@ func handleBuildCommand(args []string, cfg *Config) (err error) {
 						return fmt.Errorf("error generating build plan for '%s': %v", pkgName, err)
 					}
 					addPostRebuildSplitDependencies(plan, splitDepsBySource)
-					installedBinaryDeps, err := installAvailableBinaryBuildDeps(plan, userRequestedMap, binaryDeclined, cfg, addTemporaryBuildDep, *promptBinaryDeps, quietDependencyInstalls)
+					installedBinaryDeps, err := installAvailableBinaryBuildDeps(plan, userRequestedMap, binaryDeclined, cfg, addTemporaryBuildDep, *noRemote, *promptBinaryDeps, quietDependencyInstalls)
 					if err != nil {
 						return err
 					}
@@ -4016,7 +4011,7 @@ func handleBuildCommand(args []string, cfg *Config) (err error) {
 						break
 					}
 					addPostRebuildSplitDependencies(initialPlan, splitDepsBySource)
-					installedBinaryDeps, installErr := installAvailableBinaryBuildDeps(initialPlan, userRequestedMap, binaryDeclined, cfg, addTemporaryBuildDep, *promptBinaryDeps, quietDependencyInstalls)
+					installedBinaryDeps, installErr := installAvailableBinaryBuildDeps(initialPlan, userRequestedMap, binaryDeclined, cfg, addTemporaryBuildDep, *noRemote, *promptBinaryDeps, quietDependencyInstalls)
 					if installErr != nil {
 						return installErr
 					}
