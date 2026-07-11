@@ -521,21 +521,16 @@ func (r *throughputTimeoutReader) start() {
 	}()
 }
 
-func tryRemoveCachedFile(path string) {
-	lockPath := path + ".lock"
-	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o644)
-	if err != nil {
-		_ = os.Remove(path)
-		return
+func replaceSymlinkAtomic(target, linkPath string) error {
+	tmpLinkPath := fmt.Sprintf("%s.tmp.%d.%d", linkPath, os.Getpid(), time.Now().UnixNano())
+	if err := os.Symlink(target, tmpLinkPath); err != nil {
+		return err
 	}
-	defer f.Close()
-	if err := unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
-		// Someone is downloading or verifying the file; skip cleanup.
-		return
+	if err := os.Rename(tmpLinkPath, linkPath); err != nil {
+		_ = os.Remove(tmpLinkPath)
+		return err
 	}
-	defer unix.Flock(int(f.Fd()), unix.LOCK_UN)
-	_ = os.Remove(path)
-	_ = os.Remove(lockPath)
+	return nil
 }
 
 func downloadFile(originalURL, finalURL, destFile string) error {
@@ -1631,17 +1626,6 @@ func fetchSourcesWithOptions(pkgName, pkgDir string, processGit bool, quiet bool
 
 		cachePath = filepath.Join(CacheStore, hashName)
 
-		// This removes files like "OLDHASH-filename.tar.xz" so only "NEWHASH-filename.tar.xz" remains.
-		globPattern := filepath.Join(CacheStore, "*-"+origFilename)
-		if matches, err := filepath.Glob(globPattern); err == nil {
-			for _, match := range matches {
-				if match != cachePath {
-					debugf("Removing obsolete cached file: %s\n", match)
-					tryRemoveCachedFile(match)
-				}
-			}
-		}
-
 		downloadScript := filepath.Join(pkgDir, "download")
 		if _, err := os.Stat(downloadScript); err == nil {
 			if err := withExclusiveDownloadLock(cachePath, func() error {
@@ -1685,17 +1669,9 @@ func fetchSourcesWithOptions(pkgName, pkgDir string, processGit bool, quiet bool
 
 		linkPath = filepath.Join(pkgLinkDir, origFilename)
 
-		// Use atomic symlink creation (Create Temp -> Rename) to prevent "file exists" race conditions
-		// if the background prefetcher and main thread overlap.
-		tmpLinkPath := fmt.Sprintf("%s.tmp.%d", linkPath, time.Now().UnixNano())
-
-		if err := os.Symlink(cachePath, tmpLinkPath); err != nil {
-			return fmt.Errorf("failed to create temp symlink: %v", err)
-		}
-
-		// Atomic replace: if linkPath exists (from another thread), this simply overwrites it safely.
-		if err := os.Rename(tmpLinkPath, linkPath); err != nil {
-			os.Remove(tmpLinkPath) // Cleanup on failure
+		// Atomic replace prevents background prefetch and checksum operations from
+		// exposing a missing or partially updated package-local link.
+		if err := replaceSymlinkAtomic(cachePath, linkPath); err != nil {
 			return fmt.Errorf("failed to symlink %s -> %s: %v", cachePath, linkPath, err)
 		}
 

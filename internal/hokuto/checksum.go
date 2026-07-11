@@ -542,25 +542,12 @@ func performRedownload(fname, originalURL, substitutedURL, pkgVersion, pkgSrcDir
 	cachePath := filepath.Join(CacheStore, hashName)
 	filePath := filepath.Join(pkgSrcDir, fname)
 
-	// Clean up old versions/hashes of this file
-	globPattern := filepath.Join(CacheStore, "*-"+fname)
-	if matches, err := filepath.Glob(globPattern); err == nil {
-		for _, match := range matches {
-			if match != cachePath {
-				_ = os.Remove(match)
-			}
-		}
-	}
-
-	_ = os.Remove(cachePath)
-	_ = os.Remove(filePath)
-
 	if dErr := downloadFileWithOptions(originalURL, substitutedURL, cachePath, downloadOptions{Quiet: quiet, Force: true}); dErr != nil {
 		if !quiet {
 			fmt.Printf("Msg: failed to redownload %s: %v\n", fname, dErr)
 		}
 	} else {
-		if sErr := os.Symlink(cachePath, filepath.Join(pkgSrcDir, fname)); sErr != nil {
+		if sErr := replaceSymlinkAtomic(cachePath, filePath); sErr != nil {
 			if !quiet {
 				fmt.Printf("Msg: failed to symlink %s -> %s: %v\n", cachePath, filepath.Join(pkgSrcDir, fname), sErr)
 			}
