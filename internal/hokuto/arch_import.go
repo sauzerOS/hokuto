@@ -17,8 +17,17 @@ type PKGBUILDInfo struct {
 	Sources     []string
 	Depends     []string
 	MakeDepends []string
+	PrepareFunc string
 	BuildFunc   string
 	PackageFunc string
+	SplitFuncs  []PKGBUILDFunction
+}
+
+type PKGBUILDFunction struct {
+	Name    string
+	Package string
+	Body    string
+	Depends []string
 }
 
 // fetchPKGBUILD downloads the PKGBUILD from Arch or AUR
@@ -70,11 +79,39 @@ func parsePKGBUILD(content string, pkgName string) (*PKGBUILDInfo, error) {
 	// Extract makedepends array
 	info.MakeDepends = extractBashArray(content, "makedepends")
 
-	// Extract build() function
-	info.BuildFunc = extractBashFunction(content, "build")
-
-	// Extract package() function
-	info.PackageFunc = extractBashFunction(content, "package")
+	packageNames := extractBashArray(content, "pkgname")
+	for _, fn := range extractBashFunctions(content) {
+		switch fn.Name {
+		case "prepare":
+			info.PrepareFunc = fn.Body
+		case "build":
+			info.BuildFunc = fn.Body
+		case "package":
+			info.PackageFunc = fn.Body
+		default:
+			if !strings.HasPrefix(fn.Name, "package_") {
+				continue
+			}
+			suffix := strings.TrimPrefix(fn.Name, "package_")
+			splitName := suffix
+			for _, candidate := range packageNames {
+				if candidate == suffix || strings.ReplaceAll(candidate, "-", "_") == suffix {
+					splitName = candidate
+					break
+				}
+			}
+			fn.Package = splitName
+			fn.Depends = extractBashArray(fn.Body, "depends")
+			if splitName == pkgName && info.PackageFunc == "" {
+				info.PackageFunc = fn.Body
+				if len(fn.Depends) > 0 {
+					info.Depends = append([]string(nil), fn.Depends...)
+				}
+				continue
+			}
+			info.SplitFuncs = append(info.SplitFuncs, fn)
+		}
+	}
 
 	// Replace variable references in sources
 	// Replace variable references in sources
@@ -154,16 +191,95 @@ func extractBashArray(content string, arrayName string) []string {
 
 // extractBashFunction extracts the body of a bash function
 func extractBashFunction(content string, funcName string) string {
-	// Match function definition
-	pattern := fmt.Sprintf(`(?s)%s\s*\(\s*\)\s*\{(.*?)\n\}`, funcName)
-	re := regexp.MustCompile(pattern)
-	match := re.FindStringSubmatch(content)
-
-	if len(match) < 2 {
-		return ""
+	for _, fn := range extractBashFunctions(content) {
+		if fn.Name == funcName {
+			return fn.Body
+		}
 	}
+	return ""
+}
 
-	return strings.TrimSpace(match[1])
+func extractBashFunctions(content string) []PKGBUILDFunction {
+	re := regexp.MustCompile(`(?m)^[ \t]*([A-Za-z0-9_+.-]+)[ \t]*\([ \t]*\)[ \t]*\{`)
+	matches := re.FindAllStringSubmatchIndex(content, -1)
+	var functions []PKGBUILDFunction
+	for _, match := range matches {
+		name := content[match[2]:match[3]]
+		open := match[1] - 1
+		depth := 0
+		inSingle, inDouble, escaped, comment := false, false, false, false
+		end := -1
+		for i := open; i < len(content); i++ {
+			ch := content[i]
+			if comment {
+				if ch == '\n' {
+					comment = false
+				}
+				continue
+			}
+			if escaped {
+				escaped = false
+				continue
+			}
+			if ch == '\\' && !inSingle {
+				escaped = true
+				continue
+			}
+			if ch == '\'' && !inDouble {
+				inSingle = !inSingle
+				continue
+			}
+			if ch == '"' && !inSingle {
+				inDouble = !inDouble
+				continue
+			}
+			if inSingle || inDouble {
+				continue
+			}
+			if ch == '#' && (i == 0 || content[i-1] == ' ' || content[i-1] == '\t' || content[i-1] == '\n') {
+				comment = true
+				continue
+			}
+			switch ch {
+			case '{':
+				depth++
+			case '}':
+				depth--
+				if depth == 0 {
+					end = i
+				}
+			}
+			if end >= 0 {
+				break
+			}
+		}
+		if end > open {
+			functions = append(functions, PKGBUILDFunction{Name: name, Body: dedentShellBody(content[open+1 : end])})
+		}
+	}
+	return functions
+}
+
+func dedentShellBody(body string) string {
+	lines := strings.Split(strings.Trim(body, "\n\r"), "\n")
+	indent := -1
+	for _, line := range lines {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		width := len(line) - len(strings.TrimLeft(line, " \t"))
+		if indent == -1 || width < indent {
+			indent = width
+		}
+	}
+	if indent > 0 {
+		for i, line := range lines {
+			if len(line) >= indent {
+				lines[i] = line[indent:]
+			}
+		}
+	}
+	return strings.TrimSpace(strings.Join(lines, "\n"))
 }
 
 // generatePackageFromArch creates a package structure from Arch/AUR PKGBUILD
@@ -254,6 +370,23 @@ func generatePackageFromArch(pkgName string, source string, targetDir string) er
 	if err := os.WriteFile(dependsPath, []byte(dependsContent), 0o644); err != nil {
 		return fmt.Errorf("failed to create depends file: %w", err)
 	}
+	for _, split := range info.SplitFuncs {
+		splitDir := filepath.Join(pkgDir, "split", split.Package)
+		if err := os.MkdirAll(splitDir, 0o755); err != nil {
+			return fmt.Errorf("failed to create split package metadata for %s: %w", split.Package, err)
+		}
+		splitDepends := split.Depends
+		if len(splitDepends) == 0 {
+			splitDepends = info.Depends
+		}
+		content := strings.Join(splitDepends, "\n")
+		if content != "" {
+			content += "\n"
+		}
+		if err := os.WriteFile(filepath.Join(splitDir, "depends"), []byte(content), 0o644); err != nil {
+			return fmt.Errorf("failed to create split depends file for %s: %w", split.Package, err)
+		}
+	}
 
 	// 5. Create build script
 	buildPath := filepath.Join(pkgDir, "build")
@@ -275,6 +408,10 @@ func generatePackageFromArch(pkgName string, source string, targetDir string) er
 		colArrow.Print("-> ")
 		colInfo.Printf("Depends: %d packages\n", len(info.Depends)+len(info.MakeDepends))
 	}
+	if len(info.SplitFuncs) > 0 {
+		colArrow.Print("-> ")
+		colInfo.Printf("Split packages: %d preserved\n", len(info.SplitFuncs))
+	}
 
 	return nil
 }
@@ -286,6 +423,11 @@ func generateBuildScript(info *PKGBUILDInfo, pkgName string) string {
 	script.WriteString("#!/bin/sh -e\n")
 	script.WriteString("# Auto-generated from PKGBUILD\n")
 	script.WriteString("# You may need to adjust this script for Hokuto\n\n")
+	if info.PrepareFunc != "" {
+		script.WriteString("# Prepare phase\n")
+		script.WriteString(translatePKGBUILDFunction(info.PrepareFunc, pkgName))
+		script.WriteString("\n\n")
+	}
 
 	// Add build() function content if present
 	if info.BuildFunc != "" {
@@ -303,7 +445,15 @@ func generateBuildScript(info *PKGBUILDInfo, pkgName string) string {
 		script.WriteString("\n")
 	}
 
-	if info.BuildFunc == "" && info.PackageFunc == "" {
+	for _, split := range info.SplitFuncs {
+		script.WriteString("\n# Split install phase: " + split.Package + "\n")
+		dest := `${HOKUTO_SPLIT_DIR}/` + split.Package
+		packageContent := translatePKGBUILDFunctionWithValues(split.Body, dest, split.Package)
+		script.WriteString(packageContent)
+		script.WriteString("\n")
+	}
+
+	if info.PrepareFunc == "" && info.BuildFunc == "" && info.PackageFunc == "" && len(info.SplitFuncs) == 0 {
 		script.WriteString("# No build or package functions found in PKGBUILD\n")
 		script.WriteString("# Add your build instructions here\n")
 	}
@@ -313,25 +463,29 @@ func generateBuildScript(info *PKGBUILDInfo, pkgName string) string {
 
 // translatePKGBUILDFunction translates PKGBUILD function body to Hokuto format
 func translatePKGBUILDFunction(funcBody string, pkgName string) string {
+	return translatePKGBUILDFunctionWithValues(funcBody, "${1}", "${3}")
+}
+
+func translatePKGBUILDFunctionWithValues(funcBody, pkgdirValue, pkgnameValue string) string {
 	// Replace PKGBUILD variables with Hokuto equivalents
 	// ${pkgdir} -> ${1}
 	// ${pkgver} -> ${2}
 	// ${pkgname} -> ${3}
 	// Remove ${srcdir} references (hokuto builds in source dir)
 
-	result := funcBody
+	result := stripPKGBUILDFunctionMetadata(funcBody)
 
 	// Replace pkgdir
-	result = strings.ReplaceAll(result, "${pkgdir}", "${1}")
-	result = strings.ReplaceAll(result, "$pkgdir", "${1}")
+	result = strings.ReplaceAll(result, "${pkgdir}", pkgdirValue)
+	result = strings.ReplaceAll(result, "$pkgdir", pkgdirValue)
 
 	// Replace pkgver
 	result = strings.ReplaceAll(result, "${pkgver}", "${2}")
 	result = strings.ReplaceAll(result, "$pkgver", "${2}")
 
 	// Replace pkgname
-	result = strings.ReplaceAll(result, "${pkgname}", "${3}")
-	result = strings.ReplaceAll(result, "$pkgname", "${3}")
+	result = strings.ReplaceAll(result, "${pkgname}", pkgnameValue)
+	result = strings.ReplaceAll(result, "$pkgname", pkgnameValue)
 
 	// Remove srcdir references (just remove the variable, keep the path)
 	result = regexp.MustCompile(`\$\{srcdir\}/`).ReplaceAllString(result, "")
@@ -339,5 +493,13 @@ func translatePKGBUILDFunction(funcBody string, pkgName string) string {
 	result = strings.ReplaceAll(result, "${srcdir}", ".")
 	result = strings.ReplaceAll(result, "$srcdir", ".")
 
-	return result
+	return dedentShellBody(result)
+}
+
+func stripPKGBUILDFunctionMetadata(body string) string {
+	metadata := `(?:pkgdesc|arch|url|license|groups|depends|optdepends|provides|conflicts|replaces|backup|options|install|changelog)`
+	arrayAssignment := regexp.MustCompile(`(?ms)^[ \t]*` + metadata + `\+?=\(.*?\)[ \t]*(?:\n|$)`)
+	body = arrayAssignment.ReplaceAllString(body, "")
+	scalarAssignment := regexp.MustCompile(`(?m)^[ \t]*` + metadata + `\+?=[^\n]*(?:\n|$)`)
+	return scalarAssignment.ReplaceAllString(body, "")
 }

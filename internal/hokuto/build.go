@@ -229,6 +229,28 @@ func confirmBuildPlanWithAsk(buildOrder []string, depsToInstall []string, postRe
 	return askForConfirmationDefaultNo(colWarn, "Proceed with build?")
 }
 
+func printResolvedBuildSummary(plan *BuildPlan) {
+	buildOrder := append([]string(nil), plan.Order...)
+	colArrow.Print("-> ")
+	colSuccess.Printf("Packages to build (%d):", len(buildOrder))
+	colNote.Printf(" %s\n", strings.Join(buildOrder, " -> "))
+
+	var rebuilds []string
+	for parent, deps := range plan.PostRebuilds {
+		rebuilds = append(rebuilds, fmt.Sprintf("%s (for %s)", parent, strings.Join(deps, ",")))
+	}
+	for trigger, packages := range plan.PostBuildRebuilds {
+		for _, pkgName := range packages {
+			rebuilds = append(rebuilds, fmt.Sprintf("%s (after %s)", pkgName, trigger))
+		}
+	}
+	sort.Strings(rebuilds)
+	if len(rebuilds) > 0 {
+		colArrow.Print("-> ")
+		colWarn.Printf("Rebuilds (%d): %s\n", len(rebuilds), strings.Join(rebuilds, ", "))
+	}
+}
+
 func activeBuildDependency(dep DepSpec, cfg *Config, includeOptional bool) bool {
 	if dep.RuntimeOnly || dep.Suggest {
 		return false
@@ -3516,7 +3538,7 @@ func handleBuildCommand(args []string, cfg *Config) (err error) {
 			addPackageToProcess(sourcePkg)
 			addMappedSplitDependency(directSplitTargetsBySource, sourcePkg, pkg)
 			colArrow.Print("-> ")
-			colInfo.Printf("Target %s is a split package; scheduling %s to build it\n", pkg, sourcePkg)
+			debugf("Target %s is a split package; scheduling %s to build it\n", pkg, sourcePkg)
 			continue
 		}
 		return fmt.Errorf("cannot build %s: package not found in any repository", pkg)
@@ -3758,6 +3780,7 @@ func handleBuildCommand(args []string, cfg *Config) (err error) {
 			}
 		}
 		binaryDeclined := make(map[string]bool)
+		deferredAskConfirmation := false
 
 		if *noDeps {
 			// Skip dependency resolution when --no-deps is set
@@ -3780,7 +3803,7 @@ func handleBuildCommand(args []string, cfg *Config) (err error) {
 			}
 			missingDeps = MovePackageToFront(missingDeps, "sauzeros-base")
 
-			if *ask {
+			if *ask && Debug {
 				previewBuildSet := previewBuildSetForMissingDeps(missingDeps, forceBuildMap, cfg, *noRemote)
 				previewBuildList := buildPackageNames(previewBuildSet)
 				var previewPlan *BuildPlan
@@ -3805,6 +3828,8 @@ func handleBuildCommand(args []string, cfg *Config) (err error) {
 					colWarn.Println("Build canceled.")
 					return nil
 				}
+			} else if *ask {
+				deferredAskConfirmation = true
 			}
 
 			buildWorkStarted = true
@@ -3843,7 +3868,7 @@ func handleBuildCommand(args []string, cfg *Config) (err error) {
 							}
 							clearDependencyInstallProgress(missingDepBar)
 							colArrow.Print("-> ")
-							colInfo.Printf("Dependency %s is a split package; scheduling %s to build it\n", depPkg, sourcePkg)
+							debugf("Dependency %s is a split package; scheduling %s to build it\n", depPkg, sourcePkg)
 							packagesThatMustBeBuilt[sourcePkg] = true
 							addMappedSplitDependency(splitDepsBySource, sourcePkg, depPkg)
 							return nil
@@ -4090,14 +4115,17 @@ func handleBuildCommand(args []string, cfg *Config) (err error) {
 				return nil
 			}
 
-			colArrow.Print("-> ")
-			colSuccess.Printf("Build Order:")
-			colNote.Printf(" %s\n", strings.Join(plannedBuildDisplayOrder(initialPlan, cfg, *noRemote), " -> "))
+			printResolvedBuildSummary(initialPlan)
+			if deferredAskConfirmation && !askForConfirmationDefaultNo(colWarn, "Proceed with build?") {
+				colArrow.Print("-> ")
+				colWarn.Println("Build canceled.")
+				return nil
+			}
 			if len(initialPlan.Order) > 1 {
 				// Prefetch the plan list, skipping the first one which starts immediately
 				go prefetchSources(initialPlan.Order[1:])
 			}
-			if len(initialPlan.PostRebuilds) > 0 {
+			if Debug && len(initialPlan.PostRebuilds) > 0 {
 				var rebuilds []string
 				for parent, deps := range initialPlan.PostRebuilds {
 					rebuilds = append(rebuilds, fmt.Sprintf("%s (for %s)", parent, strings.Join(deps, ",")))
