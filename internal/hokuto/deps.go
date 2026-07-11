@@ -2285,7 +2285,6 @@ func describeDependencyCheckProgress(bar *progressbar.ProgressBar, pkgName strin
 func clearDependencyInstallProgress(bar *progressbar.ProgressBar) {
 	if bar != nil {
 		_ = bar.Clear()
-		fmt.Fprint(os.Stderr, "\n")
 	}
 }
 
@@ -2300,7 +2299,6 @@ func prepareDependencyProgressLogOutput() {
 	dependencyInstallProgress.Unlock()
 	if bar != nil {
 		_ = bar.Clear()
-		fmt.Fprintln(os.Stderr)
 	}
 }
 

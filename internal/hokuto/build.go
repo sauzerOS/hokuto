@@ -2324,8 +2324,17 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, opts BuildOptions)
 	}
 
 	if runErr != nil {
-		colArrow.Print("-> ")
-		color.Danger.Printf("Build failed for %s: %v\n", pkgName, runErr)
+		printFailure := func() {
+			colArrow.Print("-> ")
+			color.Danger.Printf("Build failed for %s: %v\n", pkgName, runErr)
+		}
+		if opts.Quiet {
+			// Parallel builds share the terminal with the live status line. Pause
+			// and clear that UI before emitting the failure on its own line.
+			WithPrompt(printFailure)
+		} else {
+			printFailure()
+		}
 		finalTitle := fmt.Sprintf("❌ FAILED: %s", pkgName)
 		setTerminalTitle(finalTitle)
 
