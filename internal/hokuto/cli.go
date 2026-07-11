@@ -1119,6 +1119,7 @@ func Main() {
 					allSucceeded = false
 					continue
 				}
+				collectMetaPackageSuggestions(meta)
 				colArrow.Print("-> ")
 				colSuccess.Printf("Meta package ")
 				colNote.Printf("%s", name)

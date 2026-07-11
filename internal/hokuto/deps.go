@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/schollz/progressbar/v3"
 )
@@ -2252,7 +2253,20 @@ func newDependencyInstallProgress(total int, description string, quiet bool) *pr
 	if !quiet || total <= 0 {
 		return nil
 	}
-	return progressbar.Default(int64(total), colArrow.Sprint("-> ")+colSuccess.Sprint(description))
+	return progressbar.NewOptions64(
+		int64(total),
+		progressbar.OptionSetDescription(colArrow.Sprint("-> ")+colSuccess.Sprint(description)),
+		progressbar.OptionSetWriter(os.Stderr),
+		progressbar.OptionSetWidth(12),
+		progressbar.OptionUseANSICodes(true),
+		progressbar.OptionShowTotalBytes(true),
+		progressbar.OptionThrottle(65*time.Millisecond),
+		progressbar.OptionShowCount(),
+		progressbar.OptionShowIts(),
+		progressbar.OptionOnCompletion(func() { fmt.Fprintln(os.Stderr) }),
+		progressbar.OptionSpinnerType(14),
+		progressbar.OptionSetRenderBlankState(true),
+	)
 }
 
 func activateDependencyInstallProgress(bar *progressbar.ProgressBar) func() {
@@ -2271,7 +2285,7 @@ func activateDependencyInstallProgress(bar *progressbar.ProgressBar) func() {
 	}
 }
 
-const dependencyProgressPackageWidth = 36
+const dependencyProgressPackageWidth = 28
 
 func formatDependencyProgressPackageName(pkgName string) string {
 	runes := []rune(pkgName)

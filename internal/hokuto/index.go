@@ -117,6 +117,7 @@ type RepoEntry struct {
 	Size        int64    `json:"size"`
 	B3Sum       string   `json:"b3sum"`
 	Depends     []string `json:"depends,omitempty"`
+	Suggests    []string `json:"suggests,omitempty"`
 	Description string   `json:"description,omitempty"`
 }
 

@@ -179,6 +179,42 @@ func collectPackageSuggestions(pkgName, rootDir string) {
 	}
 }
 
+func collectMetaPackageSuggestions(meta MetaPackage) {
+	if len(meta.Suggests) == 0 {
+		return
+	}
+
+	packageSuggestions.Lock()
+	defer packageSuggestions.Unlock()
+	if packageSuggestions.items[meta.Name] == nil {
+		packageSuggestions.items[meta.Name] = make(map[string]packageSuggestion)
+	}
+	for _, depSpec := range meta.Suggests {
+		if suggestionSatisfied(depSpec) {
+			continue
+		}
+		alternates := append([]string(nil), depSpec.Alternatives...)
+		if len(alternates) == 0 && depSpec.Name != "" {
+			alternates = []string{depSpec.Name}
+		}
+		if len(alternates) == 0 {
+			continue
+		}
+		dependency := depSpec.Name
+		if len(alternates) > 1 {
+			dependency = strings.Join(alternates, " | ")
+		} else if depSpec.Op != "" {
+			dependency += depSpec.Op + depSpec.Version
+		}
+		item := packageSuggestion{
+			Package: meta.Name, Name: depSpec.Name, Op: depSpec.Op, Version: depSpec.Version,
+			Alternates: alternates, Dependency: dependency, Text: depSpec.SuggestText,
+		}
+		key := item.Dependency + "\x00" + item.Text
+		packageSuggestions.items[meta.Name][key] = item
+	}
+}
+
 func hasPackageSuggestions() bool {
 	packageSuggestions.Lock()
 	defer packageSuggestions.Unlock()
@@ -207,7 +243,7 @@ func flushPackageSuggestions(logger io.Writer, cfg *Config, noRemote bool, promp
 
 	var packages []string
 	for pkg := range items {
-		if !isPackageInstalled(pkg) {
+		if !packageOrMetaInstalled(pkg) {
 			continue
 		}
 		packages = append(packages, pkg)

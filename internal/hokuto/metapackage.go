@@ -13,6 +13,7 @@ type MetaPackage struct {
 	Name        string
 	Description string
 	Depends     []DepSpec
+	Suggests    []DepSpec
 }
 
 func metaPackageDBDir() string {
@@ -49,6 +50,9 @@ func installMetaPackageMarker(meta MetaPackage) error {
 	}
 	for _, line := range metaPackageDependsLines(meta) {
 		b.WriteString("depends=" + line + "\n")
+	}
+	for _, line := range metaPackageSuggestLines(meta) {
+		b.WriteString("suggests=" + line + "\n")
 	}
 	path := metaPackageMarkerPath(meta.Name)
 	if err := os.WriteFile(path, []byte(b.String()), 0o644); err != nil {
@@ -126,10 +130,16 @@ func findRemoteMetaPackage(name string, cfg *Config, remoteIndex []RepoEntry, al
 			debugf("Warning: failed to parse remote meta package %s dependencies: %v\n", name, err)
 			return MetaPackage{}, false
 		}
+		suggests, err := parseMetaPackageSuggests(entry.Suggests)
+		if err != nil {
+			debugf("Warning: failed to parse remote meta package %s suggestions: %v\n", name, err)
+			return MetaPackage{}, false
+		}
 		return MetaPackage{
 			Name:        entry.Name,
 			Description: entry.Description,
 			Depends:     deps,
+			Suggests:    suggests,
 		}, true
 	}
 	return MetaPackage{}, false
@@ -172,6 +182,7 @@ func localMetaPackageIndexEntries() []RepoEntry {
 			Arch:        "meta",
 			Variant:     "meta",
 			Depends:     metaPackageDependsLines(meta),
+			Suggests:    metaPackageSuggestLines(meta),
 			Description: meta.Description,
 		})
 	}
@@ -216,11 +227,17 @@ func repoEntriesEqual(a, b RepoEntry) bool {
 		a.Size != b.Size ||
 		a.B3Sum != b.B3Sum ||
 		a.Description != b.Description ||
-		len(a.Depends) != len(b.Depends) {
+		len(a.Depends) != len(b.Depends) ||
+		len(a.Suggests) != len(b.Suggests) {
 		return false
 	}
 	for i := range a.Depends {
 		if a.Depends[i] != b.Depends[i] {
+			return false
+		}
+	}
+	for i := range a.Suggests {
+		if a.Suggests[i] != b.Suggests[i] {
 			return false
 		}
 	}
@@ -237,7 +254,7 @@ func readInstalledMetaPackageMarker(name string) (MetaPackage, bool) {
 		return MetaPackage{}, false
 	}
 	meta := MetaPackage{Name: name}
-	var depLines []string
+	var depLines, suggestLines []string
 	for _, raw := range strings.Split(string(data), "\n") {
 		line := strings.TrimSpace(raw)
 		if line == "" {
@@ -252,11 +269,16 @@ func readInstalledMetaPackageMarker(name string) (MetaPackage, bool) {
 			meta.Description = value
 		case "depends":
 			depLines = append(depLines, value)
+		case "suggests":
+			suggestLines = append(suggestLines, value)
 		}
 	}
 	deps, err := parseDependsData([]byte(strings.Join(depLines, "\n")))
 	if err == nil {
 		meta.Depends = deps
+	}
+	if suggests, err := parseMetaPackageSuggests(suggestLines); err == nil {
+		meta.Suggests = suggests
 	}
 	return meta, true
 }
@@ -329,6 +351,12 @@ func parseMetaPackageFile(path string) (map[string]MetaPackage, error) {
 				return err
 			}
 			meta.Depends = append(meta.Depends, deps...)
+		} else if multilineKey == "suggests" || multilineKey == "suggest" {
+			suggests, err := parseMetaPackageSuggests(multilineValues)
+			if err != nil {
+				return err
+			}
+			meta.Suggests = append(meta.Suggests, suggests...)
 		}
 		metas[current] = meta
 		multilineKey = ""
@@ -396,6 +424,20 @@ func parseMetaPackageFile(path string) (map[string]MetaPackage, error) {
 				return nil, err
 			}
 			meta.Depends = append(meta.Depends, deps...)
+			metas[current] = meta
+		case "suggests", "suggest":
+			if strings.HasPrefix(value, "[") && !strings.Contains(value, "]") {
+				multilineKey = key
+				multilineValues = append(multilineValues, parseMetaPackageListValues(strings.TrimPrefix(value, "["))...)
+				metas[current] = meta
+				continue
+			}
+			values := parseMetaPackageListValues(value)
+			suggests, err := parseMetaPackageSuggests(values)
+			if err != nil {
+				return nil, err
+			}
+			meta.Suggests = append(meta.Suggests, suggests...)
 			metas[current] = meta
 		}
 	}
@@ -484,10 +526,40 @@ func parseMetaPackageDepends(values []string) ([]DepSpec, error) {
 	return parseDependsData([]byte(strings.Join(values, "\n")))
 }
 
+func parseMetaPackageSuggests(values []string) ([]DepSpec, error) {
+	if len(values) == 0 {
+		return nil, nil
+	}
+	suggests := make([]DepSpec, 0, len(values))
+	for _, value := range values {
+		deps, err := parseDependsData([]byte(value))
+		if err != nil {
+			return nil, err
+		}
+		for _, dep := range deps {
+			dep.Suggest = true
+			suggests = append(suggests, dep)
+		}
+	}
+	return suggests, nil
+}
+
 func metaPackageDependsLines(meta MetaPackage) []string {
 	lines := make([]string, 0, len(meta.Depends))
 	for _, dep := range meta.Depends {
 		lines = append(lines, depSpecLine(dep))
+	}
+	return lines
+}
+
+func metaPackageSuggestLines(meta MetaPackage) []string {
+	lines := make([]string, 0, len(meta.Suggests))
+	for _, dep := range meta.Suggests {
+		line := depSpecLine(dep) + " suggest"
+		if dep.SuggestText != "" {
+			line += " " + dep.SuggestText
+		}
+		lines = append(lines, line)
 	}
 	return lines
 }

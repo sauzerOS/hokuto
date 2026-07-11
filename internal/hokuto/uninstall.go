@@ -329,33 +329,19 @@ func pkgUninstallWithRemovalSet(pkgName string, cfg *Config, execCtx *Executor, 
 			fcPrintf(logger, colArrow, "-> ")
 			fcPrintf(logger, colSuccess, "Removed %d files natively\n", removedCount)
 		} else {
-			// Keep argument lists comfortably below ARG_MAX. rm attempts every path
-			// even when one removal fails, so inspect only paths left behind instead
-			// of spawning a privileged process for every file.
-			const removalBatchSize = 512
-			const removalBatchBytes = 128 * 1024
+			// Preserve the original single-command removal behavior. rm continues
+			// processing its arguments after an individual path fails, so a non-zero
+			// exit only requires checking which paths remain; do not rerun rm once per
+			// manifest entry.
+			rmCmd := exec.Command("rm", "-f")
+			rmCmd.Args = append(rmCmd.Args, filesToRemove...)
+			batchErr := execCtx.Run(rmCmd)
 			removedCount := 0
-			for start := 0; start < len(filesToRemove); {
-				end, argBytes := start, 0
-				for end < len(filesToRemove) && end-start < removalBatchSize {
-					nextBytes := len(filesToRemove[end]) + 1
-					if end > start && argBytes+nextBytes > removalBatchBytes {
-						break
-					}
-					argBytes += nextBytes
-					end++
-				}
-				batch := filesToRemove[start:end]
-				rmCmd := exec.Command("rm", "-f", "--")
-				rmCmd.Args = append(rmCmd.Args, batch...)
-				batchErr := execCtx.Run(rmCmd)
-				if batchErr == nil {
-					removedCount += len(batch)
-					continue
-				}
-
-				debugf("Batch removal returned an error; checking %d paths that may remain: %v\n", len(batch), batchErr)
-				for _, file := range batch {
+			if batchErr == nil {
+				removedCount = len(filesToRemove)
+			} else {
+				debugf("Package file removal returned an error; checking %d paths that may remain: %v\n", len(filesToRemove), batchErr)
+				for _, file := range filesToRemove {
 					if _, statErr := os.Lstat(file); os.IsNotExist(statErr) {
 						removedCount++
 					} else if statErr != nil {
@@ -364,7 +350,6 @@ func pkgUninstallWithRemovalSet(pkgName string, cfg *Config, execCtx *Executor, 
 						failed = append(failed, fmt.Sprintf("%s: %v", file, batchErr))
 					}
 				}
-				start = end
 			}
 			fcPrintf(logger, colArrow, "-> ")
 			fcPrintf(logger, colSuccess, "Removed %d files\n", removedCount)
