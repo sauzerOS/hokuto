@@ -13,9 +13,10 @@ import (
 )
 
 type uninstallListEntry struct {
-	Name string
-	Size int64
-	Meta string
+	Name      string
+	Size      int64
+	Meta      string
+	Protected bool
 }
 
 func installedUninstallListEntries() ([]uninstallListEntry, error) {
@@ -35,7 +36,11 @@ func installedUninstallListEntries() ([]uninstallListEntry, error) {
 			version = strings.TrimSpace(string(data))
 		}
 		size, _, _, _ := installedPackageSize(name)
-		result = append(result, uninstallListEntry{Name: name, Size: size, Meta: version})
+		protected := name == protectedBasePackage
+		if protected {
+			version += " | protected base filesystem"
+		}
+		result = append(result, uninstallListEntry{Name: name, Size: size, Meta: version, Protected: protected})
 	}
 	for _, name := range installedMetaPackageNames() {
 		meta := "metapackage"
@@ -130,8 +135,15 @@ func selectPackagesToUninstall(entries []uninstallListEntry, initialForce bool) 
 		if selected[row] {
 			mark = "[X]"
 		}
-		table.SetCell(row, 0, tview.NewTableCell(tview.Escape(mark)).SetTextColor(tcell.ColorGreen).SetExpansion(0))
-		table.SetCell(row, 1, tview.NewTableCell(entries[row].Name).SetTextColor(tcell.ColorWhite).SetExpansion(1))
+		markColor := tcell.ColorGreen
+		nameColor := tcell.ColorWhite
+		if entries[row].Protected {
+			mark = "[!]"
+			markColor = tcell.ColorYellow
+			nameColor = tcell.ColorYellow
+		}
+		table.SetCell(row, 0, tview.NewTableCell(tview.Escape(mark)).SetTextColor(markColor).SetExpansion(0))
+		table.SetCell(row, 1, tview.NewTableCell(entries[row].Name).SetTextColor(nameColor).SetExpansion(1))
 		table.SetCell(row, 2, tview.NewTableCell(humanReadableSize(entries[row].Size)).SetTextColor(tcell.ColorYellow).SetExpansion(0).SetAlign(tview.AlignRight))
 		table.SetCell(row, 3, tview.NewTableCell(entries[row].Meta).SetTextColor(tcell.ColorGray).SetExpansion(0))
 	}
@@ -160,13 +172,17 @@ func selectPackagesToUninstall(entries []uninstallListEntry, initialForce bool) 
 			case ' ':
 				row, _ := table.GetSelection()
 				if row >= 0 && row < len(selected) {
+					if entries[row].Protected {
+						status.SetText("[yellow]sauzeros-base is protected and cannot be uninstalled.[white]")
+						return nil
+					}
 					selected[row] = !selected[row]
 					refreshRow(row)
 				}
 				return nil
 			case 'a':
 				for i := range selected {
-					selected[i] = true
+					selected[i] = !entries[i].Protected
 					refreshRow(i)
 				}
 				return nil

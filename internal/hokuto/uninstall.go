@@ -16,6 +16,8 @@ import (
 	"github.com/gookit/color"
 )
 
+const protectedBasePackage = "sauzeros-base"
+
 func pkgUninstall(pkgName string, cfg *Config, execCtx *Executor, force, yes bool, logger io.Writer) error {
 	return pkgUninstallWithRemovalSet(pkgName, cfg, execCtx, force, yes, logger, nil)
 }
@@ -72,6 +74,9 @@ func installedDependents(pkgName string, cfg *Config, removing map[string]bool) 
 }
 
 func pkgUninstallWithRemovalSet(pkgName string, cfg *Config, execCtx *Executor, force, yes bool, logger io.Writer, removing map[string]bool) error {
+	if pkgName == protectedBasePackage {
+		return fmt.Errorf("refusing to uninstall protected base filesystem package %s", pkgName)
+	}
 	if logger == nil {
 		logger = os.Stdout
 	}

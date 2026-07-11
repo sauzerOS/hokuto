@@ -1211,6 +1211,13 @@ func Main() {
 		for _, pkgName := range packagesToUninstall {
 			colArrow.Print("-> ")
 			colSuccess.Printf("Attempting to uninstall package: %s\n", pkgName)
+			if pkgName == protectedBasePackage {
+				colArrow.Print("-> ")
+				color.Light.Printf("Error uninstalling %s: protected base filesystem package cannot be removed\n", pkgName)
+				delete(removingSet, pkgName)
+				allSucceeded = false
+				continue
+			}
 
 			if isMetaPackageInstalled(pkgName) {
 				if err := removeMetaPackageMarker(pkgName); err != nil {
