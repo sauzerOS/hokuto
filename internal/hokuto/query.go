@@ -7,15 +7,216 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/gookit/color"
 )
+
+type packageIntegrityIssue struct {
+	Package string
+	Missing []string
+}
+
+func integrityPathExists(path string, privilegedExec *Executor) (bool, error) {
+	if _, err := os.Lstat(path); err == nil {
+		return true, nil
+	} else if os.IsNotExist(err) {
+		return false, nil
+	} else if !os.IsPermission(err) {
+		return false, err
+	}
+
+	// Protected package paths (for example parts of /var/cache/cups) cannot be
+	// verified by the calling user. GNU stat checks the directory entry itself,
+	// so broken symlinks still count as present just like os.Lstat above.
+	cmd := exec.Command("stat", "--", path)
+	if err := privilegedExec.Run(cmd); err == nil {
+		return true, nil
+	} else {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
+			return false, nil
+		}
+		return false, err
+	}
+}
+
+func scanInstalledPackageIntegrity(searchTerm string, cfg *Config) ([]packageIntegrityIssue, error) {
+	entries, err := os.ReadDir(Installed)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("failed to read installed package database: %w", err)
+	}
+
+	root := rootDir
+	if cfg != nil && cfg.Values["HOKUTO_ROOT"] != "" {
+		root = cfg.Values["HOKUTO_ROOT"]
+	}
+	if root == "" {
+		root = "/"
+	}
+	execContext := context.Background()
+	if RootExec != nil && RootExec.Context != nil {
+		execContext = RootExec.Context
+	}
+	privilegedExec := &Executor{
+		Context:         execContext,
+		ShouldRunAsRoot: true,
+		Interactive:     true,
+		Stdout:          io.Discard,
+		Stderr:          io.Discard,
+	}
+
+	var issues []packageIntegrityIssue
+	for _, entry := range entries {
+		if !entry.IsDir() || (searchTerm != "" && !strings.Contains(entry.Name(), searchTerm)) {
+			continue
+		}
+		pkgName := entry.Name()
+		manifestPath := filepath.Join(Installed, pkgName, "manifest")
+		file, err := os.Open(manifestPath)
+		if err != nil {
+			issues = append(issues, packageIntegrityIssue{Package: pkgName, Missing: []string{"installed package manifest"}})
+			continue
+		}
+
+		var missing []string
+		scanner := bufio.NewScanner(file)
+		scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+		for scanner.Scan() {
+			manifestPath := parseManifestFilePath(scanner.Text())
+			if manifestPath == "" {
+				continue
+			}
+			diskPath := manifestPathOnDisk(root, manifestPath)
+			exists, err := integrityPathExists(diskPath, privilegedExec)
+			if err != nil {
+				file.Close()
+				return nil, fmt.Errorf("failed to inspect %s for %s: %w", manifestPath, pkgName, err)
+			}
+			if !exists {
+				missing = append(missing, filepath.ToSlash(filepath.Clean(manifestPath)))
+			}
+		}
+		scanErr := scanner.Err()
+		file.Close()
+		if scanErr != nil {
+			return nil, fmt.Errorf("failed to scan manifest for %s: %w", pkgName, scanErr)
+		}
+		if len(missing) > 0 {
+			sort.Strings(missing)
+			issues = append(issues, packageIntegrityIssue{Package: pkgName, Missing: missing})
+		}
+	}
+
+	sort.Slice(issues, func(i, j int) bool { return issues[i].Package < issues[j].Package })
+	return issues, nil
+}
+
+func reinstallPackageForIntegrity(pkgName string, cfg *Config) error {
+	versionData, err := os.ReadFile(filepath.Join(Installed, pkgName, "version"))
+	if err != nil {
+		return fmt.Errorf("could not read installed version: %w", err)
+	}
+	fields := strings.Fields(string(versionData))
+	if len(fields) == 0 {
+		return fmt.Errorf("installed version metadata is empty")
+	}
+	version := fields[0]
+	revision := "1"
+	if len(fields) > 1 {
+		revision = fields[1]
+	}
+
+	installName := pkgName
+	var tarballPath string
+	if cached := findCachedBinaryTarballVersion(pkgName, version, revision, cfg); cached != "" {
+		tarballPath = cached
+	} else {
+		for _, variant := range dependencyVariantCandidates(pkgName, cfg) {
+			fetched, ok, fetchErr := fetchExactBinaryTarballIfAvailable(pkgName, version, revision, variant, cfg, false)
+			if fetchErr != nil {
+				return fetchErr
+			}
+			if ok {
+				tarballPath = fetched
+				break
+			}
+		}
+	}
+
+	if tarballPath == "" {
+		var ok bool
+		installName, tarballPath, ok, err = availableBinaryPackageTarball(pkgName, cfg, false)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return fmt.Errorf("no binary is available; rebuild it with 'hokuto build %s'", pkgName)
+		}
+	}
+
+	isCriticalAtomic.Store(1)
+	defer isCriticalAtomic.Store(0)
+	handlePreInstallUninstall(installName, cfg, RootExec, true, nil)
+	if _, err := pkgInstall(tarballPath, installName, cfg, RootExec, true, false, false, nil); err != nil {
+		return err
+	}
+	return nil
+}
+
+func checkInstalledPackageIntegrity(searchTerm string, cfg *Config) error {
+	colArrow.Print("-> ")
+	colSuccess.Println("Checking installed package integrity")
+	issues, err := scanInstalledPackageIntegrity(searchTerm, cfg)
+	if err != nil {
+		return err
+	}
+	if len(issues) == 0 {
+		colArrow.Print("-> ")
+		colSuccess.Println("All installed package files are present.")
+		return nil
+	}
+
+	colArrow.Print("-> ")
+	colWarn.Printf("Found %d package(s) with missing files.\n", len(issues))
+	for _, issue := range issues {
+		colWarn.Printf("  %s: %d missing file(s)\n", issue.Package, len(issue.Missing))
+		limit := min(len(issue.Missing), 10)
+		for _, path := range issue.Missing[:limit] {
+			fmt.Printf("    %s\n", path)
+		}
+		if len(issue.Missing) > limit {
+			fmt.Printf("    ... and %d more\n", len(issue.Missing)-limit)
+		}
+	}
+
+	for _, issue := range issues {
+		if !askForConfirmation(colWarn, "Reinstall %s?", colNote.Sprint(issue.Package)) {
+			continue
+		}
+		colArrow.Print("-> ")
+		colSuccess.Printf("Reinstalling %s\n", issue.Package)
+		if err := reinstallPackageForIntegrity(issue.Package, cfg); err != nil {
+			colWarn.Printf("Warning: failed to reinstall %s: %v\n", issue.Package, err)
+			continue
+		}
+		colArrow.Print("-> ")
+		colSuccess.Printf("Reinstalled %s successfully.\n", issue.Package)
+	}
+	return nil
+}
 
 func listPackages(searchTerm string) error {
 	// Step 1: Always get the full list of installed package directories first.

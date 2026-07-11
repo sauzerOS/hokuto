@@ -425,6 +425,7 @@ func Main() {
 	case "list", "ls":
 		lsCmd := flag.NewFlagSet("list", flag.ExitOnError)
 		var remote = lsCmd.Bool("remote", false, "List packages from the remote repository.")
+		var checkIntegrity = lsCmd.Bool("check-integrity", false, "Check installed manifests for missing files and offer to reinstall affected packages.")
 		if err := lsCmd.Parse(os.Args[2:]); err != nil {
 			fmt.Fprintf(os.Stderr, "Error parsing ls flags: %v\n", err)
 			os.Exit(1)
@@ -435,9 +436,17 @@ func Main() {
 			pkg = lsCmd.Arg(0)
 		}
 
-		if *remote {
+		if *remote && *checkIntegrity {
+			fmt.Fprintln(os.Stderr, "Error: --remote and --check-integrity cannot be used together.")
+			exitCode = 1
+		} else if *remote {
 			if err := listRemotePackages(pkg, cfg); err != nil {
 				fmt.Fprintln(os.Stderr, "Error listing remote packages:", err)
+				exitCode = 1
+			}
+		} else if *checkIntegrity {
+			if err := checkInstalledPackageIntegrity(pkg, cfg); err != nil {
+				fmt.Fprintln(os.Stderr, "Error checking package integrity:", err)
 				exitCode = 1
 			}
 		} else {
