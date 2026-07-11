@@ -3487,6 +3487,23 @@ func handleBuildCommand(args []string, cfg *Config) (err error) {
 		packagesToProcess = append(packagesToProcess, pkgName)
 	}
 	for _, pkg := range requestedPackages {
+		if meta, ok := findInstallMetaPackage(pkg, cfg, nil, !*noRemote); ok {
+			targets, splitTargets, collectErr := collectMetaPackageMissingBinaryTargets(meta, cfg, *noRemote)
+			if collectErr != nil {
+				return fmt.Errorf("cannot expand metapackage %s: %w", pkg, collectErr)
+			}
+			colArrow.Print("-> ")
+			colSuccess.Printf("Metapackage %s: %d source package(s) missing current binaries\n", pkg, len(targets))
+			for _, sourcePkg := range targets {
+				userRequestedMap[sourcePkg] = true
+				forceBuildMap[sourcePkg] = true
+				addPackageToProcess(sourcePkg)
+				for _, splitPkg := range splitTargets[sourcePkg] {
+					addMappedSplitDependency(directSplitTargetsBySource, sourcePkg, splitPkg)
+				}
+			}
+			continue
+		}
 		if _, err := findPackageDir(pkg); err == nil {
 			userRequestedMap[pkg] = true
 			forceBuildMap[pkg] = true
