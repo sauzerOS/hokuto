@@ -251,6 +251,16 @@ func printResolvedBuildSummary(plan *BuildPlan) {
 	}
 }
 
+func resolveRequestedBuildTarget(pkgName string) (sourcePkg string, split bool, err error) {
+	if sourcePkg, _, ok := findSplitPackageSource(pkgName); ok {
+		return sourcePkg, true, nil
+	}
+	if _, err := findPackageDir(pkgName); err == nil {
+		return pkgName, false, nil
+	}
+	return "", false, fmt.Errorf("package not found in any repository")
+}
+
 func activeBuildDependency(dep DepSpec, cfg *Config, includeOptional bool) bool {
 	if dep.RuntimeOnly || dep.Suggest {
 		return false
@@ -3526,13 +3536,11 @@ func handleBuildCommand(args []string, cfg *Config) (err error) {
 			}
 			continue
 		}
-		if _, err := findPackageDir(pkg); err == nil {
-			userRequestedMap[pkg] = true
-			forceBuildMap[pkg] = true
-			addPackageToProcess(pkg)
-			continue
+		sourcePkg, isSplit, targetErr := resolveRequestedBuildTarget(pkg)
+		if targetErr != nil {
+			return fmt.Errorf("cannot build %s: %w", pkg, targetErr)
 		}
-		if sourcePkg, _, ok := findSplitPackageSource(pkg); ok {
+		if isSplit {
 			userRequestedMap[pkg] = true
 			forceBuildMap[sourcePkg] = true
 			addPackageToProcess(sourcePkg)
@@ -3541,7 +3549,9 @@ func handleBuildCommand(args []string, cfg *Config) (err error) {
 			debugf("Target %s is a split package; scheduling %s to build it\n", pkg, sourcePkg)
 			continue
 		}
-		return fmt.Errorf("cannot build %s: package not found in any repository", pkg)
+		userRequestedMap[pkg] = true
+		forceBuildMap[pkg] = true
+		addPackageToProcess(pkg)
 	}
 	for _, pkg := range packagesToProcess {
 		if _, err := findPackageDir(pkg); err != nil {
