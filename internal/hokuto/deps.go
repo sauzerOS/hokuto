@@ -710,9 +710,10 @@ func resolveMissingDeps(pkgName string, processed map[string]bool, missing *[]st
 	}
 	processed[pkgName] = true
 
-	if !forceBuild[pkgName] && isPackageInstalled(pkgName) {
-		return nil
-	}
+	// An installed package is not necessarily complete: force removal may have
+	// removed one of its runtime dependencies. Continue walking its dependency
+	// graph and only skip adding the package itself to the missing/build list at
+	// the end of this function.
 	if !forceBuild[pkgName] && isMetaPackageInstalled(pkgName) {
 		return nil
 	}
