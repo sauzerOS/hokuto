@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -13,6 +14,7 @@ import (
 
 // PKGBUILDInfo holds parsed information from a PKGBUILD
 type PKGBUILDInfo struct {
+	PkgBase     string
 	Version     string
 	Sources     []string
 	Depends     []string
@@ -61,14 +63,93 @@ func fetchPKGBUILD(pkgName string, source string) (string, error) {
 	return string(body), nil
 }
 
+func archPackageFileURL(pkgName, source, fileName string) (string, error) {
+	clean := filepath.ToSlash(filepath.Clean(fileName))
+	if clean == "." || clean == "" || strings.HasPrefix(clean, "../") || strings.HasPrefix(clean, "/") {
+		return "", fmt.Errorf("unsafe local PKGBUILD source path %q", fileName)
+	}
+	parts := strings.Split(clean, "/")
+	for i, part := range parts {
+		parts[i] = url.PathEscape(part)
+	}
+	escapedPath := strings.Join(parts, "/")
+	if source == "AUR" {
+		return fmt.Sprintf("https://aur.archlinux.org/cgit/aur.git/plain/%s?h=%s", escapedPath, url.QueryEscape(pkgName)), nil
+	}
+	return fmt.Sprintf("https://gitlab.archlinux.org/archlinux/packaging/packages/%s/-/raw/main/%s", url.PathEscape(pkgName), escapedPath), nil
+}
+
+func downloadArchPackageFile(pkgName, source, fileName, destination string) error {
+	fileURL, err := archPackageFileURL(pkgName, source, fileName)
+	if err != nil {
+		return err
+	}
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Get(fileURL)
+	if err != nil {
+		return fmt.Errorf("failed to fetch %s: %w", fileName, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("failed to fetch %s (HTTP %d)", fileName, resp.StatusCode)
+	}
+	if err := os.MkdirAll(filepath.Dir(destination), 0o755); err != nil {
+		return err
+	}
+	tmp := destination + ".part"
+	out, err := os.Create(tmp)
+	if err != nil {
+		return err
+	}
+	_, copyErr := io.Copy(out, resp.Body)
+	closeErr := out.Close()
+	if copyErr != nil {
+		_ = os.Remove(tmp)
+		return copyErr
+	}
+	if closeErr != nil {
+		_ = os.Remove(tmp)
+		return closeErr
+	}
+	if err := os.Rename(tmp, destination); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return nil
+}
+
+func materializeArchLocalSources(info *PKGBUILDInfo, pkgName, source, pkgDir string) error {
+	for i, item := range info.Sources {
+		if isRemoteImportSource(item) || strings.HasPrefix(item, "files/") {
+			continue
+		}
+		// Renamed remote sources have already been translated to "URL -> name".
+		if fields := strings.Fields(item); len(fields) >= 3 && fields[len(fields)-2] == "->" && isRemoteImportSource(fields[0]) {
+			continue
+		}
+		clean := filepath.ToSlash(filepath.Clean(item))
+		destination := filepath.Join(pkgDir, "files", filepath.FromSlash(clean))
+		colArrow.Print("-> ")
+		colSuccess.Printf("Downloading PKGBUILD file %s\n", item)
+		if err := downloadArchPackageFile(pkgName, source, clean, destination); err != nil {
+			return err
+		}
+		info.Sources[i] = "files/" + clean
+	}
+	return nil
+}
+
 // parsePKGBUILD extracts relevant information from PKGBUILD content
 func parsePKGBUILD(content string, pkgName string) (*PKGBUILDInfo, error) {
 	info := &PKGBUILDInfo{}
+	variables := extractPKGBUILDVariables(content)
+	info.PkgBase = variables["pkgbase"]
+	if info.PkgBase == "" {
+		info.PkgBase = pkgName
+	}
 
 	// Extract pkgver
-	if match := regexp.MustCompile(`(?m)^pkgver=(.+)$`).FindStringSubmatch(content); len(match) > 1 {
-		info.Version = strings.Trim(match[1], `"'`)
-	}
+	info.Version = variables["pkgver"]
 
 	// Extract source array (handle multi-line)
 	info.Sources = extractBashArray(content, "source")
@@ -81,6 +162,7 @@ func parsePKGBUILD(content string, pkgName string) (*PKGBUILDInfo, error) {
 
 	packageNames := extractBashArray(content, "pkgname")
 	for _, fn := range extractBashFunctions(content) {
+		fn.Body = expandPKGBUILDVariables(fn.Body, variables)
 		switch fn.Name {
 		case "prepare":
 			info.PrepareFunc = fn.Body
@@ -116,23 +198,134 @@ func parsePKGBUILD(content string, pkgName string) (*PKGBUILDInfo, error) {
 	// Replace variable references in sources
 	// Replace variable references in sources
 	for i, src := range info.Sources {
-		src = strings.ReplaceAll(src, "${pkgname}", pkgName)
-		src = strings.ReplaceAll(src, "$pkgname", pkgName)
+		// Keep direct pkgver references tied to Hokuto's version placeholder.
 		src = strings.ReplaceAll(src, "${pkgver}", "${version}")
 		src = strings.ReplaceAll(src, "$pkgver", "${version}")
+		src = expandPKGBUILDVariables(src, variables)
+		if info.PkgBase != "" {
+			first := string([]rune(info.PkgBase)[0])
+			src = strings.ReplaceAll(src, "${pkgbase::1}", first)
+			src = strings.ReplaceAll(src, "${pkgbase}", info.PkgBase)
+			src = strings.ReplaceAll(src, "$pkgbase", info.PkgBase)
+		}
+		src = strings.ReplaceAll(src, "${pkgname}", pkgName)
+		src = strings.ReplaceAll(src, "$pkgname", pkgName)
 
 		// Convert Arch-style renaming "filename::URL" to Hokuto-style "URL -> filename"
-		if strings.Contains(src, "::") {
-			parts := strings.SplitN(src, "::", 2)
-			if len(parts) == 2 {
-				src = fmt.Sprintf("%s -> %s", parts[1], parts[0])
-			}
+		if filename, sourceURL, ok := splitArchRenamedSource(src); ok {
+			src = fmt.Sprintf("%s -> %s", sourceURL, filename)
 		}
 
 		info.Sources[i] = src
 	}
 
 	return info, nil
+}
+
+func extractPKGBUILDVariables(content string) map[string]string {
+	variables := make(map[string]string)
+	re := regexp.MustCompile(`(?m)^([A-Za-z_][A-Za-z0-9_]*)=([^\n]*)$`)
+	for _, match := range re.FindAllStringSubmatch(content, -1) {
+		value := strings.TrimSpace(match[2])
+		if strings.HasPrefix(value, "(") {
+			continue
+		}
+		value = strings.Trim(value, `"'`)
+		variables[match[1]] = expandPKGBUILDVariables(value, variables)
+	}
+	// Resolve forward references and chained assignments with a bounded pass.
+	for range 10 {
+		changed := false
+		for name, value := range variables {
+			expanded := expandPKGBUILDVariables(value, variables)
+			if expanded != value {
+				variables[name] = expanded
+				changed = true
+			}
+		}
+		if !changed {
+			break
+		}
+	}
+	return variables
+}
+
+func expandPKGBUILDVariables(value string, variables map[string]string) string {
+	substring := regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_]*)::([0-9]+)\}`)
+	value = substring.ReplaceAllStringFunc(value, func(expr string) string {
+		parts := substring.FindStringSubmatch(expr)
+		resolved, ok := variables[parts[1]]
+		if !ok {
+			return expr
+		}
+		length := 0
+		fmt.Sscanf(parts[2], "%d", &length)
+		runes := []rune(resolved)
+		if length < len(runes) {
+			runes = runes[:length]
+		}
+		return string(runes)
+	})
+
+	replacement := regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_]*)/(\/)?([^/]*)/([^}]*)\}`)
+	value = replacement.ReplaceAllStringFunc(value, func(expr string) string {
+		parts := replacement.FindStringSubmatch(expr)
+		resolved, ok := variables[parts[1]]
+		if !ok {
+			return expr
+		}
+		if parts[2] == "/" {
+			return strings.ReplaceAll(resolved, parts[3], parts[4])
+		}
+		return strings.Replace(resolved, parts[3], parts[4], 1)
+	})
+
+	braced := regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_]*)\}`)
+	value = braced.ReplaceAllStringFunc(value, func(expr string) string {
+		name := braced.FindStringSubmatch(expr)[1]
+		if resolved, ok := variables[name]; ok {
+			return resolved
+		}
+		return expr
+	})
+	unbraced := regexp.MustCompile(`\$([A-Za-z_][A-Za-z0-9_]*)`)
+	return unbraced.ReplaceAllStringFunc(value, func(expr string) string {
+		name := expr[1:]
+		if resolved, ok := variables[name]; ok {
+			return resolved
+		}
+		return expr
+	})
+}
+
+func extractBashScalar(content, name string) string {
+	pattern := fmt.Sprintf(`(?m)^[ \t]*%s=([^\n#]+)`, regexp.QuoteMeta(name))
+	match := regexp.MustCompile(pattern).FindStringSubmatch(content)
+	if len(match) < 2 {
+		return ""
+	}
+	return strings.Trim(strings.TrimSpace(match[1]), `"'`)
+}
+
+func splitArchRenamedSource(source string) (string, string, bool) {
+	idx := strings.Index(source, "::")
+	if idx <= 0 {
+		return "", "", false
+	}
+	filename, sourceURL := source[:idx], source[idx+2:]
+	if !isRemoteImportSource(sourceURL) {
+		return "", "", false
+	}
+	return filename, sourceURL, true
+}
+
+func isRemoteImportSource(source string) bool {
+	for _, prefix := range []string{"http://", "https://", "ftp://", "git+", "svn+", "hg+"} {
+		if strings.HasPrefix(source, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 // extractBashArray extracts values from a bash array declaration
@@ -328,6 +521,9 @@ func generatePackageFromArch(pkgName string, source string, targetDir string) er
 	// Create package directory
 	if err := os.MkdirAll(pkgDir, 0o755); err != nil {
 		return fmt.Errorf("failed to create package directory: %w", err)
+	}
+	if err := materializeArchLocalSources(info, info.PkgBase, source, pkgDir); err != nil {
+		return fmt.Errorf("failed to import local PKGBUILD source: %w", err)
 	}
 
 	// 1. Create version file
