@@ -2,15 +2,22 @@ package hokuto
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"golang.org/x/term"
+)
+
+var (
+	ErrPrivilegeAuthentication = errors.New("privilege re-authentication failed")
+	sudoAuthenticationMu       sync.Mutex
 )
 
 // Executor provides a consistent interface for executing commands,
@@ -23,6 +30,7 @@ type Executor struct {
 	Stdout            io.Writer       // Optional redirect for Stdout
 	Stderr            io.Writer       // Optional redirect for Stderr
 	LogPath           string          // Optional path to write output logs to
+	Reauthenticate    func() error    // Optional frontend-specific authentication prompt
 }
 
 // Update the constructor/factory function for Executor
@@ -70,10 +78,27 @@ func (e *Executor) ensureSudo() error {
 	if os.Geteuid() == 0 || !e.ShouldRunAsRoot {
 		return nil
 	}
+	// Keep the normal valid-ticket path lock-free. The mutex below only
+	// serializes callers after authentication has actually expired.
+	checkCmd := exec.CommandContext(e.Context, "sudo", "-nv")
+	checkCmd.Stdout = io.Discard
+	checkCmd.Stderr = io.Discard
+	if err := checkCmd.Run(); err == nil {
+		return nil
+	}
+
+	sudoAuthenticationMu.Lock()
+	defer sudoAuthenticationMu.Unlock()
 
 	for {
 		if e.Context.Err() != nil {
 			return e.Context.Err()
+		}
+		if e.Reauthenticate != nil {
+			if err := e.Reauthenticate(); err != nil {
+				return fmt.Errorf("%w: %v", ErrPrivilegeAuthentication, err)
+			}
+			continue
 		}
 
 		// 1. First, perform a non-interactive check (`sudo -nv`) to see if the ticket is still valid.
@@ -114,7 +139,7 @@ func (e *Executor) ensureSudo() error {
 		// we should not retry to avoid a tight infinite loop.
 		isStdinTerminal := term.IsTerminal(int(os.Stdin.Fd()))
 		if !isStdinTerminal || time.Since(startTime) < 2*time.Second {
-			return fmt.Errorf("sudo re-authentication failed: %w", err)
+			return fmt.Errorf("%w: %v", ErrPrivilegeAuthentication, err)
 		}
 
 		colArrow.Print("-> ")

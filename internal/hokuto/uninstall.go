@@ -5,6 +5,7 @@ package hokuto
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -12,6 +13,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 
 	"github.com/gookit/color"
 )
@@ -340,10 +342,50 @@ func pkgUninstallWithRemovalSet(pkgName string, cfg *Config, execCtx *Executor, 
 			// manifest entry.
 			rmCmd := exec.Command("rm", "-f")
 			rmCmd.Args = append(rmCmd.Args, filesToRemove...)
-			batchErr := execCtx.Run(rmCmd)
 			removedCount := 0
+			batchErr := execCtx.Run(rmCmd)
+			if errors.Is(batchErr, ErrPrivilegeAuthentication) {
+				return fmt.Errorf("could not remove package files: %w", batchErr)
+			}
 			if batchErr == nil {
 				removedCount = len(filesToRemove)
+			} else if errors.Is(batchErr, syscall.E2BIG) {
+				// Large package manifests can exceed ARG_MAX. Retry only this
+				// launch failure in bounded batches, avoiding the very slow
+				// one-process-per-file fallback.
+				debugf("Package file removal exceeded the command argument limit; retrying in batches\n")
+				for start := 0; start < len(filesToRemove); {
+					end := start
+					argBytes := 0
+					for end < len(filesToRemove) && end-start < 256 {
+						n := len(filesToRemove[end]) + 1
+						if end > start && argBytes+n > 64*1024 {
+							break
+						}
+						argBytes += n
+						end++
+					}
+
+					paths := filesToRemove[start:end]
+					cmd := exec.Command("rm", "-f")
+					cmd.Args = append(cmd.Args, paths...)
+					if err := execCtx.Run(cmd); errors.Is(err, ErrPrivilegeAuthentication) {
+						return fmt.Errorf("could not remove package files: %w", err)
+					} else if err == nil {
+						removedCount += len(paths)
+					} else {
+						for _, file := range paths {
+							if _, statErr := os.Lstat(file); os.IsNotExist(statErr) {
+								removedCount++
+							} else if statErr != nil {
+								failed = append(failed, fmt.Sprintf("%s: removal failed (%v); unable to inspect path: %v", file, err, statErr))
+							} else {
+								failed = append(failed, fmt.Sprintf("%s: %v", file, err))
+							}
+						}
+					}
+					start = end
+				}
 			} else {
 				debugf("Package file removal returned an error; checking %d paths that may remain: %v\n", len(filesToRemove), batchErr)
 				for _, file := range filesToRemove {

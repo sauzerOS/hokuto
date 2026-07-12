@@ -159,6 +159,13 @@ func selectPackagesToUninstall(entries []uninstallListEntry, cfg *Config, initia
 	table := tview.NewTable().SetSelectable(true, false).SetFixed(0, 0)
 	table.SetBorder(true).SetTitle(" Installed Packages ")
 	status := tview.NewTextView().SetDynamicColors(true).SetTextAlign(tview.AlignCenter)
+	searchInput := tview.NewInputField().SetLabel("Search: ")
+	bottomPages := tview.NewPages().
+		AddPage("status", status, true, true).
+		AddPage("search", searchInput, true, false)
+	searching := false
+	searchQuery := ""
+	var visibleIndices []int
 	logView := tview.NewTextView().SetDynamicColors(true).SetScrollable(true)
 	logView.SetBorder(true).SetTitle(" Uninstall Log ")
 	logger := newTUILogWriter(app, logView)
@@ -181,36 +188,58 @@ func selectPackagesToUninstall(entries []uninstallListEntry, cfg *Config, initia
 		}
 	}
 
-	refreshRow := func(row int) {
+	refreshRow := func(row, entryIndex int) {
 		mark := "[ ]"
-		if selected[row] {
+		if selected[entryIndex] {
 			mark = "[X]"
 		}
 		markColor := tcell.ColorGreen
 		nameColor := tcell.ColorWhite
-		if entries[row].Protected {
+		if entries[entryIndex].Protected {
 			mark = "[!]"
 			markColor = tcell.ColorYellow
 			nameColor = tcell.ColorYellow
 		}
 		table.SetCell(row, 0, tview.NewTableCell(tview.Escape(mark)).SetTextColor(markColor).SetExpansion(0))
-		table.SetCell(row, 1, tview.NewTableCell(entries[row].Name).SetTextColor(nameColor).SetExpansion(1))
-		table.SetCell(row, 2, tview.NewTableCell(humanReadableSize(entries[row].Size)).SetTextColor(tcell.ColorYellow).SetExpansion(0).SetAlign(tview.AlignRight))
-		table.SetCell(row, 3, tview.NewTableCell(entries[row].Meta).SetTextColor(tcell.ColorGray).SetExpansion(0))
+		table.SetCell(row, 1, tview.NewTableCell(entries[entryIndex].Name).SetTextColor(nameColor).SetExpansion(1))
+		table.SetCell(row, 2, tview.NewTableCell(humanReadableSize(entries[entryIndex].Size)).SetTextColor(tcell.ColorYellow).SetExpansion(0).SetAlign(tview.AlignRight))
+		table.SetCell(row, 3, tview.NewTableCell(entries[entryIndex].Meta).SetTextColor(tcell.ColorGray).SetExpansion(0))
 	}
 	refreshStatus = func() {
 		mode := "[green]normal[white]"
 		if force {
 			mode = "[red]force[white]"
 		}
-		status.SetText(fmt.Sprintf("[gray]Space toggles, a selects all, n selects none, f toggles mode, u uninstalls, o cleans orphans, l toggles log, q quits.  Mode: %s", mode))
+		status.SetText(fmt.Sprintf("[gray]Space toggles, a selects all, n selects none, / searches, f toggles mode, u uninstalls, o cleans orphans, l toggles log, q quits.\nMode: %s", mode))
 	}
 	refreshTable := func() {
 		table.Clear()
+		visibleIndices = visibleIndices[:0]
+		query := strings.ToLower(strings.TrimSpace(searchQuery))
 		for i := range entries {
-			refreshRow(i)
+			if query != "" && !strings.Contains(strings.ToLower(entries[i].Name), query) {
+				continue
+			}
+			row := len(visibleIndices)
+			visibleIndices = append(visibleIndices, i)
+			refreshRow(row, i)
 		}
 	}
+	searchInput.SetChangedFunc(func(text string) {
+		searchQuery = text
+		refreshTable()
+	})
+	searchInput.SetDoneFunc(func(key tcell.Key) {
+		if key == tcell.KeyEscape {
+			searchInput.SetText("")
+			searchQuery = ""
+			refreshTable()
+		}
+		searching = false
+		bottomPages.SwitchToPage("status")
+		app.SetFocus(table)
+		refreshStatus()
+	})
 	refreshTable()
 	refreshStatus()
 
@@ -228,8 +257,25 @@ func selectPackagesToUninstall(entries []uninstallListEntry, cfg *Config, initia
 		tuiExec.Interactive = false
 		tuiExec.Stdout = io.Writer(logger)
 		tuiExec.Stderr = io.Writer(logger)
+		tuiExec.Reauthenticate = func() error {
+			var authErr error
+			if !app.Suspend(func() {
+				colArrow.Print("-> ")
+				colSuccess.Println("Sudo ticket has expired. Re-authenticating")
+				authErr = runInteractiveCommand(tuiExec.Context, "sudo", "-v")
+				if authErr == nil {
+					colArrow.Print("-> ")
+					colSuccess.Println("Re-authenticated via sudo successfully.")
+				}
+			}) {
+				return fmt.Errorf("unable to suspend the uninstall interface for sudo authentication")
+			}
+			return authErr
+		}
 		for _, name := range packages {
-			fmt.Fprintf(logger, "-> Removing %s\n", name)
+			fcPrintf(logger, colArrow, "-> ")
+			fcPrintf(logger, colSuccess, "Removing ")
+			fcPrintf(logger, colNote, "%s\n", name)
 			var uninstallErr error
 			if name == protectedBasePackage {
 				uninstallErr = fmt.Errorf("protected base filesystem package cannot be removed")
@@ -241,13 +287,34 @@ func selectPackagesToUninstall(entries []uninstallListEntry, cfg *Config, initia
 			delete(removing, name)
 			if uninstallErr != nil {
 				failedCount++
-				fmt.Fprintf(logger, "ERROR: failed to remove %s: %v\n", name, uninstallErr)
+				fcPrintf(logger, colArrow, "-> ")
+				fcPrintf(logger, colError, "ERROR: ")
+				fcPrintf(logger, colSuccess, "failed to remove ")
+				fcPrintf(logger, colNote, "%s", name)
+				message := uninstallErr.Error()
+				dependencyPrefix := fmt.Sprintf("cannot uninstall %s: other packages depend on it: ", name)
+				if dependents, ok := strings.CutPrefix(message, dependencyPrefix); ok {
+					fcPrintf(logger, colSuccess, ": cannot uninstall ")
+					fcPrintf(logger, colNote, "%s", name)
+					fcPrintf(logger, colSuccess, ": other packages depend on it: ")
+					for i, dependent := range strings.Split(dependents, ", ") {
+						if i > 0 {
+							fcPrintf(logger, colSuccess, ", ")
+						}
+						fcPrintf(logger, colNote, "%s", dependent)
+					}
+					fcPrintf(logger, colSuccess, "\n")
+				} else {
+					fcPrintf(logger, colSuccess, ": %s\n", message)
+				}
 				continue
 			}
 			removeFromWorld(name)
 			removeFromWorldMake(name)
 			succeeded[name] = true
-			fmt.Fprintf(logger, "-> %s removed successfully\n", name)
+			fcPrintf(logger, colArrow, "-> ")
+			fcPrintf(logger, colNote, "%s", name)
+			fcPrintf(logger, colSuccess, " removed successfully\n")
 		}
 		app.QueueUpdateDraw(func() {
 			remaining := entries[:0]
@@ -274,6 +341,9 @@ func selectPackagesToUninstall(entries []uninstallListEntry, cfg *Config, initia
 	}
 
 	app.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		if searching {
+			return event
+		}
 		if event.Key() == tcell.KeyRune && event.Rune() == 'l' {
 			toggleLog()
 			return nil
@@ -287,30 +357,39 @@ func selectPackagesToUninstall(entries []uninstallListEntry, cfg *Config, initia
 			return nil
 		case tcell.KeyRune:
 			switch event.Rune() {
+			case '/':
+				if showingLog {
+					toggleLog()
+				}
+				searching = true
+				bottomPages.SwitchToPage("search")
+				app.SetFocus(searchInput)
+				return nil
 			case 'q':
 				app.Stop()
 				return nil
 			case ' ':
 				row, _ := table.GetSelection()
-				if row >= 0 && row < len(selected) {
-					if entries[row].Protected {
+				if row >= 0 && row < len(visibleIndices) {
+					entryIndex := visibleIndices[row]
+					if entries[entryIndex].Protected {
 						status.SetText("[yellow]sauzeros-base is protected and cannot be uninstalled.[white]")
 						return nil
 					}
-					selected[row] = !selected[row]
-					refreshRow(row)
+					selected[entryIndex] = !selected[entryIndex]
+					refreshRow(row, entryIndex)
 				}
 				return nil
 			case 'a':
-				for i := range selected {
-					selected[i] = !entries[i].Protected
-					refreshRow(i)
+				for row, entryIndex := range visibleIndices {
+					selected[entryIndex] = !entries[entryIndex].Protected
+					refreshRow(row, entryIndex)
 				}
 				return nil
 			case 'n':
-				for i := range selected {
-					selected[i] = false
-					refreshRow(i)
+				for row, entryIndex := range visibleIndices {
+					selected[entryIndex] = false
+					refreshRow(row, entryIndex)
 				}
 				return nil
 			case 'f':
@@ -346,7 +425,8 @@ func selectPackagesToUninstall(entries []uninstallListEntry, cfg *Config, initia
 					status.SetText(logStatus)
 				}
 				go func() {
-					fmt.Fprintln(logger, "-> Checking for orphan packages")
+					fcPrintf(logger, colArrow, "-> ")
+					fcPrintf(logger, colSuccess, "Checking for orphan packages\n")
 					runtimeOrphans, runtimeErr := findOrphans()
 					makeOrphans, makeErr := findMakeOrphans()
 					if runtimeErr != nil || makeErr != nil {
@@ -372,7 +452,8 @@ func selectPackagesToUninstall(entries []uninstallListEntry, cfg *Config, initia
 					}
 					sort.Strings(orphans)
 					if len(orphans) == 0 {
-						fmt.Fprintln(logger, "-> No orphan packages found.")
+						fcPrintf(logger, colArrow, "-> ")
+						fcPrintf(logger, colSuccess, "No orphan packages found.\n")
 						app.QueueUpdateDraw(func() {
 							busy = false
 							logStatus = "[green]No orphan packages found. l to return or press q to quit.[white]"
@@ -384,7 +465,9 @@ func selectPackagesToUninstall(entries []uninstallListEntry, cfg *Config, initia
 						})
 						return
 					}
-					fmt.Fprintf(logger, "-> Found %d orphan package(s): %s\n", len(orphans), strings.Join(orphans, ", "))
+					fcPrintf(logger, colArrow, "-> ")
+					fcPrintf(logger, colSuccess, "Found %d orphan package(s): ", len(orphans))
+					fcPrintf(logger, colNote, "%s\n", strings.Join(orphans, ", "))
 					app.QueueUpdateDraw(func() {
 						logStatus = "[yellow]Cleaning orphan packages… l to return to packages.[white]"
 						if showingLog {
@@ -401,7 +484,7 @@ func selectPackagesToUninstall(entries []uninstallListEntry, cfg *Config, initia
 
 	flex := tview.NewFlex().SetDirection(tview.FlexRow).
 		AddItem(pages, 0, 1, true).
-		AddItem(status, 1, 0, false)
+		AddItem(bottomPages, 2, 0, false)
 	if err := app.SetRoot(flex, true).SetFocus(table).Run(); err != nil {
 		return err
 	}
