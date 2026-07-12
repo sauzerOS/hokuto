@@ -1174,20 +1174,11 @@ func Main() {
 				fmt.Fprintln(os.Stderr, "Error listing installed packages:", err)
 				os.Exit(1)
 			}
-			selected, selectedForce, confirmed, err := selectPackagesToUninstall(entries, effectiveForce)
-			if err != nil {
+			if err := selectPackagesToUninstall(entries, cfg, effectiveForce); err != nil {
 				fmt.Fprintln(os.Stderr, "Error selecting packages:", err)
 				os.Exit(1)
 			}
-			if !confirmed {
-				colNote.Println("Uninstall canceled by user.")
-				break
-			}
-			packagesToUninstall = selected
-			effectiveForce = selectedForce
-			// Pressing 'u' confirms the selected transaction; do not prompt once
-			// more for every package after leaving the interface.
-			effectiveYes = true
+			break
 		}
 
 		if len(packagesToUninstall) == 0 {

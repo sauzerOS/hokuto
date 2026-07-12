@@ -2,6 +2,7 @@ package hokuto
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -11,6 +12,34 @@ import (
 	"github.com/rivo/tview"
 	"golang.org/x/term"
 )
+
+type tuiQueuedLogWriter struct {
+	app  *tview.Application
+	view *tview.TextView
+}
+
+func (w *tuiQueuedLogWriter) Write(p []byte) (int, error) {
+	text := string(append([]byte(nil), p...))
+	text = strings.ReplaceAll(text, "\r", "")
+	w.app.QueueUpdateDraw(func() {
+		fmt.Fprint(w.view, text)
+		w.view.ScrollToEnd()
+	})
+	return len(p), nil
+}
+
+type tuiLogWriter struct {
+	ansi io.Writer
+}
+
+func newTUILogWriter(app *tview.Application, view *tview.TextView) *tuiLogWriter {
+	queued := &tuiQueuedLogWriter{app: app, view: view}
+	return &tuiLogWriter{ansi: tview.ANSIWriter(queued)}
+}
+
+func (w *tuiLogWriter) Write(p []byte) (int, error) {
+	return w.ansi.Write(p)
+}
 
 type uninstallListEntry struct {
 	Name      string
@@ -115,20 +144,42 @@ func orderPackagesForUninstall(packages []string) []string {
 	return ordered
 }
 
-func selectPackagesToUninstall(entries []uninstallListEntry, initialForce bool) (packages []string, force bool, confirmed bool, err error) {
+func selectPackagesToUninstall(entries []uninstallListEntry, cfg *Config, initialForce bool) error {
 	if !term.IsTerminal(int(os.Stdout.Fd())) {
-		return nil, initialForce, false, fmt.Errorf("interactive package selection requires a terminal")
+		return fmt.Errorf("interactive package selection requires a terminal")
 	}
 	if len(entries) == 0 {
-		return nil, initialForce, false, fmt.Errorf("no installed packages available for selection")
+		return fmt.Errorf("no installed packages available for selection")
 	}
 
 	selected := make([]bool, len(entries))
-	force = initialForce
+	force := initialForce
+	busy := false
 	app := tview.NewApplication()
 	table := tview.NewTable().SetSelectable(true, false).SetFixed(0, 0)
 	table.SetBorder(true).SetTitle(" Installed Packages ")
 	status := tview.NewTextView().SetDynamicColors(true).SetTextAlign(tview.AlignCenter)
+	logView := tview.NewTextView().SetDynamicColors(true).SetScrollable(true)
+	logView.SetBorder(true).SetTitle(" Uninstall Log ")
+	logger := newTUILogWriter(app, logView)
+	pages := tview.NewPages().
+		AddPage("packages", table, true, true).
+		AddPage("log", logView, true, false)
+	showingLog := false
+	logStatus := "[gray]l to return to packages, q to quit.[white]"
+	var refreshStatus func()
+	toggleLog := func() {
+		showingLog = !showingLog
+		if showingLog {
+			pages.SwitchToPage("log")
+			app.SetFocus(logView)
+			status.SetText(logStatus)
+		} else {
+			pages.SwitchToPage("packages")
+			app.SetFocus(table)
+			refreshStatus()
+		}
+	}
 
 	refreshRow := func(row int) {
 		mark := "[ ]"
@@ -147,19 +198,89 @@ func selectPackagesToUninstall(entries []uninstallListEntry, initialForce bool) 
 		table.SetCell(row, 2, tview.NewTableCell(humanReadableSize(entries[row].Size)).SetTextColor(tcell.ColorYellow).SetExpansion(0).SetAlign(tview.AlignRight))
 		table.SetCell(row, 3, tview.NewTableCell(entries[row].Meta).SetTextColor(tcell.ColorGray).SetExpansion(0))
 	}
-	refreshStatus := func() {
+	refreshStatus = func() {
 		mode := "[green]normal[white]"
 		if force {
 			mode = "[red]force[white]"
 		}
-		status.SetText(fmt.Sprintf("[gray]Space toggles, a selects all, n selects none, f toggles mode, u uninstalls, q quits.  Mode: %s", mode))
+		status.SetText(fmt.Sprintf("[gray]Space toggles, a selects all, n selects none, f toggles mode, u uninstalls, o cleans orphans, l toggles log, q quits.  Mode: %s", mode))
 	}
-	for i := range entries {
-		refreshRow(i)
+	refreshTable := func() {
+		table.Clear()
+		for i := range entries {
+			refreshRow(i)
+		}
 	}
+	refreshTable()
 	refreshStatus()
 
+	runUninstall := func(packages []string, forceMode bool, actionName string) {
+		defer func() { isCriticalAtomic.Store(0) }()
+		isCriticalAtomic.Store(1)
+		packages = orderPackagesForUninstall(packages)
+		removing := make(map[string]bool, len(packages))
+		for _, name := range packages {
+			removing[name] = true
+		}
+		succeeded := make(map[string]bool)
+		failedCount := 0
+		tuiExec := *RootExec
+		tuiExec.Interactive = false
+		tuiExec.Stdout = io.Writer(logger)
+		tuiExec.Stderr = io.Writer(logger)
+		for _, name := range packages {
+			fmt.Fprintf(logger, "-> Removing %s\n", name)
+			var uninstallErr error
+			if name == protectedBasePackage {
+				uninstallErr = fmt.Errorf("protected base filesystem package cannot be removed")
+			} else if isMetaPackageInstalled(name) {
+				uninstallErr = removeMetaPackageMarker(name)
+			} else {
+				uninstallErr = pkgUninstallWithRemovalSet(name, cfg, &tuiExec, forceMode, true, logger, removing)
+			}
+			delete(removing, name)
+			if uninstallErr != nil {
+				failedCount++
+				fmt.Fprintf(logger, "ERROR: failed to remove %s: %v\n", name, uninstallErr)
+				continue
+			}
+			removeFromWorld(name)
+			removeFromWorldMake(name)
+			succeeded[name] = true
+			fmt.Fprintf(logger, "-> %s removed successfully\n", name)
+		}
+		app.QueueUpdateDraw(func() {
+			remaining := entries[:0]
+			for _, entry := range entries {
+				if !succeeded[entry.Name] {
+					remaining = append(remaining, entry)
+				}
+			}
+			entries = remaining
+			selected = make([]bool, len(entries))
+			refreshTable()
+			busy = false
+			if failedCount > 0 {
+				logStatus = fmt.Sprintf("[yellow]%s finished with %d failure(s). l to return or press q to quit.[white]", actionName, failedCount)
+			} else {
+				logStatus = fmt.Sprintf("[green]%s completed. l to return or press q to quit.[white]", actionName)
+			}
+			if showingLog {
+				status.SetText(logStatus)
+			} else {
+				refreshStatus()
+			}
+		})
+	}
+
 	app.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		if event.Key() == tcell.KeyRune && event.Rune() == 'l' {
+			toggleLog()
+			return nil
+		}
+		if busy {
+			return nil
+		}
 		switch event.Key() {
 		case tcell.KeyEsc, tcell.KeyCtrlQ:
 			app.Stop()
@@ -197,6 +318,7 @@ func selectPackagesToUninstall(entries []uninstallListEntry, initialForce bool) 
 				refreshStatus()
 				return nil
 			case 'u':
+				var packages []string
 				for i, chosen := range selected {
 					if chosen {
 						packages = append(packages, entries[i].Name)
@@ -206,8 +328,71 @@ func selectPackagesToUninstall(entries []uninstallListEntry, initialForce bool) 
 					status.SetText("[yellow]Select at least one package before uninstalling.[white]")
 					return nil
 				}
-				confirmed = true
-				app.Stop()
+				busy = true
+				logStatus = "[yellow]Uninstalling selected packages… l to return to packages.[white]"
+				if !showingLog {
+					toggleLog()
+				} else {
+					status.SetText(logStatus)
+				}
+				go runUninstall(packages, force, "Uninstall")
+				return nil
+			case 'o':
+				busy = true
+				logStatus = "[yellow]Checking for orphan packages… l to return to packages.[white]"
+				if !showingLog {
+					toggleLog()
+				} else {
+					status.SetText(logStatus)
+				}
+				go func() {
+					fmt.Fprintln(logger, "-> Checking for orphan packages")
+					runtimeOrphans, runtimeErr := findOrphans()
+					makeOrphans, makeErr := findMakeOrphans()
+					if runtimeErr != nil || makeErr != nil {
+						app.QueueUpdateDraw(func() {
+							busy = false
+							logStatus = fmt.Sprintf("[red]Failed to calculate orphans: runtime=%v build=%v[white]", runtimeErr, makeErr)
+							if showingLog {
+								status.SetText(logStatus)
+							} else {
+								refreshStatus()
+							}
+						})
+						return
+					}
+					seen := make(map[string]bool)
+					var orphans []string
+					for _, name := range append(runtimeOrphans, makeOrphans...) {
+						if name == "" || name == protectedBasePackage || seen[name] {
+							continue
+						}
+						seen[name] = true
+						orphans = append(orphans, name)
+					}
+					sort.Strings(orphans)
+					if len(orphans) == 0 {
+						fmt.Fprintln(logger, "-> No orphan packages found.")
+						app.QueueUpdateDraw(func() {
+							busy = false
+							logStatus = "[green]No orphan packages found. l to return or press q to quit.[white]"
+							if showingLog {
+								status.SetText(logStatus)
+							} else {
+								refreshStatus()
+							}
+						})
+						return
+					}
+					fmt.Fprintf(logger, "-> Found %d orphan package(s): %s\n", len(orphans), strings.Join(orphans, ", "))
+					app.QueueUpdateDraw(func() {
+						logStatus = "[yellow]Cleaning orphan packages… l to return to packages.[white]"
+						if showingLog {
+							status.SetText(logStatus)
+						}
+					})
+					runUninstall(orphans, false, "Orphan cleanup")
+				}()
 				return nil
 			}
 		}
@@ -215,10 +400,10 @@ func selectPackagesToUninstall(entries []uninstallListEntry, initialForce bool) 
 	})
 
 	flex := tview.NewFlex().SetDirection(tview.FlexRow).
-		AddItem(table, 0, 1, true).
+		AddItem(pages, 0, 1, true).
 		AddItem(status, 1, 0, false)
 	if err := app.SetRoot(flex, true).SetFocus(table).Run(); err != nil {
-		return nil, force, false, err
+		return err
 	}
-	return packages, force, confirmed, nil
+	return nil
 }

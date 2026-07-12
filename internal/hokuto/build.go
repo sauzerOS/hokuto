@@ -1130,7 +1130,9 @@ func packageSplitOutputs(parentPkgName, pkgDir, splitRoot, version, revision, ta
 		outputSplitName := getOutputPackageName(splitName, cfg)
 		if !opts.Quiet {
 			colArrow.Print("-> ")
-			colSuccess.Printf("Packaging split package %s from %s\n", outputSplitName, parentPkgName)
+			colSuccess.Print("Packaging split package ")
+			colNote.Print(outputSplitName)
+			colSuccess.Printf(" from %s\n", parentPkgName)
 		}
 		splitOptions := loadSplitPackagePostBuildOptions(pkgDir, splitName, outputSplitName, parentOptions)
 
