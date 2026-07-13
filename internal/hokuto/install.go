@@ -1593,14 +1593,9 @@ func checkStagingConflicts(pkgName, stagingDir, rootDir, stagingManifest string,
 
 	// Data structure to collect conflicts grouped by conflicting package
 	type conflictInfo struct {
-		filePath             string
-		stagingFile          string
-		targetFile           string
-		conflictPkg          string
-		isSymlink            bool
-		symlinkTarget        string
-		stagingIsSymlink     bool
-		stagingSymlinkTarget string
+		filePath    string
+		stagingFile string
+		conflictPkg string
 	}
 	conflictsByPkg := make(map[string][]conflictInfo)
 	unmanagedConflicts := []conflictInfo{}
@@ -1649,42 +1644,16 @@ func checkStagingConflicts(pkgName, stagingDir, rootDir, stagingManifest string,
 
 		if ownerPkg != "" && ownerPkg != pkgName {
 			// File is owned by another package - this is a conflict
-			// Check if the target file is a symlink
-			isSymlink := false
-			var symlinkTarget string
-			if targetInfo, err := os.Lstat(targetFile); err == nil && targetInfo.Mode()&os.ModeSymlink != 0 {
-				isSymlink = true
-				if target, err := os.Readlink(targetFile); err == nil {
-					symlinkTarget = target
-				}
-			}
-
-			// Check if staging file is a symlink
-			stagingIsSymlink := false
-			var stagingSymlinkTarget string
-			if stagingInfo, err := os.Lstat(stagingFile); err == nil && stagingInfo.Mode()&os.ModeSymlink != 0 {
-				stagingIsSymlink = true
-				if target, err := os.Readlink(stagingFile); err == nil {
-					stagingSymlinkTarget = target
-				}
-			}
-
 			conflictsByPkg[ownerPkg] = append(conflictsByPkg[ownerPkg], conflictInfo{
-				filePath:             filePath,
-				stagingFile:          stagingFile,
-				targetFile:           targetFile,
-				conflictPkg:          ownerPkg,
-				isSymlink:            isSymlink,
-				symlinkTarget:        symlinkTarget,
-				stagingIsSymlink:     stagingIsSymlink,
-				stagingSymlinkTarget: stagingSymlinkTarget,
+				filePath:    filePath,
+				stagingFile: stagingFile,
+				conflictPkg: ownerPkg,
 			})
 		} else if ownerPkg == "" {
 			// File exists but is not owned by any package
 			unmanagedConflicts = append(unmanagedConflicts, conflictInfo{
 				filePath:    filePath,
 				stagingFile: stagingFile,
-				targetFile:  targetFile,
 				conflictPkg: "",
 			})
 		}
@@ -1782,8 +1751,7 @@ func checkStagingConflicts(pkgName, stagingDir, rootDir, stagingManifest string,
 		if len(batchRequests) > 0 {
 			debugf("Processing %d alternative registrations concurrently...\n", len(batchRequests))
 			if err := BatchRegisterAlternatives(rootDir, batchRequests, execCtx); err != nil {
-				// We should probably fail or warn?
-				cPrintf(colWarn, "Warning: failed to register some alternatives: %v\n", err)
+				return fmt.Errorf("failed to register package alternatives: %w", err)
 			}
 		}
 
@@ -1872,7 +1840,7 @@ func checkStagingConflicts(pkgName, stagingDir, rootDir, stagingManifest string,
 		if len(unmanagedBatchRequests) > 0 {
 			debugf("Processing %d unmanaged alternatives concurrently...\n", len(unmanagedBatchRequests))
 			if err := BatchRegisterAlternatives(rootDir, unmanagedBatchRequests, execCtx); err != nil {
-				cPrintf(colWarn, "Warning: failed to register unmanaged alternatives: %v\n", err)
+				return fmt.Errorf("failed to register unmanaged alternatives: %w", err)
 			}
 		}
 

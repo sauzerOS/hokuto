@@ -436,8 +436,6 @@ func unpackTarballFallback(tarballPath, dest string) error {
 
 // createPackageTarball creates a .tar.zst archive of outputDir into BinDir.
 // It uses system tar if available, otherwise falls back to pure-Go tar+zstd.
-// createPackageTarball creates a .tar.zst archive of outputDir into BinDir.
-// It uses system tar if available, otherwise falls back to pure-Go tar+zstd.
 func createPackageTarball(pkgName, pkgVer, pkgRev, arch, variant, outputDir string, execCtx *Executor, logger io.Writer) error {
 	if logger == nil {
 		logger = os.Stdout

@@ -2,12 +2,15 @@ package hokuto
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -25,10 +28,12 @@ type AlternativeRequest struct {
 }
 
 type alternativeFileInfo struct {
-	Sum  string
-	Mode string
-	UID  int
-	GID  int
+	Sum        string
+	Mode       string
+	UID        int
+	GID        int
+	Type       AlternativeFileType
+	LinkTarget string
 }
 
 type alternativeBatchContext struct {
@@ -45,19 +50,26 @@ const GlobalAlternativesStoreDir = "var/db/hokuto/alternatives/store"
 // AlternativeState represents the state of an alternative (Active or Stashed)
 type AlternativeState string
 
+type AlternativeFileType string
+
 const (
 	StateActive  AlternativeState = "active"
 	StateStashed AlternativeState = "stashed"
+
+	AlternativeRegular AlternativeFileType = "regular"
+	AlternativeSymlink AlternativeFileType = "symlink"
 )
 
 // Alternative represents a specific content version of a file
 type Alternative struct {
-	B3Sum  string           `json:"b3sum"`
-	Owners []string         `json:"owners"` // List of packages that provide this exact content
-	State  AlternativeState `json:"state"`
-	Mode   string           `json:"mode"`
-	UID    int              `json:"uid"`
-	GID    int              `json:"gid"`
+	B3Sum  string              `json:"b3sum"`
+	Owners []string            `json:"owners"` // List of packages that provide this exact content
+	State  AlternativeState    `json:"state"`
+	Mode   string              `json:"mode"`
+	UID    int                 `json:"uid"`
+	GID    int                 `json:"gid"`
+	Type   AlternativeFileType `json:"type,omitempty"`
+	Target string              `json:"target,omitempty"`
 }
 
 // FileEntry represents a file path that has alternatives
@@ -93,12 +105,91 @@ func loadAlternativesDB(hRoot string) (*GlobalAlternativesDB, error) {
 	if err := json.Unmarshal(data, db); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal alternatives DB: %w", err)
 	}
+	if err := validateAlternativesDB(db); err != nil {
+		return nil, fmt.Errorf("invalid alternatives DB: %w", err)
+	}
 
 	return db, nil
 }
 
+func validAlternativeDigest(sum string) bool {
+	if len(sum) != 64 {
+		return false
+	}
+	for _, c := range sum {
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+			return false
+		}
+	}
+	return true
+}
+
+func validateAlternativePath(path string) error {
+	if !filepath.IsAbs(path) || filepath.Clean(path) != path || path == "/" {
+		return fmt.Errorf("unsafe alternative path %q", path)
+	}
+	return nil
+}
+
+func validateAlternativesDB(db *GlobalAlternativesDB) error {
+	if db.Files == nil {
+		db.Files = make(map[string]*FileEntry)
+		return nil
+	}
+	for path, entry := range db.Files {
+		if err := validateAlternativePath(path); err != nil {
+			return err
+		}
+		if entry == nil {
+			return fmt.Errorf("nil entry for %s", path)
+		}
+		if entry.Path != "" && entry.Path != path {
+			return fmt.Errorf("entry path %q does not match key %q", entry.Path, path)
+		}
+		activeCount := 0
+		for _, alt := range entry.Alternatives {
+			if alt == nil {
+				return fmt.Errorf("nil alternative for %s", path)
+			}
+			if !validAlternativeDigest(alt.B3Sum) {
+				return fmt.Errorf("invalid digest for %s", path)
+			}
+			switch normalizedAlternativeType(alt.Type) {
+			case AlternativeRegular:
+			case AlternativeSymlink:
+				if alt.Target == "" || hashString("symlink\x00"+alt.Target) != alt.B3Sum {
+					return fmt.Errorf("invalid symlink target metadata for %s", path)
+				}
+			default:
+				return fmt.Errorf("invalid file type %q for %s", alt.Type, path)
+			}
+			mode, err := strconv.ParseUint(alt.Mode, 8, 32)
+			if err != nil || mode > 0o7777 {
+				return fmt.Errorf("invalid mode %q for %s", alt.Mode, path)
+			}
+			if alt.UID < 0 || alt.GID < 0 {
+				return fmt.Errorf("invalid ownership for %s", path)
+			}
+			switch alt.State {
+			case StateActive:
+				activeCount++
+			case StateStashed:
+			default:
+				return fmt.Errorf("invalid state %q for %s", alt.State, path)
+			}
+		}
+		if len(entry.Alternatives) > 0 && activeCount != 1 {
+			return fmt.Errorf("expected exactly one active alternative for %s, found %d", path, activeCount)
+		}
+	}
+	return nil
+}
+
 // saveAlternativesDB saves the global alternatives database
 func saveAlternativesDB(hRoot string, db *GlobalAlternativesDB, execCtx *Executor) error {
+	if err := validateAlternativesDB(db); err != nil {
+		return fmt.Errorf("refusing to save invalid alternatives DB: %w", err)
+	}
 	dbPath := filepath.Join(hRoot, GlobalAlternativesDBPath)
 	dbDir := filepath.Dir(dbPath)
 
@@ -119,7 +210,18 @@ func saveAlternativesDB(hRoot string, db *GlobalAlternativesDB, execCtx *Executo
 		return fmt.Errorf("failed to marshal alternatives DB: %w", err)
 	}
 
-	return writeFileAsRoot(dbPath, data, 0644, execCtx)
+	tempPath := fmt.Sprintf("%s.tmp-%d", dbPath, os.Getpid())
+	if err := removeAlternativeDestination(tempPath, execCtx); err != nil {
+		return fmt.Errorf("failed to prepare alternatives DB temporary file: %w", err)
+	}
+	defer func() { _ = removeAlternativeDestination(tempPath, execCtx) }()
+	if err := writeFileAsRoot(tempPath, data, 0o644, execCtx); err != nil {
+		return err
+	}
+	if err := renameAlternativeAsRoot(tempPath, dbPath, execCtx); err != nil {
+		return fmt.Errorf("failed to atomically replace alternatives DB: %w", err)
+	}
+	return nil
 }
 
 // getStashedFilePath returns the path to a stashed file in the store
@@ -137,20 +239,402 @@ func ensureStoreDir(hRoot string, execCtx *Executor) error {
 	return execCtx.Run(cmd)
 }
 
-func alternativeFileMetadata(path string) (alternativeFileInfo, error) {
+func alternativeModeValue(mode os.FileMode) uint64 {
+	value := uint64(mode.Perm())
+	if mode&os.ModeSetuid != 0 {
+		value |= 0o4000
+	}
+	if mode&os.ModeSetgid != 0 {
+		value |= 0o2000
+	}
+	if mode&os.ModeSticky != 0 {
+		value |= 0o1000
+	}
+	return value
+}
+
+func osFileModeFromAlternative(value uint64) os.FileMode {
+	mode := os.FileMode(value & 0o777)
+	if value&0o4000 != 0 {
+		mode |= os.ModeSetuid
+	}
+	if value&0o2000 != 0 {
+		mode |= os.ModeSetgid
+	}
+	if value&0o1000 != 0 {
+		mode |= os.ModeSticky
+	}
+	return mode
+}
+
+func alternativeFileMetadata(path string, execCtx *Executor) (alternativeFileInfo, error) {
 	info, err := os.Lstat(path)
 	if err != nil {
 		return alternativeFileInfo{}, err
 	}
 
 	meta := alternativeFileInfo{
-		Mode: fmt.Sprintf("%04o", info.Mode().Perm()),
+		Mode: fmt.Sprintf("%04o", alternativeModeValue(info.Mode())),
+		Type: AlternativeRegular,
 	}
 	if sysStat, ok := info.Sys().(*syscall.Stat_t); ok {
 		meta.UID = int(sysStat.Uid)
 		meta.GID = int(sysStat.Gid)
 	}
+
+	switch {
+	case info.Mode()&os.ModeSymlink != 0:
+		target, err := os.Readlink(path)
+		if err != nil {
+			return alternativeFileInfo{}, fmt.Errorf("failed to read symlink %s: %w", path, err)
+		}
+		meta.Type = AlternativeSymlink
+		meta.LinkTarget = target
+		meta.Sum = hashString("symlink\x00" + target)
+	case info.Mode().IsRegular():
+		sum, err := ComputeChecksum(path, execCtx)
+		if err != nil {
+			return alternativeFileInfo{}, err
+		}
+		meta.Sum = sum
+	default:
+		return alternativeFileInfo{}, fmt.Errorf("unsupported alternative file type for %s (%s)", path, info.Mode().Type())
+	}
+
 	return meta, nil
+}
+
+func inspectAlternativeFiles(paths []string, execCtx *Executor) (map[string]alternativeFileInfo, error) {
+	results := make(map[string]alternativeFileInfo, len(paths))
+	if len(paths) == 0 {
+		return results, nil
+	}
+
+	workerCount := runtime.NumCPU() * 2
+	if workerCount > len(paths) {
+		workerCount = len(paths)
+	}
+	jobs := make(chan string, len(paths))
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var firstErr error
+	for i := 0; i < workerCount; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for path := range jobs {
+				info, err := alternativeFileMetadata(path, execCtx)
+				mu.Lock()
+				if err != nil {
+					if firstErr == nil {
+						firstErr = fmt.Errorf("failed to inspect alternative file %s: %w", path, err)
+					}
+				} else {
+					results[path] = info
+				}
+				mu.Unlock()
+			}
+		}()
+	}
+	for _, path := range paths {
+		jobs <- path
+	}
+	close(jobs)
+	wg.Wait()
+	if firstErr != nil {
+		return nil, firstErr
+	}
+	return results, nil
+}
+
+func normalizedAlternativeType(fileType AlternativeFileType) AlternativeFileType {
+	if fileType == "" {
+		return AlternativeRegular
+	}
+	return fileType
+}
+
+func alternativeMatchesInfo(alt *Alternative, info alternativeFileInfo) bool {
+	return alt != nil && alt.B3Sum == info.Sum && normalizedAlternativeType(alt.Type) == info.Type
+}
+
+func alternativeFromInfo(info alternativeFileInfo) *Alternative {
+	return &Alternative{
+		B3Sum:  info.Sum,
+		State:  StateStashed,
+		Mode:   info.Mode,
+		UID:    info.UID,
+		GID:    info.GID,
+		Type:   info.Type,
+		Target: info.LinkTarget,
+	}
+}
+
+func getOrCreateAlternative(entry *FileEntry, info alternativeFileInfo) *Alternative {
+	for _, alt := range entry.Alternatives {
+		if alternativeMatchesInfo(alt, info) {
+			return alt
+		}
+	}
+	alt := alternativeFromInfo(info)
+	entry.Alternatives = append(entry.Alternatives, alt)
+	return alt
+}
+
+func addAlternativeOwner(alt *Alternative, owner string) {
+	if owner == "" {
+		return
+	}
+	for _, existing := range alt.Owners {
+		if existing == owner {
+			return
+		}
+	}
+	alt.Owners = append(alt.Owners, owner)
+}
+
+func setActiveAlternative(entry *FileEntry, active *Alternative) {
+	for _, alt := range entry.Alternatives {
+		if alt == active {
+			alt.State = StateActive
+		} else {
+			alt.State = StateStashed
+		}
+	}
+}
+
+func copyAlternativeRegularFile(source, destination string, execCtx *Executor) error {
+	cmd := exec.Command("cp", "-a", "--reflink=auto", "--", source, destination)
+	if execCtx != nil {
+		return execCtx.Run(cmd)
+	}
+	return cmd.Run()
+}
+
+func ensureAlternativeStored(hRoot, source string, info alternativeFileInfo, execCtx *Executor) error {
+	if err := ensureStoreDir(hRoot, execCtx); err != nil {
+		return err
+	}
+	storePath := getStashedFilePath(hRoot, info.Sum)
+	if storedInfo, err := os.Lstat(storePath); err == nil {
+		if !storedInfo.Mode().IsRegular() {
+			return fmt.Errorf("alternative store path is not a regular file: %s", storePath)
+		}
+		if info.Type == AlternativeSymlink {
+			data, err := readFileAsRoot(storePath)
+			if err != nil {
+				return fmt.Errorf("failed to verify stored symlink target: %w", err)
+			}
+			if string(data) != info.LinkTarget {
+				return fmt.Errorf("alternative store collision for symlink %s", storePath)
+			}
+			return nil
+		}
+		sum, err := ComputeChecksum(storePath, execCtx)
+		if err != nil {
+			return fmt.Errorf("failed to verify stored alternative: %w", err)
+		}
+		if sum != info.Sum {
+			return fmt.Errorf("alternative store corruption at %s", storePath)
+		}
+		return nil
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+
+	if info.Type == AlternativeSymlink {
+		if err := writeFileAsRoot(storePath, []byte(info.LinkTarget), 0o600, execCtx); err != nil {
+			return fmt.Errorf("failed to store symlink target: %w", err)
+		}
+		return nil
+	}
+	if err := copyAlternativeRegularFile(source, storePath, execCtx); err != nil {
+		return fmt.Errorf("failed to copy alternative to store: %w", err)
+	}
+	return nil
+}
+
+func removeAlternativeDestination(path string, execCtx *Executor) error {
+	info, err := os.Lstat(path)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if info.IsDir() && info.Mode()&os.ModeSymlink == 0 {
+		return fmt.Errorf("refusing to replace directory %s with an alternative", path)
+	}
+	return removeFileAsRoot(path, execCtx)
+}
+
+func createSymlinkAsRoot(target, path string, execCtx *Executor) error {
+	if err := os.Symlink(target, path); err == nil {
+		return nil
+	} else if os.Geteuid() == 0 {
+		return err
+	}
+	return execCtx.Run(exec.Command("ln", "-s", "--", target, path))
+}
+
+func renameAlternativeAsRoot(oldPath, newPath string, execCtx *Executor) error {
+	if err := os.Rename(oldPath, newPath); err == nil {
+		return nil
+	} else if os.Geteuid() == 0 {
+		return err
+	}
+	return execCtx.Run(exec.Command("mv", "-f", "--", oldPath, newPath))
+}
+
+func createAlternativeTempDir(targetPath string, execCtx *Executor) (string, error) {
+	parent := filepath.Dir(targetPath)
+	pattern := "." + filepath.Base(targetPath) + ".hokuto-alt-*"
+	if dir, err := os.MkdirTemp(parent, pattern); err == nil {
+		return dir, nil
+	} else if os.Geteuid() == 0 {
+		return "", err
+	}
+
+	var output bytes.Buffer
+	cmd := exec.Command("mktemp", "-d", filepath.Join(parent, pattern))
+	cmd.Stdout = &output
+	if err := execCtx.Run(cmd); err != nil {
+		return "", err
+	}
+	dir := strings.TrimSpace(output.String())
+	if dir == "" {
+		return "", fmt.Errorf("mktemp returned an empty directory path")
+	}
+	return dir, nil
+}
+
+func removeAlternativeTempDir(path string, execCtx *Executor) {
+	if err := os.Remove(path); err == nil || os.IsNotExist(err) {
+		return
+	}
+	if os.Geteuid() != 0 {
+		_ = execCtx.Run(exec.Command("rmdir", "--", path))
+	}
+}
+
+func restoreAlternativeMetadata(path string, alt *Alternative, execCtx *Executor) error {
+	isSymlink := normalizedAlternativeType(alt.Type) == AlternativeSymlink
+	info, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	uid, gid := -1, -1
+	if stat, ok := info.Sys().(*syscall.Stat_t); ok {
+		uid, gid = int(stat.Uid), int(stat.Gid)
+	}
+	ownershipChanged := uid != alt.UID || gid != alt.GID
+	if ownershipChanged {
+		if isSymlink {
+			err = os.Lchown(path, alt.UID, alt.GID)
+		} else {
+			err = os.Chown(path, alt.UID, alt.GID)
+		}
+		if err != nil {
+			if os.Geteuid() == 0 {
+				return err
+			}
+			args := []string{fmt.Sprintf("%d:%d", alt.UID, alt.GID), path}
+			if isSymlink {
+				args = append([]string{"-h"}, args...)
+			}
+			if err := execCtx.Run(exec.Command("chown", args...)); err != nil {
+				return err
+			}
+		}
+	}
+
+	// chown may clear setuid/setgid bits, so restore the recorded mode last.
+	if !isSymlink && alt.Mode != "" {
+		mode, err := strconv.ParseUint(alt.Mode, 8, 32)
+		if err != nil {
+			return fmt.Errorf("invalid stored mode %q: %w", alt.Mode, err)
+		}
+		desiredMode := osFileModeFromAlternative(mode)
+		if !ownershipChanged && alternativeModeValue(info.Mode()) == mode {
+			return nil
+		}
+		if err := os.Chmod(path, desiredMode); err != nil {
+			if os.Geteuid() == 0 {
+				return err
+			}
+			if err := execCtx.Run(exec.Command("chmod", alt.Mode, path)); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func restoreAlternativeContent(hRoot, path string, alt *Alternative, execCtx *Executor) error {
+	storePath := getStashedFilePath(hRoot, alt.B3Sum)
+	storeInfo, err := os.Lstat(storePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("alternative content missing from store: %s", alt.B3Sum)
+		}
+		return err
+	}
+	if !storeInfo.Mode().IsRegular() {
+		return fmt.Errorf("invalid alternative store entry: %s", storePath)
+	}
+	if normalizedAlternativeType(alt.Type) == AlternativeRegular {
+		sum, err := ComputeChecksum(storePath, execCtx)
+		if err != nil {
+			return fmt.Errorf("failed to verify stored alternative: %w", err)
+		}
+		if sum != alt.B3Sum {
+			return fmt.Errorf("stored alternative checksum mismatch for %s", path)
+		}
+	}
+
+	targetPath := filepath.Join(hRoot, path)
+	if info, err := os.Lstat(targetPath); err == nil && info.IsDir() && info.Mode()&os.ModeSymlink == 0 {
+		return fmt.Errorf("refusing to replace directory %s with an alternative", targetPath)
+	} else if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	tempDir, err := createAlternativeTempDir(targetPath, execCtx)
+	if err != nil {
+		return fmt.Errorf("failed to create alternative temporary directory: %w", err)
+	}
+	tempPath := filepath.Join(tempDir, "entry")
+	defer func() {
+		_ = removeAlternativeDestination(tempPath, execCtx)
+		removeAlternativeTempDir(tempDir, execCtx)
+	}()
+
+	if normalizedAlternativeType(alt.Type) == AlternativeSymlink {
+		data, err := readFileAsRoot(storePath)
+		if err != nil {
+			return fmt.Errorf("failed to read stored symlink target: %w", err)
+		}
+		target := string(data)
+		if alt.Target != "" && target != alt.Target {
+			return fmt.Errorf("stored symlink target does not match alternatives DB for %s", path)
+		}
+		if hashString("symlink\x00"+target) != alt.B3Sum {
+			return fmt.Errorf("stored symlink target checksum mismatch for %s", path)
+		}
+		if err := createSymlinkAsRoot(target, tempPath, execCtx); err != nil {
+			return fmt.Errorf("failed to restore symlink: %w", err)
+		}
+	} else {
+		if err := copyAlternativeRegularFile(storePath, tempPath, execCtx); err != nil {
+			return fmt.Errorf("failed to restore regular file: %w", err)
+		}
+	}
+	if err := restoreAlternativeMetadata(tempPath, alt, execCtx); err != nil {
+		return fmt.Errorf("failed to restore alternative metadata: %w", err)
+	}
+	if err := renameAlternativeAsRoot(tempPath, targetPath, execCtx); err != nil {
+		return fmt.Errorf("failed to activate restored alternative: %w", err)
+	}
+	return nil
 }
 
 func parseManifestFilePath(line string) string {
@@ -215,298 +699,81 @@ func alternativeOwnerFromCache(ctx *alternativeBatchContext, hRoot, targetAbsPat
 	return ctx.ownerByPath[strings.TrimPrefix(canonicalTarget, "/")]
 }
 
-// registerAlternative registers an alternative (internal helper for batch processing).
-// It assumes the caller manages the DB lifecycle and concurrency via dbMu.
+// registerAlternative registers regular files and symlinks without ever
+// following symlinks or admitting directories into the alternatives store.
 func registerAlternative(hRoot, filePath string, req AlternativeRequest, execCtx *Executor, db *GlobalAlternativesDB, dbMu *sync.Mutex, batchCtx *alternativeBatchContext) error {
-	incomingPkg := req.IncomingPkg
-	currentPkg := req.CurrentPkg
-	incomingFile := req.IncomingFile
-	keepOriginal := req.KeepOriginal
-
 	var incomingInfo alternativeFileInfo
 	var ok bool
 	if batchCtx != nil {
-		incomingInfo, ok = batchCtx.incomingFiles[incomingFile]
+		incomingInfo, ok = batchCtx.incomingFiles[req.IncomingFile]
 	}
 	if !ok {
-		sum, err := ComputeChecksum(incomingFile, execCtx)
+		var err error
+		incomingInfo, err = alternativeFileMetadata(req.IncomingFile, execCtx)
 		if err != nil {
-			return fmt.Errorf("failed to compute checksum of incoming file: %w", err)
+			return fmt.Errorf("failed to inspect incoming alternative: %w", err)
 		}
-		incomingInfo.Sum = sum
 	}
-
-	// Get stats of incoming file for metadata
-	if incomingInfo.Mode == "" {
-		meta, err := alternativeFileMetadata(incomingFile)
-		if err != nil {
-			return fmt.Errorf("failed to stat incoming file: %w", err)
-		}
-		meta.Sum = incomingInfo.Sum
-		incomingInfo = meta
-	}
-	incomingSum := incomingInfo.Sum
 
 	dbMu.Lock()
 	defer dbMu.Unlock()
 	if db.Files == nil {
 		db.Files = make(map[string]*FileEntry)
 	}
-
-	entry, exists := db.Files[filePath]
-	if !exists {
-		entry = &FileEntry{
-			Path:         filePath,
-			Alternatives: []*Alternative{},
-		}
+	entry := db.Files[filePath]
+	if entry == nil {
+		entry = &FileEntry{Path: filePath}
 		db.Files[filePath] = entry
 	}
 
-	// 1. Handle the EXISTING file (if it exists and isn't already tracked as active)
-	// If this is the first conflict, the existing file might not be in the DB yet.
-	// We need to verify if there is an active alternative in the DB.
 	var activeAlt *Alternative
 	for _, alt := range entry.Alternatives {
-		if alt.State == StateActive {
-			activeAlt = alt
-			break
+		if alt.State != StateActive {
+			continue
 		}
+		if activeAlt != nil {
+			return fmt.Errorf("alternatives database has multiple active entries for %s", filePath)
+		}
+		activeAlt = alt
 	}
 
 	targetAbsPath := filepath.Join(hRoot, filePath)
-	if activeAlt == nil {
-		// No active alternative recorded, but file exists on disk (first conflict).
-		// We need to import the existing file into the DB as the "Active" alternative.
-		// BUT, we need to know who owns it. This is usually passed or checked.
-		// For now, we'll try to guess or require the caller to handle "unmanaged" detection.
-		// Wait, install.go logic handles "unmanaged" vs "package" conflict.
-		// If it's a package conflict, we should ideally know the owner.
-		// Ideally `install.go` passed us `conflictPkg`.
-		// To simplify, we'll assume the caller wants us to REGISTER existing file if it exists.
-
-		if _, err := os.Lstat(targetAbsPath); err == nil {
-			// Calculate sum of existing file
-			_, err := ComputeChecksum(targetAbsPath, execCtx)
-			if err == nil {
-				// We need to find the owner of this file.
-				// This is expensive to search every manifest.
-				// However, likely one of the alternatives ALREADY in the list owns it if we had a record.
-				// If not, it might be unmanaged or from a previous install that didn't use alternatives.
-				// For now, let's look up owners from the DB if they match the hash.
-
-				// Create a new alternative for the existing file
-				// We don't know the owner exactly here without searching.
-				// Let's assume the caller logic in install.go will handle the conceptual split.
-				// Actually, `saveAlternative` should probably just handle the INCOMING file and its relation to the DB.
-				// The "Existing" file logic is tricky.
-
-				// REVISIT: The prompt says "global db of files with alternatives ... b3sum, owner ...".
-				// If we strictly follow the new structure, we insert the INCOMING file.
-				// If `keepOriginal` is true, Incoming becomes STASHED.
-				// If `keepOriginal` is false, Incoming becomes ACTIVE. The Previous Active becomes STASHED.
-			}
-		}
+	currentInfo, err := alternativeFileMetadata(targetAbsPath, execCtx)
+	if err != nil {
+		return fmt.Errorf("failed to inspect existing alternative: %w", err)
+	}
+	if activeAlt != nil && !alternativeMatchesInfo(activeAlt, currentInfo) {
+		return fmt.Errorf("active alternative for %s does not match the file on disk", filePath)
 	}
 
-	// Let's refine the logic based on `keepOriginal`.
-
-	// Helper to find or create alternative
-	getOrCreateAlt := func(sum, mode string, uid, gid int) *Alternative {
-		for _, alt := range entry.Alternatives {
-			if alt.B3Sum == sum {
-				return alt
-			}
+	currentAlt := getOrCreateAlternative(entry, currentInfo)
+	currentOwner := req.CurrentPkg
+	if currentOwner == "" {
+		currentOwner = alternativeOwnerFromCache(batchCtx, hRoot, targetAbsPath)
+		if currentOwner == "" {
+			currentOwner = "unmanaged"
 		}
-		alt := &Alternative{
-			B3Sum:  sum,
-			Owners: []string{},   // Will be appended to
-			State:  StateStashed, // Default to stashed, changed later if needed
-			Mode:   mode,
-			UID:    uid,
-			GID:    gid,
-		}
-		entry.Alternatives = append(entry.Alternatives, alt)
-		return alt
 	}
+	addAlternativeOwner(currentAlt, currentOwner)
 
-	// Helper to add owner
-	addOwner := func(alt *Alternative, pkg string) {
-		for _, p := range alt.Owners {
-			if p == pkg {
-				return
-			}
-		}
-		alt.Owners = append(alt.Owners, pkg)
-	}
+	incomingAlt := getOrCreateAlternative(entry, incomingInfo)
+	addAlternativeOwner(incomingAlt, req.IncomingPkg)
 
-	incomingAlt := getOrCreateAlt(incomingSum, incomingInfo.Mode, incomingInfo.UID, incomingInfo.GID)
-	addOwner(incomingAlt, incomingPkg)
-
-	if keepOriginal {
-		// Incoming file is normally STASHED because we are keeping the original.
-		// HOWEVER, if the incoming file is IDENTICAL to the file we are keeping,
-		// we should treat it as ACTIVE (shared ownership) and NOT duplicate it to the store.
-
-		isIdentical := false
-		if activeAlt != nil && activeAlt.B3Sum == incomingSum {
-			isIdentical = true
-		} else if activeAlt == nil {
-			// Check if file on disk matches incoming
-			if _, err := os.Lstat(targetAbsPath); err == nil {
-				if dSum, err := ComputeChecksum(targetAbsPath, execCtx); err == nil && dSum == incomingSum {
-					isIdentical = true
-				}
-			}
-		}
-
-		if isIdentical {
-			incomingAlt.State = StateActive
-			// No need to copy to store.
-		} else {
-			// Incoming is different. Stash it.
-			// We ensure the file is saved to the store.
-			if err := ensureStoreDir(hRoot, execCtx); err != nil {
+	if req.KeepOriginal {
+		if incomingAlt != currentAlt {
+			if err := ensureAlternativeStored(hRoot, req.IncomingFile, incomingInfo, execCtx); err != nil {
 				return err
 			}
-			storePath := getStashedFilePath(hRoot, incomingSum)
-			// Check if store file already exists (use Lstat to detect broken links)
-			if _, err := os.Lstat(storePath); os.IsNotExist(err) {
-				// File doesn't exist, proceed to copy
-			} else if err == nil {
-				// File exists. Check if it's a symlink or regular file.
-				// If it's a symlink, it is corrupt/invalid for the store, remove it.
-				info, _ := os.Lstat(storePath)
-				if info.Mode()&os.ModeSymlink != 0 {
-					debugf("Removing invalid symlink in store: %s\n", storePath)
-					os.Remove(storePath)
-				}
-			}
-
-			// Check again (or assume safe if we just removed it)
-			if _, err := os.Lstat(storePath); os.IsNotExist(err) {
-				// Copy incoming (staging) file to store
-				if err := copyFileAsRoot(incomingFile, storePath, execCtx); err != nil {
-					return fmt.Errorf("failed to copy to store: %w", err)
-				}
-			}
-			incomingAlt.State = StateStashed
 		}
-
-		// We must ensure there IS an active alternative.
-		// If we are keeping original, the file on disk (targetAbsPath) is the active one.
-		// We should register it if not registered.
-		if activeAlt == nil {
-			// Register valid existing file as active
-			if _, err := os.Lstat(targetAbsPath); err == nil {
-				currentSum, _ := ComputeChecksum(targetAbsPath, execCtx)
-				currInfo, _ := alternativeFileMetadata(targetAbsPath)
-
-				currAlt := getOrCreateAlt(currentSum, currInfo.Mode, currInfo.UID, currInfo.GID)
-
-				// Try to find the local owner
-				if currentPkg != "" {
-					addOwner(currAlt, currentPkg)
-				} else if len(currAlt.Owners) == 0 {
-					if owner := alternativeOwnerFromCache(batchCtx, hRoot, targetAbsPath); owner != "" {
-						currAlt.Owners = append(currAlt.Owners, owner)
-					} else {
-						currAlt.Owners = append(currAlt.Owners, "unmanaged")
-					}
-				}
-
-				currAlt.State = StateActive
-			}
-		}
-
+		setActiveAlternative(entry, currentAlt)
 	} else {
-		// Incoming file becomes ACTIVE.
-		// Any previously active alternative becomes STASHED.
-
-		// 1. Stash currently active file (if any and different from incoming)
-		if activeAlt != nil && activeAlt.B3Sum != incomingSum {
-			activeAlt.State = StateStashed
-			if err := ensureStoreDir(hRoot, execCtx); err != nil {
+		if incomingAlt != currentAlt {
+			if err := ensureAlternativeStored(hRoot, targetAbsPath, currentInfo, execCtx); err != nil {
 				return err
 			}
-			storePath := getStashedFilePath(hRoot, activeAlt.B3Sum)
-
-			// Check if store file already exists (use Lstat)
-			if _, err := os.Lstat(storePath); os.IsNotExist(err) {
-				// ok to copy
-			} else if err == nil {
-				// Exists, check if symlink
-				info, _ := os.Lstat(storePath)
-				if info.Mode()&os.ModeSymlink != 0 {
-					debugf("Removing invalid symlink in store: %s\n", storePath)
-					os.Remove(storePath)
-				}
-			}
-
-			if _, err := os.Lstat(storePath); os.IsNotExist(err) {
-				// Copy from TARGET (current file on disk) to store
-				if err := copyFileAsRoot(targetAbsPath, storePath, execCtx); err != nil {
-					return fmt.Errorf("failed to stash existing file: %w", err)
-				}
-			}
-		} else if activeAlt == nil {
-			// No active record, but file might exist (unmanaged/legacy).
-			if _, err := os.Lstat(targetAbsPath); err == nil {
-				// We are overwriting it. We should stash it if we want to be safe,
-				// but usually "Use New" implies overwriting.
-				// However, if we want to restore it later, we MUST stash it and register it.
-				currentSum, _ := ComputeChecksum(targetAbsPath, execCtx)
-				currInfo, _ := alternativeFileMetadata(targetAbsPath)
-
-				currAlt := getOrCreateAlt(currentSum, currInfo.Mode, currInfo.UID, currInfo.GID)
-
-				if currentPkg != "" {
-					addOwner(currAlt, currentPkg)
-				} else if len(currAlt.Owners) == 0 {
-					if owner := alternativeOwnerFromCache(batchCtx, hRoot, targetAbsPath); owner != "" {
-						currAlt.Owners = append(currAlt.Owners, owner)
-					} else {
-						currAlt.Owners = append(currAlt.Owners, "unmanaged")
-					}
-				}
-
-				// Optimization: If legacy file is identical to incoming, don't stash it (it becomes Active).
-				if currentSum != incomingSum {
-					currAlt.State = StateStashed
-
-					if err := ensureStoreDir(hRoot, execCtx); err != nil {
-						return err
-					}
-					storePath := getStashedFilePath(hRoot, currentSum)
-					// Check if store file already exists (use Lstat)
-					if _, err := os.Lstat(storePath); os.IsNotExist(err) {
-						// ok to copy
-					} else if err == nil {
-						// Exists, check if symlink
-						info, _ := os.Lstat(storePath)
-						if info.Mode()&os.ModeSymlink != 0 {
-							debugf("Removing invalid symlink in store: %s\n", storePath)
-							os.Remove(storePath)
-						}
-					}
-
-					if _, err := os.Lstat(storePath); os.IsNotExist(err) {
-						if err := copyFileAsRoot(targetAbsPath, storePath, execCtx); err != nil {
-							return fmt.Errorf("failed to stash legacy file: %w", err)
-						}
-					}
-				}
-			}
 		}
-
-		// 2. Set incoming as active
-		incomingAlt.State = StateActive
-
-		// Note: The caller (pkgInstall) is responsible for actually moving the staging file
-		// to the target location. We just update the DB state here.
+		setActiveAlternative(entry, incomingAlt)
 	}
-
-	// File operations (copying to store) are done, and DB is updated in memory.
-	// Saving happens in BatchRegisterAlternatives.
 	return nil
 }
 
@@ -514,6 +781,17 @@ func registerAlternative(hRoot, filePath string, req AlternativeRequest, execCtx
 func BatchRegisterAlternatives(hRoot string, requests []AlternativeRequest, execCtx *Executor) error {
 	if len(requests) == 0 {
 		return nil
+	}
+	for _, req := range requests {
+		if err := validateAlternativePath(req.FilePath); err != nil {
+			return err
+		}
+		if req.IncomingFile == "" {
+			return fmt.Errorf("missing incoming file for alternative %s", req.FilePath)
+		}
+		if req.IncomingPkg == "" {
+			return fmt.Errorf("missing incoming package for alternative %s", req.FilePath)
+		}
 	}
 
 	db, err := loadAlternativesDB(hRoot)
@@ -531,7 +809,6 @@ func BatchRegisterAlternatives(hRoot string, requests []AlternativeRequest, exec
 
 	incomingPaths := make([]string, 0, len(requests))
 	seenIncoming := make(map[string]bool, len(requests))
-	incomingInfo := make(map[string]alternativeFileInfo, len(requests))
 	for _, req := range requests {
 		if req.IncomingFile == "" || seenIncoming[req.IncomingFile] {
 			continue
@@ -540,20 +817,9 @@ func BatchRegisterAlternatives(hRoot string, requests []AlternativeRequest, exec
 		incomingPaths = append(incomingPaths, req.IncomingFile)
 	}
 
-	checksums, err := ComputeChecksums(incomingPaths, execCtx)
+	incomingInfo, err := inspectAlternativeFiles(incomingPaths, execCtx)
 	if err != nil {
-		return fmt.Errorf("failed to compute alternative checksums: %w", err)
-	}
-	for _, path := range incomingPaths {
-		meta, err := alternativeFileMetadata(path)
-		if err != nil {
-			return fmt.Errorf("failed to stat alternative file %s: %w", path, err)
-		}
-		meta.Sum = checksums[path]
-		if meta.Sum == "" {
-			return fmt.Errorf("failed to compute checksum for alternative file %s", path)
-		}
-		incomingInfo[path] = meta
+		return err
 	}
 
 	batchCtx := &alternativeBatchContext{
@@ -740,24 +1006,18 @@ func restoreAlternativesOnUninstallSet(pkgName, hRoot string, execCtx *Executor,
 				// Simple policy: Find first stashed alternative with owners.
 				// TODO: Prompt user if multiple choices? For now, automatic picking.
 				for _, alt := range entry.Alternatives {
-					if alt != activeAlt && len(alt.Owners) > 0 {
+					if alt != activeAlt && alt.State == StateStashed && len(alt.Owners) > 0 {
 						candidate = alt
 						break
 					}
 				}
 
-				targetAbsPath := filepath.Join(hRoot, path)
-
 				if candidate != nil {
-					// Promote candidate to Active
-					candidate.State = StateActive
-					// Move orphan to Stashed? Or delete if invalid?
-
-					storePath := getStashedFilePath(hRoot, candidate.B3Sum)
-					if err := copyFileAsRoot(storePath, targetAbsPath, execCtx); err != nil {
+					if err := restoreAlternativeContent(hRoot, path, candidate, execCtx); err != nil {
 						debugf("Failed to restore alternative for %s: %v\n", path, err)
 						continue
 					}
+					setActiveAlternative(entry, candidate)
 
 					// Mark as restored so uninstall doesn't delete it
 					restoredFiles[path] = true
@@ -785,10 +1045,6 @@ func restoreAlternativesOnUninstallSet(pkgName, hRoot string, execCtx *Executor,
 		for _, alt := range entry.Alternatives {
 			if len(alt.Owners) > 0 {
 				cleanAlts = append(cleanAlts, alt)
-			} else {
-				// Delete stashed file if exists
-				storePath := getStashedFilePath(hRoot, alt.B3Sum)
-				os.Remove(storePath) // Ignore error
 			}
 		}
 		entry.Alternatives = cleanAlts
@@ -992,11 +1248,6 @@ func discardUnmanagedAlternatives(hRoot string, db *GlobalAlternativesDB) error 
 
 			// This alternative is now orphaned (0 owners)
 			if alt.State == StateStashed {
-				// Safe to delete
-				storePath := getStashedFilePath(hRoot, alt.B3Sum)
-				if err := removeFileAsRoot(storePath, execCtx); err != nil {
-					colWarn.Printf("Warning: failed to remove stashed file %s: %v\n", storePath, err)
-				}
 				removedCount++
 				continue // Do not add to newAlts
 			}
@@ -1007,7 +1258,7 @@ func discardUnmanagedAlternatives(hRoot string, db *GlobalAlternativesDB) error 
 
 				var candidate *Alternative
 				for _, other := range entry.Alternatives {
-					if other != alt && len(other.Owners) > 0 {
+					if other != alt && other.State == StateStashed && len(other.Owners) > 0 {
 						candidate = other
 						break
 					}
@@ -1017,27 +1268,13 @@ func discardUnmanagedAlternatives(hRoot string, db *GlobalAlternativesDB) error 
 					// Switch to candidate
 					colArrow.Printf("Switching %s to managed alternative (owners: %v)\n", path, candidate.Owners)
 
-					targetAbsPath := filepath.Join(hRoot, path)
-					storePath := getStashedFilePath(hRoot, candidate.B3Sum)
-
-					// Use os.Lstat for robust checking of store file
-					if _, err := os.Lstat(storePath); os.IsNotExist(err) {
-						colError.Printf("Error: managed alternative content missing from store: %s\n", candidate.B3Sum)
-						// Keep current active one as a fallback? better than breaking system.
-						// Even if unmanaged, it's better than nothing.
-						// Re-add "unmanaged" owner? Or leave it with 0 owners but keep in DB?
-						// Let's leave it with 0 owners but keep it active to avoid breakage.
-						newAlts = append(newAlts, alt)
-						continue
-					}
-
-					if err := copyFileAsRoot(storePath, targetAbsPath, execCtx); err != nil {
+					if err := restoreAlternativeContent(hRoot, path, candidate, execCtx); err != nil {
 						colError.Printf("Error restoring alternative for %s: %v\n", path, err)
 						newAlts = append(newAlts, alt) // Keep broken/orphaned active
 						continue
 					}
 
-					candidate.State = StateActive
+					setActiveAlternative(entry, candidate)
 					// Old active (alt) is dropped (not added to newAlts)
 					// Verify we shouldn't stash it? It's unmanaged and orphaned, so we discard it.
 					switchedCount++
@@ -1277,6 +1514,9 @@ func activateAlternativeForOwner(hRoot, path string, entry *FileEntry, pkgName s
 
 	for _, alt := range entry.Alternatives {
 		if alt.State == StateActive {
+			if activeAlt != nil {
+				return false, fmt.Errorf("multiple active alternatives recorded for %s", path)
+			}
 			activeAlt = alt
 		}
 		for _, o := range alt.Owners {
@@ -1295,52 +1535,23 @@ func activateAlternativeForOwner(hRoot, path string, entry *FileEntry, pkgName s
 		return false, nil
 	}
 
-	// Need to switch
 	targetAbsPath := filepath.Join(hRoot, path)
-
-	// 1. Stash current active (if exists)
 	if activeAlt != nil {
-		activeAlt.State = StateStashed
-		if err := ensureStoreDir(hRoot, execCtx); err != nil {
-			return false, err
+		currentInfo, err := alternativeFileMetadata(targetAbsPath, execCtx)
+		if err != nil {
+			return false, fmt.Errorf("failed to inspect active alternative: %w", err)
 		}
-
-		// If we are about to switch checking content...
-		// But here we trust the DB state mainly.
-		// Check verify B3Sum of file on disk matches activeAlt?
-		// Ideally yes. If mismatch, we might want to stash the *actual* file on disk as "unmanaged"?
-		// For simplicity/robustness, we just stash what is on disk to the store slot of currently active alt.
-
-		storePath := getStashedFilePath(hRoot, activeAlt.B3Sum)
-		// Only copy if not exists? Or overwrite to be safe?
-		// Better to check not exists.
-		if _, err := os.Stat(storePath); os.IsNotExist(err) {
-			if err := copyFileAsRoot(targetAbsPath, storePath, execCtx); err != nil {
-				return false, fmt.Errorf("failed to stash current: %w", err)
-			}
+		if !alternativeMatchesInfo(activeAlt, currentInfo) {
+			return false, fmt.Errorf("active alternative has been modified on disk")
+		}
+		if err := ensureAlternativeStored(hRoot, targetAbsPath, currentInfo, execCtx); err != nil {
+			return false, fmt.Errorf("failed to stash current alternative: %w", err)
 		}
 	}
 
-	// 2. Restore target alternative
-	storePath := getStashedFilePath(hRoot, targetAlt.B3Sum)
-	// Check if in store
-	if _, err := os.Stat(storePath); os.IsNotExist(err) {
-		// Big problem: Data missing from store!
-		return false, fmt.Errorf("alternative content missing from store: %s", targetAlt.B3Sum)
+	if err := restoreAlternativeContent(hRoot, path, targetAlt, execCtx); err != nil {
+		return false, err
 	}
-
-	// Copy from store to target
-	if err := copyFileAsRoot(storePath, targetAbsPath, execCtx); err != nil {
-		return false, fmt.Errorf("failed to restore alternative: %w", err)
-	}
-
-	// Restore metadata (permissions/owners) not fully stored, relying on file?
-	// Note: Alternative struct has Mode, UID, GID from when it was registered.
-	// We should probably restore those too if possible.
-	// (Skipping strict metadata restore for this pass, assuming copyFile preserves or sets reasonable defaults,
-	// but strictly we should use `chown`/`chmod` based on `targetAlt.Mode/UID`.
-	// The `Alternative` struct has these fields!)
-
-	targetAlt.State = StateActive
+	setActiveAlternative(entry, targetAlt)
 	return true, nil
 }
