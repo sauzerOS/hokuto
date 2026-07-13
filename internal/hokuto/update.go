@@ -1095,7 +1095,7 @@ func checkForUpgrades(_ context.Context, cfg *Config, maxJobs int, yes bool) err
 	// If hokuto is in the list, we prioritize it and stop afterwards
 	if hokutoInUpdates {
 		colArrow.Printf("-> ")
-		colSuccess.Printf("Updating Hokuto")
+		colSuccess.Println("Updating Hokuto")
 		pkgNames = []string{"hokuto"}
 		// Re-initialize userRequestedMap for just hokuto
 		userRequestedMap = map[string]bool{"hokuto": true}
@@ -1185,13 +1185,14 @@ func checkForUpgrades(_ context.Context, cfg *Config, maxJobs int, yes bool) err
 
 	// Snapshot before any update build dependency is installed. Cleanup happens
 	// once at function exit, after every selected update has finished or failed.
+	quietDependencyInstalls := true
 	installedAtUpdateStart := snapshotInstalledPackageNames()
 	endBuildSession := registerHokutoBuildSession()
 	defer endBuildSession()
 	defer func() {
 		installedAfterUpdate := snapshotInstalledPackageNames()
 		temporaryBuildDeps := temporaryUpdatePackages(installedAtUpdateStart, installedAfterUpdate, userRequestedMap)
-		uninstallBuildDependenciesWithOptions(temporaryBuildDeps, cfg, maxJobs > 1)
+		uninstallBuildDependenciesWithOptions(temporaryBuildDeps, cfg, quietDependencyInstalls)
 	}()
 
 	plan, err := resolveBuildPlan(pkgNames, userRequestedMap, false, cfg, binaryAvailable)
@@ -1201,7 +1202,7 @@ func checkForUpgrades(_ context.Context, cfg *Config, maxJobs int, yes bool) err
 	updateTargets := append([]string(nil), pkgNames...)
 	acceptedBinaryDeps := make(map[string]bool)
 	for {
-		installedBinaryDeps, installErr := installAvailableBinaryBuildDeps(plan, userRequestedMap, acceptedBinaryDeps, cfg, func(string) {}, false, false, maxJobs > 1)
+		installedBinaryDeps, installErr := installAvailableBinaryBuildDeps(plan, userRequestedMap, acceptedBinaryDeps, cfg, func(string) {}, false, false, quietDependencyInstalls)
 		if installErr != nil {
 			return fmt.Errorf("failed to install update build dependencies: %w", installErr)
 		}
@@ -1227,7 +1228,7 @@ func checkForUpgrades(_ context.Context, cfg *Config, maxJobs int, yes bool) err
 	}
 
 	includeMultilibDevel := packageSetHasBuildOption(pkgNames, "multilib")
-	if _, err := ensureDevelPackagesInstalledWithOptions(cfg, includeMultilibDevel, false, maxJobs > 1); err != nil {
+	if _, err := ensureDevelPackagesInstalledWithOptions(cfg, includeMultilibDevel, false, quietDependencyInstalls); err != nil {
 		return fmt.Errorf("failed to prepare devel packages before update: %w", err)
 	}
 
