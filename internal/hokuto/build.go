@@ -1181,6 +1181,9 @@ func packageSplitOutputs(parentPkgName, pkgDir, splitRoot, version, revision, ta
 		if !splitOptions["staticlibs"] {
 			removeStaticLibraries(splitOutputDir, buildExec)
 		}
+		if err := normalizePackagedManPages(splitOutputDir, buildExec); err != nil {
+			return fmt.Errorf("failed to normalize man pages for split package %s: %w", outputSplitName, err)
+		}
 
 		isMultilib := detectMultilib(outputSplitName, splitOutputDir)
 		pkginfoExec := buildExec
@@ -1380,6 +1383,9 @@ func finalizeBuiltPackage(in builtPackageFinalization) error {
 	}
 
 	cleanPackagedOutput(in.outputDir, in.buildExec, in.options)
+	if err := normalizePackagedManPages(in.outputDir, in.buildExec); err != nil {
+		return fmt.Errorf("failed to normalize man pages: %w", err)
+	}
 
 	logXZPath := filepath.Join(installedDir, "log.xz")
 	logExec := in.buildExec
