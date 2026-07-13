@@ -126,34 +126,34 @@ func scanInstalledPackageIntegrity(searchTerm string, cfg *Config) ([]packageInt
 
 func reinstallPackageForIntegrity(pkgName string, cfg *Config) error {
 	versionData, err := os.ReadFile(filepath.Join(Installed, pkgName, "version"))
-	if err != nil {
-		return fmt.Errorf("could not read installed version: %w", err)
-	}
 	fields := strings.Fields(string(versionData))
-	if len(fields) == 0 {
-		return fmt.Errorf("installed version metadata is empty")
-	}
-	version := fields[0]
-	revision := "1"
-	if len(fields) > 1 {
-		revision = fields[1]
-	}
 
 	installName := pkgName
 	var tarballPath string
-	if cached := findCachedBinaryTarballVersion(pkgName, version, revision, cfg); cached != "" {
-		tarballPath = cached
-	} else {
-		for _, variant := range dependencyVariantCandidates(pkgName, cfg) {
-			fetched, ok, fetchErr := fetchExactBinaryTarballIfAvailable(pkgName, version, revision, variant, cfg, false)
-			if fetchErr != nil {
-				return fetchErr
-			}
-			if ok {
-				tarballPath = fetched
-				break
+	if err == nil && len(fields) > 0 {
+		version := fields[0]
+		revision := "1"
+		if len(fields) > 1 {
+			revision = fields[1]
+		}
+		if cached := findCachedBinaryTarballVersion(pkgName, version, revision, cfg); cached != "" {
+			tarballPath = cached
+		} else {
+			for _, variant := range dependencyVariantCandidates(pkgName, cfg) {
+				fetched, ok, fetchErr := fetchExactBinaryTarballIfAvailable(pkgName, version, revision, variant, cfg, false)
+				if fetchErr != nil {
+					return fetchErr
+				}
+				if ok {
+					tarballPath = fetched
+					break
+				}
 			}
 		}
+	} else if err != nil {
+		debugf("Installed version metadata for %s is unavailable; resolving a current binary for integrity repair: %v\n", pkgName, err)
+	} else {
+		debugf("Installed version metadata for %s is empty; resolving a current binary for integrity repair\n", pkgName)
 	}
 
 	if tarballPath == "" {

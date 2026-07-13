@@ -103,6 +103,7 @@ func handleUploadCommand(args []string, cfg *Config) error {
 	// 1. Parse Flags
 	uploadCmd := flag.NewFlagSet("upload", flag.ContinueOnError)
 	var cleanup = uploadCmd.Bool("cleanup", false, "Prompt to remove older versions on remote")
+	var cleanupAll = uploadCmd.Bool("cleanup-all", false, "Remove all older versions on remote without prompting for each file")
 	var reindex = uploadCmd.Bool("reindex", false, "Regenerate the remote index by scanning the bucket")
 	var sync = uploadCmd.Bool("sync", false, "Upload all local files missing on remote without prompt")
 	var prompt = uploadCmd.Bool("prompt", false, "Prompt for each local file missing on remote (optionally filtered by name)")
@@ -133,7 +134,7 @@ func handleUploadCommand(args []string, cfg *Config) error {
 	}
 
 	// Usage check
-	if !deletePkg.Seen && !*sync && !*prompt && !*cleanup && !*reindex && !*syncdb && !*migrate {
+	if !deletePkg.Seen && !*sync && !*prompt && !*cleanup && !*cleanupAll && !*reindex && !*syncdb && !*migrate {
 		fmt.Println("Usage: hk upload [options] [pkgname]")
 		fmt.Println("")
 		fmt.Println("Options:")
@@ -607,7 +608,7 @@ func handleUploadCommand(args []string, cfg *Config) error {
 	}
 
 	// 6. Cleanup old versions on R2
-	if *cleanup {
+	if *cleanup || *cleanupAll {
 		colArrow.Print("-> ")
 		colSuccess.Printf("Checking for old versions on %s to cleanup\n", getMirrorDisplayName(cfg))
 		remoteObjects, err := r2.ListObjects(ctx, "")
@@ -648,8 +649,17 @@ func handleUploadCommand(args []string, cfg *Config) error {
 		var deletedCount int
 		for _, obj := range remoteObjects {
 			if !activeFiles[obj.Key] && strings.HasSuffix(obj.Key, ".tar.zst") {
-				colArrow.Print("-> ")
-				if askForConfirmation(colError, "Delete old version/orphan from %s: %s? ", getMirrorDisplayName(cfg), obj.Key) {
+				shouldDelete := *cleanupAll
+				if !shouldDelete {
+					colArrow.Print("-> ")
+					shouldDelete = askForConfirmation(colError, "Delete old version/orphan from %s: %s? ", getMirrorDisplayName(cfg), obj.Key)
+				}
+				if shouldDelete {
+					if *cleanupAll {
+						colArrow.Print("-> ")
+						colSuccess.Printf("Deleting old version/orphan: ")
+						colNote.Printf("%s\n", obj.Key)
+					}
 					if err := r2.DeleteFile(ctx, obj.Key); err != nil {
 						fmt.Fprintf(os.Stderr, "Warning: failed to delete %s: %v\n", obj.Key, err)
 					} else {
@@ -703,7 +713,7 @@ func handleUploadCommand(args []string, cfg *Config) error {
 
 	// 8. Finalize Index
 	metaIndexChanged := syncMetaPackageIndexEntries(newIndexMap)
-	if uploadedCount > 0 || *cleanup || (*reindex && reindexedCount > 0) || deletionsOccurred || metaIndexChanged {
+	if uploadedCount > 0 || *cleanup || *cleanupAll || (*reindex && reindexedCount > 0) || deletionsOccurred || metaIndexChanged {
 		colArrow.Print("-> ")
 		colSuccess.Println("Updating remote index")
 
