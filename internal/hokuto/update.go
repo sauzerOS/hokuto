@@ -1232,6 +1232,35 @@ func checkForUpgrades(_ context.Context, cfg *Config, maxJobs int, yes bool) err
 		return fmt.Errorf("failed to prepare devel packages before update: %w", err)
 	}
 
+	// Install binary dependencies referenced by the final plan, including split
+	// outputs such as lib32-*. Re-resolve after each pass so a source package
+	// that was present only to produce an installed split output drops out.
+	for {
+		installedPlanDeps, err := installAvailableBinaryDependenciesForPlanWithOptions(plan, cfg, false, quietDependencyInstalls)
+		if err != nil {
+			return err
+		}
+		if len(installedPlanDeps) == 0 {
+			break
+		}
+		plan, err = resolveBuildPlan(updateTargets, userRequestedMap, false, cfg, binaryAvailable)
+		if err != nil {
+			return fmt.Errorf("failed to refresh upgrade plan after installing split dependencies: %w", err)
+		}
+		pkgNames = plan.Order
+		pkgNames, manualPrereqs = applyUpdateOrder(pkgNames)
+		splitDepsBySource = prepareUpdateBuildPlan(plan, pkgNames, manualPrereqs, cfg)
+	}
+
+	requiredSplitDepsInstalled := func(sourcePkg string) bool {
+		for _, splitPkg := range splitDepsBySource[sourcePkg] {
+			if !isPackageInstalled(splitPkg) {
+				return false
+			}
+		}
+		return true
+	}
+
 	// --- PARALLEL EXECUTION PATH ---
 	if maxJobs > 1 {
 		colArrow.Print("-> ")
@@ -1327,7 +1356,7 @@ func checkForUpgrades(_ context.Context, cfg *Config, maxJobs int, yes bool) err
 				}
 			}
 
-			if _, err := os.Stat(tarballPath); err == nil {
+			if _, err := os.Stat(tarballPath); err == nil && requiredSplitDepsInstalled(pkgName) {
 				// Found binary! Return success with 0 duration to signal "skipped build" (ready for install)
 				return 0, nil
 			}
@@ -1336,9 +1365,6 @@ func checkForUpgrades(_ context.Context, cfg *Config, maxJobs int, yes bool) err
 			return pkgBuild(pkgName, cfg, exec, opts)
 		}
 
-		if _, err := installAvailableBinaryDependenciesForPlanWithOptions(updatePlan, cfg, false, true); err != nil {
-			return err
-		}
 		if _, err := RunParallelBuilds(updatePlan, cfg, maxJobs, userRequestedMap, yes, true, splitDepsBySource, smartBuilder); err != nil {
 			return err
 		}
@@ -1444,6 +1470,13 @@ func checkForUpgrades(_ context.Context, cfg *Config, maxJobs int, yes bool) err
 			}
 		}
 
+		// A normal source-package binary does not satisfy a required split output.
+		// If no split binary was available above, build the source so those outputs
+		// are produced before dependent packages are updated.
+		if foundBinary && !requiredSplitDepsInstalled(pkgName) {
+			foundBinary = false
+		}
+
 		if foundBinary {
 			isCriticalAtomic.Store(1)
 			handlePreInstallUninstall(outputPkgName, cfg, RootExec, false, nil)
@@ -1499,6 +1532,19 @@ func checkForUpgrades(_ context.Context, cfg *Config, maxJobs int, yes bool) err
 			continue
 		}
 		isCriticalAtomic.Store(0)
+
+		splitInstallFailed := false
+		for _, splitPkg := range splitDepsBySource[pkgName] {
+			if err := installBuiltSplitDependencyWithOptions(pkgName, splitPkg, cfg, quietDependencyInstalls); err != nil {
+				color.Danger.Printf("Installation failed for split dependency %s from %s: %v\n", splitPkg, pkgName, err)
+				failedPackages = append(failedPackages, splitPkg)
+				splitInstallFailed = true
+				break
+			}
+		}
+		if splitInstallFailed {
+			continue
+		}
 
 		colArrow.Print("-> ")
 		if userRequestedMap[pkgName] {
