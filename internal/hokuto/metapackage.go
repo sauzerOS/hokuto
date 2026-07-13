@@ -70,9 +70,12 @@ func removeMetaPackageMarker(name string) error {
 		return nil
 	}
 	if os.IsPermission(err) && os.Geteuid() != 0 {
-		return RootExec.Run(exec.Command("rm", "-f", metaPackageMarkerPath(name)))
+		err = RootExec.Run(exec.Command("rm", "-f", metaPackageMarkerPath(name)))
 	}
-	return err
+	if err != nil {
+		return err
+	}
+	return removeAcceptedSuggestions(name)
 }
 
 func installedMetaPackageNames() []string {

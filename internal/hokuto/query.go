@@ -380,6 +380,13 @@ func listPackages(searchTerm string) error {
 }
 
 func FetchRemoteIndex(cfg *Config) ([]RepoEntry, error) {
+	return fetchRemoteIndex(cfg, false)
+}
+
+// fetchRemoteIndex fetches the remote package index. When quiet is true,
+// informational status lines are suppressed so callers can keep an active
+// progress bar intact.
+func fetchRemoteIndex(cfg *Config, quiet bool) ([]RepoEntry, error) {
 	ctx := context.Background()
 	var data []byte
 	var err error
@@ -395,9 +402,10 @@ func FetchRemoteIndex(cfg *Config) ([]RepoEntry, error) {
 	// 1. Try public Binary Mirror first (high priority for most users)
 	if BinaryMirror != "" {
 		mirrorAttempted = true
-		prepareDependencyProgressLogOutput()
-		colArrow.Print("-> ")
-		colSuccess.Println("Fetching remote index via Binary Mirror")
+		if !quiet {
+			prepareDependencyProgressLogOutput()
+			fmt.Fprintln(os.Stdout, colArrow.Sprint("->"), colSuccess.Sprint("Fetching remote index via Binary Mirror"))
+		}
 		url := fmt.Sprintf("%s/repo-index.json", BinaryMirror)
 		dest := filepath.Join(os.TempDir(), "hokuto-index.json")
 		indexDownloadOpt := downloadOptions{Quiet: true, NativeAttempts: 2, NativeOnly: true}
@@ -424,9 +432,10 @@ func FetchRemoteIndex(cfg *Config) ([]RepoEntry, error) {
 	if len(data) == 0 && !mirrorAttempted && hasCreds {
 		r2, r2Err := NewR2Client(cfg)
 		if r2Err == nil {
-			prepareDependencyProgressLogOutput()
-			colArrow.Print("-> ")
-			colSuccess.Printf("Fetching remote index from %s (R2 fallback)\n", getMirrorDisplayName(cfg))
+			if !quiet {
+				prepareDependencyProgressLogOutput()
+				fmt.Fprintln(os.Stdout, colArrow.Sprint("->"), colSuccess.Sprintf("Fetching remote index from %s (R2 fallback)", getMirrorDisplayName(cfg)))
+			}
 			data, err = r2.DownloadFile(ctx, "repo-index.json")
 			if err == nil {
 				sigData, _ = r2.DownloadFile(ctx, "repo-index.json.sig")
@@ -451,8 +460,9 @@ func FetchRemoteIndex(cfg *Config) ([]RepoEntry, error) {
 		if vErr := VerifyRepoIndexSignature(data, sigData, cfg); vErr != nil {
 			return nil, vErr
 		}
-		colArrow.Print("-> ")
-		colSuccess.Println("Remote index signature OK")
+		if !quiet {
+			fmt.Fprintln(os.Stdout, colArrow.Sprint("->"), colSuccess.Sprint("Remote index signature OK"))
+		}
 	} else if len(sigData) > 0 {
 		// Even if not enforced, if it's there, verify it for safety
 		if vErr := VerifyRepoIndexSignature(data, sigData, cfg); vErr != nil {

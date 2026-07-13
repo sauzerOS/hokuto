@@ -3895,83 +3895,32 @@ func handleBuildCommand(args []string, cfg *Config) (err error) {
 						return fmt.Errorf("error: dependency %s has no source package and could not be installed as a binary package: %w", depPkg, installErr)
 					}
 
-					version, revision, err := getRepoVersion2(depPkg)
-					if err != nil {
-						return fmt.Errorf("error: could not get version for dependency %s: %v", depPkg, err)
+					outputDepPkg, tarballPath, binaryAvailable, binaryErr := availableBuildDependencyBinaryTarball(depPkg, cfg, *noRemote)
+					if binaryErr != nil {
+						debugf("Binary dependency lookup failed for %s; falling back to source build: %v\n", depPkg, binaryErr)
+						packagesThatMustBeBuilt[depPkg] = true
+						return nil
 					}
-					// Use output package name for dependencies too (may be renamed for cross-system)
-					outputDepPkg := getOutputPackageName(depPkg, cfg)
-					tarballPath := findCachedBinaryTarballVersion(outputDepPkg, version, revision, cfg)
-					if _, err := os.Stat(tarballPath); err == nil {
-						if useAvailableBuildDependencyBinary(*promptBinaryDeps, "Dependency '%s' is missing. Use available binary package?", depPkg) {
-							logger, fast := dependencyInstallLogger(quietDependencyInstalls)
-							isCriticalAtomic.Store(1)
-							handlePreInstallUninstall(outputDepPkg, cfg, RootExec, false, logger)
-							if _, err := pkgInstall(tarballPath, outputDepPkg, cfg, RootExec, false, fast, false, logger); err != nil {
-								isCriticalAtomic.Store(0)
-								return fmt.Errorf("fatal error installing binary %s: %v", depPkg, err)
-							}
-							isCriticalAtomic.Store(0)
-							addTemporaryBuildDep(outputDepPkg)
-						} else {
-							binaryDeclined[depPkg] = true
-							packagesThatMustBeBuilt[depPkg] = true
-						}
-					} else {
-						// Local binary missing. Try to fetch from remote mirror.
-						foundRemote := false
-						if !*noRemote && BinaryMirror != "" {
-							// Optimization: Check remote index first
-							index, err := GetCachedRemoteIndex(cfg)
-							shouldTryDownload := true
-							var expectedSum string
-
-							if err == nil {
-								shouldTryDownload = false
-								targetArch := GetSystemArchForPackage(cfg, depPkg)
-								targetVariant := GetSystemVariantForPackage(cfg, depPkg)
-								for _, entry := range index {
-									if entry.Name == depPkg && entry.Version == version &&
-										entry.Revision == revision && entry.Arch == targetArch &&
-										entry.Variant == targetVariant {
-										shouldTryDownload = true
-										expectedSum = entry.B3Sum
-										break
-									}
-								}
-								if !shouldTryDownload {
-									debugf("Message: Skipping download for %s (not found in remote index details)\n", depPkg)
-								}
-							}
-
-							if shouldTryDownload {
-								if err := fetchBinaryPackage(depPkg, version, revision, cfg, true, expectedSum, false); err == nil {
-									// Successfully fetched! Check stat again to be sure.
-									if _, err := os.Stat(tarballPath); err == nil {
-										foundRemote = true
-										if useAvailableBuildDependencyBinary(*promptBinaryDeps, "Dependency '%s' found on remote mirror. Use binary?", depPkg) {
-											logger, fast := dependencyInstallLogger(quietDependencyInstalls)
-											isCriticalAtomic.Store(1)
-											handlePreInstallUninstall(outputDepPkg, cfg, RootExec, false, logger)
-											if _, err := pkgInstall(tarballPath, outputDepPkg, cfg, RootExec, false, fast, false, logger); err != nil {
-												isCriticalAtomic.Store(0)
-												return fmt.Errorf("fatal error installing downloaded binary %s: %v", depPkg, err)
-											}
-											isCriticalAtomic.Store(0)
-											addTemporaryBuildDep(outputDepPkg)
-										} else {
-											binaryDeclined[depPkg] = true
-											packagesThatMustBeBuilt[depPkg] = true
-										}
-									}
-								}
-							}
-						}
-
-						if !foundRemote {
-							packagesThatMustBeBuilt[depPkg] = true
-						}
+					if !binaryAvailable {
+						packagesThatMustBeBuilt[depPkg] = true
+						return nil
 					}
+
+					if !useAvailableBuildDependencyBinary(*promptBinaryDeps, "Dependency '%s' is missing. Use available binary package?", depPkg) {
+						binaryDeclined[depPkg] = true
+						packagesThatMustBeBuilt[depPkg] = true
+						return nil
+					}
+
+					logger, fast := dependencyInstallLogger(quietDependencyInstalls)
+					isCriticalAtomic.Store(1)
+					handlePreInstallUninstall(outputDepPkg, cfg, RootExec, false, logger)
+					if _, err := pkgInstall(tarballPath, outputDepPkg, cfg, RootExec, false, fast, false, logger); err != nil {
+						isCriticalAtomic.Store(0)
+						return fmt.Errorf("fatal error installing binary %s: %v", depPkg, err)
+					}
+					isCriticalAtomic.Store(0)
+					addTemporaryBuildDep(outputDepPkg)
 					return nil
 				}(); err != nil {
 					clearDependencyInstallProgress(missingDepBar)

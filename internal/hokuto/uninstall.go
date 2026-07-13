@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"syscall"
@@ -36,6 +37,7 @@ func installedDependents(pkgName string, cfg *Config, removing map[string]bool) 
 	if err != nil {
 		return dependents
 	}
+	acceptedSuggestions := readAcceptedSuggestions(hRoot)
 	for _, e := range entries {
 		if !e.IsDir() {
 			continue
@@ -46,12 +48,9 @@ func installedDependents(pkgName string, cfg *Config, removing map[string]bool) 
 		}
 		depFile := filepath.Join(dbRoot, other, "depends")
 		b, err := readFileAsRoot(depFile)
-		if err != nil {
-			continue
-		}
-		deps, err := parseDependsData(b)
-		if err != nil {
-			continue
+		var deps []DepSpec
+		if err == nil {
+			deps, _ = parseDependsData(b)
 		}
 		for _, dep := range deps {
 			if dep.Name == pkgName {
@@ -67,6 +66,12 @@ func installedDependents(pkgName string, cfg *Config, removing map[string]bool) 
 				}
 			}
 			if found {
+				break
+			}
+		}
+		for _, dep := range acceptedSuggestions[other] {
+			if dep == pkgName && !slices.Contains(dependents, other) {
+				dependents = append(dependents, other)
 				break
 			}
 		}
@@ -511,6 +516,9 @@ func pkgUninstallWithRemovalSet(pkgName string, cfg *Config, execCtx *Executor, 
 		}
 	}
 	invalidateFileOwnershipPackage(pkgName)
+	if err := removeAcceptedSuggestions(pkgName); err != nil {
+		debugf("Warning: failed to remove accepted suggestions for %s: %v\n", pkgName, err)
+	}
 
 	// 10. Run post-uninstall hook if present (unchanged)
 	postScript := filepath.Join(installedDir, "post-uninstall")

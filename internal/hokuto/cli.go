@@ -572,6 +572,7 @@ func Main() {
 		var remote = installCmd.Bool("remote", false, "Install from remote mirror even if not in HOKUTO_PATH.")
 		var noRemote = installCmd.Bool("no-remote", false, "Install only from local package sources and cached package files.")
 		var fast = installCmd.Bool("fast", false, "Enable fast install mode (progress bar, deferred tasks).")
+		var ask = installCmd.Bool("ask", false, "Show the install plan and ask before installing packages.")
 
 		if err := installCmd.Parse(os.Args[2:]); err != nil {
 			fmt.Fprintf(os.Stderr, "Error parsing install flags: %v\n", err)
@@ -601,11 +602,13 @@ func Main() {
 		if *noDeps {
 			defer suppressRuntimeDependencyAutoInstallScope()()
 		}
+		effectiveYes := *yes || *yesLong
+		effectiveFast := *fast
 
 		var remoteIndex []RepoEntry
 		if *remote {
 			var err error
-			remoteIndex, err = FetchRemoteIndex(cfg)
+			remoteIndex, err = fetchRemoteIndex(cfg, effectiveFast)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Error fetching remote index: %v\n", err)
 				os.Exit(1)
@@ -629,9 +632,6 @@ func Main() {
 				packagesToInstall = append([]string{"sauzeros-base"}, packagesToInstall...)
 			}
 		}
-
-		effectiveYes := *yes || *yesLong
-		effectiveFast := *fast
 
 		// We build a list of ALL packages to install (explicit + dependencies).
 		var installPlan []string
@@ -742,6 +742,12 @@ func Main() {
 			os.Exit(0)
 		}
 
+		if *ask && !confirmInstallPlanWithAsk(installPlan, requestedMetas) {
+			colArrow.Print("-> ")
+			colWarn.Println("Install canceled.")
+			break
+		}
+
 		// Set to CRITICAL (1) for the entire installation process
 		isCriticalAtomic.Store(1)
 		// Ensure it is reset when the install function returns/panics
@@ -846,7 +852,7 @@ func Main() {
 					// Fallback: If local version lookup failed, try remote index
 					if !*noRemote && remoteIndex == nil {
 						// Lazily fetch index
-						if idx, rErr := FetchRemoteIndex(cfg); rErr == nil {
+						if idx, rErr := fetchRemoteIndex(cfg, effectiveFast); rErr == nil {
 							remoteIndex = idx
 						}
 					}
@@ -899,7 +905,7 @@ func Main() {
 						if !*noRemote && BinaryMirror != "" {
 							// Ensure remote index is available
 							if remoteIndex == nil {
-								if idx, rErr := FetchRemoteIndex(cfg); rErr == nil {
+								if idx, rErr := fetchRemoteIndex(cfg, effectiveFast); rErr == nil {
 									remoteIndex = idx
 								} else {
 									cPrintf(colWarn, "Warning: Failed to fetch remote index: %v\n", rErr)
@@ -966,8 +972,9 @@ func Main() {
 									}
 
 									if inIndexGeneric {
-										colArrow.Print("-> ")
-										cPrintf(colInfo, "Optimized binary not found, trying fallback: %s\n", fallbackVariant)
+										if !effectiveFast {
+											fmt.Fprintln(os.Stdout, colArrow.Sprint("->"), colInfo.Sprintf("Optimized binary not found, trying fallback: %s", fallbackVariant))
+										}
 
 										cfg.Values["HOKUTO_GENERIC"] = "1"
 										if err := fetchBinaryPackage(pkgName, version, revision, cfg, effectiveFast, expectedSumGeneric, *remote); err == nil {
@@ -982,7 +989,9 @@ func Main() {
 
 								// 2b. FALLBACK: Try multi-lib variants if standard failed
 								if !foundOnMirror && isMultilibPackage(pkgName) && cfg.Values["HOKUTO_MULTILIB"] != "1" {
-									cPrintf(colInfo, "Standard binary not found, trying fallback: multi-lib\n")
+									if !effectiveFast {
+										fmt.Fprintln(os.Stdout, colArrow.Sprint("->"), colInfo.Sprint("Standard binary not found, trying fallback: multi-lib"))
+									}
 
 									oldMulti := cfg.Values["HOKUTO_MULTILIB"]
 									cfg.Values["HOKUTO_MULTILIB"] = "1"
@@ -1077,7 +1086,7 @@ func Main() {
 				colNote.Printf(" %s (%d/%d)\n", pkgName, i+1, len(installPlan))
 			}
 
-			if _, err := pkgInstall(tarballPath, pkgName, cfg, RootExec, effectiveYes, effectiveFast, false, nil); err != nil {
+			if _, err := pkgInstallWithRemotePolicy(tarballPath, pkgName, cfg, RootExec, effectiveYes, effectiveFast, false, *noRemote, nil); err != nil {
 				fmt.Fprintln(os.Stderr,
 					colArrow.Sprint("->"),
 					colSuccess.Sprintf("Error installing package"),

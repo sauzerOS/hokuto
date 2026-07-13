@@ -309,6 +309,9 @@ func flushPackageSuggestions(logger io.Writer, cfg *Config, noRemote bool, promp
 				fmt.Fprintf(logger, "%s%s\n", colArrow.Sprint("-> "), colWarn.Sprintf("Warning: failed to install suggested dependency %s: %v", altName, err))
 				continue
 			}
+			if err := recordAcceptedSuggestion(item.Package, altName); err != nil {
+				fmt.Fprintf(logger, "%s%s\n", colArrow.Sprint("-> "), colWarn.Sprintf("Warning: failed to record %s as a suggested dependency of %s: %v", altName, item.Package, err))
+			}
 			break
 		}
 	}
@@ -318,7 +321,7 @@ func flushPackageSuggestions(logger io.Writer, cfg *Config, noRemote bool, promp
 	}
 }
 
-func installMissingPackageRuntimeDependencies(pkgName string, cfg *Config, logger io.Writer, quiet bool) error {
+func installMissingPackageRuntimeDependencies(pkgName string, cfg *Config, logger io.Writer, quiet, noRemote bool) error {
 	if cfg != nil && cfg.Values["HOKUTO_BOOTSTRAP"] == "1" {
 		return nil
 	}
@@ -394,12 +397,37 @@ func installMissingPackageRuntimeDependencies(pkgName string, cfg *Config, logge
 			fmt.Fprintf(logger, "%s", colSuccess.Sprint("Installing runtime dependency: "))
 			fmt.Fprintln(logger, colNote.Sprint(depName))
 		}
-		if _, err := ensurePackageInstalledWithOptions(depName, cfg, true, nil, quiet); err != nil {
+		if _, err := ensurePackageInstalledWithOptions(depName, cfg, noRemote, nil, quiet); err != nil {
 			return fmt.Errorf("failed to install runtime dependency %s for %s: %w", depName, pkgName, err)
 		}
 	}
 
 	return nil
+}
+
+func confirmInstallPlanWithAsk(installPlan []string, metas map[string]MetaPackage) bool {
+	colArrow.Print("-> ")
+	colSuccess.Println("Install preview (--ask)")
+
+	if len(installPlan) == 0 {
+		colArrow.Print("-> ")
+		colNote.Println("Packages to install: none")
+	} else {
+		colArrow.Print("-> ")
+		colNote.Printf("Packages to install (%d): %s\n", len(installPlan), strings.Join(installPlan, " -> "))
+	}
+
+	metaNames := make([]string, 0, len(metas))
+	for name := range metas {
+		metaNames = append(metaNames, name)
+	}
+	sort.Strings(metaNames)
+	if len(metaNames) > 0 {
+		colArrow.Print("-> ")
+		colNote.Printf("Metapackages to mark installed (%d): %s\n", len(metaNames), strings.Join(metaNames, ", "))
+	}
+
+	return askForConfirmationDefaultNo(colWarn, "Proceed with install?")
 }
 
 // pkgInstall installs a compiled hokuto package from a tarball.
@@ -409,6 +437,14 @@ func installMissingPackageRuntimeDependencies(pkgName string, cfg *Config, logge
 // pkgInstall installs a package from a tarball.
 // It returns a list of packages that need to be rebuilt if managed is true, or nil otherwise.
 func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes, fast, managed bool, logger io.Writer) ([]string, error) {
+	return pkgInstallWithRemotePolicy(tarballPath, pkgName, cfg, execCtx, yes, fast, managed, true, logger)
+}
+
+// pkgInstallWithRemotePolicy installs a package and controls whether runtime
+// dependencies discovered after extraction may be fetched from the binary
+// mirror. Callers that do not explicitly opt in retain pkgInstall's historical
+// local-only behavior.
+func pkgInstallWithRemotePolicy(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes, fast, managed, noRemote bool, logger io.Writer) ([]string, error) {
 	if logger == nil {
 		logger = os.Stdout
 	}
@@ -430,8 +466,9 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 			}
 		}
 
-		colArrow.Print("-> ")
-		colSuccess.Println("Installing glibc using direct extraction method")
+		if !fast {
+			fmt.Fprintln(os.Stdout, colArrow.Sprint("->"), colSuccess.Sprint("Installing glibc using direct extraction method"))
+		}
 
 		var extractErr error
 
@@ -449,8 +486,9 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 
 			if err := execCtx.Run(tarCmd); err == nil {
 				tarSuccess = true
-				colArrow.Print("-> ")
-				colSuccess.Println("glibc installed successfully via direct extraction")
+				if !fast {
+					fmt.Fprintln(os.Stdout, colArrow.Sprint("->"), colSuccess.Sprint("glibc installed successfully via direct extraction"))
+				}
 			} else {
 				debugf("System tar failed for %s, falling back to internal tar+zstd: %v\n", tarballPath, err)
 			}
@@ -460,9 +498,8 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 			if os.Geteuid() == 0 {
 				if err := unpackTarballFallback(tarballPath, rootDir); err != nil {
 					extractErr = fmt.Errorf("native fallback failed: %v", err)
-				} else {
-					colArrow.Print("-> ")
-					colSuccess.Println("glibc installed successfully via direct extraction")
+				} else if !fast {
+					fmt.Fprintln(os.Stdout, colArrow.Sprint("->"), colSuccess.Sprint("glibc installed successfully via direct extraction"))
 				}
 			} else {
 				extractErr = fmt.Errorf("System tar missing or broken, run hokuto as root!")
@@ -1278,7 +1315,7 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 	if err := executePostInstall(pkgName, rootDir, execCtx, cfg, logger); err != nil {
 		fmt.Fprintf(logger, "warning: post-install for %s returned error: %v\n", pkgName, err)
 	}
-	if err := installMissingPackageRuntimeDependencies(pkgName, cfg, logger, fast); err != nil {
+	if err := installMissingPackageRuntimeDependencies(pkgName, cfg, logger, fast, noRemote); err != nil {
 		return nil, err
 	}
 

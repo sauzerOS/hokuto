@@ -1673,13 +1673,14 @@ func getInstalledDeps(pkgName string) ([]string, error) {
 	depFile := filepath.Join(Installed, pkgName, "depends")
 	data, err := os.ReadFile(depFile)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return []string{}, nil
+		if !os.IsNotExist(err) {
+			return nil, err
 		}
-		return nil, err
+		data = nil
 	}
 
 	var deps []string
+	seen := make(map[string]bool)
 	for _, raw := range strings.Split(string(data), "\n") {
 		line := strings.TrimSpace(raw)
 		if line == "" || strings.HasPrefix(line, "#") {
@@ -1687,8 +1688,15 @@ func getInstalledDeps(pkgName string) ([]string, error) {
 		}
 		// Parse "pkgname>=1.0" -> "pkgname"
 		name, _, _, _, _, _, _, _, _, _, _ := parseDepToken(line)
-		if name != "" && name != pkgName {
+		if name != "" && name != pkgName && !seen[name] {
 			deps = append(deps, name)
+			seen[name] = true
+		}
+	}
+	for _, name := range acceptedSuggestedDependencies(pkgName) {
+		if name != "" && name != pkgName && !seen[name] {
+			deps = append(deps, name)
+			seen[name] = true
 		}
 	}
 	return deps, nil

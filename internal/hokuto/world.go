@@ -4,6 +4,7 @@ package hokuto
 // No behavior changes intended.
 
 import (
+	"bufio"
 	"fmt"
 	"io"
 	"os"
@@ -14,6 +15,90 @@ import (
 
 	"github.com/gookit/color"
 )
+
+const acceptedSuggestionsFile = "accepted-suggestions"
+
+func acceptedSuggestionsPath(root string) string {
+	return filepath.Join(root, "var", "db", "hokuto", acceptedSuggestionsFile)
+}
+
+func readAcceptedSuggestions(root string) map[string][]string {
+	result := make(map[string][]string)
+	data, err := os.ReadFile(acceptedSuggestionsPath(root))
+	if err != nil {
+		data, err = readFileAsRoot(acceptedSuggestionsPath(root))
+		if err != nil {
+			return result
+		}
+	}
+	scanner := bufio.NewScanner(strings.NewReader(string(data)))
+	for scanner.Scan() {
+		fields := strings.Fields(scanner.Text())
+		if len(fields) == 2 && fields[0] != fields[1] {
+			result[fields[0]] = append(result[fields[0]], fields[1])
+		}
+	}
+	return result
+}
+
+func acceptedSuggestedDependencies(owner string) []string {
+	return readAcceptedSuggestions(rootDir)[owner]
+}
+
+func recordAcceptedSuggestion(owner, dependency string) error {
+	if owner == "" || dependency == "" || owner == dependency {
+		return fmt.Errorf("invalid accepted suggestion relation %q -> %q", owner, dependency)
+	}
+	accepted := readAcceptedSuggestions(rootDir)
+	for _, existing := range accepted[owner] {
+		if existing == dependency {
+			return nil
+		}
+	}
+	path := acceptedSuggestionsPath(rootDir)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		if !os.IsPermission(err) || os.Geteuid() == 0 {
+			return err
+		}
+		if err := RootExec.Run(exec.Command("mkdir", "-p", filepath.Dir(path))); err != nil {
+			return err
+		}
+	}
+	return appendLineToFile(path, owner+" "+dependency)
+}
+
+func removeAcceptedSuggestions(owner string) error {
+	path := acceptedSuggestionsPath(rootDir)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		data, err = readFileAsRoot(path)
+		if err != nil {
+			return err
+		}
+	}
+	var kept []string
+	for _, raw := range strings.Split(string(data), "\n") {
+		line := strings.TrimSpace(raw)
+		fields := strings.Fields(line)
+		if line != "" && (len(fields) != 2 || fields[0] != owner) {
+			kept = append(kept, line)
+		}
+	}
+	content := []byte("")
+	if len(kept) > 0 {
+		content = []byte(strings.Join(kept, "\n") + "\n")
+	}
+	if err := os.WriteFile(path, content, 0o644); err != nil {
+		if os.IsPermission(err) && os.Geteuid() != 0 {
+			return writeRootFile(path, content, 0o644, RootExec)
+		}
+		return err
+	}
+	return nil
+}
 
 func appendLineToFile(path, line string) error {
 	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
@@ -261,6 +346,11 @@ func addMetaRuntimeRequirements(meta MetaPackage, required map[string]bool, seen
 				addMetaRuntimeRequirements(nested, required, seen)
 				continue
 			}
+			required[name] = true
+		}
+	}
+	for _, name := range acceptedSuggestedDependencies(meta.Name) {
+		if name != "" {
 			required[name] = true
 		}
 	}
