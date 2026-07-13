@@ -873,8 +873,9 @@ func Main() {
 							version = rv
 							revision = rr
 							err = nil
-							// Enable remote mode implicitly since we found it remotely
-							*remote = true
+							// This package needed remote metadata, but that must not
+							// turn the user's explicit --remote cache-bypass policy on
+							// for every package that follows it in the install plan.
 						}
 					}
 				}
