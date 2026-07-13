@@ -2647,7 +2647,11 @@ func installAvailableBuildDependencyBinaryWithOptions(pkgName string, cfg *Confi
 	if err != nil || !ok {
 		return false, err
 	}
-	if !installRuntimeDeps {
+	if installRuntimeDeps {
+		if err := ensureBinaryRuntimeDependenciesInstalledWithOptions(installName, cfg, noRemote, nil, quiet); err != nil {
+			return false, err
+		}
+	} else {
 		defer suppressRuntimeDependencyAutoInstallScope()()
 	}
 	return installBinaryTarballWithOptions(tarballPath, installName, cfg, quiet)
@@ -2671,7 +2675,11 @@ func installAvailableBinaryPackageWithRuntimeDepsOption(pkgName string, cfg *Con
 		return false, err
 	}
 
-	if !installRuntimeDeps {
+	if installRuntimeDeps {
+		if err := ensureBinaryRuntimeDependenciesInstalledWithOptions(installName, cfg, noRemote, nil, quiet); err != nil {
+			return false, err
+		}
+	} else {
 		defer suppressRuntimeDependencyAutoInstallScope()()
 	}
 	return installBinaryTarballWithOptions(tarballPath, installName, cfg, quiet)
