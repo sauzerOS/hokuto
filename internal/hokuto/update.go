@@ -78,6 +78,10 @@ func getRepoVersion2(pkgName string) (version string, revision string, err error
 	if len(fields) >= 2 {
 		pkgRevision = fields[1]
 	}
+	if !versionedPackageMajorMatches(lookupName, pkgVersion) {
+		_, major, _ := splitVersionedPackageName(lookupName)
+		return "", "", fmt.Errorf("package %s requires major version %s, but repository source resolves to %s", lookupName, major, pkgVersion)
+	}
 
 	return pkgVersion, pkgRevision, nil
 }

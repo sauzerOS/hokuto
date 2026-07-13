@@ -154,6 +154,10 @@ func dependencyVariantCandidates(pkgName string, cfg *Config) []string {
 }
 
 func findCachedBinaryTarball(pkgName string, cfg *Config) string {
+	if _, _, versioned := splitVersionedPackageName(pkgName); versioned {
+		tarballPath, _ := findCachedVersionedBinaryTarball(pkgName, cfg)
+		return tarballPath
+	}
 	for _, variant := range dependencyVariantCandidates(pkgName, cfg) {
 		tarballPath, _, _ := findNewestTarball(pkgName, variant)
 		if tarballPath != "" {
@@ -184,6 +188,15 @@ func splitVersionedPackageName(pkgName string) (baseName, major string, ok bool)
 		return "", "", false
 	}
 	return pkgName[:lastDash], major, true
+}
+
+func versionedPackageMajorMatches(pkgName, version string) bool {
+	_, major, ok := splitVersionedPackageName(pkgName)
+	if !ok {
+		return true
+	}
+	versionMajor := strings.SplitN(strings.TrimSpace(version), ".", 2)[0]
+	return versionMajor == major
 }
 
 // findSourcePackageSatisfying resolves a constrained logical package name to a
@@ -618,7 +631,7 @@ func resolveBinaryDependencies(pkgName string, visited map[string]bool, plan *[]
 			if entry.Type == "meta" {
 				continue
 			}
-			if entry.Name == lookupName {
+			if entry.Name == lookupName && versionedPackageMajorMatches(lookupName, entry.Version) {
 				found = true
 				break
 			}
@@ -1944,7 +1957,19 @@ func ensurePackageInstalledWithOptions(pkgName string, cfg *Config, noRemote boo
 	// 1. Get repo version
 	version, revision, err := getRepoVersion2(pkgName)
 	if err != nil {
-		return ensureBinaryOnlyPackageInstalled(pkgName, cfg, noRemote)
+		if _, _, versioned := splitVersionedPackageName(pkgName); versioned {
+			preparedName, prepareErr := prepareVersionedPackageMajor(pkgName)
+			if prepareErr != nil {
+				return false, fmt.Errorf("failed to prepare sources for versioned package %s: %w", pkgName, prepareErr)
+			}
+			if preparedName != pkgName {
+				return false, fmt.Errorf("versioned package %s resolved to unexpected package name %s", pkgName, preparedName)
+			}
+			version, revision, err = getRepoVersion2(pkgName)
+		}
+		if err != nil {
+			return ensureBinaryOnlyPackageInstalled(pkgName, cfg, noRemote)
+		}
 	}
 
 	outputPkgName := getOutputPackageName(pkgName, cfg)
@@ -2394,37 +2419,20 @@ func installBinaryTarballWithRemotePolicy(tarballPath, pkgName string, cfg *Conf
 }
 
 func ensureBinaryOnlyPackageInstalled(pkgName string, cfg *Config, noRemote bool) (bool, error) {
-	if tarballPath := findCachedBinaryTarball(pkgName, cfg); tarballPath != "" {
-		if err := ensureBinaryRuntimeDependenciesInstalled(pkgName, cfg, noRemote, nil); err != nil {
-			return false, err
-		}
-		return installBinaryTarball(tarballPath, pkgName, cfg)
-	}
-
-	if noRemote || BinaryMirror == "" {
-		return false, fmt.Errorf("source not found for %s and no cached binary package is available", pkgName)
-	}
-
-	index, err := GetCachedRemoteIndex(cfg)
+	installName, tarballPath, ok, err := availableBinaryPackageTarball(pkgName, cfg, noRemote)
 	if err != nil {
-		return false, fmt.Errorf("source not found for %s and failed to fetch remote index: %w", pkgName, err)
-	}
-
-	entryRef, err := GetRemotePackageEntry(pkgName, cfg, index)
-	if err != nil {
-		return false, fmt.Errorf("source not found for %s and no remote binary package is available: %w", pkgName, err)
-	}
-	entry := *entryRef
-	if err := fetchSpecificBinaryPackage(entry.Name, entry.Version, entry.Revision, entry.Variant, cfg, true, entry.B3Sum, false); err != nil {
-		return false, fmt.Errorf("failed to fetch binary %s: %w", pkgName, err)
-	}
-
-	arch := GetSystemArchForPackage(cfg, entry.Name)
-	tarballPath := filepath.Join(BinDir, StandardizeRemoteName(entry.Name, entry.Version, entry.Revision, arch, entry.Variant))
-	if err := ensureBinaryRuntimeDependenciesInstalled(entry.Name, cfg, noRemote, nil); err != nil {
 		return false, err
 	}
-	return installBinaryTarball(tarballPath, entry.Name, cfg)
+	if !ok {
+		if noRemote || BinaryMirror == "" {
+			return false, fmt.Errorf("source not found for %s and no cached binary package is available", pkgName)
+		}
+		return false, fmt.Errorf("source not found for %s and no remote binary package is available", pkgName)
+	}
+	if err := ensureBinaryRuntimeDependenciesInstalled(installName, cfg, noRemote, nil); err != nil {
+		return false, err
+	}
+	return installBinaryTarballWithRemotePolicy(tarballPath, installName, cfg, false, noRemote)
 }
 
 func fetchExactBinaryTarballIfAvailable(pkgName, version, revision, variant string, cfg *Config, noRemote bool) (string, bool, error) {
@@ -2461,6 +2469,26 @@ func availableBinaryPackageTarball(pkgName string, cfg *Config, noRemote bool) (
 
 	if tarballPath, ok := findCachedVersionedBinaryTarball(lookupName, cfg); ok {
 		return lookupName, tarballPath, true, nil
+	}
+	if _, _, versioned := splitVersionedPackageName(lookupName); versioned {
+		if noRemote || BinaryMirror == "" {
+			return "", "", false, nil
+		}
+		index, err := GetCachedRemoteIndex(cfg)
+		if err != nil {
+			debugf("Skipping remote versioned binary check for %s: %v\n", lookupName, err)
+			return "", "", false, nil
+		}
+		entryRef, err := GetRemotePackageEntry(lookupName, cfg, index)
+		if err != nil {
+			return "", "", false, nil
+		}
+		entry := *entryRef
+		if err := fetchSpecificBinaryPackage(entry.Name, entry.Version, entry.Revision, entry.Variant, cfg, true, entry.B3Sum, false); err != nil {
+			return "", "", false, err
+		}
+		tarballPath := filepath.Join(BinDir, StandardizeRemoteName(entry.Name, entry.Version, entry.Revision, entry.Arch, entry.Variant))
+		return entry.Name, tarballPath, true, nil
 	}
 
 	if _, sourceErr := findPackageMetadataDir(lookupName); sourceErr != nil {

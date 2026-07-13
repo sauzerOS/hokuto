@@ -881,6 +881,22 @@ func Main() {
 				}
 
 				if err != nil {
+					if cached, ok := findCachedVersionedBinaryTarball(pkgName, cfg); ok {
+						metadata, _, scanErr := scanTarballMetadata(cached)
+						if scanErr == nil {
+							tarballPath = cached
+							version = metadata["version"]
+							revision = metadata["revision"]
+							if revision == "" {
+								revision = "1"
+							}
+							tarballFoundDirectly = true
+							err = nil
+						}
+					}
+				}
+
+				if err != nil {
 					// If source not found (e.g., renamed cross-system packages), try to find tarball
 					if strings.Contains(err.Error(), "not found") {
 						// Try to find the newest tarball matching this package name with appropriate variant
@@ -901,7 +917,7 @@ func Main() {
 						allSucceeded = false
 						continue
 					}
-				} else {
+				} else if !tarballFoundDirectly {
 					arch := GetSystemArchForPackage(cfg, pkgName)
 					variant := GetSystemVariantForPackage(cfg, pkgName)
 					tarballPath = filepath.Join(BinDir, StandardizeRemoteName(pkgName, version, revision, arch, variant))
@@ -1633,6 +1649,10 @@ func findNewestTarball(pkgName, variant string) (string, string, string) {
 			}
 			if metadata["name"] != pkgName {
 				debugf("Skipping cached tarball %s: metadata name %q does not match %q\n", match, metadata["name"], pkgName)
+				continue
+			}
+			if !versionedPackageMajorMatches(pkgName, metadata["version"]) {
+				debugf("Skipping cached tarball %s: version %q does not match package major\n", match, metadata["version"])
 				continue
 			}
 			if IdentifyVariant(metadata["name"], metadata["generic"] == "1", metadata["multilib"] == "1") != variant {

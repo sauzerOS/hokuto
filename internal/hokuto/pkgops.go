@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 )
@@ -1366,6 +1367,67 @@ func prepareVersionedPackage(arg string) (string, error) {
 	colSuccess.Printf("Extracted %s@%s (as %s) from commit %s into temporary directory\n", pkgName, foundVersion, renamedPkgName, foundCommit[:8])
 
 	return renamedPkgName, nil
+}
+
+// prepareVersionedPackageMajor reconstructs the newest source release whose
+// major version matches a concrete pkg-MAJOR runtime package identity.
+func prepareVersionedPackageMajor(pkgName string) (string, error) {
+	baseName, major, ok := splitVersionedPackageName(pkgName)
+	if !ok {
+		return pkgName, fmt.Errorf("package %s is not a versioned pkg-MAJOR identity", pkgName)
+	}
+	if _, err := strconv.Atoi(major); err != nil {
+		return pkgName, err
+	}
+
+	pkgDir, err := findPackageDir(baseName)
+	if err != nil {
+		return pkgName, fmt.Errorf("could not find base package %s: %w", baseName, err)
+	}
+	gitRootCmd := exec.Command("git", "rev-parse", "--show-toplevel")
+	gitRootCmd.Dir = pkgDir
+	gitRootOut, err := gitRootCmd.Output()
+	if err != nil {
+		return pkgName, fmt.Errorf("package directory %s is not in a Git repository: %w", pkgDir, err)
+	}
+	gitRoot := strings.TrimSpace(string(gitRootOut))
+	relPath, err := filepath.Rel(gitRoot, pkgDir)
+	if err != nil {
+		return pkgName, fmt.Errorf("failed to determine relative path for %s: %w", baseName, err)
+	}
+	logCmd := exec.Command("git", "log", "--all", "--format=%H", "--", relPath)
+	logCmd.Dir = gitRoot
+	logOut, err := logCmd.Output()
+	if err != nil {
+		return pkgName, fmt.Errorf("failed to search git history for major version %s of %s: %w", major, baseName, err)
+	}
+
+	targetVersion := ""
+	for _, commit := range strings.Fields(string(logOut)) {
+		showCmd := exec.Command("git", "show", fmt.Sprintf("%s:%s/version", commit, relPath))
+		showCmd.Dir = gitRoot
+		showOut, err := showCmd.Output()
+		if err != nil {
+			continue
+		}
+		fields := strings.Fields(string(showOut))
+		if len(fields) > 0 && strings.SplitN(fields[0], ".", 2)[0] == major {
+			targetVersion = fields[0]
+			break
+		}
+	}
+	if targetVersion == "" {
+		return pkgName, fmt.Errorf("no source release with major version %s was found for %s", major, baseName)
+	}
+
+	resolved, err := prepareVersionedPackage(fmt.Sprintf("%s@%s", baseName, targetVersion))
+	if err != nil {
+		return pkgName, err
+	}
+	if resolved != pkgName {
+		return pkgName, fmt.Errorf("no source release with major version %s was found for %s", major, baseName)
+	}
+	return resolved, nil
 }
 
 // deriveVersionedPackageDir attempts to find the sources for an installed package

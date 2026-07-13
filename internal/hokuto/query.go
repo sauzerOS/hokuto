@@ -631,6 +631,7 @@ func GetRemotePackageEntry(pkgName string, cfg *Config, remoteIndex []RepoEntry)
 
 	arch := GetSystemArch(cfg)
 	variant := GetSystemVariantForPackage(cfg, lookupName)
+	_, versionedMajor, versionedName := splitVersionedPackageName(lookupName)
 
 	// Helper to search in a specific variant
 	searchInVariant := func(searchVariant string) *RepoEntry {
@@ -651,6 +652,9 @@ func GetRemotePackageEntry(pkgName string, cfg *Config, remoteIndex []RepoEntry)
 			}
 
 			if match && entry.Arch == arch && entry.Variant == searchVariant {
+				if versionedName && strings.SplitN(entry.Version, ".", 2)[0] != versionedMajor {
+					continue
+				}
 				if targetVersion != "" {
 					if entry.Version == targetVersion {
 						if targetRevision != "" && entry.Revision != targetRevision {
