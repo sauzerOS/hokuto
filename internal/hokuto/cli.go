@@ -613,6 +613,16 @@ func Main() {
 				fmt.Fprintf(os.Stderr, "Error fetching remote index: %v\n", err)
 				os.Exit(1)
 			}
+		} else if !*noRemote && BinaryMirror != "" {
+			// A normal install may still obtain packages from the binary mirror. Use
+			// the mirror's dependency metadata when constructing that install plan;
+			// local recipes can differ from the dependencies recorded in a built
+			// archive (for example, through generated shared-library dependencies).
+			if index, err := getCachedRemoteIndex(cfg, effectiveFast); err == nil {
+				remoteIndex = index
+			} else {
+				debugf("Failed to load remote index for install planning: %v\n", err)
+			}
 		}
 
 		packagesToInstall := installCmd.Args()

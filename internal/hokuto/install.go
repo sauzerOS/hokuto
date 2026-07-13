@@ -373,7 +373,7 @@ func installMissingPackageRuntimeDependencies(pkgName string, cfg *Config, logge
 		}
 
 		if binaryOnlyRuntimeDependencyInstall.Load() > 0 {
-			installed, err := installRuntimeDependencyBinaryOnly(depName, cfg, true, nil, quiet)
+			installed, err := installRuntimeDependencyBinaryOnly(depName, cfg, noRemote, nil, quiet)
 			if err != nil {
 				return fmt.Errorf("failed to install binary runtime dependency %s for %s: %w", depName, pkgName, err)
 			}

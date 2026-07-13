@@ -170,7 +170,7 @@ func reinstallPackageForIntegrity(pkgName string, cfg *Config) error {
 	isCriticalAtomic.Store(1)
 	defer isCriticalAtomic.Store(0)
 	handlePreInstallUninstall(installName, cfg, RootExec, true, nil)
-	if _, err := pkgInstall(tarballPath, installName, cfg, RootExec, true, false, false, nil); err != nil {
+	if _, err := pkgInstallWithRemotePolicy(tarballPath, installName, cfg, RootExec, true, false, false, false, nil); err != nil {
 		return err
 	}
 	return nil

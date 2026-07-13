@@ -1483,7 +1483,7 @@ func checkForUpgrades(_ context.Context, cfg *Config, maxJobs int, yes bool) err
 			colArrow.Print("-> ")
 			colSuccess.Printf("Installing")
 			colNote.Printf(" %s\n", outputPkgName)
-			if _, err := pkgInstall(tarballPath, outputPkgName, cfg, RootExec, false, false, false, nil); err != nil {
+			if _, err := pkgInstallWithRemotePolicy(tarballPath, outputPkgName, cfg, RootExec, false, false, false, false, nil); err != nil {
 				isCriticalAtomic.Store(0)
 				color.Danger.Printf("Binary installation failed for %s: %v. Falling back to build.\n", outputPkgName, err)
 			} else {

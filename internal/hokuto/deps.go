@@ -1938,7 +1938,7 @@ func ensurePackageInstalledWithOptions(pkgName string, cfg *Config, noRemote boo
 		if err := ensureBinaryRuntimeDependenciesInstalledWithOptions(installName, cfg, noRemote, seen, quiet); err != nil {
 			return false, err
 		}
-		return installBinaryTarballWithOptions(tarballPath, installName, cfg, quiet)
+		return installBinaryTarballWithRemotePolicy(tarballPath, installName, cfg, quiet, noRemote)
 	}
 
 	// 1. Get repo version
@@ -1986,7 +1986,7 @@ func ensurePackageInstalledWithOptions(pkgName string, cfg *Config, noRemote boo
 		isCriticalAtomic.Store(1)
 		defer isCriticalAtomic.Store(0)
 		handlePreInstallUninstall(outputPkgName, cfg, RootExec, true, logger)
-		if _, err := pkgInstall(tarballPath, outputPkgName, cfg, RootExec, true, fast, false, logger); err != nil {
+		if _, err := pkgInstallWithRemotePolicy(tarballPath, outputPkgName, cfg, RootExec, true, fast, false, noRemote, logger); err != nil {
 			return false, fmt.Errorf("failed to install binary %s: %v", pkgName, err)
 		}
 		return true, nil
@@ -2010,7 +2010,7 @@ func ensurePackageInstalledWithOptions(pkgName string, cfg *Config, noRemote boo
 	isCriticalAtomic.Store(1)
 	defer isCriticalAtomic.Store(0)
 	handlePreInstallUninstall(outputPkgName, cfg, RootExec, true, logger)
-	if _, err := pkgInstall(tarballPath, outputPkgName, cfg, RootExec, true, fast, false, logger); err != nil {
+	if _, err := pkgInstallWithRemotePolicy(tarballPath, outputPkgName, cfg, RootExec, true, fast, false, noRemote, logger); err != nil {
 		return false, fmt.Errorf("failed to install built package %s: %v", pkgName, err)
 	}
 	return true, nil
@@ -2065,7 +2065,7 @@ func ensureSplitPackageInstalled(sourcePkg, splitPkg string, cfg *Config, noRemo
 		if err := ensureBinaryRuntimeDependenciesInstalledWithOptions(splitPkg, cfg, noRemote, seen, quiet); err != nil {
 			return false, err
 		}
-		return installBinaryTarballWithOptions(tarballPath, splitPkg, cfg, quiet)
+		return installBinaryTarballWithRemotePolicy(tarballPath, splitPkg, cfg, quiet, noRemote)
 	}
 
 	if err := installSourceFallbackBuildDependenciesWithOptions(sourcePkg, cfg, noRemote, quiet); err != nil {
@@ -2136,7 +2136,7 @@ func installAvailableSplitDependencyBinary(sourcePkg, splitPkg string, cfg *Conf
 	if err := ensureBinaryRuntimeDependenciesInstalledWithOptions(splitPkg, cfg, noRemote, seen, quiet); err != nil {
 		return false, err
 	}
-	return installBinaryTarballWithOptions(tarballPath, splitPkg, cfg, quiet)
+	return installBinaryTarballWithRemotePolicy(tarballPath, splitPkg, cfg, quiet, noRemote)
 }
 
 func binaryRuntimeDependencySpecs(pkgName string, cfg *Config, noRemote bool) ([]DepSpec, error) {
@@ -2145,16 +2145,19 @@ func binaryRuntimeDependencySpecs(pkgName string, cfg *Config, noRemote bool) ([
 		lookupName = pkgName[:idx]
 	}
 
-	if pkgDir, err := findPackageMetadataDir(lookupName); err == nil {
-		return parseDependsFile(pkgDir)
-	}
-
+	// When installing a binary, its own metadata is authoritative. A source
+	// recipe can omit dependencies that were generated while packaging, or can
+	// describe a newer build than the archive being installed.
 	deps, found, err := resolveBinaryDependenciesFromArchive(pkgName, cfg, nil, !noRemote)
 	if err != nil {
 		return nil, err
 	}
 	if found {
 		return deps, nil
+	}
+
+	if pkgDir, err := findPackageMetadataDir(lookupName); err == nil {
+		return parseDependsFile(pkgDir)
 	}
 	return nil, nil
 }
@@ -2254,7 +2257,7 @@ func installRuntimeDependencyBinaryOnly(pkgName string, cfg *Config, noRemote bo
 	// pkgInstall also scans the installed depends file. Suppress that second pass;
 	// the recursive binary-only pass above has already handled it.
 	defer suppressRuntimeDependencyAutoInstallScope()()
-	return installBinaryTarballWithOptions(tarballPath, installName, cfg, quiet)
+	return installBinaryTarballWithRemotePolicy(tarballPath, installName, cfg, quiet, noRemote)
 }
 
 func dependencyInstallLogger(quiet bool) (io.Writer, bool) {
@@ -2363,6 +2366,10 @@ func installBinaryTarball(tarballPath, pkgName string, cfg *Config) (bool, error
 }
 
 func installBinaryTarballWithOptions(tarballPath, pkgName string, cfg *Config, quiet bool) (bool, error) {
+	return installBinaryTarballWithRemotePolicy(tarballPath, pkgName, cfg, quiet, true)
+}
+
+func installBinaryTarballWithRemotePolicy(tarballPath, pkgName string, cfg *Config, quiet, noRemote bool) (bool, error) {
 	if quiet {
 		describeActiveDependencyInstallProgress(pkgName)
 	}
@@ -2380,7 +2387,7 @@ func installBinaryTarballWithOptions(tarballPath, pkgName string, cfg *Config, q
 	isCriticalAtomic.Store(1)
 	defer isCriticalAtomic.Store(0)
 	handlePreInstallUninstall(pkgName, cfg, execCtx, true, logger)
-	if _, err := pkgInstall(tarballPath, pkgName, cfg, execCtx, true, fast, false, logger); err != nil {
+	if _, err := pkgInstallWithRemotePolicy(tarballPath, pkgName, cfg, execCtx, true, fast, false, noRemote, logger); err != nil {
 		return false, fmt.Errorf("failed to install binary %s: %v", pkgName, err)
 	}
 	return true, nil
@@ -2654,7 +2661,7 @@ func installAvailableBuildDependencyBinaryWithOptions(pkgName string, cfg *Confi
 	} else {
 		defer suppressRuntimeDependencyAutoInstallScope()()
 	}
-	return installBinaryTarballWithOptions(tarballPath, installName, cfg, quiet)
+	return installBinaryTarballWithRemotePolicy(tarballPath, installName, cfg, quiet, noRemote)
 }
 
 func installAvailableBinaryPackageOnly(pkgName string, cfg *Config, noRemote bool) (bool, error) {
@@ -2682,7 +2689,7 @@ func installAvailableBinaryPackageWithRuntimeDepsOption(pkgName string, cfg *Con
 	} else {
 		defer suppressRuntimeDependencyAutoInstallScope()()
 	}
-	return installBinaryTarballWithOptions(tarballPath, installName, cfg, quiet)
+	return installBinaryTarballWithRemotePolicy(tarballPath, installName, cfg, quiet, noRemote)
 }
 
 func requiredDevelPackages(cfg *Config, includeMultilib bool) []string {
