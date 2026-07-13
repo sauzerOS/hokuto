@@ -33,6 +33,15 @@ func loadBuildOptions(pkgDir string) map[string]bool {
 }
 
 func loadOptionsFile(path string, options map[string]bool, allow map[string]bool) {
+	loadOptionsFileWithOverrides(path, options, allow, false)
+}
+
+// loadOptionsOverrideFile loads additive options and !option removals.
+func loadOptionsOverrideFile(path string, options map[string]bool, allow map[string]bool) {
+	loadOptionsFileWithOverrides(path, options, allow, true)
+}
+
+func loadOptionsFileWithOverrides(path string, options map[string]bool, allow map[string]bool, allowOverrides bool) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return
@@ -43,13 +52,20 @@ func loadOptionsFile(path string, options map[string]bool, allow map[string]bool
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
-		// Split line into fields (allow multiple options per line)
-		fields := strings.Fields(line)
-		for _, f := range fields {
-			if allow != nil && !allow[f] {
+		for _, field := range strings.Fields(line) {
+			disable := allowOverrides && strings.HasPrefix(field, "!")
+			option := field
+			if disable {
+				option = strings.TrimPrefix(field, "!")
+			}
+			if option == "" || (allow != nil && !allow[option]) {
 				continue
 			}
-			options[f] = true
+			if disable {
+				delete(options, option)
+				continue
+			}
+			options[option] = true
 		}
 	}
 }
@@ -66,7 +82,7 @@ func loadSplitPackagePostBuildOptions(pkgDir, splitName, outputSplitName string,
 		candidates = append(candidates, outputSplitName)
 	}
 	for _, name := range candidates {
-		loadOptionsFile(filepath.Join(pkgDir, "options."+name), options, splitPostBuildOptions)
+		loadOptionsOverrideFile(filepath.Join(pkgDir, "options."+name), options, splitPostBuildOptions)
 	}
 	return options
 }
