@@ -1171,7 +1171,7 @@ func packageSplitOutputs(parentPkgName, pkgDir, splitRoot, version, revision, ta
 
 		splitShouldStrip := shouldStrip && !splitOptions["nostrip"]
 		if splitShouldStrip {
-			if err := stripPackage(splitOutputDir, buildExec, opts.LogWriter); err != nil {
+			if err := stripPackage(splitOutputDir, splitOptions["staticlibs"], buildExec, opts.LogWriter); err != nil {
 				return fmt.Errorf("split package %s failed during stripping phase: %w", outputSplitName, err)
 			}
 		} else {
@@ -1371,7 +1371,7 @@ func finalizeBuiltPackage(in builtPackageFinalization) error {
 	debugf("Depends written to %s\n", filepath.Join(installedDir, "depends"))
 
 	if in.shouldStrip {
-		if err := stripPackage(in.outputDir, in.buildExec, in.logger); err != nil {
+		if err := stripPackage(in.outputDir, in.options["staticlibs"], in.buildExec, in.logger); err != nil {
 			return fmt.Errorf("build failed during stripping phase for %s: %w", in.sourcePkgName, err)
 		}
 	} else {

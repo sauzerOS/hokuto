@@ -9,17 +9,22 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
 )
 
-func stripPackage(outputDir string, buildExec *Executor, logger io.Writer) error {
+func stripPackage(outputDir string, stripStaticArchives bool, buildExec *Executor, logger io.Writer) error {
 	if logger == nil {
 		logger = os.Stdout
 	}
 	fmt.Fprint(logger, colArrow.Sprint("-> "))
-	fmt.Fprintln(logger, colSuccess.Sprint("Stripping executables in parallel"))
+	if stripStaticArchives {
+		fmt.Fprintln(logger, colSuccess.Sprint("Stripping executables and static archives in parallel"))
+	} else {
+		fmt.Fprintln(logger, colSuccess.Sprint("Stripping executables in parallel"))
+	}
 
 	var wg sync.WaitGroup
 
@@ -50,12 +55,30 @@ func stripPackage(outputDir string, buildExec *Executor, logger io.Writer) error
 	}
 
 	// --- PHASE 2: Process the collected output ---
-	pathsRaw := strings.TrimSpace(findOutput.String())
-	if pathsRaw == "" {
-		debugf("-> No stripable ELF files found.")
+	var paths []string
+	if pathsRaw := strings.TrimSpace(findOutput.String()); pathsRaw != "" {
+		paths = strings.Split(pathsRaw, "\n")
+	}
+
+	if stripStaticArchives {
+		err := filepath.WalkDir(outputDir, func(path string, entry os.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".a") {
+				paths = append(paths, path)
+			}
+			return nil
+		})
+		if err != nil {
+			return fmt.Errorf("failed to discover static archives: %w", err)
+		}
+	}
+
+	if len(paths) == 0 {
+		debugf("-> No stripable files found.")
 		return nil
 	}
-	paths := strings.Split(pathsRaw, "\n")
 
 	var failedMu sync.Mutex
 	var failedFiles []string
@@ -68,8 +91,9 @@ func stripPackage(outputDir string, buildExec *Executor, logger io.Writer) error
 		wg.Add(1)
 		concurrencyLimit <- struct{}{}
 		p := path
+		isStaticArchive := stripStaticArchives && strings.HasSuffix(path, ".a")
 
-		go func(p string) {
+		go func(p string, isStaticArchive bool) {
 			defer wg.Done()
 			defer func() { <-concurrencyLimit }()
 
@@ -123,8 +147,14 @@ func stripPackage(outputDir string, buildExec *Executor, logger io.Writer) error
 				return
 			}
 
+			stripArgs := []string{p}
+			if isStaticArchive {
+				// Preserve the symbols and object code needed by the linker while
+				// removing DWARF data from archive members.
+				stripArgs = []string{"--strip-debug", p}
+			}
 			debugf("  -> Stripping %s\n", p)
-			stripCmd := exec.Command("strip", p)
+			stripCmd := exec.Command("strip", stripArgs...)
 			stripCmd.Stderr = stderrWriter // Use the conditional writer
 			if err := buildExec.Run(stripCmd); err != nil {
 				// Log as warning only. Do not mark the whole package as failed.
@@ -134,7 +164,7 @@ func stripPackage(outputDir string, buildExec *Executor, logger io.Writer) error
 				failedMu.Unlock()
 				return
 			}
-		}(p)
+		}(p, isStaticArchive)
 	}
 
 	wg.Wait()
