@@ -475,6 +475,12 @@ func fetchRemoteIndex(cfg *Config, quiet bool) ([]RepoEntry, error) {
 
 // GetCachedRemoteIndex returns the global remote index, fetching it if necessary.
 func GetCachedRemoteIndex(cfg *Config) ([]RepoEntry, error) {
+	return getCachedRemoteIndex(cfg, false)
+}
+
+// getCachedRemoteIndex returns the process-wide remote index and controls only
+// the informational output emitted when the cache must be populated.
+func getCachedRemoteIndex(cfg *Config, quiet bool) ([]RepoEntry, error) {
 	GlobalRemoteIndexMu.Lock()
 	defer GlobalRemoteIndexMu.Unlock()
 
@@ -482,7 +488,7 @@ func GetCachedRemoteIndex(cfg *Config) ([]RepoEntry, error) {
 		return GlobalRemoteIndex, GlobalRemoteIndexErr
 	}
 
-	index, err := FetchRemoteIndex(cfg)
+	index, err := fetchRemoteIndex(cfg, quiet)
 	if err != nil {
 		GlobalRemoteIndexErr = err
 		GlobalRemoteIndexLoaded = true

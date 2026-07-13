@@ -852,7 +852,7 @@ func Main() {
 					// Fallback: If local version lookup failed, try remote index
 					if !*noRemote && remoteIndex == nil {
 						// Lazily fetch index
-						if idx, rErr := fetchRemoteIndex(cfg, effectiveFast); rErr == nil {
+						if idx, rErr := getCachedRemoteIndex(cfg, effectiveFast); rErr == nil {
 							remoteIndex = idx
 						}
 					}
@@ -905,7 +905,7 @@ func Main() {
 						if !*noRemote && BinaryMirror != "" {
 							// Ensure remote index is available
 							if remoteIndex == nil {
-								if idx, rErr := fetchRemoteIndex(cfg, effectiveFast); rErr == nil {
+								if idx, rErr := getCachedRemoteIndex(cfg, effectiveFast); rErr == nil {
 									remoteIndex = idx
 								} else {
 									cPrintf(colWarn, "Warning: Failed to fetch remote index: %v\n", rErr)
