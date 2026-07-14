@@ -101,6 +101,29 @@ func packageSetHasBuildOption(pkgNames []string, option string) bool {
 	return false
 }
 
+func packageSetNeedsDevelPackages(pkgNames []string) bool {
+	for _, pkgName := range pkgNames {
+		pkgDir, err := findPackageDir(pkgName)
+		if err != nil {
+			// Be conservative when recipe metadata cannot be inspected.
+			debugf("Unable to check binary/nodevel options for %s: %v\n", pkgName, err)
+			return true
+		}
+		options := loadBuildOptions(pkgDir)
+		if !options["binary"] && !options["nodevel"] {
+			return true
+		}
+	}
+	return false
+}
+
+func missingDevelPackagesForBuildSet(cfg *Config, pkgNames []string) []string {
+	if !packageSetNeedsDevelPackages(pkgNames) {
+		return nil
+	}
+	return missingDevelPackagesForBuild(cfg, packageSetHasBuildOption(pkgNames, "multilib"))
+}
+
 func buildPackageNames(packageSet map[string]bool) []string {
 	pkgNames := make([]string, 0, len(packageSet))
 	for pkgName := range packageSet {
@@ -3825,7 +3848,7 @@ func handleBuildCommand(args []string, cfg *Config) (err error) {
 		}
 	}
 	defer cleanupTemporaryBuildDeps()
-	prepareDevelPackages := func(includeMultilib bool) error {
+	prepareDevelPackages := func(pkgNames []string) error {
 		if *bootstrap {
 			return nil
 		}
@@ -3834,6 +3857,11 @@ func handleBuildCommand(args []string, cfg *Config) (err error) {
 			colWarn.Println("Skipping devel package check (--no-devel enabled)")
 			return nil
 		}
+		if !packageSetNeedsDevelPackages(pkgNames) {
+			debugf("Skipping devel package check: all packages in the build set use binary or nodevel\n")
+			return nil
+		}
+		includeMultilib := packageSetHasBuildOption(pkgNames, "multilib")
 		installedDevelDeps, err := ensureDevelPackagesInstalledWithOptions(cfg, includeMultilib, *noRemote, quietDependencyInstalls)
 		if err != nil {
 			return fmt.Errorf("failed to prepare devel packages: %w", err)
@@ -3861,7 +3889,7 @@ func handleBuildCommand(args []string, cfg *Config) (err error) {
 		fullBuildList = MovePackageToFront(fullBuildList, "sauzeros-base")
 
 		if *ask {
-			depsToInstall := missingDevelPackagesForBuild(cfg, packageSetHasBuildOption(fullBuildList, "multilib"))
+			depsToInstall := missingDevelPackagesForBuildSet(cfg, fullBuildList)
 			if !confirmBuildPlanWithAsk(fullBuildList, depsToInstall, nil) {
 				colArrow.Print("-> ")
 				colWarn.Println("Build canceled.")
@@ -3870,7 +3898,7 @@ func handleBuildCommand(args []string, cfg *Config) (err error) {
 		}
 
 		buildWorkStarted = true
-		if err := prepareDevelPackages(packageSetHasBuildOption(fullBuildList, "multilib")); err != nil {
+		if err := prepareDevelPackages(fullBuildList); err != nil {
 			return err
 		}
 
@@ -4006,8 +4034,8 @@ func handleBuildCommand(args []string, cfg *Config) (err error) {
 					buildOrder = plannedBuildDisplayOrder(previewPlan, cfg, *noRemote)
 					postRebuilds = previewPlan.PostRebuilds
 				}
-				includeMultilib := packageSetHasBuildOption(buildPackageNames(previewBuildSet), "multilib")
-				depsToInstall := append(plannedBinaryInstallsForMissingDeps(missingDeps, forceBuildMap, cfg, *noRemote), missingDevelPackagesForBuild(cfg, includeMultilib)...)
+				previewPackages := buildPackageNames(previewBuildSet)
+				depsToInstall := append(plannedBinaryInstallsForMissingDeps(missingDeps, forceBuildMap, cfg, *noRemote), missingDevelPackagesForBuildSet(cfg, previewPackages)...)
 				if !confirmBuildPlanWithAsk(buildOrder, depsToInstall, postRebuilds) {
 					colArrow.Print("-> ")
 					colWarn.Println("Build canceled.")
@@ -4113,7 +4141,7 @@ func handleBuildCommand(args []string, cfg *Config) (err error) {
 		if *ask && *noDeps {
 			buildList := buildPackageNames(packagesThatMustBeBuilt)
 			buildList = MovePackageToFront(buildList, "sauzeros-base")
-			depsToInstall := missingDevelPackagesForBuild(cfg, packageSetHasBuildOption(buildList, "multilib"))
+			depsToInstall := missingDevelPackagesForBuildSet(cfg, buildList)
 			if !confirmBuildPlanWithAsk(buildList, depsToInstall, nil) {
 				colArrow.Print("-> ")
 				colWarn.Println("Build canceled.")
@@ -4122,7 +4150,7 @@ func handleBuildCommand(args []string, cfg *Config) (err error) {
 		}
 
 		buildWorkStarted = true
-		if err := prepareDevelPackages(packageSetHasBuildOption(buildPackageNames(packagesThatMustBeBuilt), "multilib")); err != nil {
+		if err := prepareDevelPackages(buildPackageNames(packagesThatMustBeBuilt)); err != nil {
 			return err
 		}
 
