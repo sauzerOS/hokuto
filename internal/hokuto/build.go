@@ -4355,6 +4355,9 @@ func handleBuildCommand(args []string, cfg *Config) (err error) {
 				fmt.Println("All packages are up to date. Nothing to build.")
 				return nil
 			}
+			if err := prepareVersionedPlanSources(initialPlan.Order); err != nil {
+				return err
+			}
 
 			printResolvedBuildSummary(initialPlan)
 			if deferredAskConfirmation && !askForConfirmationDefaultNo(colWarn, "Proceed with build?") {

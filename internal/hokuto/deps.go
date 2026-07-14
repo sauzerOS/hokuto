@@ -939,10 +939,18 @@ func resolveMissingDeps(pkgName string, processed map[string]bool, missing *[]st
 			} else {
 				// 2. Not installed or doesn't satisfy. Check the current repository version.
 				repoVer, _, err := getRepoVersion2(depName)
-				if err == nil {
+				if err != nil {
+					if _, _, versioned := splitVersionedPackageName(depName); versioned {
+						renamed, prepareErr := prepareConstrainedDependencySource(depName, dep.Op, dep.Version)
+						if prepareErr != nil {
+							return fmt.Errorf("failed to prepare versioned package %s: %w", depName, prepareErr)
+						}
+						depName = renamed
+					}
+				} else {
 					if !versionSatisfies(repoVer, dep.Op, dep.Version) {
 						// Repo version doesn't satisfy. Fetch from git history.
-						renamed, err := prepareVersionedPackage(fmt.Sprintf("%s@%s%s", depName, dep.Op, dep.Version))
+						renamed, err := prepareConstrainedDependencySource(depName, dep.Op, dep.Version)
 						if err != nil {
 							return fmt.Errorf("failed to prepare versioned package %s@%s%s: %w", depName, dep.Op, dep.Version, err)
 						}
@@ -1453,7 +1461,15 @@ func resolveBuildPlan(targetPackages []string, userRequestedPackages map[string]
 					// 2. Not installed. Check the current repository version.
 					// We now support all standard operators (==, <=, >=, <, >)
 					repoVer, _, err := getRepoVersion2(depName)
-					if err == nil {
+					if err != nil {
+						if _, _, versioned := splitVersionedPackageName(depName); versioned {
+							renamed, prepareErr := prepareConstrainedDependencySource(depName, dep.Op, dep.Version)
+							if prepareErr != nil {
+								return fmt.Errorf("failed to prepare versioned package %s: %w", depName, prepareErr)
+							}
+							depName = renamed
+						}
+					} else {
 						if !versionSatisfies(repoVer, dep.Op, dep.Version) {
 							// The repo has a different version / doesn't satisfy constraint.
 							// Attempt to fetch a satisfying version from git history.
@@ -1461,7 +1477,7 @@ func resolveBuildPlan(targetPackages []string, userRequestedPackages map[string]
 							colSuccess.Printf("Repo version %s of %s does not match constraint %s%s. Fetching from git history\n", repoVer, depName, dep.Op, dep.Version)
 
 							// Pass the full constraint (e.g. "pkg@<=5.0.0") to prepareVersionedPackage
-							renamed, err := prepareVersionedPackage(fmt.Sprintf("%s@%s%s", depName, dep.Op, dep.Version))
+							renamed, err := prepareConstrainedDependencySource(depName, dep.Op, dep.Version)
 							if err != nil {
 								return fmt.Errorf("failed to prepare versioned package %s@%s%s: %w", depName, dep.Op, dep.Version, err)
 							}
@@ -1619,6 +1635,40 @@ func wildcardMajorDependencyName(name, op, version string) string {
 	installName := name + "-" + prefix
 	registerParallelPackageName(installName, name)
 	return installName
+}
+
+// prepareConstrainedDependencySource resolves either a normal constrained
+// package name or an already-derived pkg-VERSION.LINE identity. Wildcard
+// identities must be reconstructed from their canonical source package rather
+// than treating the dotted suffix as part of the repository package name.
+func prepareConstrainedDependencySource(name, op, version string) (string, error) {
+	if _, _, versioned := splitVersionedPackageName(name); versioned {
+		return prepareVersionedPackageMajor(name)
+	}
+	return prepareVersionedPackage(fmt.Sprintf("%s@%s%s", name, op, version))
+}
+
+// prepareVersionedPlanSources completes all historical source lookups before
+// parallel workers start. Besides preventing workers from falling back to the
+// current repository source, this keeps versionedPkgDirs writes out of the
+// concurrent build phase.
+func prepareVersionedPlanSources(packages []string) error {
+	for _, pkgName := range packages {
+		if _, _, versioned := splitVersionedPackageName(pkgName); !versioned {
+			continue
+		}
+		if _, _, err := getRepoVersion2(pkgName); err == nil {
+			continue
+		}
+		resolved, err := prepareVersionedPackageMajor(pkgName)
+		if err != nil {
+			return fmt.Errorf("failed to prepare historical source for %s: %w", pkgName, err)
+		}
+		if resolved != pkgName {
+			return fmt.Errorf("historical source for %s resolved as %s", pkgName, resolved)
+		}
+	}
+	return nil
 }
 
 // compareVersions compares two version strings split by dots. Numeric segments are compared numerically; non-numeric fall back to lexicographic.
