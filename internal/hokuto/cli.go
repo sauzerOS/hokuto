@@ -118,6 +118,25 @@ func printHelp() {
 
 }
 
+// refreshPkgDBInBackground starts a detached, best-effort database refresh.
+// The child owns no terminal streams, so it cannot delay the command or add
+// output after edit, bump, or update has completed.
+func refreshPkgDBInBackground() {
+	executable, err := os.Executable()
+	if err != nil {
+		return
+	}
+	cmd := exec.Command(executable, "__refresh-pkg-db")
+	cmd.Stdin = nil
+	cmd.Stdout = nil
+	cmd.Stderr = nil
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	if err := cmd.Start(); err != nil {
+		return
+	}
+	_ = cmd.Process.Release()
+}
+
 // Main is the CLI entrypoint for cmd/hokuto.
 func Main() {
 	// 1. CONTEXT AND SIGNAL SETUP
@@ -259,7 +278,7 @@ func Main() {
 
 	// Ensure critical directories have correct ownership after establishing the
 	// operation-wide privilege session. This avoids separate run0 prompts.
-	if len(os.Args) > 1 && os.Args[1] != "check" && os.Args[1] != "__complete" {
+	if len(os.Args) > 1 && os.Args[1] != "check" && os.Args[1] != "__complete" && os.Args[1] != "__refresh-pkg-db" {
 		if err := ensureHokutoOwnership(cfg); err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: Ownership check failed: %v\n", err)
 		}
@@ -281,6 +300,10 @@ func Main() {
 	var exitCode int
 
 	switch os.Args[1] {
+	case "__refresh-pkg-db":
+		// Internal detached hook. All output is discarded by the parent.
+		_ = generatePkgDBQuiet(cfg)
+
 	case "__complete":
 		if len(os.Args) >= 3 && os.Args[2] == "install" {
 			printInstallCompletionCandidates(cfg)
@@ -1345,6 +1368,7 @@ func Main() {
 				fmt.Fprintf(os.Stderr, "Remote upgrade process failed: %v\n", err)
 				os.Exit(1)
 			}
+			refreshPkgDBInBackground()
 			os.Exit(0) // Exit after remote update
 		}
 
@@ -1375,12 +1399,14 @@ func Main() {
 				fmt.Fprintf(os.Stderr, "Missing binary build failed: %v\n", err)
 				os.Exit(1)
 			}
+			refreshPkgDBInBackground()
 			break
 		}
 		if err := checkForUpgrades(ctx, cfg, maxJobs, effectiveYes); err != nil {
 			fmt.Fprintf(os.Stderr, "Upgrade process failed: %v\n", err)
 			os.Exit(1)
 		}
+		refreshPkgDBInBackground()
 
 	case "manifest", "m":
 		if len(os.Args) < 3 {
@@ -1558,6 +1584,7 @@ func Main() {
 			fmt.Fprintln(os.Stderr, "Error:", err)
 			os.Exit(1)
 		}
+		refreshPkgDBInBackground()
 
 	case "bump":
 		bumpCmd := flag.NewFlagSet("bump", flag.ExitOnError)
@@ -1577,6 +1604,7 @@ func Main() {
 				fmt.Fprintf(os.Stderr, "Auto bump failed: %v\n", err)
 				os.Exit(1)
 			}
+			refreshPkgDBInBackground()
 			os.Exit(0)
 		}
 
@@ -1611,6 +1639,7 @@ func Main() {
 				os.Exit(1)
 			}
 		}
+		refreshPkgDBInBackground()
 
 	case "meta":
 		if err := HandleMetaCommand(os.Args[2:], cfg); err != nil {

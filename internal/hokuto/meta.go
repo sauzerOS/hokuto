@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"sort"
@@ -623,8 +624,27 @@ func promptYesNo(label string, defaultYes bool) bool {
 
 // GeneratePkgDB generates the global package database from all repositories.
 func GeneratePkgDB(cfg *Config) error {
-	colArrow.Print("-> ")
-	colNote.Println("Generating global package database")
+	return generatePkgDB(cfg, false)
+}
+
+// generatePkgDBQuiet regenerates the package database without writing status
+// messages. It is used by detached post-command refreshes and by operations
+// which must refresh the database before immediately uploading it.
+func generatePkgDBQuiet(cfg *Config) error {
+	return generatePkgDB(cfg, true)
+}
+
+func generatePkgDB(cfg *Config, quiet bool) error {
+	unlock, err := lockPkgDBGeneration()
+	if err != nil {
+		return err
+	}
+	defer unlock()
+
+	if !quiet {
+		colArrow.Print("-> ")
+		colNote.Println("Generating global package database")
+	}
 
 	db := PkgDB{
 		Revision: time.Now().Unix(),
@@ -745,9 +765,32 @@ func GeneratePkgDB(cfg *Config) error {
 		return fmt.Errorf("failed to write database file: %w", err)
 	}
 
-	colArrow.Print("-> ")
-	colSuccess.Printf("Global package database generated: %s (revision: %d, packages: %d)\n", PkgDBPath, db.Revision, len(db.Packages))
+	if !quiet {
+		colArrow.Print("-> ")
+		colSuccess.Printf("Global package database generated: %s (revision: %d, packages: %d)\n", PkgDBPath, db.Revision, len(db.Packages))
+	}
 	return nil
+}
+
+// lockPkgDBGeneration serializes manual and background database writers. The
+// lock is deliberately outside the database directory so an unprivileged
+// edit command can acquire it before writeFileAsRoot performs any escalation.
+func lockPkgDBGeneration() (func(), error) {
+	lockID := hashString(PkgDBPath)
+	lockPath := filepath.Join(os.TempDir(), "hokuto-pkg-db-"+lockID[:16]+".lock")
+	fd, err := syscall.Open(lockPath, syscall.O_CREAT|syscall.O_RDWR|syscall.O_CLOEXEC|syscall.O_NOFOLLOW, 0666)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open package database lock: %w", err)
+	}
+	_ = syscall.Fchmod(fd, 0666)
+	if err := syscall.Flock(fd, syscall.LOCK_EX); err != nil {
+		_ = syscall.Close(fd)
+		return nil, fmt.Errorf("failed to lock package database: %w", err)
+	}
+	return func() {
+		_ = syscall.Flock(fd, syscall.LOCK_UN)
+		_ = syscall.Close(fd)
+	}, nil
 }
 
 // SearchPkgDB searches the global package database by name or tag.

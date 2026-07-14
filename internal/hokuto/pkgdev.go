@@ -584,7 +584,7 @@ func handleSingleBumpCommand(pkgName, newVersion string, build bool, cfg *Config
 		if err := buildBumpedPackage(pkgName, cfg); err != nil {
 			return err
 		}
-		GeneratePkgDB(cfg)
+		_ = generatePkgDBQuiet(cfg)
 		handleUploadCommand([]string{"--sync"}, cfg)
 	}
 
@@ -641,7 +641,7 @@ func handleSetBumpCommand(pkgsetName, oldVersion, newVersion string, build bool,
 	}
 
 	if build {
-		GeneratePkgDB(cfg)
+		_ = generatePkgDBQuiet(cfg)
 		handleUploadCommand([]string{"--sync"}, cfg)
 	}
 
@@ -1279,13 +1279,11 @@ func HandleAutoBumpCommand(cfg *Config, autoBuild bool, assumeYes bool) error {
 		fmt.Println("------------------------------------------------")
 	}
 
-	// Update package database
-	if err := GeneratePkgDB(cfg); err != nil {
-		colError.Printf("Warning: failed to update package database: %v\n", err)
-	}
-
 	// If build was requested and some packages were built, run upload --sync
 	if autoBuild && len(successfullyBuilt) > 0 {
+		// upload --sync must see the new database immediately, so this one
+		// refresh is synchronous, but remains silent like the background hook.
+		_ = generatePkgDBQuiet(cfg)
 		colArrow.Print("-> ")
 		colNote.Println("Builds complete. Running upload --sync")
 		if err := handleUploadCommand([]string{"--sync"}, cfg); err != nil {
