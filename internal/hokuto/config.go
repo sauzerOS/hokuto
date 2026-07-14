@@ -217,6 +217,7 @@ func initConfig(cfg *Config) {
 	PkgDBPath = filepath.Join(rootDir, "/var/db/hokuto/pkg-db.json.zst")
 	BumpLogFile = filepath.Join(rootDir, "/var/log/hokuto-bump.log")
 	BumpIgnoreFile = filepath.Join(rootDir, "/var/db/hokuto/bump-ignore.json")
+	OptionalRebuildFile = filepath.Join(rootDir, "/var/db/hokuto/optional-rebuilds.json")
 	newPackageDir = "/repo/sauzeros/extra" // default for 'hokuto new'
 }
 

@@ -977,7 +977,7 @@ func formatBuildDependency(dep DepSpec) string {
 	return name
 }
 
-func buildLogDependencies(pkgDir string, cfg *Config) (declared, installed []string) {
+func buildLogDependencies(pkgDir string, cfg *Config, optionalState optionalBuildSnapshot) (declared, installed []string) {
 	deps, err := parseDependsFile(pkgDir)
 	if err != nil {
 		return []string{"<unavailable: " + err.Error() + ">"}, nil
@@ -1003,6 +1003,20 @@ func buildLogDependencies(pkgDir string, cfg *Config) (declared, installed []str
 		addInstalled(installedName)
 	}
 	for _, dep := range deps {
+		if dep.Optional {
+			if !activeBuildDependency(dep, cfg, true) {
+				continue
+			}
+			optionalInstalled := optionalState.Present[formatBuildDependency(dep)]
+			if len(optionalInstalled) == 0 {
+				continue
+			}
+			declared = append(declared, formatBuildDependency(dep))
+			for _, installedName := range optionalInstalled {
+				addInstalled(installedName)
+			}
+			continue
+		}
 		if !activeBuildDependency(dep, cfg, false) {
 			continue
 		}
@@ -2391,7 +2405,8 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, opts BuildOptions)
 
 	// 1. Define the log file path
 	logPath := filepath.Join(logDir, "build-log.txt")
-	declaredBuildDeps, installedBuildDeps := buildLogDependencies(pkgDir, cfg)
+	optionalBuildState := snapshotOptionalBuildDependencies(pkgDir, cfg)
+	declaredBuildDeps, installedBuildDeps := buildLogDependencies(pkgDir, cfg, optionalBuildState)
 	if err := writeBuildLogHeader(logPath, pkgName, version, revision, startTime, declaredBuildDeps, installedBuildDeps); err != nil {
 		return 0, fmt.Errorf("failed to initialize build log: %w", err)
 	}
@@ -2736,6 +2751,9 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, opts BuildOptions)
 	finalTitle := fmt.Sprintf("✅ SUCCESS: %s", pkgName)
 	setTerminalTitle(finalTitle)
 	debugf("HOKUTO ROOT IS %s\n", rootDir)
+	if err := updateOptionalRebuildTracker(pkgName, optionalBuildState); err != nil {
+		debugf("failed to update optional rebuild tracker for %s: %v\n", pkgName, err)
+	}
 	return time.Since(startTime), nil
 
 }
@@ -3227,7 +3245,8 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 
 	// 1. Define the log file path
 	logPath := filepath.Join(logDir, "build-log.txt")
-	declaredBuildDeps, installedBuildDeps := buildLogDependencies(pkgDir, cfg)
+	optionalBuildState := snapshotOptionalBuildDependencies(pkgDir, cfg)
+	declaredBuildDeps, installedBuildDeps := buildLogDependencies(pkgDir, cfg, optionalBuildState)
 	if err := writeBuildLogHeader(logPath, pkgName, version, revision, startTime, declaredBuildDeps, installedBuildDeps); err != nil {
 		return fmt.Errorf("failed to initialize rebuild log: %w", err)
 	}
@@ -3442,6 +3461,9 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 	//Set title to success status
 	finalTitle := fmt.Sprintf("✅ SUCCESS: %s", pkgName)
 	setTerminalTitle(finalTitle)
+	if err := updateOptionalRebuildTracker(pkgName, optionalBuildState); err != nil {
+		debugf("failed to update optional rebuild tracker for %s: %v\n", pkgName, err)
+	}
 
 	// Note: We skip cleanup of outputDir here to allow pkgInstall to sync from it.
 	return nil

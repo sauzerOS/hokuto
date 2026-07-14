@@ -223,6 +223,9 @@ func Main() {
 	}
 	mergeEnvOverrides(cfg)
 	initConfig(cfg)
+	if os.Args[1] != "__complete" && os.Args[1] != "__refresh-pkg-db" {
+		printOptionalRebuildReminders()
+	}
 
 	// 4.5 Handle versioned package requests (pkg@version)
 	// This allows commands like 'build gcc@1.2.3' to work by extracting the old version from Git history.
