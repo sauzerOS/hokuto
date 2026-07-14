@@ -937,15 +937,33 @@ func writeBuildLogHeader(path, pkgName, version, revision string, started time.T
 		installedText = strings.Join(installed, " ")
 	}
 	var b strings.Builder
-	fmt.Fprintf(&b, ">>> %s: Building %s %s-%s started %s\n", pkgName, pkgName, version, revision, started.UTC().Format(time.RFC1123Z))
-	fmt.Fprintf(&b, ">>> %s: Installing for build: %s\n", pkgName, declaredText)
-	fmt.Fprintf(&b, ">>> %s: Installed build dependencies: %s\n", pkgName, installedText)
+	prefix := colArrow.Sprint(">>> ")
+	packageText := colNote.Sprint(pkgName)
+	fmt.Fprintf(&b, "%s%s%s%s%s%s\r\n",
+		prefix,
+		packageText,
+		colSuccess.Sprint(": Building "),
+		colNote.Sprintf("%s %s-%s", pkgName, version, revision),
+		colSuccess.Sprint(" started "),
+		colNote.Sprint(started.UTC().Format(time.RFC1123Z)))
+	fmt.Fprintf(&b, "%s%s%s%s\r\n",
+		prefix, packageText, colSuccess.Sprint(": Installing for build: "), colNote.Sprint(declaredText))
+	fmt.Fprintf(&b, "%s%s%s%s\r\n\r\n",
+		prefix, packageText, colSuccess.Sprint(": Installed build dependencies: "), colNote.Sprint(installedText))
 	return os.WriteFile(path, []byte(b.String()), 0o644)
 }
 
 func appendBuildLogStatus(path, pkgName, status string, started time.Time, execCtx *Executor) error {
 	elapsed := time.Since(started).Truncate(time.Second)
-	line := fmt.Sprintf(">>> %s: Build %s at %s elapsed time %s\n", pkgName, status, time.Now().UTC().Format(time.RFC1123Z), elapsed)
+	line := fmt.Sprintf("\r\n%s%s%s%s%s%s%s%s\r\n",
+		colArrow.Sprint(">>> "),
+		colNote.Sprint(pkgName),
+		colSuccess.Sprint(": Build "),
+		colNote.Sprint(status),
+		colSuccess.Sprint(" at "),
+		colNote.Sprint(time.Now().UTC().Format(time.RFC1123Z)),
+		colSuccess.Sprint(" elapsed time "),
+		colNote.Sprint(elapsed))
 	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0)
 	if err == nil {
 		_, writeErr := io.WriteString(f, line)
