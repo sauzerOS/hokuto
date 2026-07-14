@@ -207,7 +207,7 @@ func Main() {
 
 	// Ensure critical directories have correct ownership
 	// Skip for 'check' command to avoid nested sudo prompts in builds
-	if len(os.Args) > 1 && os.Args[1] != "check" {
+	if len(os.Args) > 1 && os.Args[1] != "check" && os.Args[1] != "__complete" {
 		if err := ensureHokutoOwnership(cfg); err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: Ownership check failed: %v\n", err)
 		}
@@ -281,6 +281,10 @@ func Main() {
 	var exitCode int
 
 	switch os.Args[1] {
+	case "__complete":
+		if len(os.Args) >= 3 && os.Args[2] == "install" {
+			printInstallCompletionCandidates(cfg)
+		}
 	case "log":
 		if len(os.Args) >= 3 {
 			pkgName := os.Args[2]
