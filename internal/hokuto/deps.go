@@ -572,6 +572,7 @@ func resolveDependencyList(parentPkg string, deps []DepSpec, visited map[string]
 				continue
 			}
 		}
+		depName = wildcardMajorDependencyName(depName, dep.Op, dep.Version)
 
 		if err := resolveBinaryDependencies(depName, visited, plan, force, yes, cfg, remoteIndex, allowRemote); err != nil {
 			return err
@@ -1127,6 +1128,7 @@ func resolvedBuildDependencyCandidates(dep DepSpec, yes bool, cfg *Config) ([]st
 			return []string{source}, nil
 		}
 	}
+	resolved = wildcardMajorDependencyName(resolved, dep.Op, dep.Version)
 	return []string{resolved}, nil
 }
 
@@ -1472,6 +1474,18 @@ func prunePostRebuilds(plan *BuildPlan) {
 // findPackageDir locates the package source directory
 
 func versionSatisfies(installed, op, ref string) bool {
+	if strings.Contains(ref, "*") {
+		prefix, wildcard := wildcardEqualityPrefix(ref)
+		if op != "==" || !wildcard {
+			return false
+		}
+		installedParts := strings.Split(installed, ".")
+		prefixParts := strings.Split(prefix, ".")
+		if len(installedParts) < len(prefixParts) {
+			return false
+		}
+		return compareVersions(strings.Join(installedParts[:len(prefixParts)], "."), prefix) == 0
+	}
 	cmp := compareVersions(installed, ref)
 	switch op {
 	case "==":
@@ -1487,6 +1501,32 @@ func versionSatisfies(installed, op, ref string) bool {
 	default:
 		return true
 	}
+}
+
+func wildcardEqualityPrefix(ref string) (string, bool) {
+	if !strings.HasSuffix(ref, ".*") {
+		return "", false
+	}
+	prefix := strings.TrimSuffix(ref, ".*")
+	if prefix == "" || strings.ContainsAny(prefix, ".*") {
+		return "", false
+	}
+	return prefix, true
+}
+
+func wildcardMajorDependencyName(name, op, version string) string {
+	prefix, ok := wildcardEqualityPrefix(version)
+	if op != "==" || !ok || strings.Contains(prefix, ".") {
+		return name
+	}
+	base, major, alreadyVersioned := splitVersionedPackageName(name)
+	if alreadyVersioned {
+		if major == prefix {
+			return name
+		}
+		return base + "-" + prefix
+	}
+	return name + "-" + prefix
 }
 
 // compareVersions compares two version strings split by dots. Numeric segments are compared numerically; non-numeric fall back to lexicographic.
@@ -2230,6 +2270,7 @@ func ensureBinaryRuntimeDependenciesInstalledWithOptions(pkgName string, cfg *Co
 		if findInstalledSatisfying(depName, dep.Op, dep.Version) != "" {
 			continue
 		}
+		depName = wildcardMajorDependencyName(depName, dep.Op, dep.Version)
 		if binaryOnlyRuntimeDependencyInstall.Load() > 0 {
 			installed, err := installRuntimeDependencyBinaryOnly(depName, cfg, noRemote, seen, quiet)
 			if err != nil {

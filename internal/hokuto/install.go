@@ -371,6 +371,7 @@ func installMissingPackageRuntimeDependencies(pkgName string, cfg *Config, logge
 		if findInstalledSatisfying(depName, dep.Op, dep.Version) != "" {
 			continue
 		}
+		depName = wildcardMajorDependencyName(depName, dep.Op, dep.Version)
 
 		if binaryOnlyRuntimeDependencyInstall.Load() > 0 {
 			installed, err := installRuntimeDependencyBinaryOnly(depName, cfg, noRemote, nil, quiet)
