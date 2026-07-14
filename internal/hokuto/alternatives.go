@@ -486,17 +486,24 @@ func renameAlternativeAsRoot(oldPath, newPath string, execCtx *Executor) error {
 	return execCtx.Run(exec.Command("mv", "-f", "--", oldPath, newPath))
 }
 
+func alternativeTempPatterns(targetPath string) (goPattern, mktempTemplate string) {
+	prefix := "." + filepath.Base(targetPath) + ".hokuto-alt-"
+	// os.MkdirTemp uses a single '*' placeholder, while GNU mktemp requires
+	// its template to end in at least three consecutive 'X' characters.
+	return prefix + "*", prefix + "XXXXXX"
+}
+
 func createAlternativeTempDir(targetPath string, execCtx *Executor) (string, error) {
 	parent := filepath.Dir(targetPath)
-	pattern := "." + filepath.Base(targetPath) + ".hokuto-alt-*"
-	if dir, err := os.MkdirTemp(parent, pattern); err == nil {
+	goPattern, mktempTemplate := alternativeTempPatterns(targetPath)
+	if dir, err := os.MkdirTemp(parent, goPattern); err == nil {
 		return dir, nil
 	} else if os.Geteuid() == 0 {
 		return "", err
 	}
 
 	var output bytes.Buffer
-	cmd := exec.Command("mktemp", "-d", filepath.Join(parent, pattern))
+	cmd := exec.Command("mktemp", "-d", filepath.Join(parent, mktempTemplate))
 	cmd.Stdout = &output
 	if err := execCtx.Run(cmd); err != nil {
 		return "", err

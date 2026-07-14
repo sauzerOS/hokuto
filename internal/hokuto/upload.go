@@ -87,7 +87,7 @@ func selectRemoteDeleteEntries(entries []remoteDeleteEntry, action func([]remote
 			Meta:    entry.Meta,
 		}
 	}
-	return selectEntries("Remote Delete", "[gray]Space toggles, a selects all, n selects none, d deletes, q quits.[white]", 'd', displayEntries, func(indices []int) error {
+	return selectEntries("Remote Delete", "[gray]Space toggles, a selects all, n selects none, / searches, d deletes, q quits.[white]", 'd', true, displayEntries, func(indices []int) error {
 		chosen := make([]remoteDeleteEntry, 0, len(indices))
 		for _, idx := range indices {
 			chosen = append(chosen, entries[idx])

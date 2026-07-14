@@ -54,6 +54,26 @@ type selectableEntry struct {
 	Meta    string
 }
 
+func selectableEntryMatches(entry selectableEntry, query string) bool {
+	query = strings.ToLower(strings.TrimSpace(query))
+	return query == "" || strings.Contains(strings.ToLower(entry.Primary), query)
+}
+
+func selectableEntryColors(entry selectableEntry) (tcell.Color, tcell.Color) {
+	switch {
+	case strings.HasPrefix(entry.Meta, "modified:"):
+		return tcell.ColorYellow, tcell.ColorRed
+	case entry.Meta == "unmanaged":
+		return tcell.ColorLightCyan, tcell.ColorAqua
+	case entry.Meta == "extra":
+		return tcell.ColorLightGoldenrodYellow, tcell.ColorYellow
+	case entry.Meta == "archive":
+		return tcell.ColorLightGreen, tcell.ColorGreen
+	default:
+		return tcell.ColorWhite, tcell.ColorGray
+	}
+}
+
 func normalizeTrackedPath(root, path string) (string, bool) {
 	path = strings.TrimSpace(path)
 	if path == "" || strings.HasSuffix(path, "/") {
@@ -590,7 +610,7 @@ func restoreBackupArchive(root, archivePath string, selected map[string]bool) er
 	return nil
 }
 
-func selectEntries(title, footerText string, actionKey rune, entries []selectableEntry, action func([]int) error) error {
+func selectEntries(title, footerText string, actionKey rune, initiallySelected bool, entries []selectableEntry, action func([]int) error) error {
 	if !term.IsTerminal(int(os.Stdout.Fd())) {
 		return fmt.Errorf("interactive selection requires a terminal")
 	}
@@ -600,38 +620,69 @@ func selectEntries(title, footerText string, actionKey rune, entries []selectabl
 
 	selected := make([]bool, len(entries))
 	for i := range selected {
-		selected[i] = true
+		selected[i] = initiallySelected
 	}
 
 	app := tview.NewApplication()
 	table := tview.NewTable().SetSelectable(true, false).SetFixed(0, 0)
 	table.SetBorder(true).SetTitle(" " + title + " ")
+	var visibleIndices []int
+	searchQuery := ""
+	searching := false
 
-	refreshRow := func(row int) {
+	refreshRow := func(row, entryIndex int) {
 		mark := "[ ]"
-		if selected[row] {
+		markColor := tcell.ColorGray
+		if selected[entryIndex] {
 			mark = "[X]"
+			markColor = tcell.ColorGreen
 		}
-		meta := entries[row].Meta
+		meta := entries[entryIndex].Meta
 		if meta == "" {
 			meta = "file"
 		}
-		size := humanReadableSize(entries[row].Size)
-		table.SetCell(row, 0, tview.NewTableCell(tview.Escape(mark)).SetTextColor(tcell.ColorGreen).SetExpansion(0))
-		table.SetCell(row, 1, tview.NewTableCell(entries[row].Primary).SetTextColor(tcell.ColorWhite).SetExpansion(1))
+		primaryColor, metaColor := selectableEntryColors(entries[entryIndex])
+		size := humanReadableSize(entries[entryIndex].Size)
+		table.SetCell(row, 0, tview.NewTableCell(tview.Escape(mark)).SetTextColor(markColor).SetExpansion(0))
+		table.SetCell(row, 1, tview.NewTableCell(entries[entryIndex].Primary).SetTextColor(primaryColor).SetExpansion(1))
 		table.SetCell(row, 2, tview.NewTableCell(size).SetTextColor(tcell.ColorYellow).SetExpansion(0).SetAlign(tview.AlignRight))
-		table.SetCell(row, 3, tview.NewTableCell(meta).SetTextColor(tcell.ColorGray).SetExpansion(0))
+		table.SetCell(row, 3, tview.NewTableCell(meta).SetTextColor(metaColor).SetExpansion(0))
 	}
 	refresh := func() {
 		table.Clear()
+		visibleIndices = visibleIndices[:0]
 		for i := range entries {
-			refreshRow(i)
+			if !selectableEntryMatches(entries[i], searchQuery) {
+				continue
+			}
+			row := len(visibleIndices)
+			visibleIndices = append(visibleIndices, i)
+			refreshRow(row, i)
 		}
 	}
 	refresh()
 
 	status := tview.NewTextView().SetDynamicColors(true).SetTextAlign(tview.AlignCenter)
 	status.SetText(footerText)
+	searchInput := tview.NewInputField().SetLabel("Search: ")
+	bottomPages := tview.NewPages().
+		AddPage("status", status, true, true).
+		AddPage("search", searchInput, true, false)
+	searchInput.SetChangedFunc(func(text string) {
+		searchQuery = text
+		refresh()
+	})
+	searchInput.SetDoneFunc(func(key tcell.Key) {
+		if key == tcell.KeyEscape {
+			searchInput.SetText("")
+			searchQuery = ""
+			refresh()
+		}
+		searching = false
+		bottomPages.SwitchToPage("status")
+		app.SetFocus(table)
+		status.SetText(footerText)
+	})
 
 	var actionErr error
 	runAction := func() {
@@ -646,36 +697,46 @@ func selectEntries(title, footerText string, actionKey rune, entries []selectabl
 			status.SetText("[red]" + err.Error())
 			return
 		}
+		actionErr = nil
 		app.Stop()
 	}
 
 	app.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		if searching {
+			return event
+		}
 		switch event.Key() {
 		case tcell.KeyEsc, tcell.KeyCtrlQ:
 			app.Stop()
 			return nil
 		case tcell.KeyRune:
 			switch event.Rune() {
+			case '/':
+				searching = true
+				bottomPages.SwitchToPage("search")
+				app.SetFocus(searchInput)
+				return nil
 			case 'q':
 				app.Stop()
 				return nil
 			case ' ':
 				row, _ := table.GetSelection()
-				if row >= 0 && row < len(selected) {
-					selected[row] = !selected[row]
-					refreshRow(row)
+				if row >= 0 && row < len(visibleIndices) {
+					entryIndex := visibleIndices[row]
+					selected[entryIndex] = !selected[entryIndex]
+					refreshRow(row, entryIndex)
 				}
 				return nil
 			case 'a':
-				for i := range selected {
-					selected[i] = true
-					refreshRow(i)
+				for row, entryIndex := range visibleIndices {
+					selected[entryIndex] = true
+					refreshRow(row, entryIndex)
 				}
 				return nil
 			case 'n':
-				for i := range selected {
-					selected[i] = false
-					refreshRow(i)
+				for row, entryIndex := range visibleIndices {
+					selected[entryIndex] = false
+					refreshRow(row, entryIndex)
 				}
 				return nil
 			case actionKey:
@@ -689,7 +750,7 @@ func selectEntries(title, footerText string, actionKey rune, entries []selectabl
 	flex := tview.NewFlex().
 		SetDirection(tview.FlexRow).
 		AddItem(table, 0, 1, true).
-		AddItem(status, 1, 0, false)
+		AddItem(bottomPages, 2, 0, false)
 
 	if err := app.SetRoot(flex, true).SetFocus(table).Run(); err != nil {
 		return err
@@ -697,7 +758,7 @@ func selectEntries(title, footerText string, actionKey rune, entries []selectabl
 	return actionErr
 }
 
-func selectUnmanagedEntries(title, footerText string, actionKey rune, entries []unmanagedEntry, action func([]unmanagedEntry) error) error {
+func selectUnmanagedEntries(title, footerText string, actionKey rune, initiallySelected bool, entries []unmanagedEntry, action func([]unmanagedEntry) error) error {
 	displayEntries := make([]selectableEntry, len(entries))
 	for i, entry := range entries {
 		displayEntries[i] = selectableEntry{
@@ -706,13 +767,26 @@ func selectUnmanagedEntries(title, footerText string, actionKey rune, entries []
 			Meta:    entry.Reason,
 		}
 	}
-	return selectEntries(title, footerText, actionKey, displayEntries, func(indices []int) error {
+	return selectEntries(title, footerText, actionKey, initiallySelected, displayEntries, func(indices []int) error {
 		chosen := make([]unmanagedEntry, 0, len(indices))
 		for _, idx := range indices {
 			chosen = append(chosen, entries[idx])
 		}
 		return action(chosen)
 	})
+}
+
+func deleteUnmanagedEntries(root string, entries []unmanagedEntry, execCtx *Executor) error {
+	if len(entries) == 0 {
+		return fmt.Errorf("no files selected")
+	}
+	for _, entry := range entries {
+		diskPath := manifestPathOnDisk(root, entry.Path)
+		if err := removeFileAsRoot(diskPath, execCtx); err != nil {
+			return fmt.Errorf("failed to delete %s: %w", entry.Path, err)
+		}
+	}
+	return nil
 }
 
 func handleUnmanagedCommand(cfg *Config, opts unmanagedOptions) error {
@@ -732,7 +806,7 @@ func handleUnmanagedCommand(cfg *Config, opts unmanagedOptions) error {
 		if err != nil {
 			return err
 		}
-		return selectUnmanagedEntries("Restore Backup", "[gray]Space toggles, a selects all, n selects none, r restores, q quits.[white]", 'r', entries, func(chosen []unmanagedEntry) error {
+		return selectUnmanagedEntries("Restore Backup", "[gray]Space toggles, a selects all, n selects none, / searches, r restores, q quits.[white]", 'r', true, entries, func(chosen []unmanagedEntry) error {
 			selected := make(map[string]bool, len(chosen))
 			for _, entry := range chosen {
 				selected[entry.Path] = true
@@ -784,7 +858,7 @@ func handleUnmanagedCommand(cfg *Config, opts unmanagedOptions) error {
 	}
 
 	if opts.BackupPath != "" {
-		return selectUnmanagedEntries("Unmanaged Backup", "[gray]Space toggles, a selects all, n selects none, b backs up, q quits.[white]", 'b', entries, func(chosen []unmanagedEntry) error {
+		return selectUnmanagedEntries("Unmanaged Backup", "[gray]Space toggles, a selects all, n selects none, / searches, b backs up, q quits.[white]", 'b', true, entries, func(chosen []unmanagedEntry) error {
 			if err := writeBackupArchive(root, opts.BackupPath, chosen); err != nil {
 				return err
 			}
@@ -795,5 +869,12 @@ func handleUnmanagedCommand(cfg *Config, opts unmanagedOptions) error {
 	}
 
 	colWarn.Printf("Found %d unmanaged/modified file(s) in /etc and /usr.\n", len(entries))
-	return RunPager("Unmanaged Files", unmanagedDisplayLines(entries))
+	return selectUnmanagedEntries("Unmanaged Files", "[gray]Space toggles, a selects all, n selects none, / searches, d deletes selected files, q quits.[white]", 'd', false, entries, func(chosen []unmanagedEntry) error {
+		if err := deleteUnmanagedEntries(root, chosen, RootExec); err != nil {
+			return err
+		}
+		colArrow.Print("-> ")
+		colSuccess.Printf("Deleted %d selected file(s)\n", len(chosen))
+		return nil
+	})
 }

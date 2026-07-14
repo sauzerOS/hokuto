@@ -49,7 +49,7 @@ func printHelp() {
 		{"update, u", "[options]", "Update repositories and check for upgrades"},
 		{"manifest, m", "<pkg>", "Show the file list for an installed package"},
 		{"size", "<pkg>", "Show installed package disk usage"},
-		{"unmanaged", "", "List files in /etc and /usr not owned by installed packages"},
+		{"unmanaged", "", "Inspect, search, and delete unmanaged files in /etc and /usr"},
 		{"find, f", "<query>", "Find which package matches query string"},
 		{"new, n", "<pkg>", "Create a new package skeleton"},
 		{"edit, e", "<pkg>", "Edit a package's build files"},
