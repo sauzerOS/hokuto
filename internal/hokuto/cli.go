@@ -1298,7 +1298,6 @@ func Main() {
 		var parallel = updateCmd.Int("j", 1, "Number of parallel jobs (default: 1)")
 		// Add long flags for consistency
 		var idleBuildLong = updateCmd.Bool("idle", false, "Use half CPU cores and lowest niceness for build process.")
-		var superidleBuildLong = updateCmd.Bool("superidle", false, "Use one CPU core and lowest niceness for build process.")
 		var parallelLong = updateCmd.Int("parallel", 1, "Number of parallel jobs (default: 1)")
 
 		var verboseLong = updateCmd.Bool("verbose", false, "Enable verbose output.")
@@ -1313,7 +1312,7 @@ func Main() {
 		}
 
 		// Set the global variables that pkgBuild() reads
-		if *superidleBuild || *superidleBuildLong {
+		if *superidleBuild {
 			buildPriority = "superidle"
 		} else if *idleBuild || *idleBuildLong {
 			buildPriority = "idle"
@@ -1349,10 +1348,10 @@ func Main() {
 		effectiveYes := *yes || *yesLong
 		if *buildMissingBinaries {
 			buildArgs := []string{"--no-install", "--parallel", strconv.Itoa(maxJobs)}
-			if *superidleBuild || *superidleBuildLong {
-				buildArgs = append(buildArgs, "--superidle")
+			if *superidleBuild {
+				buildArgs = append(buildArgs, "-ii")
 			} else if *idleBuild || *idleBuildLong {
-				buildArgs = append(buildArgs, "--idle")
+				buildArgs = append(buildArgs, "-i")
 			}
 			if *verbose || *verboseLong {
 				buildArgs = append(buildArgs, "--verbose")

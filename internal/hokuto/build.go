@@ -1820,7 +1820,7 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, opts BuildOptions)
 	env := []string{}
 	for _, e := range os.Environ() {
 		// Skip CFLAGS, CXXFLAGS, and LDFLAGS from environment - we'll set them from defaults
-		if strings.HasPrefix(e, "CFLAGS=") || strings.HasPrefix(e, "CXXFLAGS=") || strings.HasPrefix(e, "LDFLAGS=") {
+		if strings.HasPrefix(e, "CFLAGS=") || strings.HasPrefix(e, "CXXFLAGS=") || strings.HasPrefix(e, "LDFLAGS=") || strings.HasPrefix(e, "HOKUTO_LTO=") {
 			continue
 		}
 		if opts.Bootstrap && strings.HasPrefix(e, "CONFIG_SITE=") {
@@ -1895,6 +1895,9 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, opts BuildOptions)
 			"SET_HOKUTO_LTO":    cfg.Values["SET_HOKUTO_LTO"],
 			"MULTILIB":          multilibVal,
 		}
+		// Bootstrap builds do not use the LTO flag sets. SET_HOKUTO_LTO is
+		// retained separately for configuring the final system.
+		defaults["HOKUTO_LTO"] = "0"
 
 		if cfg.Values["HOKUTO_GENERIC"] == "1" {
 			defaults["HOKUTO_GENERIC"] = "1"
@@ -2097,6 +2100,11 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, opts BuildOptions)
 			"HOKUTO_OUTPUT_DIR":          outputDir,
 			"HOKUTO_SPLIT_DIR":           splitRoot,
 			"GNU_MIRROR":                 cfg.Values["GNU_MIRROR"],
+		}
+		if shouldLTO {
+			defaults["HOKUTO_LTO"] = "1"
+		} else {
+			defaults["HOKUTO_LTO"] = "0"
 		}
 
 		if !isGeneric {
@@ -2866,6 +2874,11 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 		debugf("Disabling LTO for %s architecture (rebuild).\n", targetArch)
 		shouldLTO = false
 	}
+	if shouldLTO {
+		defaults["HOKUTO_LTO"] = "1"
+	} else {
+		defaults["HOKUTO_LTO"] = "0"
+	}
 
 	multilibVal := "0"
 	if isX86 && cfg.Values["HOKUTO_MULTILIB"] == "1" {
@@ -3064,7 +3077,7 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 	env := []string{}
 	for _, e := range os.Environ() {
 		// Skip CFLAGS, CXXFLAGS, and LDFLAGS from environment - we'll set them from defaults
-		if strings.HasPrefix(e, "CFLAGS=") || strings.HasPrefix(e, "CXXFLAGS=") || strings.HasPrefix(e, "LDFLAGS=") {
+		if strings.HasPrefix(e, "CFLAGS=") || strings.HasPrefix(e, "CXXFLAGS=") || strings.HasPrefix(e, "LDFLAGS=") || strings.HasPrefix(e, "HOKUTO_LTO=") {
 			continue
 		}
 		env = append(env, e)
