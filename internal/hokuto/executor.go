@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -50,10 +51,11 @@ func runInteractiveCommand(ctx context.Context, name string, arg ...string) erro
 }
 
 // ensurePrivilege checks if the selected privilege backend is still usable and
-// re-prompts if necessary. sudo supports ticket refresh; run0 delegates auth to
-// polkit for each elevated command after the initial startup check.
+// re-prompts if necessary. sudo supports ticket refresh; modern run0 executes
+// Hokuto inside one empowered session, while older run0 releases retain the
+// per-command compatibility path.
 func (e *Executor) ensurePrivilege() error {
-	if os.Geteuid() == 0 || !e.ShouldRunAsRoot {
+	if hasProcessPrivileges() || !e.ShouldRunAsRoot {
 		return nil
 	}
 	if activePrivilegeBackend == privilegeBackendUnset {
@@ -75,7 +77,7 @@ func (e *Executor) ensurePrivilege() error {
 // if the non-interactive check `sudo -nv` fails.
 // No action needed if we are already root or the command doesn't require root.
 func (e *Executor) ensureSudo() error {
-	if os.Geteuid() == 0 || !e.ShouldRunAsRoot {
+	if hasProcessPrivileges() || !e.ShouldRunAsRoot {
 		return nil
 	}
 	// Keep the normal valid-ticket path lock-free. The mutex below only
@@ -200,8 +202,29 @@ func (e *Executor) Run(cmd *exec.Cmd) error {
 		basePath = "nice"
 	}
 
+	// run0 --empower grants the Hokuto session capabilities and the polkit
+	// empower group. Commands intentionally assigned to UserExec must lose both
+	// before exec, especially package build scripts.
+	if !e.ShouldRunAsRoot && isRun0Empowered() {
+		if _, err := exec.LookPath("setpriv"); err != nil {
+			return fmt.Errorf("cannot drop run0 session privileges for %s: setpriv is unavailable: %w", basePath, err)
+		}
+		dropArgs := []string{
+			"--reuid=" + strconv.Itoa(os.Getuid()),
+			"--regid=" + strconv.Itoa(os.Getgid()),
+			"--init-groups",
+			"--inh-caps=-all",
+			"--ambient-caps=-all",
+			"--bounding-set=-all",
+			"--no-new-privs",
+			basePath,
+		}
+		baseArgs = append(dropArgs, baseArgs...)
+		basePath = "setpriv"
+	}
+
 	// 2c. Apply privilege wrapper if needed
-	if e.ShouldRunAsRoot && os.Geteuid() != 0 {
+	if e.ShouldRunAsRoot && !hasProcessPrivileges() {
 		switch activePrivilegeBackend {
 		case privilegeBackendRun0:
 			args := []string{"--pipe"}
@@ -228,7 +251,7 @@ func (e *Executor) Run(cmd *exec.Cmd) error {
 	}
 
 	// preserve or inherit the environment
-	if e.ShouldRunAsRoot && os.Geteuid() != 0 && activePrivilegeBackend == privilegeBackendRun0 {
+	if e.ShouldRunAsRoot && !hasProcessPrivileges() && activePrivilegeBackend == privilegeBackendRun0 {
 		finalCmd.Env = os.Environ()
 	} else if len(cmd.Env) > 0 {
 		finalCmd.Env = cmd.Env

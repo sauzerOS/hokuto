@@ -4,8 +4,13 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"sort"
 	"strings"
+	"syscall"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 type privilegeBackend string
@@ -14,7 +19,25 @@ const (
 	privilegeBackendUnset privilegeBackend = ""
 	privilegeBackendSudo  privilegeBackend = "sudo"
 	privilegeBackendRun0  privilegeBackend = "run0"
+	run0EmpoweredEnv                       = "HOKUTO_RUN0_EMPOWERED"
 )
+
+func isRun0Empowered() bool {
+	if os.Getenv(run0EmpoweredEnv) != "1" {
+		return false
+	}
+	hdr := unix.CapUserHeader{Version: unix.LINUX_CAPABILITY_VERSION_3}
+	data := [2]unix.CapUserData{}
+	if err := unix.Capget(&hdr, &data[0]); err != nil {
+		return false
+	}
+	capability := uint(unix.CAP_DAC_OVERRIDE)
+	return data[capability/32].Effective&(uint32(1)<<(capability%32)) != 0
+}
+
+func hasProcessPrivileges() bool {
+	return os.Geteuid() == 0 || isRun0Empowered()
+}
 
 // needsRootPrivileges checks if any of the requested operations require root
 func needsRootPrivileges(args []string) bool {
@@ -79,14 +102,16 @@ func authenticateSudo() error {
 }
 
 func authenticateRun0() error {
-	if _, err := exec.LookPath("run0"); err != nil {
-		return err
-	}
 	cmd := exec.Command("run0", "true")
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
+}
+
+func run0SupportsEmpower() bool {
+	output, err := exec.Command("run0", "--help").Output()
+	return err == nil && strings.Contains(string(output), "--empower")
 }
 
 func startSudoKeepAlive() {
@@ -100,7 +125,7 @@ func startSudoKeepAlive() {
 }
 
 func newPrivilegedCommand(name string, args ...string) *exec.Cmd {
-	if os.Geteuid() == 0 {
+	if hasProcessPrivileges() {
 		return exec.Command(name, args...)
 	}
 	if activePrivilegeBackend == privilegeBackendRun0 {
@@ -111,10 +136,80 @@ func newPrivilegedCommand(name string, args ...string) *exec.Cmd {
 	return exec.Command("sudo", sudoArgs...)
 }
 
+func run0ReexecEnvironment() []string {
+	keys := make(map[string]bool)
+	for _, item := range os.Environ() {
+		if key, _, ok := strings.Cut(item, "="); ok && validEnvironmentName(key) {
+			keys[key] = true
+		}
+	}
+	keys[run0EmpoweredEnv] = true
+	result := make([]string, 0, len(keys))
+	for key := range keys {
+		result = append(result, key)
+	}
+	sort.Strings(result)
+	return result
+}
+
+func validEnvironmentName(name string) bool {
+	if name == "" {
+		return false
+	}
+	for i, r := range name {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || r == '_' || (i > 0 && r >= '0' && r <= '9') {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func reexecViaRun0() error {
+	run0Path, err := exec.LookPath("run0")
+	if err != nil {
+		return err
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("failed to locate hokuto executable: %w", err)
+	}
+	executable, err = filepath.EvalSymlinks(executable)
+	if err != nil {
+		return fmt.Errorf("failed to resolve hokuto executable: %w", err)
+	}
+
+	args := []string{"run0", "--empower"}
+	if cwd, cwdErr := os.Getwd(); cwdErr == nil {
+		args = append(args, "--chdir="+cwd)
+	}
+	for _, item := range run0ReexecEnvironment() {
+		args = append(args, "--setenv="+item)
+	}
+	args = append(args, executable)
+	args = append(args, os.Args[1:]...)
+	run0Env := append(os.Environ(), run0EmpoweredEnv+"=1")
+	if err := syscall.Exec(run0Path, args, run0Env); err != nil {
+		return fmt.Errorf("failed to re-execute hokuto through run0: %w", err)
+	}
+	return nil
+}
+
 // authenticateOnce performs a single authentication check at program start
 func authenticateOnce(quiet bool) error {
 	if os.Geteuid() == 0 {
 		return nil // Already root
+	}
+	if isRun0Empowered() {
+		activePrivilegeBackend = privilegeBackendRun0
+		if !quiet {
+			colArrow.Print("-> ")
+			colSuccess.Println("Authenticated via run0")
+		}
+		return nil
+	}
+	if activePrivilegeBackend != privilegeBackendUnset {
+		return nil
 	}
 
 	if err := authenticateSudo(); err == nil {
@@ -129,15 +224,24 @@ func authenticateOnce(quiet bool) error {
 		debugf("sudo authentication unavailable: %v\n", err)
 	}
 
-	if err := authenticateRun0(); err == nil {
-		activePrivilegeBackend = privilegeBackendRun0
-		if !quiet {
-			colArrow.Print("-> ")
-			colSuccess.Println("Authenticated via run0")
+	if _, err := exec.LookPath("run0"); err == nil {
+		if run0SupportsEmpower() {
+			return reexecViaRun0()
 		}
-		return nil
+		// systemd before v259 has no operation-wide empowered session. Keep
+		// the legacy backend functional, even though polkit may authenticate
+		// individual transient units on these older releases.
+		if err := authenticateRun0(); err == nil {
+			activePrivilegeBackend = privilegeBackendRun0
+			if !quiet {
+				colArrow.Print("-> ")
+				colSuccess.Println("Authenticated via run0")
+			}
+			return nil
+		}
+		return fmt.Errorf("run0 authentication failed")
 	} else {
-		debugf("run0 authentication unavailable: %v\n", err)
+		debugf("run0 unavailable: %v\n", err)
 	}
 
 	var missing []string

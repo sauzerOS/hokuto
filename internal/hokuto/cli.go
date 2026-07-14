@@ -205,14 +205,6 @@ func Main() {
 	mergeEnvOverrides(cfg)
 	initConfig(cfg)
 
-	// Ensure critical directories have correct ownership
-	// Skip for 'check' command to avoid nested sudo prompts in builds
-	if len(os.Args) > 1 && os.Args[1] != "check" && os.Args[1] != "__complete" {
-		if err := ensureHokutoOwnership(cfg); err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: Ownership check failed: %v\n", err)
-		}
-	}
-
 	// 4.5 Handle versioned package requests (pkg@version)
 	// This allows commands like 'build gcc@1.2.3' to work by extracting the old version from Git history.
 	if len(os.Args) >= 2 {
@@ -262,6 +254,14 @@ func Main() {
 		if err := authenticateOnce(false); err != nil {
 			fmt.Fprintf(os.Stderr, "Authentication failed: %v\n", err)
 			os.Exit(1)
+		}
+	}
+
+	// Ensure critical directories have correct ownership after establishing the
+	// operation-wide privilege session. This avoids separate run0 prompts.
+	if len(os.Args) > 1 && os.Args[1] != "check" && os.Args[1] != "__complete" {
+		if err := ensureHokutoOwnership(cfg); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: Ownership check failed: %v\n", err)
 		}
 	}
 
