@@ -851,6 +851,102 @@ type BuildOptions struct {
 	UpdateWebsite bool      // If true, update the github.io status table
 }
 
+func formatBuildDependency(dep DepSpec) string {
+	name := dep.Name
+	if len(dep.Alternatives) > 0 {
+		name = strings.Join(dep.Alternatives, "|")
+	}
+	if dep.Op != "" && dep.Version != "" {
+		name += dep.Op + dep.Version
+	}
+	return name
+}
+
+func buildLogDependencies(pkgDir string, cfg *Config) (declared, installed []string) {
+	deps, err := parseDependsFile(pkgDir)
+	if err != nil {
+		return []string{"<unavailable: " + err.Error() + ">"}, nil
+	}
+	seenInstalled := make(map[string]bool)
+	addInstalled := func(name string) {
+		if name == "" || seenInstalled[name] {
+			return
+		}
+		version, revision, err := getInstalledVersionAndRevision(name)
+		if err != nil {
+			return
+		}
+		seenInstalled[name] = true
+		installed = append(installed, fmt.Sprintf("%s-%s-%s", name, version, revision))
+	}
+	options := loadBuildOptions(pkgDir)
+	for _, develPkg := range requiredDevelPackages(cfg, options["multilib"]) {
+		installedName := getOutputPackageName(develPkg, cfg)
+		if !checkPackageExactMatch(installedName) {
+			installedName = findInstalledPackageVariant(installedName)
+		}
+		addInstalled(installedName)
+	}
+	for _, dep := range deps {
+		if !activeBuildDependency(dep, cfg, false) {
+			continue
+		}
+		declared = append(declared, formatBuildDependency(dep))
+		candidates, err := resolvedBuildDependencyCandidates(dep, false, cfg)
+		if err != nil {
+			continue
+		}
+		for _, candidate := range candidates {
+			installedName := candidate
+			if dep.Op != "" && dep.Version != "" {
+				installedName = findInstalledSatisfying(candidate, dep.Op, dep.Version)
+			} else if !checkPackageExactMatch(candidate) {
+				installedName = findInstalledPackageVariant(candidate)
+			}
+			addInstalled(installedName)
+		}
+	}
+	sort.Strings(installed)
+	return declared, installed
+}
+
+func writeBuildLogHeader(path, pkgName, version, revision string, started time.Time, declared, installed []string) error {
+	declaredText := "(none)"
+	if len(declared) > 0 {
+		declaredText = strings.Join(declared, " ")
+	}
+	installedText := "(none)"
+	if len(installed) > 0 {
+		installedText = strings.Join(installed, " ")
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, ">>> %s: Building %s %s-%s started %s\n", pkgName, pkgName, version, revision, started.UTC().Format(time.RFC1123Z))
+	fmt.Fprintf(&b, ">>> %s: Installing for build: %s\n", pkgName, declaredText)
+	fmt.Fprintf(&b, ">>> %s: Installed build dependencies: %s\n", pkgName, installedText)
+	return os.WriteFile(path, []byte(b.String()), 0o644)
+}
+
+func appendBuildLogStatus(path, pkgName, status string, started time.Time, execCtx *Executor) error {
+	elapsed := time.Since(started).Truncate(time.Second)
+	line := fmt.Sprintf(">>> %s: Build %s at %s elapsed time %s\n", pkgName, status, time.Now().UTC().Format(time.RFC1123Z), elapsed)
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0)
+	if err == nil {
+		_, writeErr := io.WriteString(f, line)
+		closeErr := f.Close()
+		if writeErr != nil {
+			return writeErr
+		}
+		return closeErr
+	}
+	if execCtx == nil || !execCtx.ShouldRunAsRoot {
+		return err
+	}
+	cmd := exec.Command("tee", "-a", path)
+	cmd.Stdin = strings.NewReader(line)
+	cmd.Stdout = io.Discard
+	return execCtx.Run(cmd)
+}
+
 func shellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'"
 }
@@ -1241,6 +1337,7 @@ type builtPackageFinalization struct {
 	options       map[string]bool
 	buildExec     *Executor
 	logger        io.Writer
+	started       time.Time
 	elapsed       time.Duration
 	shouldStrip   bool
 	isGeneric     bool
@@ -1407,6 +1504,9 @@ func finalizeBuiltPackage(in builtPackageFinalization) error {
 	logExec := in.buildExec
 	if in.buildExec.ShouldRunAsRoot {
 		logExec = RootExec
+	}
+	if err := appendBuildLogStatus(in.logPath, in.sourcePkgName, "complete", in.started, in.buildExec); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: failed to append build completion status: %v\n", err)
 	}
 	if err := compressXZ(in.logPath, logXZPath, logExec); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: failed to compress build log: %v\n", err)
@@ -2160,6 +2260,10 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, opts BuildOptions)
 
 	// 1. Define the log file path
 	logPath := filepath.Join(logDir, "build-log.txt")
+	declaredBuildDeps, installedBuildDeps := buildLogDependencies(pkgDir, cfg)
+	if err := writeBuildLogHeader(logPath, pkgName, version, revision, startTime, declaredBuildDeps, installedBuildDeps); err != nil {
+		return 0, fmt.Errorf("failed to initialize build log: %w", err)
+	}
 	// Ensure logDir exists (already created above, but ensure it's there)
 
 	// Check if /bin/script exists
@@ -2191,7 +2295,7 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, opts BuildOptions)
 			// -c: command to run
 			// script writes the PTY session to the log file automatically
 			// script also outputs to stdout/stderr, which we capture for console
-			cmd = exec.Command("script", "-q", "-f", "-c", cmdStr, logPath)
+			cmd = exec.Command("script", "-q", "-f", "-a", "-c", cmdStr, logPath)
 			cmd.Dir = buildDir
 		} else {
 			// Fallback: Execute directly with sh
@@ -2204,7 +2308,7 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, opts BuildOptions)
 				logFile.Close()
 			}
 			var err error
-			logFile, err = os.Create(logPath)
+			logFile, err = os.OpenFile(logPath, os.O_APPEND|os.O_WRONLY, 0)
 			if err != nil {
 				return 0, fmt.Errorf("failed to create log file: %w", err)
 			}
@@ -2380,6 +2484,9 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, opts BuildOptions)
 	}
 
 	if runErr != nil {
+		if err := appendBuildLogStatus(logPath, pkgName, "failed", startTime, buildExec); err != nil {
+			debugf("Warning: failed to append build failure status: %v\n", err)
+		}
 		printFailure := func() {
 			colArrow.Print("-> ")
 			color.Danger.Printf("Build failed for %s: %v\n", pkgName, runErr)
@@ -2469,6 +2576,7 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, opts BuildOptions)
 		options:       options,
 		buildExec:     buildExec,
 		logger:        opts.LogWriter,
+		started:       startTime,
 		elapsed:       elapsed,
 		shouldStrip:   shouldStrip,
 		isGeneric:     isGeneric,
