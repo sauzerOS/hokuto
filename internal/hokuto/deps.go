@@ -227,25 +227,51 @@ func findCachedRequestedBinaryTarball(pkgRequest string, cfg *Config) (path, ver
 	return "", version, revision, false
 }
 
-func splitVersionedPackageName(pkgName string) (baseName, major string, ok bool) {
+func splitVersionedPackageName(pkgName string) (baseName, line string, ok bool) {
 	lastDash := strings.LastIndex(pkgName, "-")
 	if lastDash == -1 || lastDash == len(pkgName)-1 {
 		return "", "", false
 	}
-	major = pkgName[lastDash+1:]
-	if _, err := strconv.Atoi(major); err != nil {
+	line = pkgName[lastDash+1:]
+	if !isNumericVersionLine(line) {
 		return "", "", false
 	}
-	return pkgName[:lastDash], major, true
+	return pkgName[:lastDash], line, true
+}
+
+func isNumericVersionLine(line string) bool {
+	if line == "" {
+		return false
+	}
+	for _, part := range strings.Split(line, ".") {
+		if part == "" {
+			return false
+		}
+		if _, err := strconv.Atoi(part); err != nil {
+			return false
+		}
+	}
+	return true
+}
+
+func versionMatchesPackageLine(version, line string) bool {
+	if !isNumericVersionLine(line) {
+		return false
+	}
+	versionParts := strings.Split(strings.TrimSpace(version), ".")
+	lineParts := strings.Split(line, ".")
+	if len(versionParts) < len(lineParts) {
+		return false
+	}
+	return compareVersions(strings.Join(versionParts[:len(lineParts)], "."), line) == 0
 }
 
 func versionedPackageMajorMatches(pkgName, version string) bool {
-	_, major, ok := splitVersionedPackageName(pkgName)
+	_, line, ok := splitVersionedPackageName(pkgName)
 	if !ok {
 		return true
 	}
-	versionMajor := strings.SplitN(strings.TrimSpace(version), ".", 2)[0]
-	return versionMajor == major
+	return versionMatchesPackageLine(version, line)
 }
 
 // findSourcePackageSatisfying resolves a constrained logical package name to a
@@ -342,7 +368,7 @@ func revisionCompare(a, b string) int {
 }
 
 func findCachedVersionedBinaryTarball(pkgName string, cfg *Config) (string, bool) {
-	baseName, major, ok := splitVersionedPackageName(pkgName)
+	baseName, line, ok := splitVersionedPackageName(pkgName)
 	if !ok {
 		return "", false
 	}
@@ -375,7 +401,7 @@ func findCachedVersionedBinaryTarball(pkgName string, cfg *Config) (string, bool
 			if requestedVersion := parallelPackageVersion(pkgName); requestedVersion != "" && version != requestedVersion {
 				continue
 			}
-			if strings.Split(version, ".")[0] != major {
+			if !versionMatchesPackageLine(version, line) {
 				continue
 			}
 			revision := metadata["revision"]
@@ -1569,7 +1595,7 @@ func wildcardEqualityPrefix(ref string) (string, bool) {
 		return "", false
 	}
 	prefix := strings.TrimSuffix(ref, ".")
-	if prefix == "" || strings.ContainsAny(prefix, ".*") {
+	if prefix == "" || strings.Contains(prefix, "*") {
 		return "", false
 	}
 	return prefix, true
@@ -1577,12 +1603,12 @@ func wildcardEqualityPrefix(ref string) (string, bool) {
 
 func wildcardMajorDependencyName(name, op, version string) string {
 	prefix, ok := wildcardEqualityPrefix(version)
-	if op != "==" || !ok || strings.Contains(prefix, ".") {
+	if op != "==" || !ok || !isNumericVersionLine(prefix) {
 		return name
 	}
-	base, major, alreadyVersioned := splitVersionedPackageName(name)
+	base, line, alreadyVersioned := splitVersionedPackageName(name)
 	if alreadyVersioned {
-		if major == prefix {
+		if line == prefix {
 			registerParallelPackageName(name, base)
 			return name
 		}

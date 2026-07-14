@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 )
 
@@ -329,12 +328,12 @@ func findPackageDir(pkgName string) (string, error) {
 		}
 	}
 
-	// Check if this is a versioned package name (pkg-MAJOR)
+	// Check if this is a versioned package name (pkg-MAJOR[.MINOR...])
 	// If so, add the base name to searchNames as a fallback.
 	for _, name := range searchNames {
 		if lastDash := strings.LastIndex(name, "-"); lastDash != -1 {
 			suffix := name[lastDash+1:]
-			if _, err := strconv.Atoi(suffix); err == nil {
+			if isNumericVersionLine(suffix) {
 				baseName := name[:lastDash]
 				searchNames = append(searchNames, baseName)
 			}
@@ -386,7 +385,7 @@ func findInstalledSatisfyingIn(installedRoot, name, op, refVersion string) strin
 		}
 	}
 
-	// 2. Scan for name-MAJOR versions only when a dependency has an explicit
+	// 2. Scan for name-VERSION.LINE packages only when a dependency has an explicit
 	// version constraint. An unconstrained dependency on "foo" means the current
 	// package, not any installed ABI-suffixed historical package like "foo-2".
 	if op == "" || refVersion == "" {
@@ -405,9 +404,9 @@ func findInstalledSatisfyingIn(installedRoot, name, op, refVersion string) strin
 		}
 		pkgName := e.Name()
 		if strings.HasPrefix(pkgName, prefix) {
-			// Check if the suffix is a major version (integer)
+			// Check that the suffix is a numeric version line (for example 2 or 2.28).
 			suffix := strings.TrimPrefix(pkgName, prefix)
-			if _, err := strconv.Atoi(suffix); err == nil {
+			if isNumericVersionLine(suffix) {
 				ver, ok := getInstalledVersionFromRoot(installedRoot, pkgName)
 				if ok && versionSatisfies(ver, op, refVersion) {
 					return pkgName
@@ -449,7 +448,7 @@ func findInstalledPackageVariant(name string) string {
 		pkgName := e.Name()
 		if strings.HasPrefix(pkgName, prefix) {
 			suffix := strings.TrimPrefix(pkgName, prefix)
-			if _, err := strconv.Atoi(suffix); err == nil {
+			if isNumericVersionLine(suffix) {
 				return pkgName
 			}
 		}
@@ -529,10 +528,10 @@ func isMultilibPackage(pkgName string) bool {
 		}
 	}
 
-	// Also handle versioned names (pkg-MAJOR) by checking the base name
+	// Also handle versioned names (pkg-MAJOR[.MINOR...]) by checking the base name
 	if lastDash := strings.LastIndex(baseName, "-"); lastDash != -1 {
 		suffix := baseName[lastDash+1:]
-		if _, err := strconv.Atoi(suffix); err == nil {
+		if isNumericVersionLine(suffix) {
 			strippedName := baseName[:lastDash]
 			for _, multilibPkg := range MultilibPackages {
 				if multilibPkg == strippedName {

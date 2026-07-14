@@ -15,7 +15,6 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 )
@@ -1266,13 +1265,19 @@ func prepareVersionedPackage(arg string) (string, error) {
 		return arg, fmt.Errorf("version %s for package %s not found in Git history", targetVersionStr, pkgName)
 	}
 
-	// Rename the package to pkgname-MAJOR for parallel version installation
+	// Wildcard equality constraints retain their complete release line so two
+	// incompatible minor lines in the same major can coexist (pkg-2.28 and
+	// pkg-2.36). Exact requests retain the historical pkg-MAJOR convention.
 	major := strings.Split(foundVersion, ".")[0]
+	versionLine := major
+	if prefix, ok := wildcardEqualityPrefix(ver); ok && isNumericVersionLine(prefix) {
+		versionLine = prefix
+	}
 	renamedPkgName := pkgName
-	if major != "" {
-		suffix := "-" + major
+	if versionLine != "" {
+		suffix := "-" + versionLine
 		if !strings.HasSuffix(pkgName, suffix) {
-			renamedPkgName = fmt.Sprintf("%s-%s", pkgName, major)
+			renamedPkgName = fmt.Sprintf("%s-%s", pkgName, versionLine)
 		}
 	}
 
@@ -1374,14 +1379,11 @@ func prepareVersionedPackage(arg string) (string, error) {
 }
 
 // prepareVersionedPackageMajor reconstructs the newest source release whose
-// major version matches a concrete pkg-MAJOR runtime package identity.
+// version line matches a concrete pkg-MAJOR or pkg-MAJOR.MINOR identity.
 func prepareVersionedPackageMajor(pkgName string) (string, error) {
-	baseName, major, ok := splitVersionedPackageName(pkgName)
+	baseName, line, ok := splitVersionedPackageName(pkgName)
 	if !ok {
-		return pkgName, fmt.Errorf("package %s is not a versioned pkg-MAJOR identity", pkgName)
-	}
-	if _, err := strconv.Atoi(major); err != nil {
-		return pkgName, err
+		return pkgName, fmt.Errorf("package %s is not a versioned package-line identity", pkgName)
 	}
 
 	pkgDir, err := findPackageDir(baseName)
@@ -1403,7 +1405,7 @@ func prepareVersionedPackageMajor(pkgName string) (string, error) {
 	logCmd.Dir = gitRoot
 	logOut, err := logCmd.Output()
 	if err != nil {
-		return pkgName, fmt.Errorf("failed to search git history for major version %s of %s: %w", major, baseName, err)
+		return pkgName, fmt.Errorf("failed to search git history for version line %s of %s: %w", line, baseName, err)
 	}
 
 	targetVersion := ""
@@ -1415,21 +1417,21 @@ func prepareVersionedPackageMajor(pkgName string) (string, error) {
 			continue
 		}
 		fields := strings.Fields(string(showOut))
-		if len(fields) > 0 && strings.SplitN(fields[0], ".", 2)[0] == major {
+		if len(fields) > 0 && versionMatchesPackageLine(fields[0], line) {
 			targetVersion = fields[0]
 			break
 		}
 	}
 	if targetVersion == "" {
-		return pkgName, fmt.Errorf("no source release with major version %s was found for %s", major, baseName)
+		return pkgName, fmt.Errorf("no source release in version line %s was found for %s", line, baseName)
 	}
 
-	resolved, err := prepareVersionedPackage(fmt.Sprintf("%s@%s", baseName, targetVersion))
+	resolved, err := prepareVersionedPackage(fmt.Sprintf("%s@==%s*", baseName, line))
 	if err != nil {
 		return pkgName, err
 	}
 	if resolved != pkgName {
-		return pkgName, fmt.Errorf("no source release with major version %s was found for %s", major, baseName)
+		return pkgName, fmt.Errorf("no source release in version line %s was found for %s", line, baseName)
 	}
 	return resolved, nil
 }

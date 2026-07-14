@@ -631,7 +631,7 @@ func GetRemotePackageEntry(pkgName string, cfg *Config, remoteIndex []RepoEntry)
 
 	arch := GetSystemArch(cfg)
 	variant := GetSystemVariantForPackage(cfg, lookupName)
-	versionedBase, versionedMajor, versionedName := splitVersionedPackageName(lookupName)
+	versionedBase, versionedLine, versionedName := splitVersionedPackageName(lookupName)
 	if targetVersion == "" && versionedName {
 		targetVersion = parallelPackageVersion(lookupName)
 	}
@@ -648,7 +648,7 @@ func GetRemotePackageEntry(pkgName string, cfg *Config, remoteIndex []RepoEntry)
 			// and index entries retain the canonical package name.
 			match := entry.Name == lookupName || (versionedName && entry.Name == versionedBase)
 			if match && entry.Arch == arch && entry.Variant == searchVariant {
-				if versionedName && strings.SplitN(entry.Version, ".", 2)[0] != versionedMajor {
+				if versionedName && !versionMatchesPackageLine(entry.Version, versionedLine) {
 					continue
 				}
 				if targetVersion != "" {
