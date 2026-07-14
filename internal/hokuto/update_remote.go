@@ -253,8 +253,9 @@ func installRemotePackage(pkgName string, cfg *Config, remoteIndex []RepoEntry) 
 	}
 
 	var bestMatch *RepoEntry
+	archivePkgName := canonicalParallelPackageName(pkgName)
 	for _, e := range remoteIndex {
-		if e.Name == pkgName && e.Arch == arch {
+		if e.Name == archivePkgName && versionedPackageMajorMatches(pkgName, e.Version) && e.Arch == arch {
 			if e.Variant == preferredVariant || (fallbackVariant != "" && e.Variant == fallbackVariant) {
 				if bestMatch == nil || isNewer(e, *bestMatch) ||
 					(e.Version == bestMatch.Version && e.Revision == bestMatch.Revision &&
@@ -275,11 +276,11 @@ func installRemotePackage(pkgName string, cfg *Config, remoteIndex []RepoEntry) 
 	version := entry.Version
 	revision := entry.Revision
 	// Note: entry.Arch and entry.Variant are the ones we FOUND
-	tarballName := StandardizeRemoteName(pkgName, version, revision, entry.Arch, entry.Variant)
+	tarballName := StandardizeRemoteName(archivePkgName, version, revision, entry.Arch, entry.Variant)
 	tarballPath := filepath.Join(BinDir, tarballName)
 
 	if _, err := os.Stat(tarballPath); err != nil {
-		if err := fetchSpecificBinaryPackage(pkgName, version, revision, entry.Variant, cfg, false, entry.B3Sum, false); err != nil {
+		if err := fetchSpecificBinaryPackage(archivePkgName, version, revision, entry.Variant, cfg, false, entry.B3Sum, false); err != nil {
 			return fmt.Errorf("download failed: %w", err)
 		}
 	}

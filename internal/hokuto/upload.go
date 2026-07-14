@@ -616,9 +616,10 @@ func handleUploadCommand(args []string, cfg *Config) error {
 			return fmt.Errorf("failed to list remote files: %w", err)
 		}
 
-		// Identify the LATEST version for each package
+		// Identify the latest version in each retained major release line.
 		type pkgGroupKey struct {
 			Name    string
+			Major   string
 			Arch    string
 			Variant string
 		}
@@ -627,7 +628,8 @@ func handleUploadCommand(args []string, cfg *Config) error {
 			if entry.Type == "meta" || entry.Filename == "" {
 				continue
 			}
-			k := pkgGroupKey{Name: entry.Name, Arch: entry.Arch, Variant: entry.Variant}
+			major := strings.SplitN(entry.Version, ".", 2)[0]
+			k := pkgGroupKey{Name: entry.Name, Major: major, Arch: entry.Arch, Variant: entry.Variant}
 			groupedPkgs[k] = append(groupedPkgs[k], entry)
 		}
 
@@ -640,7 +642,7 @@ func handleUploadCommand(args []string, cfg *Config) error {
 			sort.Slice(entries, func(i, j int) bool {
 				return isNewer(entries[i], entries[j])
 			})
-			// Keep only the newest version as "active"
+			// Keep the newest version of this major as active.
 			if len(entries) > 0 {
 				activeFiles[entries[0].Filename] = true
 			}

@@ -107,13 +107,14 @@ func currentBinaryOutputVariants(sourcePkg, outputPkg string, cfg *Config) []str
 
 func currentBinaryOutputAvailable(sourcePkg, outputPkg, version, revision string, cfg *Config, remoteIndex []RepoEntry) bool {
 	arch := GetSystemArchForPackage(cfg, sourcePkg)
+	archivePkg := canonicalParallelPackageName(outputPkg)
 	for _, variant := range currentBinaryOutputVariants(sourcePkg, outputPkg, cfg) {
-		tarballPath := filepath.Join(BinDir, StandardizeRemoteName(outputPkg, version, revision, arch, variant))
+		tarballPath := filepath.Join(BinDir, StandardizeRemoteName(archivePkg, version, revision, arch, variant))
 		if _, err := os.Stat(tarballPath); err == nil {
 			return true
 		}
 		for _, entry := range remoteIndex {
-			if entry.Type != "meta" && entry.Name == outputPkg && entry.Version == version &&
+			if entry.Type != "meta" && entry.Name == archivePkg && entry.Version == version &&
 				entry.Revision == revision && entry.Arch == arch && entry.Variant == variant {
 				return true
 			}
@@ -1129,10 +1130,10 @@ func checkForUpgrades(_ context.Context, cfg *Config, maxJobs int, yes bool) err
 				continue
 			}
 
-			outputPkgName := getOutputPackageName(pkgName, cfg)
+			archivePkgName := getArchivePackageName(pkgName, cfg)
 			arch := GetSystemArchForPackage(cfg, pkgName)
 			variant := GetSystemVariantForPackage(cfg, pkgName)
-			tarballName := StandardizeRemoteName(outputPkgName, version, revision, arch, variant)
+			tarballName := StandardizeRemoteName(archivePkgName, version, revision, arch, variant)
 			tarballPath := filepath.Join(BinDir, tarballName)
 
 			// 1. Check local cache
@@ -1157,7 +1158,7 @@ func checkForUpgrades(_ context.Context, cfg *Config, maxJobs int, yes bool) err
 
 				var bestEntry *RepoEntry
 				for _, entry := range remoteIndex {
-					if entry.Name == pkgName && entry.Version == version &&
+					if entry.Name == archivePkgName && entry.Version == version &&
 						entry.Revision == revision && entry.Arch == targetArch {
 						if entry.Variant == preferredVariant {
 							e := entry
@@ -1179,7 +1180,7 @@ func checkForUpgrades(_ context.Context, cfg *Config, maxJobs int, yes bool) err
 				// Only attempt download if the package was found in the remote index
 				if foundInIndex {
 					// Use quiet mode for check
-					if err := fetchBinaryPackage(pkgName, version, revision, cfg, true, expectedSum, false); err == nil {
+					if err := fetchBinaryPackage(archivePkgName, version, revision, cfg, true, expectedSum, false); err == nil {
 						binaryAvailable[pkgName] = true
 					}
 				}
@@ -1289,6 +1290,7 @@ func checkForUpgrades(_ context.Context, cfg *Config, maxJobs int, yes bool) err
 			if isRebuild {
 				return pkgBuild(pkgName, cfg, exec, opts)
 			}
+			archivePkgName := getArchivePackageName(pkgName, cfg)
 
 			// Try to fetch binary if configured (mirror check logic reused logic from sequential)
 			if BinaryMirror != "" && len(remoteIndex) > 0 {
@@ -1307,7 +1309,7 @@ func checkForUpgrades(_ context.Context, cfg *Config, maxJobs int, yes bool) err
 
 				var bestEntry *RepoEntry
 				for _, entry := range remoteIndex {
-					if entry.Name == pkgName && entry.Version == version &&
+					if entry.Name == archivePkgName && entry.Version == version &&
 						entry.Revision == revision && entry.Arch == targetArch {
 						if entry.Variant == preferredVariant {
 							e := entry
@@ -1330,14 +1332,13 @@ func checkForUpgrades(_ context.Context, cfg *Config, maxJobs int, yes bool) err
 				if foundInIndex {
 					// Errors here are ignored, we just fail to find binary and proceed to build
 					// Parallel mode: pass quiet=true
-					_ = fetchBinaryPackage(pkgName, version, revision, cfg, true, expectedSum, false)
+					_ = fetchBinaryPackage(archivePkgName, version, revision, cfg, true, expectedSum, false)
 				}
 			}
 
-			outputPkgName := getOutputPackageName(pkgName, cfg)
 			arch := GetSystemArchForPackage(cfg, pkgName)
 			variant := GetSystemVariantForPackage(cfg, pkgName)
-			tarballPath := filepath.Join(BinDir, StandardizeRemoteName(outputPkgName, version, revision, arch, variant))
+			tarballPath := filepath.Join(BinDir, StandardizeRemoteName(archivePkgName, version, revision, arch, variant))
 
 			// If we found a different variant in the index and it was successfully fetched,
 			// we need to check for that path instead.
@@ -1348,10 +1349,10 @@ func checkForUpgrades(_ context.Context, cfg *Config, maxJobs int, yes bool) err
 				targetArch := GetSystemArchForPackage(cfg, pkgName)
 
 				for _, entry := range remoteIndex {
-					if entry.Name == pkgName && entry.Version == version &&
+					if entry.Name == archivePkgName && entry.Version == version &&
 						entry.Revision == revision && entry.Arch == targetArch {
 						// Check if this variant's tarball exists
-						testPath := filepath.Join(BinDir, StandardizeRemoteName(outputPkgName, version, revision, targetArch, entry.Variant))
+						testPath := filepath.Join(BinDir, StandardizeRemoteName(archivePkgName, version, revision, targetArch, entry.Variant))
 						if _, err := os.Stat(testPath); err == nil {
 							tarballPath = testPath
 							break
@@ -1413,9 +1414,10 @@ func checkForUpgrades(_ context.Context, cfg *Config, maxJobs int, yes bool) err
 		}
 
 		outputPkgName := getOutputPackageName(pkgName, cfg)
+		archivePkgName := getArchivePackageName(pkgName, cfg)
 		arch := GetSystemArchForPackage(cfg, pkgName)
 		variant := GetSystemVariantForPackage(cfg, pkgName)
-		tarballName := StandardizeRemoteName(outputPkgName, version, revision, arch, variant)
+		tarballName := StandardizeRemoteName(archivePkgName, version, revision, arch, variant)
 		tarballPath := filepath.Join(BinDir, tarballName)
 
 		foundBinary := false
@@ -1439,7 +1441,7 @@ func checkForUpgrades(_ context.Context, cfg *Config, maxJobs int, yes bool) err
 
 			var bestEntry *RepoEntry
 			for _, entry := range remoteIndex {
-				if entry.Name == pkgName && entry.Version == version &&
+				if entry.Name == archivePkgName && entry.Version == version &&
 					entry.Revision == revision && entry.Arch == targetArch {
 					if entry.Variant == preferredVariant {
 						e := entry
@@ -1458,14 +1460,14 @@ func checkForUpgrades(_ context.Context, cfg *Config, maxJobs int, yes bool) err
 				foundInIndex = true
 				// If we are using a fallback, update the tarball path
 				if bestEntry.Variant != preferredVariant {
-					tarballName = StandardizeRemoteName(outputPkgName, version, revision, targetArch, bestEntry.Variant)
+					tarballName = StandardizeRemoteName(archivePkgName, version, revision, targetArch, bestEntry.Variant)
 					tarballPath = filepath.Join(BinDir, tarballName)
 				}
 			}
 
 			if foundInIndex {
 				// Sequential mode: output is fine (quiet=false)
-				if err := fetchBinaryPackage(pkgName, version, revision, cfg, false, expectedSum, false); err == nil {
+				if err := fetchBinaryPackage(archivePkgName, version, revision, cfg, false, expectedSum, false); err == nil {
 					foundBinary = true
 				} else {
 					colArrow.Print("-> ")

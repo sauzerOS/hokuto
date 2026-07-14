@@ -296,9 +296,10 @@ func (pm *ParallelManager) installDeferredTargets() error {
 			return fmt.Errorf("failed to determine version for %s: %w", pkgName, err)
 		}
 		outputPkgName := getOutputPackageName(pkgName, pm.Config)
+		archivePkgName := getArchivePackageName(pkgName, pm.Config)
 		arch := GetSystemArchForPackage(pm.Config, pkgName)
 		variant := GetSystemVariantForPackage(pm.Config, pkgName)
-		tarballPath := filepath.Join(BinDir, StandardizeRemoteName(outputPkgName, version, revision, arch, variant))
+		tarballPath := filepath.Join(BinDir, StandardizeRemoteName(archivePkgName, version, revision, arch, variant))
 
 		isCriticalAtomic.Store(1)
 		handlePreInstallUninstall(outputPkgName, pm.Config, RootExec, false, nil)
@@ -761,9 +762,10 @@ func (pm *ParallelManager) installPackage(pkgName string, userRequestedMap map[s
 	}
 
 	outputPkgName := getOutputPackageName(pkgName, pm.Config)
+	archivePkgName := getArchivePackageName(pkgName, pm.Config)
 	arch := GetSystemArchForPackage(pm.Config, pkgName)
 	variant := GetSystemVariantForPackage(pm.Config, pkgName)
-	tarballPath := filepath.Join(BinDir, StandardizeRemoteName(outputPkgName, version, revision, arch, variant))
+	tarballPath := filepath.Join(BinDir, StandardizeRemoteName(archivePkgName, version, revision, arch, variant))
 
 	// We use RootExec for installation as it requires privileges
 	isCriticalAtomic.Store(1)
@@ -979,8 +981,11 @@ func (pm *ParallelManager) canBuild(pkgName string) bool {
 				satisfied = true
 				break
 			}
-			// 2. Check if installed in system (only if we're not planning to update/rebuild it!)
-			if !isBuilding && isPackageInstalled(cand) {
+			// 2. Check if installed in system. A make-time self dependency is a
+			// bootstrap compiler/runtime deliberately installed before rebuilding
+			// the same package, so it remains valid while that package is pending.
+			selfBootstrap := dep.Make && cand == pkgName
+			if (!isBuilding || selfBootstrap) && isPackageInstalled(cand) {
 				satisfied = true
 				break
 			}

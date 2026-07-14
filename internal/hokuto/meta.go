@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -780,6 +781,15 @@ func SearchPkgDB(args []string, cfg *Config) error {
 		return nil
 	}
 
+	if !tagMode {
+		if pkgName, major, ok := parseMajorVersionSearch(query); ok {
+			return searchPackageMajorVersion(pkgName, major, cfg)
+		}
+		if strings.Contains(query, "@") {
+			return fmt.Errorf("invalid version-line search %q: use pkgname@MAJOR (for example, java-openjdk@17)", query)
+		}
+	}
+
 	db, err := readPkgDB(PkgDBPath)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -849,8 +859,203 @@ func SearchPkgDB(args []string, cfg *Config) error {
 	return nil
 }
 
+type majorVersionSearchResult struct {
+	version  string
+	revision string
+	remote   bool
+	git      bool
+}
+
+func parseMajorVersionSearch(query string) (string, string, bool) {
+	pkgName, major, found := strings.Cut(strings.TrimSpace(query), "@")
+	if !found || pkgName == "" || major == "" || strings.Contains(major, "@") {
+		return "", "", false
+	}
+	if _, err := strconv.Atoi(major); err != nil {
+		return "", "", false
+	}
+	return pkgName, major, true
+}
+
+func normalizePackageRevision(revision string) string {
+	revision = strings.TrimSpace(revision)
+	if revision == "" {
+		return "1"
+	}
+	return revision
+}
+
+// compareMajorLineVersions performs a natural comparison so embedded numeric
+// components such as the 20 in 17.0.20+7 are compared numerically. The general
+// dependency comparator splits only on dots and would otherwise order 9+7
+// after 20+7 lexicographically.
+func compareMajorLineVersions(a, b string) int {
+	for ai, bi := 0, 0; ai < len(a) || bi < len(b); {
+		if ai >= len(a) {
+			return -1
+		}
+		if bi >= len(b) {
+			return 1
+		}
+		aDigit := a[ai] >= '0' && a[ai] <= '9'
+		bDigit := b[bi] >= '0' && b[bi] <= '9'
+		aj, bj := ai, bi
+		for aj < len(a) && (a[aj] >= '0' && a[aj] <= '9') == aDigit {
+			aj++
+		}
+		for bj < len(b) && (b[bj] >= '0' && b[bj] <= '9') == bDigit {
+			bj++
+		}
+		at, bt := a[ai:aj], b[bi:bj]
+		if aDigit && bDigit {
+			an := strings.TrimLeft(at, "0")
+			bn := strings.TrimLeft(bt, "0")
+			if an == "" {
+				an = "0"
+			}
+			if bn == "" {
+				bn = "0"
+			}
+			if len(an) < len(bn) {
+				return -1
+			}
+			if len(an) > len(bn) {
+				return 1
+			}
+			if an < bn {
+				return -1
+			}
+			if an > bn {
+				return 1
+			}
+		} else {
+			if at < bt {
+				return -1
+			}
+			if at > bt {
+				return 1
+			}
+		}
+		ai, bi = aj, bj
+	}
+	return 0
+}
+
+func addMajorVersionSearchCandidate(best *majorVersionSearchResult, version, revision string, remote, git bool) {
+	version = strings.TrimSpace(version)
+	if version == "" {
+		return
+	}
+	revision = normalizePackageRevision(revision)
+	cmp := compareMajorLineVersions(version, best.version)
+	if best.version == "" || cmp > 0 || (cmp == 0 && revisionCompare(revision, best.revision) > 0) {
+		*best = majorVersionSearchResult{
+			version:  version,
+			revision: revision,
+			remote:   remote,
+			git:      git,
+		}
+		return
+	}
+	if cmp == 0 && revisionCompare(revision, best.revision) == 0 {
+		best.remote = best.remote || remote
+		best.git = best.git || git
+	}
+}
+
+func searchPackageMajorVersion(pkgName, major string, cfg *Config) error {
+	best := majorVersionSearchResult{}
+	targetArch := GetSystemArchForPackage(cfg, pkgName)
+	remoteIndex, remoteErr := getCachedRemoteIndex(cfg, true)
+	if remoteErr == nil {
+		for _, entry := range remoteIndex {
+			if entry.Type == "meta" || entry.Name != pkgName || entry.Arch != targetArch {
+				continue
+			}
+			if strings.SplitN(strings.TrimSpace(entry.Version), ".", 2)[0] == major {
+				addMajorVersionSearchCandidate(&best, entry.Version, entry.Revision, true, false)
+			}
+		}
+	}
+
+	gitErr := addGitMajorVersionCandidates(&best, pkgName, major)
+	if best.version == "" {
+		if remoteErr != nil && gitErr != nil {
+			debugf("Major-version search remote lookup failed: %v\n", remoteErr)
+			debugf("Major-version search Git lookup failed: %v\n", gitErr)
+		}
+		return fmt.Errorf("no version of %s in major line %s was found in the remote repository or Git history", pkgName, major)
+	}
+
+	source := "remote repository"
+	if best.git {
+		source = "Git history"
+	}
+	if best.remote && best.git {
+		source = "remote repository and Git history"
+	}
+	colSuccess.Printf("%s@%s: latest version is %s", pkgName, major, best.version)
+	colNote.Printf(" (revision %s; %s)\n", best.revision, source)
+	return nil
+}
+
+func addGitMajorVersionCandidates(best *majorVersionSearchResult, pkgName, major string) error {
+	pkgDir, err := findPackageDir(pkgName)
+	if err != nil {
+		return err
+	}
+	if versionData, readErr := os.ReadFile(filepath.Join(pkgDir, "version")); readErr == nil {
+		fields := strings.Fields(string(versionData))
+		if len(fields) > 0 && strings.SplitN(fields[0], ".", 2)[0] == major {
+			revision := "1"
+			if len(fields) > 1 {
+				revision = fields[1]
+			}
+			addMajorVersionSearchCandidate(best, fields[0], revision, false, true)
+		}
+	}
+
+	gitRootCmd := exec.Command("git", "rev-parse", "--show-toplevel")
+	gitRootCmd.Dir = pkgDir
+	gitRootOut, err := gitRootCmd.Output()
+	if err != nil {
+		return fmt.Errorf("package directory %s is not in a Git repository: %w", pkgDir, err)
+	}
+	gitRoot := strings.TrimSpace(string(gitRootOut))
+	relPath, err := filepath.Rel(gitRoot, pkgDir)
+	if err != nil {
+		return fmt.Errorf("failed to determine the repository path for %s: %w", pkgName, err)
+	}
+
+	logCmd := exec.Command("git", "log", "--all", "--format=%H", "--", relPath)
+	logCmd.Dir = gitRoot
+	logOut, err := logCmd.Output()
+	if err != nil {
+		return fmt.Errorf("failed to search Git history for %s: %w", pkgName, err)
+	}
+	for _, commit := range strings.Fields(string(logOut)) {
+		showCmd := exec.Command("git", "show", fmt.Sprintf("%s:%s/version", commit, relPath))
+		showCmd.Dir = gitRoot
+		showOut, showErr := showCmd.Output()
+		if showErr != nil {
+			continue
+		}
+		fields := strings.Fields(string(showOut))
+		if len(fields) == 0 || strings.SplitN(fields[0], ".", 2)[0] != major {
+			continue
+		}
+		revision := "1"
+		if len(fields) > 1 {
+			revision = fields[1]
+		}
+		addMajorVersionSearchCandidate(best, fields[0], revision, false, true)
+	}
+	return nil
+}
+
 func printSearchHelp() {
 	colNote.Println("Usage: hokuto search <query>       Search by package name or description")
+	colNote.Println("       hokuto search <pkg>@<major> Find the latest release in a major version line")
 	colNote.Println("       hokuto search -tag <tag>    Search by package tag")
 	colNote.Println("       hokuto search -strict <q>   Search for exact name matches")
 	fmt.Println()

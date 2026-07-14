@@ -169,13 +169,62 @@ func findCachedBinaryTarball(pkgName string, cfg *Config) string {
 
 func findCachedBinaryTarballVersion(pkgName, version, revision string, cfg *Config) string {
 	arch := GetSystemArchForPackage(cfg, pkgName)
+	archivePkgName := canonicalParallelPackageName(pkgName)
 	for _, variant := range dependencyVariantCandidates(pkgName, cfg) {
-		tarballPath := filepath.Join(BinDir, StandardizeRemoteName(pkgName, version, revision, arch, variant))
+		tarballPath := filepath.Join(BinDir, StandardizeRemoteName(archivePkgName, version, revision, arch, variant))
 		if _, err := os.Stat(tarballPath); err == nil {
 			return tarballPath
 		}
 	}
 	return ""
+}
+
+func findCachedRequestedBinaryTarball(pkgRequest string, cfg *Config) (path, version, revision string, ok bool) {
+	name := pkgRequest
+	request := ""
+	if idx := strings.Index(pkgRequest, "@"); idx != -1 {
+		name = pkgRequest[:idx]
+		request = pkgRequest[idx+1:]
+	}
+	if name == "" || request == "" {
+		return "", "", "", false
+	}
+	version = request
+	if lastDash := strings.LastIndex(request, "-"); lastDash != -1 {
+		if _, err := strconv.Atoi(request[lastDash+1:]); err == nil {
+			version = request[:lastDash]
+			revision = request[lastDash+1:]
+		}
+	}
+
+	arch := GetSystemArchForPackage(cfg, name)
+	for _, variant := range dependencyVariantCandidates(name, cfg) {
+		pattern := filepath.Join(BinDir, fmt.Sprintf("%s-*-*-*-%s.tar.zst", name, variant))
+		matches, _ := filepath.Glob(pattern)
+		bestRevision := ""
+		bestPath := ""
+		for _, match := range matches {
+			metadata, _, err := scanTarballMetadata(match)
+			if err != nil || metadata["name"] != name || metadata["version"] != version {
+				continue
+			}
+			if metadata["arch"] != "" && metadata["arch"] != arch {
+				continue
+			}
+			candidateRevision := metadata["revision"]
+			if revision != "" && candidateRevision != revision {
+				continue
+			}
+			if bestPath == "" || revisionCompare(candidateRevision, bestRevision) > 0 {
+				bestPath = match
+				bestRevision = candidateRevision
+			}
+		}
+		if bestPath != "" {
+			return bestPath, version, bestRevision, true
+		}
+	}
+	return "", version, revision, false
 }
 
 func splitVersionedPackageName(pkgName string) (baseName, major string, ok bool) {
@@ -293,14 +342,14 @@ func revisionCompare(a, b string) int {
 }
 
 func findCachedVersionedBinaryTarball(pkgName string, cfg *Config) (string, bool) {
-	_, major, ok := splitVersionedPackageName(pkgName)
+	baseName, major, ok := splitVersionedPackageName(pkgName)
 	if !ok {
 		return "", false
 	}
 
 	arch := GetSystemArchForPackage(cfg, pkgName)
 	for _, variant := range dependencyVariantCandidates(pkgName, cfg) {
-		pattern := filepath.Join(BinDir, fmt.Sprintf("%s-*-*-*-%s.tar.zst", pkgName, variant))
+		pattern := filepath.Join(BinDir, fmt.Sprintf("%s-*-*-*-%s.tar.zst", baseName, variant))
 		matches, err := filepath.Glob(pattern)
 		if err != nil {
 			continue
@@ -313,7 +362,7 @@ func findCachedVersionedBinaryTarball(pkgName string, cfg *Config) (string, bool
 				debugf("Skipping cached tarball %s: failed to read metadata: %v\n", match, err)
 				continue
 			}
-			if metadata["name"] != pkgName {
+			if metadata["name"] != baseName {
 				continue
 			}
 			if metadata["arch"] != "" && metadata["arch"] != arch {
@@ -323,6 +372,9 @@ func findCachedVersionedBinaryTarball(pkgName string, cfg *Config) (string, bool
 				continue
 			}
 			version := metadata["version"]
+			if requestedVersion := parallelPackageVersion(pkgName); requestedVersion != "" && version != requestedVersion {
+				continue
+			}
 			if strings.Split(version, ".")[0] != major {
 				continue
 			}
@@ -348,8 +400,8 @@ func findCachedVersionedBinaryTarball(pkgName string, cfg *Config) (string, bool
 func depSpecsFromNames(names []string) []DepSpec {
 	deps := make([]DepSpec, 0, len(names))
 	for _, name := range names {
-		if strings.TrimSpace(name) != "" {
-			deps = append(deps, DepSpec{Name: name})
+		if parsed, err := parseDependsData([]byte(name + "\n")); err == nil {
+			deps = append(deps, parsed...)
 		}
 	}
 	return deps
@@ -361,7 +413,13 @@ func resolveBinaryDependenciesFromArchive(pkgName string, cfg *Config, remoteInd
 		lookupName = pkgName[:idx]
 	}
 
-	if tarballPath := findCachedBinaryTarball(lookupName, cfg); tarballPath != "" {
+	tarballPath := ""
+	if strings.Contains(pkgName, "@") {
+		tarballPath, _, _, _ = findCachedRequestedBinaryTarball(pkgName, cfg)
+	} else {
+		tarballPath = findCachedBinaryTarball(lookupName, cfg)
+	}
+	if tarballPath != "" {
 		deps, err := scanTarballDependencySpecs(tarballPath)
 		if err != nil {
 			return nil, true, fmt.Errorf("failed to scan dependencies from %s: %w", filepath.Base(tarballPath), err)
@@ -385,13 +443,14 @@ func resolveBinaryDependenciesFromArchive(pkgName string, cfg *Config, remoteInd
 		return nil, false, nil
 	}
 
-	entryRef, err := GetRemotePackageEntry(lookupName, cfg, remoteIndex)
+	entryRef, err := GetRemotePackageEntry(pkgName, cfg, remoteIndex)
 	if err != nil {
 		return nil, false, nil
 	}
 	entry := *entryRef
 
-	if len(entry.Depends) > 0 {
+	_, _, parallelName := splitVersionedPackageName(lookupName)
+	if len(entry.Depends) > 0 && !strings.Contains(pkgName, "@") && !parallelName {
 		return depSpecsFromNames(entry.Depends), true, nil
 	}
 
@@ -401,7 +460,7 @@ func resolveBinaryDependenciesFromArchive(pkgName string, cfg *Config, remoteInd
 
 	arch := GetSystemArchForPackage(cfg, entry.Name)
 	tarballName := StandardizeRemoteName(entry.Name, entry.Version, entry.Revision, arch, entry.Variant)
-	tarballPath := filepath.Join(BinDir, tarballName)
+	tarballPath = filepath.Join(BinDir, tarballName)
 	deps, err := scanTarballDependencySpecs(tarballPath)
 	if err != nil {
 		return nil, true, fmt.Errorf("failed to scan dependencies from %s: %w", tarballName, err)
@@ -471,10 +530,22 @@ func splitPackageNamesFromDir(pkgDir string) []string {
 
 func findSplitPackageSource(pkgName string) (sourcePkg string, sourceDir string, ok bool) {
 	lookupNames := []string{pkgName}
+	if canonicalName := canonicalParallelPackageName(pkgName); canonicalName != pkgName {
+		lookupNames = append(lookupNames, canonicalName)
+	}
 	for _, prefix := range []string{"aarch64-", "x86_64-"} {
 		if strings.HasPrefix(pkgName, prefix) {
 			lookupNames = append(lookupNames, strings.TrimPrefix(pkgName, prefix))
 			break
+		}
+	}
+	for historicalName, historicalDir := range versionedPkgDirs {
+		for _, splitName := range splitPackageNamesFromDir(historicalDir) {
+			for _, lookupName := range lookupNames {
+				if splitName == lookupName {
+					return historicalName, historicalDir, true
+				}
+			}
 		}
 	}
 
@@ -621,24 +692,7 @@ func resolveBinaryDependencies(pkgName string, visited map[string]bool, plan *[]
 	// If the user requested --remote (implied by non-empty remoteIndex), we prioritize
 	// the remote package's dependencies over the local source definition.
 	if allowRemote && len(remoteIndex) > 0 {
-		// Check if package exists in remote index
-		found := false
-		lookupName := pkgName
-		if idx := strings.Index(pkgName, "@"); idx != -1 {
-			lookupName = pkgName[:idx]
-		}
-
-		for _, entry := range remoteIndex {
-			if entry.Type == "meta" {
-				continue
-			}
-			if entry.Name == lookupName && versionedPackageMajorMatches(lookupName, entry.Version) {
-				found = true
-				break
-			}
-		}
-
-		if found {
+		if _, entryErr := GetRemotePackageEntry(pkgName, cfg, remoteIndex); entryErr == nil {
 			// Unmark visited to allow resolveRemoteDependencies to handle it
 			delete(visited, pkgName)
 			if err := resolveRemoteDependencies(pkgName, visited, plan, force, yes, cfg, remoteIndex); err != nil {
@@ -831,9 +885,10 @@ func resolveMissingDeps(pkgName string, processed map[string]bool, missing *[]st
 			}
 			depName = resolved
 		}
+		depName = wildcardMajorDependencyName(depName, dep.Op, dep.Version)
 
 		// Safety check: a package cannot depend on itself.
-		if depName == pkgName {
+		if sameSourcePackage(depName, pkgName) {
 			continue
 		}
 
@@ -938,11 +993,14 @@ func resolveRemoteDependencies(pkgName string, visited map[string]bool, plan *[]
 	var entry = *entryRef
 
 	var deps []DepSpec
-	if len(entry.Depends) > 0 {
+	lookupName := pkgName
+	if idx := strings.Index(lookupName, "@"); idx != -1 {
+		lookupName = lookupName[:idx]
+	}
+	_, _, parallelName := splitVersionedPackageName(lookupName)
+	if len(entry.Depends) > 0 && !strings.Contains(pkgName, "@") && !parallelName {
 		// Optimization: Use pre-resolved dependencies from index
-		for _, d := range entry.Depends {
-			deps = append(deps, DepSpec{Name: d})
-		}
+		deps = depSpecsFromNames(entry.Depends)
 	} else {
 		// Fallback: Fetch binary package to read depends (older index or missing info)
 		if err := fetchSpecificBinaryPackage(entry.Name, entry.Version, entry.Revision, entry.Variant, cfg, false, entry.B3Sum, false); err != nil {
@@ -960,9 +1018,7 @@ func resolveRemoteDependencies(pkgName string, visited map[string]bool, plan *[]
 			return fmt.Errorf("failed to scan metadata from %s: %w", tarballName, err)
 		}
 
-		for _, d := range entryDeps {
-			deps = append(deps, DepSpec{Name: d})
-		}
+		deps = depSpecsFromNames(entryDeps)
 	}
 
 	// 7. Recurse
@@ -1310,7 +1366,8 @@ func resolveBuildPlan(targetPackages []string, userRequestedPackages map[string]
 				}
 				depName = resolved
 			}
-			if depName == pkgName {
+			depName = wildcardMajorDependencyName(depName, dep.Op, dep.Version)
+			if sameSourcePackage(depName, pkgName) {
 				continue
 			}
 
@@ -1338,7 +1395,7 @@ func resolveBuildPlan(targetPackages []string, userRequestedPackages map[string]
 					continue
 				}
 			}
-			if depName == pkgName {
+			if sameSourcePackage(depName, pkgName) {
 				continue
 			}
 
@@ -1504,10 +1561,14 @@ func versionSatisfies(installed, op, ref string) bool {
 }
 
 func wildcardEqualityPrefix(ref string) (string, bool) {
-	if !strings.HasSuffix(ref, ".*") {
+	if strings.HasSuffix(ref, ".*") {
+		ref = strings.TrimSuffix(ref, ".*")
+	} else if strings.HasSuffix(ref, "*") {
+		ref = strings.TrimSuffix(ref, "*")
+	} else {
 		return "", false
 	}
-	prefix := strings.TrimSuffix(ref, ".*")
+	prefix := strings.TrimSuffix(ref, ".")
 	if prefix == "" || strings.ContainsAny(prefix, ".*") {
 		return "", false
 	}
@@ -1522,11 +1583,16 @@ func wildcardMajorDependencyName(name, op, version string) string {
 	base, major, alreadyVersioned := splitVersionedPackageName(name)
 	if alreadyVersioned {
 		if major == prefix {
+			registerParallelPackageName(name, base)
 			return name
 		}
-		return base + "-" + prefix
+		installName := base + "-" + prefix
+		registerParallelPackageName(installName, base)
+		return installName
 	}
-	return name + "-" + prefix
+	installName := name + "-" + prefix
+	registerParallelPackageName(installName, name)
+	return installName
 }
 
 // compareVersions compares two version strings split by dots. Numeric segments are compared numerically; non-numeric fall back to lexicographic.
@@ -2013,9 +2079,10 @@ func ensurePackageInstalledWithOptions(pkgName string, cfg *Config, noRemote boo
 	}
 
 	outputPkgName := getOutputPackageName(pkgName, cfg)
+	archivePkgName := getArchivePackageName(pkgName, cfg)
 	arch := GetSystemArchForPackage(cfg, pkgName)
 	variant := GetSystemVariantForPackage(cfg, pkgName)
-	tarballName := StandardizeRemoteName(outputPkgName, version, revision, arch, variant)
+	tarballName := StandardizeRemoteName(archivePkgName, version, revision, arch, variant)
 	tarballPath := filepath.Join(BinDir, tarballName)
 
 	foundBinary := false
@@ -2029,7 +2096,7 @@ func ensurePackageInstalledWithOptions(pkgName string, cfg *Config, noRemote boo
 		if index != nil {
 			shouldTryDownload = false
 			for _, entry := range index {
-				if entry.Name == pkgName && entry.Version == version && entry.Revision == revision && entry.Arch == arch && entry.Variant == variant {
+				if entry.Name == archivePkgName && entry.Version == version && entry.Revision == revision && entry.Arch == arch && entry.Variant == variant {
 					shouldTryDownload = true
 					expectedSum = entry.B3Sum
 					break
@@ -2037,7 +2104,7 @@ func ensurePackageInstalledWithOptions(pkgName string, cfg *Config, noRemote boo
 			}
 		}
 		if shouldTryDownload {
-			if err := fetchBinaryPackage(pkgName, version, revision, cfg, true, expectedSum, false); err == nil {
+			if err := fetchBinaryPackage(archivePkgName, version, revision, cfg, true, expectedSum, false); err == nil {
 				foundBinary = true
 			}
 		}
@@ -2099,7 +2166,8 @@ func ensureSplitPackageInstalled(sourcePkg, splitPkg string, cfg *Config, noRemo
 	isGeneric := cfg.Values["HOKUTO_GENERIC"] == "1" || options["generic"]
 	arch := GetSystemArchForPackage(cfg, sourcePkg)
 	variant := IdentifyVariant(splitPkg, isGeneric, isMultilibPackage(splitPkg))
-	tarballName := StandardizeRemoteName(splitPkg, version, revision, arch, variant)
+	archiveSplitName := canonicalParallelPackageName(splitPkg)
+	tarballName := StandardizeRemoteName(archiveSplitName, version, revision, arch, variant)
 	tarballPath := filepath.Join(BinDir, tarballName)
 
 	foundBinary := false
@@ -2112,7 +2180,7 @@ func ensureSplitPackageInstalled(sourcePkg, splitPkg string, cfg *Config, noRemo
 		if index != nil {
 			shouldTryDownload = false
 			for _, entry := range index {
-				if entry.Name == splitPkg && entry.Version == version && entry.Revision == revision && entry.Arch == arch && entry.Variant == variant {
+				if entry.Name == archiveSplitName && entry.Version == version && entry.Revision == revision && entry.Arch == arch && entry.Variant == variant {
 					shouldTryDownload = true
 					expectedSum = entry.B3Sum
 					break
@@ -2120,7 +2188,7 @@ func ensureSplitPackageInstalled(sourcePkg, splitPkg string, cfg *Config, noRemo
 			}
 		}
 		if shouldTryDownload {
-			if err := fetchBinaryPackage(splitPkg, version, revision, cfg, true, expectedSum, false); err == nil {
+			if err := fetchBinaryPackage(archiveSplitName, version, revision, cfg, true, expectedSum, false); err == nil {
 				foundBinary = true
 			}
 		}
@@ -2167,7 +2235,8 @@ func installAvailableSplitDependencyBinary(sourcePkg, splitPkg string, cfg *Conf
 	isGeneric := cfg.Values["HOKUTO_GENERIC"] == "1" || options["generic"]
 	arch := GetSystemArchForPackage(cfg, sourcePkg)
 	variant := IdentifyVariant(splitPkg, isGeneric, isMultilibPackage(splitPkg))
-	tarballPath := filepath.Join(BinDir, StandardizeRemoteName(splitPkg, version, revision, arch, variant))
+	archiveSplitName := canonicalParallelPackageName(splitPkg)
+	tarballPath := filepath.Join(BinDir, StandardizeRemoteName(archiveSplitName, version, revision, arch, variant))
 
 	if _, err := os.Stat(tarballPath); err != nil {
 		if noRemote || BinaryMirror == "" {
@@ -2180,7 +2249,7 @@ func installAvailableSplitDependencyBinary(sourcePkg, splitPkg string, cfg *Conf
 		if index != nil {
 			shouldTryDownload = false
 			for _, entry := range index {
-				if entry.Name == splitPkg && entry.Version == version && entry.Revision == revision && entry.Arch == arch && entry.Variant == variant {
+				if entry.Name == archiveSplitName && entry.Version == version && entry.Revision == revision && entry.Arch == arch && entry.Variant == variant {
 					shouldTryDownload = true
 					expectedSum = entry.B3Sum
 					break
@@ -2190,7 +2259,7 @@ func installAvailableSplitDependencyBinary(sourcePkg, splitPkg string, cfg *Conf
 		if !shouldTryDownload {
 			return false, nil
 		}
-		if err := fetchBinaryPackage(splitPkg, version, revision, cfg, true, expectedSum, false); err != nil {
+		if err := fetchBinaryPackage(archiveSplitName, version, revision, cfg, true, expectedSum, false); err != nil {
 			return false, err
 		}
 		if _, err := os.Stat(tarballPath); err != nil {
@@ -2264,7 +2333,7 @@ func ensureBinaryRuntimeDependenciesInstalledWithOptions(pkgName string, cfg *Co
 			}
 			depName = resolved
 		}
-		if depName == "" || depName == pkgName || shouldSkipMultilibMakeDep(dep, depName, cfg) {
+		if depName == "" || sameSourcePackage(depName, pkgName) || shouldSkipMultilibMakeDep(dep, depName, cfg) {
 			continue
 		}
 		if findInstalledSatisfying(depName, dep.Op, dep.Version) != "" {
@@ -2488,8 +2557,9 @@ func fetchExactBinaryTarballIfAvailable(pkgName, version, revision, variant stri
 	}
 
 	arch := GetSystemArchForPackage(cfg, pkgName)
+	archivePkgName := canonicalParallelPackageName(pkgName)
 	for _, entry := range index {
-		if entry.Name != pkgName || entry.Version != version || entry.Revision != revision || entry.Arch != arch || entry.Variant != variant {
+		if entry.Name != archivePkgName || entry.Version != version || entry.Revision != revision || entry.Arch != arch || entry.Variant != variant {
 			continue
 		}
 		if err := fetchSpecificBinaryPackage(entry.Name, entry.Version, entry.Revision, entry.Variant, cfg, true, entry.B3Sum, false); err != nil {
@@ -2529,7 +2599,7 @@ func availableBinaryPackageTarball(pkgName string, cfg *Config, noRemote bool) (
 			return "", "", false, err
 		}
 		tarballPath := filepath.Join(BinDir, StandardizeRemoteName(entry.Name, entry.Version, entry.Revision, entry.Arch, entry.Variant))
-		return entry.Name, tarballPath, true, nil
+		return lookupName, tarballPath, true, nil
 	}
 
 	if _, sourceErr := findPackageMetadataDir(lookupName); sourceErr != nil {

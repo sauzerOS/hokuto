@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -538,7 +539,8 @@ func installBuiltSplitPackageWithLogger(sourcePkg, splitPkg string, cfg *Config,
 	isGeneric := cfg.Values["HOKUTO_GENERIC"] == "1" || options["generic"]
 	arch := GetSystemArchForPackage(cfg, sourcePkg)
 	variant := IdentifyVariant(splitPkg, isGeneric, isMultilibPackage(splitPkg))
-	tarballPath := filepath.Join(BinDir, StandardizeRemoteName(splitPkg, version, revision, arch, variant))
+	archiveSplitName := canonicalParallelPackageName(splitPkg)
+	tarballPath := filepath.Join(BinDir, StandardizeRemoteName(archiveSplitName, version, revision, arch, variant))
 	if _, err := os.Stat(tarballPath); err != nil {
 		return fmt.Errorf("expected split package tarball missing: %s", tarballPath)
 	}
@@ -582,11 +584,15 @@ func packageHasSelfBuildDependency(pkgName string, cfg *Config) bool {
 		if !dep.Make || !activeBuildDependency(dep, cfg, false) {
 			continue
 		}
-		if dep.Name == pkgName {
-			return true
+		candidates, err := resolvedBuildDependencyCandidates(dep, false, cfg)
+		if err != nil {
+			continue
 		}
-		for _, alt := range dep.Alternatives {
-			if alt == pkgName {
+		for _, candidate := range candidates {
+			// Historical sources are planned as pkg-MAJOR while their depends
+			// files retain the canonical constraint (for example,
+			// java-openjdk-17 depending on java-openjdk==17*).
+			if candidate == pkgName {
 				return true
 			}
 		}
@@ -729,6 +735,75 @@ func getOutputPackageName(pkgName string, cfg *Config) string {
 		return prefix + pkgName
 	}
 	return pkgName
+}
+
+// getArchivePackageName returns the stable package identity used by binary
+// archives and the remote index. Historical pkg-MAJOR names exist only while
+// planning/building and after installation; they do not alter archive names.
+func getArchivePackageName(pkgName string, cfg *Config) string {
+	if baseName := canonicalParallelPackageName(pkgName); baseName != pkgName {
+		pkgName = baseName
+	}
+	return getOutputPackageName(pkgName, cfg)
+}
+
+func sameSourcePackage(a, b string) bool {
+	return canonicalParallelPackageName(a) == canonicalParallelPackageName(b)
+}
+
+func registerParallelPackageName(installName, archiveName string) {
+	if installName == "" || archiveName == "" || installName == archiveName {
+		return
+	}
+	versionedPkgBaseMu.Lock()
+	versionedPkgBaseNames[installName] = archiveName
+	versionedPkgBaseMu.Unlock()
+}
+
+func registerParallelPackageVersion(installName, version string) {
+	if installName == "" || version == "" {
+		return
+	}
+	versionedPkgBaseMu.Lock()
+	versionedPkgVersions[installName] = version
+	versionedPkgBaseMu.Unlock()
+}
+
+func parallelPackageVersion(name string) string {
+	versionedPkgBaseMu.RLock()
+	version := versionedPkgVersions[name]
+	versionedPkgBaseMu.RUnlock()
+	return version
+}
+
+func canonicalParallelPackageName(name string) string {
+	versionedPkgBaseMu.RLock()
+	baseName := versionedPkgBaseNames[name]
+	versionedPkgBaseMu.RUnlock()
+	if baseName != "" {
+		return baseName
+	}
+	if data, err := os.ReadFile(filepath.Join(Installed, name, "pkginfo")); err == nil {
+		if installedName := ParsePkgInfo(data)["name"]; installedName != "" {
+			return installedName
+		}
+	}
+	return name
+}
+
+func parallelInstallPackageName(pkgName, version string, cfg *Config) string {
+	outputName := getOutputPackageName(pkgName, cfg)
+	major := strings.SplitN(strings.TrimSpace(version), ".", 2)[0]
+	if major == "" {
+		return outputName
+	}
+	if _, err := strconv.Atoi(major); err != nil {
+		return outputName
+	}
+	installName := outputName + "-" + major
+	registerParallelPackageName(installName, outputName)
+	registerParallelPackageVersion(installName, version)
+	return installName
 }
 
 // buildRustFlags constructs RUSTFLAGS based on CFLAGS and CPU flags
@@ -1069,7 +1144,10 @@ for pattern in "$@"; do
     fi
 
     for src in $search; do
-        [ -e "$src" ] || continue
+        # A globbed SONAME chain may become temporarily dangling as its target
+        # is moved earlier in this loop. Preserve symlinks even when -e is
+        # false so split packages receive the complete chain.
+        [ -e "$src" ] || [ -L "$src" ] || continue
 
         if [ -n "$source_root" ]; then
             case "$src" in
@@ -2593,7 +2671,7 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, opts BuildOptions)
 	}
 
 	// Determine output package name (rename if cross-system is enabled)
-	outputPkgName := getOutputPackageName(pkgName, cfg)
+	outputPkgName := getArchivePackageName(pkgName, cfg)
 
 	debugf("%s built successfully, output in %s\n", pkgName, outputDir)
 
@@ -3332,7 +3410,7 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 	debugf("\n%s built successfully in %s, output in %s\n", pkgName, elapsed, outputDir)
 
 	// Determine output package name (rename if cross-system is enabled)
-	outputPkgName := getOutputPackageName(pkgName, cfg)
+	outputPkgName := getArchivePackageName(pkgName, cfg)
 
 	debugf("%s built successfully, output in %s\n", pkgName, outputDir)
 
@@ -3945,9 +4023,10 @@ func handleBuildCommand(args []string, cfg *Config) (err error) {
 			}
 			// Use output package name for tarball and installation (may be renamed for cross-system)
 			outputPkgName := getOutputPackageName(pkgName, cfg)
+			archivePkgName := getArchivePackageName(pkgName, cfg)
 			arch := GetSystemArchForPackage(cfg, pkgName)
 			variant := GetSystemVariantForPackage(cfg, pkgName)
-			tarballPath := filepath.Join(BinDir, StandardizeRemoteName(outputPkgName, version, revision, arch, variant))
+			tarballPath := filepath.Join(BinDir, StandardizeRemoteName(archivePkgName, version, revision, arch, variant))
 			isCriticalAtomic.Store(1)
 			handlePreInstallUninstall(outputPkgName, cfg, RootExec, false, nil)
 			if _, installErr := pkgInstall(tarballPath, outputPkgName, cfg, RootExec, true, false, false, nil); installErr != nil {
@@ -4320,6 +4399,7 @@ func handleBuildCommand(args []string, cfg *Config) (err error) {
 						// Fallback to build if version lookup fails (shouldn't happen if plan resolved)
 						return pkgBuild(pkgName, cfg, exec, opts)
 					}
+					archivePkgName := getArchivePackageName(pkgName, cfg)
 
 					// Try to fetch binary if configured
 					if !*noRemote && BinaryMirror != "" {
@@ -4327,7 +4407,7 @@ func handleBuildCommand(args []string, cfg *Config) (err error) {
 						index, err := GetCachedRemoteIndex(cfg)
 						shouldTryDownload := true
 						if err == nil {
-							if !IsPackageInIndex(index, pkgName, version, revision, cfg) {
+							if !IsPackageInIndex(index, archivePkgName, version, revision, cfg) {
 								shouldTryDownload = false
 							}
 						}
@@ -4337,21 +4417,20 @@ func handleBuildCommand(args []string, cfg *Config) (err error) {
 							targetArch := GetSystemArchForPackage(cfg, pkgName)
 							targetVariant := GetSystemVariantForPackage(cfg, pkgName)
 							for _, entry := range index {
-								if entry.Name == pkgName && entry.Version == version &&
+								if entry.Name == archivePkgName && entry.Version == version &&
 									entry.Revision == revision && entry.Arch == targetArch &&
 									entry.Variant == targetVariant {
 									expectedSum = entry.B3Sum
 									break
 								}
 							}
-							_ = fetchBinaryPackage(pkgName, version, revision, cfg, true, expectedSum, false)
+							_ = fetchBinaryPackage(archivePkgName, version, revision, cfg, true, expectedSum, false)
 						}
 					}
 
-					outputPkgName := getOutputPackageName(pkgName, cfg)
 					arch := GetSystemArch(cfg)
 					variant := GetSystemVariantForPackage(cfg, pkgName)
-					tarballPath := filepath.Join(BinDir, StandardizeRemoteName(outputPkgName, version, revision, arch, variant))
+					tarballPath := filepath.Join(BinDir, StandardizeRemoteName(archivePkgName, version, revision, arch, variant))
 
 					if _, err := os.Stat(tarballPath); err == nil {
 						// Found binary! Return success with 0 duration to signal "skipped build" (ready for install)
@@ -4419,9 +4498,10 @@ func handleBuildCommand(args []string, cfg *Config) (err error) {
 						}
 						version, revision, _ := getRepoVersion2(finalPkg)
 						outputFinalPkg := getOutputPackageName(finalPkg, cfg)
+						archiveFinalPkg := getArchivePackageName(finalPkg, cfg)
 						arch := GetSystemArchForPackage(cfg, finalPkg)
 						variant := GetSystemVariantForPackage(cfg, finalPkg)
-						tarballPath := filepath.Join(BinDir, StandardizeRemoteName(outputFinalPkg, version, revision, arch, variant))
+						tarballPath := filepath.Join(BinDir, StandardizeRemoteName(archiveFinalPkg, version, revision, arch, variant))
 						isCriticalAtomic.Store(1)
 						handlePreInstallUninstall(outputFinalPkg, cfg, RootExec, false, nil)
 						if _, err := pkgInstall(tarballPath, outputFinalPkg, cfg, RootExec, false, false, false, nil); err != nil {
@@ -4719,10 +4799,11 @@ func executeBuildPass(plan *BuildPlan, _ string, installAllTargets bool, cfg *Co
 					// Install the package immediately.
 					version, revision, _ := getRepoVersion2(pkgName)
 					outputPkgName := getOutputPackageName(pkgName, cfg)
+					archivePkgName := getArchivePackageName(pkgName, cfg)
 					wasInstalledBefore := isPackageInstalled(outputPkgName)
 					arch := GetSystemArchForPackage(cfg, pkgName)
 					variant := GetSystemVariantForPackage(cfg, pkgName)
-					tarballPath := filepath.Join(BinDir, StandardizeRemoteName(outputPkgName, version, revision, arch, variant))
+					tarballPath := filepath.Join(BinDir, StandardizeRemoteName(archivePkgName, version, revision, arch, variant))
 					installLogger := io.Writer(nil)
 					installFast := false
 					if !userRequestedMap[pkgName] {
@@ -4881,9 +4962,10 @@ func executeBuildPass(plan *BuildPlan, _ string, installAllTargets bool, cfg *Co
 						// Install the newly rebuilt parent
 						version, revision, _ := getRepoVersion2(parent)
 						outputParent := getOutputPackageName(parent, cfg)
+						archiveParent := getArchivePackageName(parent, cfg)
 						arch := GetSystemArchForPackage(cfg, parent)
 						variant := GetSystemVariantForPackage(cfg, parent)
-						tarballPath := filepath.Join(BinDir, StandardizeRemoteName(outputParent, version, revision, arch, variant))
+						tarballPath := filepath.Join(BinDir, StandardizeRemoteName(archiveParent, version, revision, arch, variant))
 						isCriticalAtomic.Store(1)
 						handlePreInstallUninstall(outputParent, cfg, RootExec, false, nil)
 						if _, installErr := pkgInstall(tarballPath, outputParent, cfg, RootExec, true, false, false, nil); installErr != nil {
@@ -4929,9 +5011,10 @@ func executeBuildPass(plan *BuildPlan, _ string, installAllTargets bool, cfg *Co
 					// B. Install the newly rebuilt package automatically
 					version, revision, _ := getRepoVersion2(rebuildPkg)
 					outputRebuildPkg := getOutputPackageName(rebuildPkg, cfg)
+					archiveRebuildPkg := getArchivePackageName(rebuildPkg, cfg)
 					arch := GetSystemArchForPackage(cfg, rebuildPkg)
 					variant := GetSystemVariantForPackage(cfg, rebuildPkg)
-					tarballPath := filepath.Join(BinDir, StandardizeRemoteName(outputRebuildPkg, version, revision, arch, variant))
+					tarballPath := filepath.Join(BinDir, StandardizeRemoteName(archiveRebuildPkg, version, revision, arch, variant))
 					isCriticalAtomic.Store(1)
 					handlePreInstallUninstall(outputRebuildPkg, cfg, RootExec, false, nil)
 					// Always run this non-interactively

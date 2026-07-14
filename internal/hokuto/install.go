@@ -441,6 +441,30 @@ func pkgInstall(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes
 	return pkgInstallWithRemotePolicy(tarballPath, pkgName, cfg, execCtx, yes, fast, managed, true, logger)
 }
 
+func stagedArchivePackageName(stagingDir, requestedName string) (string, error) {
+	metadataRoot := filepath.Join(stagingDir, "var", "db", "hokuto", "installed")
+	if info, err := os.Stat(filepath.Join(metadataRoot, requestedName)); err == nil && info.IsDir() {
+		return requestedName, nil
+	}
+	entries, err := os.ReadDir(metadataRoot)
+	if err != nil {
+		return "", fmt.Errorf("package archive has no installed metadata: %w", err)
+	}
+	var candidates []string
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		if _, err := os.Stat(filepath.Join(metadataRoot, entry.Name(), "pkginfo")); err == nil {
+			candidates = append(candidates, entry.Name())
+		}
+	}
+	if len(candidates) != 1 {
+		return "", fmt.Errorf("cannot determine package identity from archive: found %d metadata directories", len(candidates))
+	}
+	return candidates[0], nil
+}
+
 // pkgInstallWithRemotePolicy installs a package and controls whether runtime
 // dependencies discovered after extraction may be fetched from the binary
 // mirror. Callers that do not explicitly opt in retain pkgInstall's historical
@@ -567,13 +591,30 @@ func pkgInstallWithRemotePolicy(tarballPath, pkgName string, cfg *Config, execCt
 		}
 	}
 
+	archivePkgName, err := stagedArchivePackageName(stagingDir, pkgName)
+	if err != nil {
+		return nil, err
+	}
+
 	// 1.5. Verify package signature
 	sigLogger := logger
 	if fast {
 		sigLogger = io.Discard
 	}
-	if err := VerifyPackageSignature(stagingDir, pkgName, cfg, execCtx, sigLogger); err != nil {
+	if err := VerifyPackageSignature(stagingDir, archivePkgName, cfg, execCtx, sigLogger); err != nil {
 		return nil, err
+	}
+	if archivePkgName != pkgName {
+		from := filepath.Join(stagingDir, "var", "db", "hokuto", "installed", archivePkgName)
+		to := filepath.Join(stagingDir, "var", "db", "hokuto", "installed", pkgName)
+		if _, err := os.Stat(to); err == nil {
+			return nil, fmt.Errorf("cannot install %s as %s: target metadata already exists", archivePkgName, pkgName)
+		}
+		if err := os.Rename(from, to); err != nil {
+			if moveErr := execCtx.Run(exec.Command("mv", "--", from, to)); moveErr != nil {
+				return nil, fmt.Errorf("failed to assign parallel install identity %s to %s: %w", pkgName, archivePkgName, moveErr)
+			}
+		}
 	}
 
 	// Helper function to run diff with root executor fallback if permission denied

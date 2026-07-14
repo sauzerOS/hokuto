@@ -1284,6 +1284,8 @@ func prepareVersionedPackage(arg string) (string, error) {
 	// If already extracted, we can reuse it
 	if _, err := os.Stat(finalTmpDir); err == nil {
 		versionedPkgDirs[renamedPkgName] = finalTmpDir
+		registerParallelPackageName(renamedPkgName, pkgName)
+		registerParallelPackageVersion(renamedPkgName, foundVersion)
 		return renamedPkgName, nil
 	}
 
@@ -1363,6 +1365,8 @@ func prepareVersionedPackage(arg string) (string, error) {
 	}
 
 	versionedPkgDirs[renamedPkgName] = finalTmpDir
+	registerParallelPackageName(renamedPkgName, pkgName)
+	registerParallelPackageVersion(renamedPkgName, foundVersion)
 	colArrow.Print("-> ")
 	colSuccess.Printf("Extracted %s@%s (as %s) from commit %s into temporary directory\n", pkgName, foundVersion, renamedPkgName, foundCommit[:8])
 

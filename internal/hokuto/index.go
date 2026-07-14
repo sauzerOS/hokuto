@@ -211,7 +211,11 @@ func scanTarballMetadata(tarballPath string) (map[string]string, []string, error
 			}
 			for _, d := range depSpecs {
 				if !d.Make && !d.Optional && !d.Rebuild && !d.Suggest { // Only store hard runtime dependencies
-					dependencies = append(dependencies, d.Name)
+					name := d.Name
+					if len(d.Alternatives) > 1 {
+						name = strings.Join(d.Alternatives, " | ")
+					}
+					dependencies = append(dependencies, name+d.Op+d.Version)
 				}
 			}
 			continue

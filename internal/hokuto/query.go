@@ -631,7 +631,10 @@ func GetRemotePackageEntry(pkgName string, cfg *Config, remoteIndex []RepoEntry)
 
 	arch := GetSystemArch(cfg)
 	variant := GetSystemVariantForPackage(cfg, lookupName)
-	_, versionedMajor, versionedName := splitVersionedPackageName(lookupName)
+	versionedBase, versionedMajor, versionedName := splitVersionedPackageName(lookupName)
+	if targetVersion == "" && versionedName {
+		targetVersion = parallelPackageVersion(lookupName)
+	}
 
 	// Helper to search in a specific variant
 	searchInVariant := func(searchVariant string) *RepoEntry {
@@ -641,16 +644,9 @@ func GetRemotePackageEntry(pkgName string, cfg *Config, remoteIndex []RepoEntry)
 			if entry.Type == "meta" {
 				continue
 			}
-			// Match logic: exact name or versioned name (pkg-MAJOR)
-			match := entry.Name == lookupName
-			if !match && targetVersion != "" {
-				// If looking for a specific version, also check if the index has it under pkg-MAJOR
-				major := strings.Split(targetVersion, ".")[0]
-				if major != "" && entry.Name == lookupName+"-"+major {
-					match = true
-				}
-			}
-
+			// Historical parallel installs use pkg-MAJOR locally, while archives
+			// and index entries retain the canonical package name.
+			match := entry.Name == lookupName || (versionedName && entry.Name == versionedBase)
 			if match && entry.Arch == arch && entry.Variant == searchVariant {
 				if versionedName && strings.SplitN(entry.Version, ".", 2)[0] != versionedMajor {
 					continue

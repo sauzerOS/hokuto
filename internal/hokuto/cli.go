@@ -65,7 +65,7 @@ func printHelp() {
 		{"upload", "[options] [pkgname...]", "Upload local binaries to remote mirror and update index"},
 		{"depends", "[--reverse] <pkg>", "Show package dependencies or reverse dependencies"},
 		{"meta", "pkgname [-e] [-db]", "Show/edit package metadata or generate global DB"},
-		{"search, s", "[query | -tag <tag>]", "Search global package database"},
+		{"search, s", "[query | pkg@MAJOR | -tag <tag>]", "Search packages and major version lines"},
 		{"sync", "", "Manually sync global package database from mirror"},
 		{"cross-sync", "[-native] [-jN] [-i]", "Identify and build missing native cross (or aarch64 native) packages"},
 	}
@@ -212,7 +212,7 @@ func Main() {
 		// List of commands that support package name arguments and should handle @version
 		versionedSupportedCmds := map[string]bool{
 			"build": true, "b": true, "checksum": true, "c": true, "edit": true, "e": true, "cd": true,
-			"install": true, "i": true, "manifest": true, "m": true, "size": true, "uninstall": true, "r": true, "remove": true,
+			"manifest": true, "m": true, "size": true, "uninstall": true, "r": true, "remove": true,
 		}
 
 		if versionedSupportedCmds[cmd] {
@@ -776,7 +776,9 @@ func Main() {
 		}
 
 		for i, arg := range installPlan {
-			var tarballPath, pkgName string
+			var tarballPath, pkgName, resolvedVersion string
+			parallelVersionRequest := false
+			explicitlyRequested := userRequestedMap[arg]
 
 			if strings.HasSuffix(arg, ".tar.zst") {
 				// Case A: Direct Tarball
@@ -829,25 +831,29 @@ func Main() {
 			} else {
 				// Case B: Package Name (Auto-resolved or requested)
 				pkgName = arg
+				parallelVersionRequest = strings.Contains(arg, "@")
 				if idx := strings.Index(arg, "@"); idx != -1 {
 					pkgName = arg[:idx]
 				}
+				archivePkgName := canonicalParallelPackageName(pkgName)
 				// Keep package name as-is, but use multi variant in filename if multilib is enabled
 
 				version, revision, err := "", "", error(nil)
 				tarballFoundDirectly := false
 
-				// If --remote is used and a version is specified with @, prioritize remote index.
-				// This allows installing specific versions that might not be in the local HOKUTO_PATH.
-				if *remote && strings.Contains(arg, "@") {
-					rv, rr, rerr := GetRemotePackageVersion(arg, cfg, remoteIndex)
-					if rerr == nil {
-						version = rv
-						revision = rr
+				// Explicit versions must never silently resolve to the current source
+				// version. Prefer an exact cached archive, then the remote index.
+				if strings.Contains(arg, "@") {
+					if cached, cachedVersion, cachedRevision, ok := findCachedRequestedBinaryTarball(arg, cfg); ok && !*remote {
+						tarballPath = cached
+						version = cachedVersion
+						revision = cachedRevision
+						tarballFoundDirectly = true
 						err = nil
+					} else if !*noRemote && len(remoteIndex) > 0 {
+						version, revision, err = GetRemotePackageVersion(arg, cfg, remoteIndex)
 					} else {
-						// Fallback to local repo if remote doesn't have it (might be a local-only package)
-						version, revision, err = getRepoVersion2(arg)
+						err = fmt.Errorf("exact binary %s is not available in the local cache", arg)
 					}
 				} else {
 					version, revision, err = getRepoVersion2(arg)
@@ -924,7 +930,7 @@ func Main() {
 				} else if !tarballFoundDirectly {
 					arch := GetSystemArchForPackage(cfg, pkgName)
 					variant := GetSystemVariantForPackage(cfg, pkgName)
-					tarballPath = filepath.Join(BinDir, StandardizeRemoteName(pkgName, version, revision, arch, variant))
+					tarballPath = filepath.Join(BinDir, StandardizeRemoteName(archivePkgName, version, revision, arch, variant))
 				}
 
 				// 1. Check Local Cache (skip if we already found the tarball directly)
@@ -951,7 +957,7 @@ func Main() {
 							var expectedSum string
 							if len(remoteIndex) > 0 {
 								for _, entry := range remoteIndex {
-									if entry.Name == pkgName && entry.Version == version &&
+									if entry.Name == archivePkgName && entry.Version == version &&
 										entry.Revision == revision && entry.Arch == targetArch &&
 										entry.Variant == targetVariant {
 										inIndex = true
@@ -962,7 +968,7 @@ func Main() {
 							}
 
 							if inIndex {
-								if err := fetchBinaryPackage(pkgName, version, revision, cfg, effectiveFast, expectedSum, *remote); err == nil {
+								if err := fetchBinaryPackage(archivePkgName, version, revision, cfg, effectiveFast, expectedSum, *remote); err == nil {
 									foundOnMirror = true
 								} else {
 									debugf("Mirror fetch failed for %s: %v\n", pkgName, err)
@@ -992,7 +998,7 @@ func Main() {
 									expectedSumGeneric := ""
 									if len(remoteIndex) > 0 {
 										for _, entry := range remoteIndex {
-											if entry.Name == pkgName && entry.Version == version &&
+											if entry.Name == archivePkgName && entry.Version == version &&
 												entry.Revision == revision && entry.Arch == targetArch &&
 												entry.Variant == targetVariantGeneric {
 												inIndexGeneric = true
@@ -1008,11 +1014,11 @@ func Main() {
 										}
 
 										cfg.Values["HOKUTO_GENERIC"] = "1"
-										if err := fetchBinaryPackage(pkgName, version, revision, cfg, effectiveFast, expectedSumGeneric, *remote); err == nil {
+										if err := fetchBinaryPackage(archivePkgName, version, revision, cfg, effectiveFast, expectedSumGeneric, *remote); err == nil {
 											foundOnMirror = true
 											// Update tarballPath for installation
 											arch := GetSystemArchForPackage(cfg, pkgName)
-											tarballPath = filepath.Join(BinDir, StandardizeRemoteName(pkgName, version, revision, arch, fallbackVariant))
+											tarballPath = filepath.Join(BinDir, StandardizeRemoteName(archivePkgName, version, revision, arch, fallbackVariant))
 										}
 										cfg.Values["HOKUTO_GENERIC"] = oldGeneric
 									}
@@ -1033,7 +1039,7 @@ func Main() {
 									expectedSumMulti := ""
 									if len(remoteIndex) > 0 {
 										for _, entry := range remoteIndex {
-											if entry.Name == pkgName && entry.Version == version &&
+											if entry.Name == archivePkgName && entry.Version == version &&
 												entry.Revision == revision && entry.Arch == targetArch &&
 												entry.Variant == targetVariantMulti {
 												inIndexMulti = true
@@ -1044,11 +1050,11 @@ func Main() {
 									}
 
 									if inIndexMulti {
-										if err := fetchBinaryPackage(pkgName, version, revision, cfg, effectiveFast, expectedSumMulti, *remote); err == nil {
+										if err := fetchBinaryPackage(archivePkgName, version, revision, cfg, effectiveFast, expectedSumMulti, *remote); err == nil {
 											foundOnMirror = true
 											arch := GetSystemArchForPackage(cfg, pkgName)
 											variant := GetSystemVariantForPackage(cfg, pkgName)
-											tarballPath = filepath.Join(BinDir, StandardizeRemoteName(pkgName, version, revision, arch, variant))
+											tarballPath = filepath.Join(BinDir, StandardizeRemoteName(archivePkgName, version, revision, arch, variant))
 										}
 									}
 
@@ -1063,7 +1069,7 @@ func Main() {
 										expectedSumMultiGeneric := ""
 										if len(remoteIndex) > 0 {
 											for _, entry := range remoteIndex {
-												if entry.Name == pkgName && entry.Version == version &&
+												if entry.Name == archivePkgName && entry.Version == version &&
 													entry.Revision == revision && entry.Arch == targetArch &&
 													entry.Variant == targetVariantMultiGeneric {
 													inIndexMultiGeneric = true
@@ -1077,11 +1083,11 @@ func Main() {
 											oldGeneric := cfg.Values["HOKUTO_GENERIC"]
 											if oldGeneric != "1" {
 												cfg.Values["HOKUTO_GENERIC"] = "1"
-												if err := fetchBinaryPackage(pkgName, version, revision, cfg, effectiveFast, expectedSumMultiGeneric, *remote); err == nil {
+												if err := fetchBinaryPackage(archivePkgName, version, revision, cfg, effectiveFast, expectedSumMultiGeneric, *remote); err == nil {
 													foundOnMirror = true
 													arch := GetSystemArchForPackage(cfg, pkgName)
 													variant := GetSystemVariantForPackage(cfg, pkgName)
-													tarballPath = filepath.Join(BinDir, StandardizeRemoteName(pkgName, version, revision, arch, variant))
+													tarballPath = filepath.Join(BinDir, StandardizeRemoteName(archivePkgName, version, revision, arch, variant))
 												}
 												cfg.Values["HOKUTO_GENERIC"] = oldGeneric
 											}
@@ -1105,6 +1111,11 @@ func Main() {
 						}
 					}
 				}
+				resolvedVersion = version
+			}
+
+			if parallelVersionRequest {
+				pkgName = parallelInstallPackageName(pkgName, resolvedVersion, cfg)
 			}
 
 			handlePreInstallUninstall(pkgName, cfg, RootExec, effectiveYes, nil)
@@ -1130,7 +1141,7 @@ func Main() {
 
 			// --- Add to World File ---
 			// Only if the user explicitly requested this package (not auto-deps)
-			if userRequestedMap[pkgName] {
+			if explicitlyRequested || userRequestedMap[pkgName] {
 				if err := addToWorld(pkgName); err != nil {
 					fmt.Fprintf(os.Stderr, "Warning: failed to add %s to world file: %v\n", pkgName, err)
 				}
