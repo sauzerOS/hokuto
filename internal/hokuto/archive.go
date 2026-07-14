@@ -478,7 +478,9 @@ func createPackageTarball(pkgName, pkgVer, pkgRev, arch, variant, outputDir stri
 			}
 		}
 
-		args := []string{"--use-compress-program=zstd -T0 -19", "-cf", tarballPath, "-C", outputDir, "."}
+		// A 32 MiB window materially improves compression of large package
+		// members such as Java module and CDS images while retaining zstd -19.
+		args := []string{"--use-compress-program=zstd -T0 -19 --long=25", "-cf", tarballPath, "-C", outputDir, "."}
 		if !execCtx.ShouldRunAsRoot {
 			args = append(args, "--owner=0", "--group=0", "--numeric-owner")
 		}
@@ -512,6 +514,7 @@ func createPackageTarball(pkgName, pkgVer, pkgRev, arch, variant, outputDir stri
 	zw, err := zstd.NewWriter(outFile,
 		zstd.WithEncoderLevel(zstd.SpeedBestCompression),
 		zstd.WithEncoderConcurrency(runtime.GOMAXPROCS(0)),
+		zstd.WithWindowSize(32<<20),
 	)
 	if err != nil {
 		return fmt.Errorf("failed to create zstd writer: %v", err)
