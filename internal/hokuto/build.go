@@ -851,6 +851,23 @@ type BuildOptions struct {
 	UpdateWebsite bool      // If true, update the github.io status table
 }
 
+// reserveBuildTempDir atomically claims the first available numbered build
+// directory. Mkdir is the reservation, so parallel builds of the same package
+// cannot select the same path.
+func reserveBuildTempDir(parent, pkgName string) (string, error) {
+	if err := os.MkdirAll(parent, 0o755); err != nil {
+		return "", fmt.Errorf("failed to create build temporary directory %s: %w", parent, err)
+	}
+	for suffix := 1; ; suffix++ {
+		path := filepath.Join(parent, fmt.Sprintf("%s-%02d", pkgName, suffix))
+		if err := os.Mkdir(path, 0o755); err == nil {
+			return path, nil
+		} else if !os.IsExist(err) {
+			return "", fmt.Errorf("failed to reserve build temporary directory %s: %w", path, err)
+		}
+	}
+}
+
 func formatBuildDependency(dep DepSpec) string {
 	name := dep.Name
 	if len(dep.Alternatives) > 0 {
@@ -1653,31 +1670,18 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, opts BuildOptions)
 		currentTmpDir = cfg.Values["TMPDIR2"]
 	}
 
-	// set tmpdirs for build
-	// Append random two-digit number to pkgTmpDir to avoid conflicts
-	randNum := time.Now().UnixNano() % 100
-	pkgTmpDir := filepath.Join(currentTmpDir, fmt.Sprintf("%s-%02d", pkgName, randNum))
+	// Atomically reserve a predictable directory. Failed builds leave their
+	// directory behind, so the next attempt advances from -01 to -02, etc.
+	pkgTmpDir, err := reserveBuildTempDir(currentTmpDir, pkgName)
+	if err != nil {
+		return 0, err
+	}
 	logDir := filepath.Join(pkgTmpDir, "log")
 	buildDir := filepath.Join(pkgTmpDir, "build")
 	outputDir := filepath.Join(pkgTmpDir, "output")
 	splitRoot := filepath.Join(pkgTmpDir, "split")
 
-	// First try to cleanup pkgTmpDir with Go's os.RemoveAll
-	if os.Geteuid() == 0 {
-		if err := os.RemoveAll(pkgTmpDir); err != nil {
-			return 0, fmt.Errorf("failed to clean pkgTmpDir %s natively: %v", pkgTmpDir, err)
-		}
-	} else {
-		if err := os.RemoveAll(pkgTmpDir); err != nil {
-			// If that fails, fall back to system rm -rf with rootExec
-			rmCmd := exec.Command("rm", "-rf", pkgTmpDir)
-			if err2 := RootExec.Run(rmCmd); err2 != nil {
-				return 0, fmt.Errorf("failed to clean pkgTmpDir %s: %v (fallback also failed: %v)", pkgTmpDir, err, err2)
-			}
-		}
-	}
-
-	// Rereate build/output dirs (non-root, inside TMPDIR)
+	// Create build/output dirs (non-root, inside TMPDIR).
 	for _, dir := range []string{buildDir, outputDir, logDir, splitRoot} {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return 0, fmt.Errorf("failed to create dir %s: %v", dir, err)
@@ -3091,8 +3095,12 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 
 	// 1. Define the log file path
 	logPath := filepath.Join(logDir, "build-log.txt")
+	declaredBuildDeps, installedBuildDeps := buildLogDependencies(pkgDir, cfg)
+	if err := writeBuildLogHeader(logPath, pkgName, version, revision, startTime, declaredBuildDeps, installedBuildDeps); err != nil {
+		return fmt.Errorf("failed to initialize rebuild log: %w", err)
+	}
 	// Ensure logDir exists (already created above, but ensure it's there)
-	// script will create the log file itself
+	// script appends its PTY output after the structured header.
 
 	// Use script command to create a PTY, preserving colors and progress bars
 	// Build the command string to execute
@@ -3104,7 +3112,7 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 	// -c: command to run
 	// script writes the PTY session to the log file automatically
 	// script also outputs to stdout/stderr, which we capture for console
-	cmd := exec.Command("script", "-q", "-f", "-c", cmdStr, logPath)
+	cmd := exec.Command("script", "-q", "-f", "-a", "-c", cmdStr, logPath)
 	cmd.Dir = buildDir
 
 	// Set up environment with color support
@@ -3234,6 +3242,9 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 
 	// Check the single runErr variable (compiler knows it may be non-nil)
 	if runErr != nil {
+		if err := appendBuildLogStatus(logPath, pkgName, "failed", startTime, buildExec); err != nil {
+			debugf("Warning: failed to append rebuild failure status: %v\n", err)
+		}
 		cPrintf(colError, "\nBuild failed for %s: %v\n", pkgName, runErr)
 
 		// Set title to warning status
@@ -3287,6 +3298,7 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 		options:       options,
 		buildExec:     buildExec,
 		logger:        logger,
+		started:       startTime,
 		elapsed:       elapsed,
 		shouldStrip:   shouldStrip,
 		isGeneric:     isGeneric,
