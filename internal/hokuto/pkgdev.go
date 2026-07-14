@@ -218,9 +218,9 @@ func newPackage(pkgName string, targetDir string) error {
 		return fmt.Errorf("failed to create package directory %s: %w", pkgDir, err)
 	}
 
-	// 1) build file: mode 0755, content "#!/bin/sh -e\n"
+	// 1) build file: mode 0755, content "#!/bin/bash -e\n"
 	buildPath := filepath.Join(pkgDir, "build")
-	buildContent := []byte("#!/bin/sh -e\n")
+	buildContent := []byte("#!/bin/bash -e\n")
 	if err := os.WriteFile(buildPath, buildContent, 0o755); err != nil {
 		return fmt.Errorf("failed to create build file: %w", err)
 	}

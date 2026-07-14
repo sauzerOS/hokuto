@@ -616,7 +616,7 @@ func generatePackageFromArch(pkgName string, source string, targetDir string) er
 func generateBuildScript(info *PKGBUILDInfo, pkgName string) string {
 	var script strings.Builder
 
-	script.WriteString("#!/bin/sh -e\n")
+	script.WriteString("#!/bin/bash -e\n")
 	script.WriteString("# Auto-generated from PKGBUILD\n")
 	script.WriteString("# You may need to adjust this script for Hokuto\n\n")
 	if info.PrepareFunc != "" {
