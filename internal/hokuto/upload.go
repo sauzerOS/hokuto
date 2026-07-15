@@ -31,6 +31,25 @@ type optionalStringFlag struct {
 	Seen  bool
 }
 
+func r2MigrationSourceConfig(cfg *Config) *Config {
+	sourceCfg := &Config{Values: make(map[string]string)}
+	maps.Copy(sourceCfg.Values, cfg.Values)
+
+	const sourceMirror = "cloudflare-r2"
+	prefix := "MIRROR_" + sourceMirror + "_"
+	if cfg.Values[prefix+"URL"] != "" ||
+		cfg.Values[prefix+"ACCESS_KEY"] != "" ||
+		cfg.Values[prefix+"SECRET_KEY"] != "" {
+		sourceCfg.Values["HOKUTO_MIRROR_NAME"] = sourceMirror
+	} else {
+		// No named Cloudflare mirror is configured. Preserve support for the
+		// legacy R2_ACCOUNT_ID/R2_ACCESS_KEY_ID/R2_SECRET_ACCESS_KEY settings.
+		delete(sourceCfg.Values, "HOKUTO_MIRROR_NAME")
+	}
+
+	return sourceCfg
+}
+
 func (f *optionalStringFlag) String() string {
 	return f.Value
 }
@@ -157,13 +176,9 @@ func handleUploadCommand(args []string, cfg *Config) error {
 			return fmt.Errorf("failed to connect to destination mirror: %w", err)
 		}
 
-		// 2. Source Client (R2)
-		// Create a config copy and unset mirror name to force fallback
-		legacyCfg := &Config{Values: make(map[string]string)}
-		maps.Copy(legacyCfg.Values, cfg.Values)
-		delete(legacyCfg.Values, "HOKUTO_MIRROR_NAME")
-
-		sourceClient, err := NewR2Client(legacyCfg)
+		// 2. Source Client (R2). Prefer the named Cloudflare mirror and only
+		// fall back to the legacy R2_* configuration when it is not configured.
+		sourceClient, err := NewR2Client(r2MigrationSourceConfig(cfg))
 		if err != nil {
 			return fmt.Errorf("failed to connect to R2: %w", err)
 		}
