@@ -1105,9 +1105,24 @@ func resolveAlternativeDep(dep DepSpec, yes bool, cfg *Config) (string, error) {
 			available = append(available, altName)
 			continue
 		}
+		// Split outputs such as lib32-nvidia-utils may be buildable from a
+		// parent source package even though they have no standalone directory.
+		if _, _, ok := findSplitPackageSource(altName); ok {
+			available = append(available, altName)
+			continue
+		}
 		// Check if can be found in repos
 		if _, err := findPackageMetadataDir(altName); err == nil {
 			available = append(available, altName)
+			continue
+		}
+		// A binary-only or split package can exist solely in the remote index.
+		// The build command has normally fetched this index already, so this is
+		// process-local and does not add another network request.
+		if index, err := GetCachedRemoteIndex(cfg); err == nil {
+			if _, err := GetRemotePackageEntry(altName, cfg, index); err == nil {
+				available = append(available, altName)
+			}
 		}
 	}
 
