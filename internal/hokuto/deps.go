@@ -16,6 +16,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/gookit/color"
 	"github.com/schollz/progressbar/v3"
 )
 
@@ -1134,15 +1135,32 @@ func resolveAlternativeDep(dep DepSpec, yes bool, cfg *Config) (string, error) {
 	}
 
 	// Prompt user to choose
-	fmt.Printf("\nPackage requires one of the following dependencies:\n")
-	for i, alt := range available {
-		status := ""
-		if isPackageInstalled(alt) {
-			status = " (installed)"
-		}
-		fmt.Printf("  %d) %s%s\n", i+1, alt, status)
+	interactiveMu.Lock()
+	defer interactiveMu.Unlock()
+	if promptStartHook != nil {
+		promptStartHook()
 	}
-	fmt.Printf("Choose dependency [1-%d] (default: 1): ", len(available))
+	if promptEndHook != nil {
+		defer promptEndHook()
+	}
+
+	fmt.Println()
+	cPrintf(colArrow, "-> ")
+	cPrintln(colSuccess, "Package requires one of the following dependencies:")
+	for i, alt := range available {
+		cPrintf(colNote, "  %d) ", i+1)
+		cPrintf(color.Bold, "%s", alt)
+		if isPackageInstalled(alt) {
+			cPrintf(colSuccess, " (installed)")
+		}
+		fmt.Println()
+	}
+	cPrintf(colArrow, "-> ")
+	cPrintf(colSuccess, "Choose dependency ")
+	cPrintf(colNote, "[1-%d]", len(available))
+	cPrintf(colSuccess, " (default: ")
+	cPrintf(colNote, "1")
+	cPrintf(colSuccess, "): ")
 
 	stdinReader := bufio.NewReader(os.Stdin)
 	response, err := stdinReader.ReadString('\n')
