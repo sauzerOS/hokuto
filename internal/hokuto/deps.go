@@ -902,6 +902,13 @@ func resolveMissingDeps(pkgName string, processed map[string]bool, missing *[]st
 			}
 		}
 
+		// Make dependencies are only needed when the parent package will be
+		// built from source. Decide that before resolving alternatives so a
+		// binary/installed parent cannot trigger a prompt for an unused dep.
+		if dep.Make && (isPackageInstalled(pkgName) || binaryAvailableForPkg) && !forceBuild[pkgName] {
+			continue
+		}
+
 		depName := dep.Name
 
 		// Resolve alternative dependencies if present
@@ -916,11 +923,6 @@ func resolveMissingDeps(pkgName string, processed map[string]bool, missing *[]st
 
 		// Safety check: a package cannot depend on itself.
 		if sameSourcePackage(depName, pkgName) {
-			continue
-		}
-
-		// Skip Make dependencies if this package will not be built from source.
-		if dep.Make && (isPackageInstalled(pkgName) || binaryAvailableForPkg) && !forceBuild[pkgName] {
 			continue
 		}
 
@@ -1433,6 +1435,29 @@ func resolveBuildPlan(targetPackages []string, userRequestedPackages map[string]
 				}
 			}
 
+			// Resolve make-only dependencies only when this package is actually
+			// going to be built. In particular, do not ask the user to choose an
+			// alternative that an available binary will never consume.
+			if dep.Make {
+				hasBinary := binaryAvailable != nil && binaryAvailable[pkgName]
+				skip := false
+
+				// A binary is available locally or remotely and no rebuild was
+				// requested, so its build dependencies are irrelevant.
+				if hasBinary && !plan.RebuildPackages[pkgName] {
+					skip = true
+				}
+				// An installed dependency is also reused unless it was explicitly
+				// requested as a build target.
+				if isInstalled && !userRequestedPackages[pkgName] && !plan.RebuildPackages[pkgName] {
+					skip = true
+				}
+
+				if skip {
+					continue
+				}
+			}
+
 			depName := dep.Name
 
 			// Resolve alternative dependencies if present
@@ -1448,30 +1473,6 @@ func resolveBuildPlan(targetPackages []string, userRequestedPackages map[string]
 				continue
 			}
 
-			// Skip Make dependencies if:
-			// 1. The package is already installed, OR
-			// 2. A binary is available (locally or remotely) which we intend to use.
-			// AND it's not a forced rebuild.
-			hasBinary := binaryAvailable != nil && binaryAvailable[pkgName]
-
-			if dep.Make {
-				skip := false
-				// Case 1: Binary Available (e.g. from update check).
-				// We skip make deps even if userRequestedPackages is true (because update list counts as user requested),
-				// unless specifically forced to rebuild (which update generally doesn't set).
-				if hasBinary && !plan.RebuildPackages[pkgName] {
-					skip = true
-				}
-				// Case 2: Installed and NOT requested by user.
-				// If installed but user requested it (e.g. "build foo"), we do NOT skip make deps because we are rebuilding.
-				if isInstalled && !userRequestedPackages[pkgName] && !plan.RebuildPackages[pkgName] {
-					skip = true
-				}
-
-				if skip {
-					continue
-				}
-			}
 			if sameSourcePackage(depName, pkgName) {
 				continue
 			}
