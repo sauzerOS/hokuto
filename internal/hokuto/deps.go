@@ -658,7 +658,7 @@ func resolveDependencyList(parentPkg string, deps []DepSpec, visited map[string]
 
 		depName := dep.Name
 		if len(dep.Alternatives) > 0 {
-			resolved, err := resolveAlternativeDep(dep, yes, cfg)
+			resolved, err := resolveAlternativeDep(dep, yes, cfg, parentPkg)
 			if err != nil {
 				return fmt.Errorf("failed to resolve alternative dependency for %s: %w", parentPkg, err)
 			}
@@ -820,7 +820,7 @@ func resolveMissingDeps(pkgName string, processed map[string]bool, missing *[]st
 			}
 			depName := dep.Name
 			if len(dep.Alternatives) > 0 {
-				resolved, err := resolveAlternativeDep(dep, false, cfg)
+				resolved, err := resolveAlternativeDep(dep, false, cfg, pkgName)
 				if err != nil {
 					return fmt.Errorf("failed to resolve alternative dependency: %w", err)
 				}
@@ -906,7 +906,7 @@ func resolveMissingDeps(pkgName string, processed map[string]bool, missing *[]st
 
 		// Resolve alternative dependencies if present
 		if len(dep.Alternatives) > 0 {
-			resolved, err := resolveAlternativeDep(dep, false, cfg) // resolveMissingDeps doesn't have yes flag, use false
+			resolved, err := resolveAlternativeDep(dep, false, cfg, pkgName) // resolveMissingDeps doesn't have yes flag, use false
 			if err != nil {
 				return fmt.Errorf("failed to resolve alternative dependency: %w", err)
 			}
@@ -1069,7 +1069,7 @@ func resolveRemoteDependencies(pkgName string, visited map[string]bool, plan *[]
 // resolveAlternativeDep resolves an alternative dependency by checking which alternatives are available
 // and prompting the user to choose. Returns the chosen package name.
 // Uses a cache to avoid prompting multiple times for the same alternative set.
-func resolveAlternativeDep(dep DepSpec, yes bool, cfg *Config) (string, error) {
+func resolveAlternativeDep(dep DepSpec, yes bool, cfg *Config, requestingPkg ...string) (string, error) {
 	if len(dep.Alternatives) < 2 {
 		// Not an alternative dependency, return the name as-is
 		return dep.Name, nil
@@ -1161,7 +1161,17 @@ func resolveAlternativeDep(dep DepSpec, yes bool, cfg *Config) (string, error) {
 
 	fmt.Println()
 	cPrintf(colArrow, "-> ")
-	cPrintln(colSuccess, "Package requires one of the following dependencies:")
+	parent := ""
+	if len(requestingPkg) > 0 {
+		parent = strings.TrimSpace(requestingPkg[0])
+	}
+	if parent != "" {
+		cPrintf(colSuccess, "Package ")
+		cPrintf(color.Bold, "%s", parent)
+		cPrintln(colSuccess, " requires one of the following dependencies:")
+	} else {
+		cPrintln(colSuccess, "Package requires one of the following dependencies:")
+	}
 	for i, alt := range available {
 		cPrintf(colNote, "  %d) ", i+1)
 		cPrintf(color.Bold, "%s", alt)
@@ -1427,7 +1437,7 @@ func resolveBuildPlan(targetPackages []string, userRequestedPackages map[string]
 
 			// Resolve alternative dependencies if present
 			if len(dep.Alternatives) > 0 {
-				resolved, err := resolveAlternativeDep(dep, false, cfg) // Use false for build (no yes flag available)
+				resolved, err := resolveAlternativeDep(dep, false, cfg, pkgName) // Use false for build (no yes flag available)
 				if err != nil {
 					return fmt.Errorf("failed to resolve alternative dependency for %s: %w", pkgName, err)
 				}
@@ -1824,7 +1834,7 @@ func getPackageDependenciesForward(pkgName string, cfg *Config) ([]string, error
 
 			// Resolve alternative dependencies if present
 			if len(dep.Alternatives) > 0 {
-				resolved, err := resolveAlternativeDep(dep, false, cfg) // Use false for build (no yes flag available)
+				resolved, err := resolveAlternativeDep(dep, false, cfg, currentPkg) // Use false for build (no yes flag available)
 				if err != nil {
 					return fmt.Errorf("failed to resolve alternative dependency: %w", err)
 				}
