@@ -2516,10 +2516,13 @@ func installRuntimeDependencyBinaryOnly(pkgName string, cfg *Config, noRemote bo
 }
 
 func dependencyInstallLogger(quiet bool) (io.Writer, bool) {
+	if Debug {
+		return nil, false
+	}
 	if quiet {
 		return io.Discard, true
 	}
-	return nil, false
+	return nil, true
 }
 
 func newDependencyInstallProgress(total int, description string, quiet bool) *progressbar.ProgressBar {

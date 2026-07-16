@@ -3482,6 +3482,7 @@ func handleBuildCommand(args []string, cfg *Config) (err error) {
 	var superidleBuild = buildCmd.Bool("ii", false, "Use one CPU core and lowest niceness for build process.")
 	var verbose = buildCmd.Bool("v", false, "Enable verbose output.")
 	var verboseLong = buildCmd.Bool("verbose", false, "Enable verbose output.")
+	var debug = buildCmd.Bool("debug", false, "Enable debug output (HOKUTO_DEBUG=1).")
 	var bootstrap = buildCmd.Bool("bootstrap", false, "Enable bootstrap build mode.")
 	var bootstrapDir = buildCmd.String("bootstrap-dir", "", "Specify the bootstrap directory.")
 	var allDeps = buildCmd.Bool("alldeps", false, "Force rebuild of all dependencies")
@@ -3529,6 +3530,9 @@ func handleBuildCommand(args []string, cfg *Config) (err error) {
 
 	if err := buildCmd.Parse(args); err != nil {
 		return fmt.Errorf("error parsing build flags: %v", err)
+	}
+	if *debug {
+		enableRuntimeDebug(cfg)
 	}
 	if *noInstall && *autoInstall {
 		return fmt.Errorf("--no-install and -a cannot be used together")

@@ -78,6 +78,15 @@ func mergeEnvOverrides(cfg *Config) {
 	}
 }
 
+func enableRuntimeDebug(cfg *Config) {
+	Debug = true
+	WantDebug = "1"
+	if cfg != nil {
+		cfg.Values["HOKUTO_DEBUG"] = "1"
+	}
+	_ = os.Setenv("HOKUTO_DEBUG", "1")
+}
+
 func initConfig(cfg *Config) {
 	rootDir = cfg.Values["HOKUTO_ROOT"]
 	if rootDir == "" {

@@ -601,12 +601,15 @@ func Main() {
 		var multiFlag = installCmd.Bool("multi", false, "Install multilib variants of packages that support them.")
 		var remote = installCmd.Bool("remote", false, "Install from remote mirror even if not in HOKUTO_PATH.")
 		var noRemote = installCmd.Bool("no-remote", false, "Install only from local package sources and cached package files.")
-		var fast = installCmd.Bool("fast", false, "Enable fast install mode (progress bar, deferred tasks).")
+		var debug = installCmd.Bool("debug", false, "Enable debug output and detailed install mode (HOKUTO_DEBUG=1).")
 		var ask = installCmd.Bool("ask", false, "Show the install plan and ask before installing packages.")
 
 		if err := installCmd.Parse(os.Args[2:]); err != nil {
 			fmt.Fprintf(os.Stderr, "Error parsing install flags: %v\n", err)
 			os.Exit(1)
+		}
+		if *debug {
+			enableRuntimeDebug(cfg)
 		}
 
 		if *genericFlag || *genericShortFlag {
@@ -633,7 +636,7 @@ func Main() {
 			defer suppressRuntimeDependencyAutoInstallScope()()
 		}
 		effectiveYes := *yes || *yesLong
-		effectiveFast := *fast
+		effectiveFast := !Debug
 
 		var remoteIndex []RepoEntry
 		if *remote {
