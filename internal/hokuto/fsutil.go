@@ -723,6 +723,9 @@ func writeFileAsRoot(path string, data []byte, perm os.FileMode, execCtx *Execut
 	if os.Geteuid() == 0 {
 		return err // Should have worked if we are root
 	}
+	if execCtx == nil {
+		return err
+	}
 
 	// Write to temp file first
 	tmpFile, err := os.CreateTemp("", "hokuto-write-*")

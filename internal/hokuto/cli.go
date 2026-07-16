@@ -20,6 +20,7 @@ import (
 
 	"github.com/gookit/color"
 	"github.com/schollz/progressbar/v3"
+	"golang.org/x/sys/unix"
 )
 
 // printHelp prints the commands table
@@ -119,16 +120,49 @@ func printHelp() {
 // refreshPkgDBInBackground starts a detached, best-effort database refresh.
 // The child owns no terminal streams, so it cannot delay the command or add
 // output after edit, bump, or update has completed.
+const backgroundPkgDBRefreshEnv = "HOKUTO_BACKGROUND_PKG_DB_REFRESH"
+
+func pkgDBWritableByCurrentUser() bool {
+	path := PkgDBPath
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		path = filepath.Dir(path)
+	}
+	return unix.Access(path, unix.W_OK) == nil
+}
+
 func refreshPkgDBInBackground() {
 	executable, err := os.Executable()
 	if err != nil {
 		return
 	}
-	cmd := exec.Command(executable, "__refresh-pkg-db")
+
+	var cmd *exec.Cmd
+	if hasProcessPrivileges() || pkgDBWritableByCurrentUser() {
+		cmd = exec.Command(executable, "__refresh-pkg-db")
+		cmd.Env = append(os.Environ(), backgroundPkgDBRefreshEnv+"=1")
+		cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	} else {
+		// Check sudo while the parent still has its terminal/session context.
+		// Never let a detached refresh authenticate or fall back to run0: a
+		// best-effort background hook must not produce a polkit prompt.
+		if _, lookErr := exec.LookPath("sudo"); lookErr != nil {
+			return
+		}
+		check := exec.Command("sudo", "-n", "true")
+		check.Stdin = nil
+		check.Stdout = nil
+		check.Stderr = nil
+		if check.Run() != nil {
+			return
+		}
+		cmd = exec.Command("sudo", "-n", "-E", executable, "__refresh-pkg-db")
+		// Keep the controlling-session context used by sudo's timestamp while
+		// isolating the worker from Hokuto's foreground process group.
+		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	}
 	cmd.Stdin = nil
 	cmd.Stdout = nil
 	cmd.Stderr = nil
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	if err := cmd.Start(); err != nil {
 		return
 	}
@@ -303,6 +337,12 @@ func Main() {
 	switch os.Args[1] {
 	case "__refresh-pkg-db":
 		// Internal detached hook. All output is discarded by the parent.
+		if os.Getenv(backgroundPkgDBRefreshEnv) == "1" {
+			// This path was selected only because the database is directly
+			// writable. Disable all privilege fallback if that changes while the
+			// worker is running.
+			RootExec = nil
+		}
 		_ = generatePkgDBQuiet(cfg)
 
 	case "__complete":
