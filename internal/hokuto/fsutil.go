@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"bufio"
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -573,13 +574,21 @@ func getModifiedFiles(pkgName, rootDir string, execCtx *Executor) ([]string, err
 	// Compute checksums using the unified optimized path
 	checksums, err := ComputeChecksums(filesToCheck, execCtx)
 	if err != nil {
-		// Fall back to manual loop if batch fails (though ComputeChecksums already has fallbacks)
+		// Preserve successful batch results and retry only failed paths. A
+		// permission failure must escape this function so install.go can retry
+		// with the root executor; silently omitting it would make a modified
+		// protected configuration file look unmodified.
 		debugf("ComputeChecksums failed in getModifiedFiles: %v\n", err)
-		checksums = make(map[string]string)
 		for _, absPath := range filesToCheck {
+			if _, ok := checksums[absPath]; ok {
+				continue
+			}
 			sum, err := ComputeChecksum(absPath, execCtx)
 			if err != nil {
-				continue // skip missing files or checksum failures
+				if errors.Is(err, os.ErrNotExist) {
+					continue // Missing files will be restored by the package update.
+				}
+				return nil, fmt.Errorf("failed to checksum installed file %s: %w", absPath, err)
 			}
 			checksums[absPath] = sum
 		}
