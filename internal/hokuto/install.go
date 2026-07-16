@@ -86,6 +86,10 @@ func getRebuildTriggers(triggerPkg string, rootDir string) []string {
 }
 
 func readPackageSuggestions(pkgName, rootDir string) []packageSuggestion {
+	return readPackageSuggestionsForCollection(pkgName, rootDir, false)
+}
+
+func readPackageSuggestionsForCollection(pkgName, rootDir string, includeSatisfied bool) []packageSuggestion {
 	suggestsPath := filepath.Join(rootDir, "var", "db", "hokuto", "installed", pkgName, "suggests")
 	data, err := os.ReadFile(suggestsPath)
 	if err != nil {
@@ -114,7 +118,7 @@ func readPackageSuggestions(pkgName, rootDir string) []packageSuggestion {
 		if len(alternates) == 0 && depSpec.Name != "" {
 			alternates = []string{depSpec.Name}
 		}
-		if len(alternates) == 0 || suggestionSatisfied(depSpec) {
+		if len(alternates) == 0 || (!includeSatisfied && suggestionSatisfied(depSpec)) {
 			continue
 		}
 
@@ -162,15 +166,15 @@ func suggestionAlternativesInstalled(item packageSuggestion) bool {
 }
 
 func collectPackageSuggestions(pkgName, rootDir string) {
-	missing := readPackageSuggestions(pkgName, rootDir)
-	if len(missing) == 0 {
+	declared := readPackageSuggestionsForCollection(pkgName, rootDir, true)
+	if len(declared) == 0 {
 		return
 	}
 
 	packageSuggestions.Lock()
 	defer packageSuggestions.Unlock()
 
-	for _, item := range missing {
+	for _, item := range declared {
 		if packageSuggestions.items[item.Package] == nil {
 			packageSuggestions.items[item.Package] = make(map[string]packageSuggestion)
 		}
@@ -190,9 +194,6 @@ func collectMetaPackageSuggestions(meta MetaPackage) {
 		packageSuggestions.items[meta.Name] = make(map[string]packageSuggestion)
 	}
 	for _, depSpec := range meta.Suggests {
-		if suggestionSatisfied(depSpec) {
-			continue
-		}
 		alternates := append([]string(nil), depSpec.Alternatives...)
 		if len(alternates) == 0 && depSpec.Name != "" {
 			alternates = []string{depSpec.Name}
@@ -242,11 +243,19 @@ func flushPackageSuggestions(logger io.Writer, cfg *Config, noRemote bool, promp
 	}
 
 	var packages []string
+	pending := make(map[string][]packageSuggestion)
 	for pkg := range items {
 		if !packageOrMetaInstalled(pkg) {
 			continue
 		}
-		packages = append(packages, pkg)
+		for _, item := range items[pkg] {
+			if !suggestionAlternativesInstalled(item) {
+				pending[pkg] = append(pending[pkg], item)
+			}
+		}
+		if len(pending[pkg]) > 0 {
+			packages = append(packages, pkg)
+		}
 	}
 	if len(packages) == 0 {
 		return
@@ -260,10 +269,7 @@ func flushPackageSuggestions(logger io.Writer, cfg *Config, noRemote bool, promp
 		fmt.Fprint(logger, colArrow.Sprint("-> "))
 		fmt.Fprintln(logger, colNote.Sprintf("%s:", pkg))
 
-		var suggestions []packageSuggestion
-		for _, item := range items[pkg] {
-			suggestions = append(suggestions, item)
-		}
+		suggestions := pending[pkg]
 		sort.Slice(suggestions, func(i, j int) bool {
 			if suggestions[i].Dependency == suggestions[j].Dependency {
 				return suggestions[i].Text < suggestions[j].Text
