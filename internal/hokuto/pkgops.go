@@ -936,18 +936,12 @@ func executePostInstall(pkgName, rootDir string, execCtx *Executor, cfg *Config,
 		cmd = exec.Command("chroot", rootDir, scriptPath)
 	}
 
-	// Inject MULTILIB environment variable
-	cmd.Env = os.Environ() // Start with system environment
-	if cfg.Values["HOKUTO_MULTILIB"] == "1" {
-		cmd.Env = append(cmd.Env, "MULTILIB=1")
-	}
-
 	// Get the user who invoked sudo (SUDO_USER) or current user
 	realUser := os.Getenv("SUDO_USER")
 	if realUser == "" {
 		realUser = os.Getenv("USER")
 	}
-	cmd.Env = append(os.Environ(), fmt.Sprintf("HOKUTO_REAL_USER=%s", realUser))
+	cmd.Env = postInstallEnvironment(pkgName, hostScript, realUser, cfg)
 
 	if logger != nil {
 		cmd.Stdout = logger
@@ -1023,6 +1017,44 @@ func executePostInstall(pkgName, rootDir string, execCtx *Executor, cfg *Config,
 		return fmt.Errorf("post-install script %s failed: %v", hostScript, err)
 	}
 	return nil
+}
+
+func postInstallEnvironment(pkgName, hostScript, realUser string, cfg *Config) []string {
+	// Package identity comes from metadata embedded in the binary archive, so
+	// hooks receive the same values for local and remote installations.
+	env := os.Environ()
+	if cfg != nil && cfg.Values["HOKUTO_MULTILIB"] == "1" {
+		env = setEnvironmentValue(env, "MULTILIB", "1")
+	}
+	env = setEnvironmentValue(env, "HOKUTO_PACKAGE_NAME", pkgName)
+	env = setEnvironmentValue(env, "HOKUTO_REAL_USER", realUser)
+
+	versionPath := filepath.Join(filepath.Dir(hostScript), "version")
+	if versionData, err := os.ReadFile(versionPath); err == nil {
+		fields := strings.Fields(string(versionData))
+		if len(fields) > 0 {
+			env = setEnvironmentValue(env, "HOKUTO_VERSION", fields[0])
+			env = setEnvironmentValue(env, "HOKUTO_PACKAGE_VERSION", fields[0])
+		}
+		if len(fields) > 1 {
+			env = setEnvironmentValue(env, "HOKUTO_PACKAGE_REVISION", fields[1])
+		}
+	} else {
+		debugf("Could not read package version for post-install hook %s: %v\n", pkgName, err)
+	}
+
+	return env
+}
+
+func setEnvironmentValue(env []string, key, value string) []string {
+	prefix := key + "="
+	filtered := make([]string, 0, len(env)+1)
+	for _, entry := range env {
+		if !strings.HasPrefix(entry, prefix) {
+			filtered = append(filtered, entry)
+		}
+	}
+	return append(filtered, prefix+value)
 }
 
 func getPackageDependenciesToUninstall(name string) []string {
