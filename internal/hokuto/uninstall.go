@@ -219,8 +219,7 @@ func pkgUninstallWithRemovalSet(pkgName string, cfg *Config, execCtx *Executor, 
 	restoredFilesToKeep := make(map[string]bool)
 	// New API: returns map of restored files
 	if restoredMap, err := restoreAlternativesOnUninstallSet(pkgName, hRoot, execCtx, removing); err != nil {
-		debugf("Warning: failed to restore alternatives for %s: %v\n", pkgName, err)
-		// Non-fatal, continue with uninstall
+		return fmt.Errorf("refusing to uninstall %s because alternatives could not be restored: %w", pkgName, err)
 	} else {
 		for f := range restoredMap {
 			restoredFilesToKeep[f] = true

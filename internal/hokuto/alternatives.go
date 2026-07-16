@@ -512,6 +512,14 @@ func createAlternativeTempDir(targetPath string, execCtx *Executor) (string, err
 	if dir == "" {
 		return "", fmt.Errorf("mktemp returned an empty directory path")
 	}
+	// Privileged mktemp creates a root-owned 0700 directory. Hokuto still
+	// needs to lstat the staged entry before delegating mutations back to the
+	// privileged executor. Allow traversal without making the directory
+	// listable or writable by the invoking user.
+	if err := execCtx.Run(exec.Command("chmod", "0711", "--", dir)); err != nil {
+		_ = execCtx.Run(exec.Command("rmdir", "--", dir))
+		return "", fmt.Errorf("failed to prepare alternative temporary directory: %w", err)
+	}
 	return dir, nil
 }
 
@@ -1021,8 +1029,7 @@ func restoreAlternativesOnUninstallSet(pkgName, hRoot string, execCtx *Executor,
 
 				if candidate != nil {
 					if err := restoreAlternativeContent(hRoot, path, candidate, execCtx); err != nil {
-						debugf("Failed to restore alternative for %s: %v\n", path, err)
-						continue
+						return nil, fmt.Errorf("failed to restore alternative for %s: %w", path, err)
 					}
 					setActiveAlternative(entry, candidate)
 
