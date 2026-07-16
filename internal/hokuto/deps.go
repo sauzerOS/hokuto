@@ -434,6 +434,13 @@ func depSpecsFromNames(names []string) []DepSpec {
 	return deps
 }
 
+// repoEntryHasDependencyMetadata distinguishes a dependency-free package from
+// an older index entry that was never scanned. Keep accepting populated legacy
+// entries, while current entries may legitimately contain an empty Depends list.
+func repoEntryHasDependencyMetadata(entry RepoEntry) bool {
+	return entry.MetadataVersion >= repoEntryMetadataVersion || len(entry.Depends) > 0
+}
+
 func resolveBinaryDependenciesFromArchive(pkgName string, cfg *Config, remoteIndex []RepoEntry, allowRemote bool) ([]DepSpec, bool, error) {
 	lookupName := pkgName
 	if idx := strings.Index(pkgName, "@"); idx != -1 {
@@ -476,12 +483,11 @@ func resolveBinaryDependenciesFromArchive(pkgName string, cfg *Config, remoteInd
 	}
 	entry := *entryRef
 
-	_, _, parallelName := splitVersionedPackageName(lookupName)
-	if len(entry.Depends) > 0 && !strings.Contains(pkgName, "@") && !parallelName {
+	if repoEntryHasDependencyMetadata(entry) {
 		return depSpecsFromNames(entry.Depends), true, nil
 	}
 
-	if err := fetchSpecificBinaryPackage(entry.Name, entry.Version, entry.Revision, entry.Variant, cfg, true, entry.B3Sum, false); err != nil {
+	if err := fetchSpecificBinaryPackage(entry.Name, entry.Version, entry.Revision, entry.Variant, cfg, !Debug, entry.B3Sum, false); err != nil {
 		return nil, true, fmt.Errorf("failed to fetch %s for dependency resolution: %w", lookupName, err)
 	}
 
@@ -1030,23 +1036,19 @@ func resolveRemoteDependencies(pkgName string, visited map[string]bool, plan *[]
 	var entry = *entryRef
 
 	var deps []DepSpec
-	lookupName := pkgName
-	if idx := strings.Index(lookupName, "@"); idx != -1 {
-		lookupName = lookupName[:idx]
-	}
-	_, _, parallelName := splitVersionedPackageName(lookupName)
-	if len(entry.Depends) > 0 && !strings.Contains(pkgName, "@") && !parallelName {
+	if repoEntryHasDependencyMetadata(entry) {
 		// Optimization: Use pre-resolved dependencies from index
 		deps = depSpecsFromNames(entry.Depends)
 	} else {
 		// Fallback: Fetch binary package to read depends (older index or missing info)
-		if err := fetchSpecificBinaryPackage(entry.Name, entry.Version, entry.Revision, entry.Variant, cfg, false, entry.B3Sum, false); err != nil {
+		if err := fetchSpecificBinaryPackage(entry.Name, entry.Version, entry.Revision, entry.Variant, cfg, !Debug, entry.B3Sum, false); err != nil {
 			return fmt.Errorf("failed to fetch remote package for dependency resolution (%s): %v", pkgName, err)
 		}
 
-		arch := GetSystemArch(cfg)
-		variant := GetSystemVariantForPackage(cfg, entry.Name)
-		tarballName := StandardizeRemoteName(entry.Name, entry.Version, entry.Revision, arch, variant)
+		tarballName := entry.Filename
+		if tarballName == "" {
+			tarballName = StandardizeRemoteName(entry.Name, entry.Version, entry.Revision, entry.Arch, entry.Variant)
+		}
 		tarballPath := filepath.Join(BinDir, tarballName)
 
 		// 5. Scan metadata (pkginfo and depends)
