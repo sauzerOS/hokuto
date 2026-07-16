@@ -13,6 +13,12 @@ import (
 // It deliberately emits no diagnostics: shell completion must remain parseable
 // when local repositories or the remote mirror are unavailable.
 func printInstallCompletionCandidates(cfg *Config) {
+	for _, name := range installCompletionCandidates(cfg) {
+		fmt.Println(name)
+	}
+}
+
+func installCompletionCandidates(cfg *Config) []string {
 	names := make(map[string]struct{})
 	add := func(name string) {
 		name = strings.TrimSpace(name)
@@ -44,6 +50,27 @@ func printInstallCompletionCandidates(cfg *Config) {
 		add(name)
 	}
 
+	result := make([]string, 0, len(names))
+	for name := range names {
+		result = append(result, name)
+	}
+	sort.Strings(result)
+	return result
+}
+
+func printLogCompletionCandidates(cfg *Config) {
+	names := make(map[string]struct{})
+	for _, name := range installCompletionCandidates(cfg) {
+		names[name] = struct{}{}
+	}
+	installedRoot := filepath.Join(rootDir, "var", "db", "hokuto", "installed")
+	if entries, err := os.ReadDir(installedRoot); err == nil {
+		for _, entry := range entries {
+			if entry.IsDir() {
+				names[entry.Name()] = struct{}{}
+			}
+		}
+	}
 	result := make([]string, 0, len(names))
 	for name := range names {
 		result = append(result, name)

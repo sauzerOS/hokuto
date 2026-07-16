@@ -6,7 +6,6 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"io"
 	"math/rand"
 	"os"
 	"os/exec"
@@ -21,7 +20,6 @@ import (
 
 	"github.com/gookit/color"
 	"github.com/schollz/progressbar/v3"
-	"github.com/ulikunitz/xz"
 )
 
 // printHelp prints the commands table
@@ -40,7 +38,7 @@ func printHelp() {
 	// Restore detailed descriptions including command-specific options
 	cmds := []cmdInfo{
 		{"version, --version", "", "Version information"},
-		{"log", "", "TUI build log viewer"},
+		{"log", "[pkg]", "View saved build logs (TUI when no package is given)"},
 		{"list, ls", "<pkg>", "List installed packages, optionally filter by name"},
 		{"checksum, c", "<pkg>", "Fetch sources and generate checksum file"},
 		{"build, b", "<pkg>", "Build package(s)"},
@@ -308,55 +306,28 @@ func Main() {
 		_ = generatePkgDBQuiet(cfg)
 
 	case "__complete":
-		if len(os.Args) >= 3 && os.Args[2] == "install" {
-			printInstallCompletionCandidates(cfg)
+		if len(os.Args) >= 3 {
+			switch os.Args[2] {
+			case "install":
+				printInstallCompletionCandidates(cfg)
+			case "log":
+				printLogCompletionCandidates(cfg)
+			}
 		}
 	case "log":
 		if len(os.Args) >= 3 {
 			pkgName := os.Args[2]
-			installedDir := filepath.Join(rootDir, "/var/db/hokuto/installed", pkgName)
-			logXZPath := filepath.Join(installedDir, "log.xz")
-
-			if _, err := os.Stat(logXZPath); err == nil {
-				// Decompress and display
-				f, err := os.Open(logXZPath)
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "Error opening log: %v\n", err)
-					os.Exit(1)
-				}
-				defer f.Close()
-
-				xr, err := xz.NewReader(f)
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "Error creating xz reader: %v\n", err)
-					os.Exit(1)
-				}
-
-				// Pipe to a pager if possible, otherwise dump to stdout
-				pager := os.Getenv("PAGER")
-				var args []string
-				if pager == "" {
-					pager = "less"
-					args = []string{"-r"}
-				} else if pager == "less" {
-					args = []string{"-r"}
-				}
-
-				cmd := exec.Command(pager, args...)
-				cmd.Stdin = xr
-				cmd.Stdout = os.Stdout
-				cmd.Stderr = os.Stderr
-
-				if err := cmd.Run(); err != nil {
-					// Fallback to plain stdout if pager fails
-					f.Seek(0, 0)
-					xr, _ = xz.NewReader(f)
-					io.Copy(os.Stdout, xr)
-				}
-			} else {
-				fmt.Fprintf(os.Stderr, "No build log found for package %s\n", pkgName)
-				os.Exit(1)
+			logPath, cleanup, err := preparePackageBuildLog(pkgName, cfg)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Log lookup failed: %v\n", err)
+				exitCode = 1
+				break
 			}
+			if err := displayCompressedBuildLog(logPath); err != nil {
+				fmt.Fprintf(os.Stderr, "Failed to display build log: %v\n", err)
+				exitCode = 1
+			}
+			cleanup()
 		} else {
 			exitCode = runTUI()
 		}

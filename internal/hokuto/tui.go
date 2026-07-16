@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -30,17 +31,28 @@ var (
 	tuiHeaderBox    *tview.TextView
 	tuiLogView      *tview.TextView
 	tuiFooterBox    *tview.TextView
+	tuiSearchField  *tview.InputField
 	tuiFlex         *tview.Flex
 	tuiUpdateChan   chan []logInfo
 	tuiPrevContent  map[string]string // Track previous content per log path
 	tuiShouldScroll bool              // Flag to force scroll to end on next update
+	tuiSearchActive bool
+	tuiSearchQuery  string
+	tuiSearchStatus string
+	tuiSearchRow    int
 )
+
+var tuiANSISequence = regexp.MustCompile(`\x1b\[[0-?]*[ -/]*[@-~]`)
 
 func runTUI() int {
 	// Initialize channels and maps
 	tuiUpdateChan = make(chan []logInfo, 10)
 	tuiPrevContent = make(map[string]string)
 	tuiPrevIdx = -1
+	tuiSearchActive = false
+	tuiSearchQuery = ""
+	tuiSearchStatus = ""
+	tuiSearchRow = -1
 
 	// Create the application
 	tuiApp = tview.NewApplication()
@@ -58,10 +70,7 @@ func runTUI() int {
 	tuiLogView = tview.NewTextView().
 		SetDynamicColors(true).
 		SetWrap(false).
-		SetScrollable(true).
-		SetChangedFunc(func() {
-			tuiApp.Draw()
-		})
+		SetScrollable(true)
 	tuiLogView.SetBorder(true)
 
 	// Create footer box with border
@@ -70,16 +79,38 @@ func runTUI() int {
 		SetWrap(true).
 		SetTextAlign(tview.AlignLeft)
 	tuiFooterBox.SetBorder(true)
+	tuiSearchField = tview.NewInputField().
+		SetLabel("Search: ").
+		SetFieldWidth(0)
+	tuiSearchField.SetBorder(true)
+	tuiSearchField.SetDoneFunc(func(key tcell.Key) {
+		query := strings.TrimSpace(tuiSearchField.GetText())
+		tuiSearchActive = false
+		tuiFlex.ResizeItem(tuiSearchField, 0, 0)
+		tuiApp.SetFocus(tuiLogView)
+		if key == tcell.KeyEnter && query != "" {
+			if query != tuiSearchQuery {
+				tuiSearchRow = -1
+			}
+			tuiSearchQuery = query
+			findTUILogMatch(1, true)
+		}
+		updateTUI()
+	})
 
 	// Create flex layout: header (fixed) + log (flexible) + footer (fixed)
 	tuiFlex = tview.NewFlex().
 		SetDirection(tview.FlexRow).
 		AddItem(tuiHeaderBox, 3, 0, false). // Header: 3 lines (title + info + border)
 		AddItem(tuiLogView, 0, 1, true).    // Log: flexible, takes remaining space
-		AddItem(tuiFooterBox, 4, 0, false)  // Footer: fixed height (same as header)
+		AddItem(tuiSearchField, 0, 0, false).
+		AddItem(tuiFooterBox, 5, 0, false)
 
 	// Set up key handlers
 	tuiFlex.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		if tuiSearchActive {
+			return event
+		}
 		key := event.Key()
 		rune := event.Rune()
 
@@ -95,6 +126,8 @@ func runTUI() int {
 					tuiActiveIdx = len(tuiLogs) - 1
 				}
 				tuiShouldScroll = true
+				tuiSearchRow = -1
+				tuiSearchStatus = ""
 				updateTUI()
 			}
 			return nil
@@ -105,6 +138,8 @@ func runTUI() int {
 					tuiActiveIdx = 0
 				}
 				tuiShouldScroll = true
+				tuiSearchRow = -1
+				tuiSearchStatus = ""
 				updateTUI()
 			}
 			return nil
@@ -141,6 +176,17 @@ func runTUI() int {
 		case tcell.KeyRune:
 			// Handle rune keys
 			switch rune {
+			case '/':
+				openTUISearch()
+				return nil
+			case 'n':
+				findTUILogMatch(1, false)
+				updateTUI()
+				return nil
+			case 'N':
+				findTUILogMatch(-1, false)
+				updateTUI()
+				return nil
 			case 'q':
 				tuiApp.Stop()
 				return nil
@@ -171,6 +217,8 @@ func runTUI() int {
 						tuiActiveIdx = len(tuiLogs) - 1
 					}
 					tuiShouldScroll = true
+					tuiSearchRow = -1
+					tuiSearchStatus = ""
 					updateTUI()
 				}
 				return nil
@@ -181,6 +229,8 @@ func runTUI() int {
 						tuiActiveIdx = 0
 					}
 					tuiShouldScroll = true
+					tuiSearchRow = -1
+					tuiSearchStatus = ""
 					updateTUI()
 				}
 				return nil
@@ -205,32 +255,27 @@ func runTUI() int {
 	// Start update handler goroutine
 	go func() {
 		for logs := range tuiUpdateChan {
-			// Track the currently viewed log path to maintain focus
-			var currentLogPath string
-			if tuiActiveIdx < len(tuiLogs) {
-				currentLogPath = tuiLogs[tuiActiveIdx].path
-			}
-
-			tuiLogs = logs
-
-			// Try to maintain focus on the same log file
-			if currentLogPath != "" {
-				found := false
-				for i, log := range tuiLogs {
-					if log.path == currentLogPath {
-						tuiActiveIdx = i
-						found = true
-						break
+			tuiApp.QueueUpdateDraw(func() {
+				// Keep all shared TUI state on the application goroutine so search,
+				// scrolling, and periodic refreshes cannot race each other.
+				var currentLogPath string
+				if tuiActiveIdx < len(tuiLogs) {
+					currentLogPath = tuiLogs[tuiActiveIdx].path
+				}
+				tuiLogs = logs
+				if currentLogPath != "" {
+					found := false
+					for i, log := range tuiLogs {
+						if log.path == currentLogPath {
+							tuiActiveIdx = i
+							found = true
+							break
+						}
+					}
+					if !found && tuiActiveIdx >= len(tuiLogs) && len(tuiLogs) > 0 {
+						tuiActiveIdx = len(tuiLogs) - 1
 					}
 				}
-				// Only adjust if the log we were viewing disappeared
-				if !found && tuiActiveIdx >= len(tuiLogs) && len(tuiLogs) > 0 {
-					tuiActiveIdx = len(tuiLogs) - 1
-				}
-			}
-
-			// Use QueueUpdateDraw to ensure thread-safe UI updates
-			tuiApp.QueueUpdateDraw(func() {
 				updateTUI()
 			})
 		}
@@ -239,13 +284,15 @@ func runTUI() int {
 	// Set root first
 	tuiApp.SetRoot(tuiFlex, true).SetFocus(tuiLogView)
 
-	// Initial update - must happen after setting root
+	// Populate the first view on the application event loop. Writing through
+	// ANSIWriter before Run initialized the screen could leave the first rows
+	// unpainted until a later scroll forced another draw.
 	logs := readAllBuildLogs()
 	tuiLogs = logs
 	if len(tuiLogs) > 0 {
 		tuiActiveIdx = 0
 	}
-	updateTUI()
+	go tuiApp.QueueUpdateDraw(updateTUI)
 
 	// Run the application
 	if err := tuiApp.Run(); err != nil {
@@ -308,13 +355,18 @@ func updateTUI() {
 			tuiLogView.Clear()
 			// Use ANSIWriter to convert ANSI escape sequences to tview color tags
 			ansiWriter := tview.ANSIWriter(tuiLogView)
-			ansiWriter.Write([]byte(log.content))
+			ansiWriter.Write(sanitizeTerminalLog([]byte(log.content)))
 
 			// Scroll logic:
-			// 1. If we switched tabs or tuiShouldScroll flag is set, always scroll to end
+			// Newly opened logs must start at the first line. Previously this used
+			// ScrollToEnd during the initial draw, which left the top viewport
+			// incompletely painted until the user scrolled away and back.
 			// 2. If content updated and we were at bottom, scroll to end
 			// 3. Otherwise, try to maintain scroll position
-			if switchedTabs || tuiShouldScroll {
+			if switchedTabs {
+				tuiLogView.ScrollToBeginning()
+				tuiShouldScroll = false
+			} else if tuiShouldScroll {
 				tuiLogView.ScrollToEnd()
 				tuiShouldScroll = false
 			} else if wasAtBottom {
@@ -345,12 +397,89 @@ func updateTUI() {
 	footerSegments = append(footerSegments, "← → (or h/l) to switch panes")
 	footerSegments = append(footerSegments, "↑ ↓ to scroll")
 	footerSegments = append(footerSegments, "Home/End to jump to start/end")
+	footerSegments = append(footerSegments, "/ search, n/N next/previous")
+	if tuiSearchQuery != "" {
+		searchInfo := fmt.Sprintf("Search: %s", tuiSearchQuery)
+		if tuiSearchStatus != "" {
+			searchInfo += " (" + tuiSearchStatus + ")"
+		}
+		footerSegments = append(footerSegments, searchInfo)
+	}
 	footerSegments = append(footerSegments, "'o' to open in VS Code")
 	if len(tuiLogs) > 0 && tuiActiveIdx < len(tuiLogs) && tuiLogs[tuiActiveIdx].canDelete {
 		footerSegments = append(footerSegments, "'d' to delete")
 	}
 	footerText := strings.Join(footerSegments, " | ")
 	tuiFooterBox.SetText(fmt.Sprintf("[gray]%s[white]", footerText))
+}
+
+func openTUISearch() {
+	if tuiSearchField == nil || tuiFlex == nil || tuiApp == nil {
+		return
+	}
+	tuiSearchActive = true
+	tuiSearchField.SetText(tuiSearchQuery)
+	tuiFlex.ResizeItem(tuiSearchField, 3, 0)
+	tuiApp.SetFocus(tuiSearchField)
+}
+
+func findTUILogMatch(direction int, includeCurrent bool) bool {
+	if tuiSearchQuery == "" || tuiLogView == nil || tuiActiveIdx >= len(tuiLogs) {
+		return false
+	}
+	matches := matchingLogRows(tuiLogs[tuiActiveIdx].content, tuiSearchQuery)
+	if len(matches) == 0 {
+		tuiSearchStatus = "not found"
+		return false
+	}
+
+	current, _ := tuiLogView.GetScrollOffset()
+	if !includeCurrent && tuiSearchRow >= 0 {
+		current = tuiSearchRow
+	}
+	selected := -1
+	if direction >= 0 {
+		for i, row := range matches {
+			if row > current || (includeCurrent && row == current) {
+				selected = i
+				break
+			}
+		}
+		if selected < 0 {
+			selected = 0
+		}
+	} else {
+		for i := len(matches) - 1; i >= 0; i-- {
+			row := matches[i]
+			if row < current || (includeCurrent && row == current) {
+				selected = i
+				break
+			}
+		}
+		if selected < 0 {
+			selected = len(matches) - 1
+		}
+	}
+	tuiLogView.ScrollTo(matches[selected], 0)
+	tuiSearchRow = matches[selected]
+	tuiSearchStatus = fmt.Sprintf("match %d/%d", selected+1, len(matches))
+	return true
+}
+
+func matchingLogRows(content, query string) []int {
+	query = strings.ToLower(strings.TrimSpace(query))
+	if query == "" {
+		return nil
+	}
+	lines := strings.Split(content, "\n")
+	matches := make([]int, 0)
+	for row, line := range lines {
+		plain := tuiANSISequence.ReplaceAllString(line, "")
+		if strings.Contains(strings.ToLower(plain), query) {
+			matches = append(matches, row)
+		}
+	}
+	return matches
 }
 
 func readAllBuildLogs() []logInfo {
