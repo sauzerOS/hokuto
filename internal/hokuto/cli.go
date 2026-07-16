@@ -746,8 +746,16 @@ func Main() {
 		}
 
 		if len(extraDeps) > 0 {
+			sort.Strings(extraDeps)
 			colArrow.Print("-> ")
-			colWarn.Printf("The following extra dependencies will be installed: %v\n", extraDeps)
+			colSuccess.Print("The following extra dependencies will be installed: [")
+			for i, dep := range extraDeps {
+				if i > 0 {
+					colSuccess.Print(" ")
+				}
+				colNote.Print(dep)
+			}
+			colSuccess.Println("]")
 		}
 
 		if len(installPlan) == 0 && len(requestedMetas) == 0 && *force {
