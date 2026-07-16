@@ -290,7 +290,10 @@ func handleUploadCommand(args []string, cfg *Config) error {
 		}
 
 		var entry RepoEntry
-		if cached, ok := cache[filename]; ok && cached.Size == info.Size() && cached.Mtime.Equal(info.ModTime()) {
+		if cached, ok := cache[filename]; ok &&
+			cached.Size == info.Size() &&
+			cached.Mtime.Equal(info.ModTime()) &&
+			cached.Entry.MetadataVersion >= repoEntryMetadataVersion {
 			entry = cached.Entry
 		} else {
 			entry, err = ReadPackageMetadata(file)
@@ -484,10 +487,11 @@ func handleUploadCommand(args []string, cfg *Config) error {
 				continue
 			}
 
-			// 1. Check if we already have this in the OLD index and it matches the size
-			// AND it has dependency info (Depends field is not empty if it should have some)
-			// Actually, just check if it's missing Depends and force re-scan if so.
-			if existing, ok := oldByFilename[obj.Key]; ok && existing.Size == obj.Size && len(existing.Depends) > 0 {
+			// Reuse entries produced by the current metadata scanner. An empty
+			// dependency list is valid and must not force another archive download.
+			if existing, ok := oldByFilename[obj.Key]; ok &&
+				existing.Size == obj.Size &&
+				existing.MetadataVersion >= repoEntryMetadataVersion {
 				key := fmt.Sprintf("%s-%s-%s-%s-%s", existing.Name, existing.Version, existing.Revision, existing.Arch, existing.Variant)
 				reconciledMap[key] = existing
 				continue
