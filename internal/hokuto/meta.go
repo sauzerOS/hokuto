@@ -833,50 +833,43 @@ func SearchPkgDB(args []string, cfg *Config) error {
 		}
 	}
 
-	db, err := readPkgDB(PkgDBPath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return fmt.Errorf("package database not found: %s. Run 'hokuto meta -db' or 'hokuto sync'", PkgDBPath)
-		}
-		return err
-	}
-
 	results := []PkgDBEntry{}
 	queryLower := strings.ToLower(query)
-
-	for _, pkg := range db.Packages {
-		if tagMode {
-			for _, t := range pkg.Metadata.Tags {
-				if strictMode {
-					if strings.EqualFold(t, query) {
-						results = append(results, pkg)
-						break
-					}
-				} else {
-					if strings.Contains(strings.ToLower(t), queryLower) {
-						results = append(results, pkg)
-						break
-					}
-				}
-			}
-		} else {
-			if strictMode {
-				if strings.EqualFold(pkg.Name, query) {
-					results = append(results, pkg)
-				}
-			} else {
-				if strings.Contains(strings.ToLower(pkg.Name), queryLower) ||
-					strings.Contains(strings.ToLower(pkg.Metadata.Description), queryLower) {
-					results = append(results, pkg)
-				}
+	db, dbErr := readPkgDB(PkgDBPath)
+	if dbErr == nil {
+		for _, pkg := range db.Packages {
+			if packageDBEntryMatchesSearch(pkg, query, queryLower, tagMode, strictMode) {
+				results = append(results, pkg)
 			}
 		}
+	}
+	if tagMode && dbErr != nil {
+		if os.IsNotExist(dbErr) {
+			return fmt.Errorf("package database not found: %s. Run 'hokuto sync' to enable tag searches", PkgDBPath)
+		}
+		return dbErr
+	}
+
+	// A rootfs or binary-only system may have no HOKUTO_PATH and therefore no
+	// useful locally generated database. Fall back to the signed binary index
+	// for ordinary name/description searches. Tags remain local-only because
+	// RepoEntry intentionally does not carry source metadata tags.
+	var remoteErr error
+	if len(results) == 0 && !tagMode {
+		results, remoteErr = searchRemotePackageIndex(query, queryLower, strictMode, cfg)
+	}
+	if len(results) == 0 && dbErr != nil && remoteErr != nil {
+		if os.IsNotExist(dbErr) {
+			return fmt.Errorf("package database not found at %s and remote search failed: %w", PkgDBPath, remoteErr)
+		}
+		return fmt.Errorf("local package database unavailable (%v) and remote search failed: %w", dbErr, remoteErr)
 	}
 
 	if len(results) == 0 {
 		colWarn.Printf("No matches found for '%s'.\n", query)
 		return nil
 	}
+	sort.Slice(results, func(i, j int) bool { return results[i].Name < results[j].Name })
 
 	colNote.Printf("\nSearch results for '%s' (%d matches):\n", query, len(results))
 	fmt.Printf("--------------------------------------------------------------------------------\n")
@@ -900,6 +893,68 @@ func SearchPkgDB(args []string, cfg *Config) error {
 	fmt.Println()
 
 	return nil
+}
+
+func packageDBEntryMatchesSearch(pkg PkgDBEntry, query, queryLower string, tagMode, strictMode bool) bool {
+	if tagMode {
+		for _, tag := range pkg.Metadata.Tags {
+			if (strictMode && strings.EqualFold(tag, query)) ||
+				(!strictMode && strings.Contains(strings.ToLower(tag), queryLower)) {
+				return true
+			}
+		}
+		return false
+	}
+	if strictMode {
+		return strings.EqualFold(pkg.Name, query)
+	}
+	return strings.Contains(strings.ToLower(pkg.Name), queryLower) ||
+		strings.Contains(strings.ToLower(pkg.Metadata.Description), queryLower)
+}
+
+func searchRemotePackageIndex(query, queryLower string, strictMode bool, cfg *Config) ([]PkgDBEntry, error) {
+	index, err := getCachedRemoteIndex(cfg, true)
+	if err != nil {
+		return nil, err
+	}
+
+	matchedNames := make(map[string]RepoEntry)
+	for _, entry := range index {
+		nameMatch := strings.Contains(strings.ToLower(entry.Name), queryLower) ||
+			strings.Contains(strings.ToLower(entry.Description), queryLower)
+		if strictMode {
+			nameMatch = strings.EqualFold(entry.Name, query)
+		}
+		if !nameMatch {
+			continue
+		}
+		if entry.Type != "meta" && entry.Arch != GetSystemArchForPackage(cfg, entry.Name) {
+			continue
+		}
+		current, exists := matchedNames[entry.Name]
+		if !exists || isNewer(entry, current) {
+			matchedNames[entry.Name] = entry
+		}
+	}
+
+	results := make([]PkgDBEntry, 0, len(matchedNames))
+	for name, candidate := range matchedNames {
+		selected := candidate
+		if candidate.Type != "meta" {
+			if preferred, resolveErr := GetRemotePackageEntry(name, cfg, index); resolveErr == nil {
+				selected = *preferred
+			}
+		}
+		results = append(results, PkgDBEntry{
+			Name:    selected.Name,
+			Type:    selected.Type,
+			Version: selected.Version,
+			Metadata: PackageMetadata{
+				Description: selected.Description,
+			},
+		})
+	}
+	return results, nil
 }
 
 type majorVersionSearchResult struct {
