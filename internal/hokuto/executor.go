@@ -202,6 +202,27 @@ func (e *Executor) Run(cmd *exec.Cmd) error {
 		basePath = "nice"
 	}
 
+	// run0 --empower intentionally keeps Hokuto at the invoking user's UID and
+	// grants capabilities instead. That is sufficient for filesystem work, but
+	// system services such as systemd authorize D-Bus operations by caller UID
+	// and would ask polkit a second time. RootExec children therefore assume UID
+	// 0 using the CAP_SETUID/CAP_SETGID already granted by the single run0
+	// authentication. Hokuto itself remains the invoking user, and UserExec below
+	// still drops all capabilities for package build scripts.
+	if e.ShouldRunAsRoot && os.Geteuid() != 0 && isRun0Empowered() {
+		if _, err := exec.LookPath("setpriv"); err != nil {
+			return fmt.Errorf("cannot give root identity to %s in the run0 session: setpriv is unavailable: %w", basePath, err)
+		}
+		rootArgs := []string{
+			"--reuid=0",
+			"--regid=0",
+			"--init-groups",
+			basePath,
+		}
+		baseArgs = append(rootArgs, baseArgs...)
+		basePath = "setpriv"
+	}
+
 	// run0 --empower grants the Hokuto session capabilities and the polkit
 	// empower group. Commands intentionally assigned to UserExec must lose both
 	// before exec, especially package build scripts.

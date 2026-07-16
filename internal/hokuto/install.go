@@ -923,6 +923,12 @@ func pkgInstallWithRemotePolicy(tarballPath, pkgName string, cfg *Config, execCt
 
 			var input string
 			if (!yes && !skipAllPrompts) || fast {
+				// The fast installer keeps its progress bar on the current terminal
+				// line. Move below it before displaying an interactive prompt so the
+				// prompt does not get appended to the progress bar.
+				if fast {
+					fmt.Println()
+				}
 				cPrintf(colInfo, "File %s modified, %schoose action: [K]eep current, [u]se new, [e]dit, use new for [A]ll: ", file, ownerDisplay)
 				// Flush stdout to ensure prompt is visible
 				os.Stdout.Sync()
