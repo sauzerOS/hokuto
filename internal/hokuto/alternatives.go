@@ -14,8 +14,6 @@ import (
 	"strings"
 	"sync"
 	"syscall"
-
-	"github.com/gookit/color"
 )
 
 // AlternativeRequest represents a request to register an alternative (used for batch processing)
@@ -1404,119 +1402,7 @@ func listAlternativesGrouped(db *GlobalAlternativesDB) error {
 }
 
 func handleAlternativeSwitch(hRoot string, db *GlobalAlternativesDB, targetPkg string) error {
-	// Find all files where targetPkg is a valid owner
-	var affectedFiles []string
-	var conflictPartners = make(map[string]bool)
-
-	for path, entry := range db.Files {
-		// First check if targetPkg participates in this file
-		isCandidate := false
-		for _, alt := range entry.Alternatives {
-			for _, o := range alt.Owners {
-				if o == targetPkg {
-					isCandidate = true
-					break
-				}
-			}
-			if isCandidate {
-				break
-			}
-		}
-
-		if isCandidate {
-			affectedFiles = append(affectedFiles, path)
-			// Now collect partners ONLY from this valid candidate file
-			for _, alt := range entry.Alternatives {
-				for _, o := range alt.Owners {
-					if o != targetPkg {
-						conflictPartners[o] = true
-					}
-				}
-			}
-		}
-	}
-
-	if len(affectedFiles) == 0 {
-		return fmt.Errorf("package '%s' has no alternatives registered", targetPkg)
-	}
-
-	// Calculate current state for affected files
-	currentCounts := make(map[string]int)
-	for _, path := range affectedFiles {
-		entry := db.Files[path]
-		active := getActiveOwner(entry)
-		currentCounts[active]++
-	}
-
-	colInfo.Printf("Found %d files involving '%s'.\n", len(affectedFiles), targetPkg)
-	colInfo.Printf("Current state: ")
-	for owner, count := range currentCounts {
-		fmt.Printf("%s: %d  ", owner, count)
-	}
-	fmt.Println()
-
-	// Build menu options
-	var options []string
-	options = append(options, targetPkg)
-
-	// Add other partners found
-	var partners []string
-	for p := range conflictPartners {
-		partners = append(partners, p)
-	}
-	sort.Strings(partners)
-	options = append(options, partners...)
-
-	fmt.Println("Switch all to:")
-	for i, opt := range options {
-		fmt.Printf("%d) %s\n", i+1, opt)
-	}
-	fmt.Printf("%d) Cancel\n", len(options)+1)
-
-	fmt.Print("Select: ")
-	var selection int
-	_, err := fmt.Scanln(&selection)
-	if err != nil || selection < 1 || selection > len(options) {
-		fmt.Println("Cancelled.")
-		return nil
-	}
-
-	chosenOwner := options[selection-1]
-
-	// Execute switch using the global root executor so sudo authentication,
-	// re-authentication, and environment handling match other privileged flows.
-	execCtx := RootExec
-	count := 0
-
-	// Need to lock DB update? This runs sequentially so it's fine, but saving needs root privileges logic if not root.
-	// But `saveAlternativesDB` handles root check.
-	// File moves/copies are performed through execCtx and will elevate when needed.
-
-	for _, path := range affectedFiles {
-		entry := db.Files[path]
-		// Simple check, though "active" string might be comma separated if shared.
-		// If chosenOwner is part of the active list, we might skip?
-		// But explicit switch usually implies "make this the SOLE active content if possible, or matches content".
-
-		// Actually, we delegate to helper
-		switched, err := activateAlternativeForOwner(hRoot, path, entry, chosenOwner, execCtx)
-		if err != nil {
-			color.Danger.Printf("Failed to switch %s: %v\n", path, err)
-		} else if switched {
-			count++
-		}
-	}
-
-	if count > 0 {
-		if err := saveAlternativesDB(hRoot, db, execCtx); err != nil {
-			return fmt.Errorf("failed to save DB: %w", err)
-		}
-		colSuccess.Printf("Successfully switched %d files to '%s'.\n", count, chosenOwner)
-	} else {
-		colInfo.Println("No changes needed.")
-	}
-
-	return nil
+	return runAlternativesTUI(hRoot, db, targetPkg)
 }
 
 // activateAlternativeForOwner makes the alternative owned by pkgName active.
