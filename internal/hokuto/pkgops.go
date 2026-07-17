@@ -907,7 +907,51 @@ func generateDepends(pkgName, pkgDir, outputDir, rootDir string, execCtx *Execut
 // isDirectoryPrivileged uses the Executor to check if a path is a directory.
 // helper for listOutputFilesWithTypes
 
-func executePostInstall(pkgName, rootDir string, execCtx *Executor, cfg *Config, logger io.Writer) error {
+type postInstallOutputWriter struct {
+	destination     io.Writer
+	startOnNewLine  bool
+	mu              sync.Mutex
+	started         bool
+	wroteOutput     bool
+	endsWithNewline bool
+}
+
+func (w *postInstallOutputWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if len(p) == 0 {
+		return 0, nil
+	}
+	if !w.started {
+		w.started = true
+		if w.startOnNewLine && p[0] != '\n' {
+			if _, err := io.WriteString(w.destination, "\n"); err != nil {
+				return 0, err
+			}
+		}
+	}
+	n, err := w.destination.Write(p)
+	if n > 0 {
+		w.wroteOutput = true
+		w.endsWithNewline = p[n-1] == '\n'
+	}
+	return n, err
+}
+
+func (w *postInstallOutputWriter) finishLine() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if !w.wroteOutput || w.endsWithNewline {
+		return nil
+	}
+	_, err := io.WriteString(w.destination, "\n")
+	if err == nil {
+		w.endsWithNewline = true
+	}
+	return err
+}
+
+func executePostInstall(pkgName, rootDir string, execCtx *Executor, cfg *Config, logger io.Writer, fast bool) error {
 	if logger == nil {
 		logger = os.Stdout
 	}
@@ -943,13 +987,9 @@ func executePostInstall(pkgName, rootDir string, execCtx *Executor, cfg *Config,
 	}
 	cmd.Env = postInstallEnvironment(pkgName, hostScript, realUser, cfg)
 
-	if logger != nil {
-		cmd.Stdout = logger
-		cmd.Stderr = logger
-	} else {
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-	}
+	hookOutput := &postInstallOutputWriter{destination: logger, startOnNewLine: fast}
+	cmd.Stdout = hookOutput
+	cmd.Stderr = hookOutput
 
 	if execCtx.Interactive {
 		cmd.Stdin = os.Stdin
@@ -1006,15 +1046,23 @@ func executePostInstall(pkgName, rootDir string, execCtx *Executor, cfg *Config,
 			}
 		}
 
-		if err := execCtx.Run(cmd); err != nil {
-			fmt.Fprintf(logger, "Warning: chroot to %s failed or post-install could not run: %v\n", rootDir, err)
+		runErr := execCtx.Run(cmd)
+		if err := hookOutput.finishLine(); err != nil {
+			debugf("Failed to finish post-install output line for %s: %v\n", pkgName, err)
+		}
+		if runErr != nil {
+			fmt.Fprintf(logger, "Warning: chroot to %s failed or post-install could not run: %v\n", rootDir, runErr)
 			return nil
 		}
 		return nil
 	}
 
-	if err := execCtx.Run(cmd); err != nil {
-		return fmt.Errorf("post-install script %s failed: %v", hostScript, err)
+	runErr := execCtx.Run(cmd)
+	if err := hookOutput.finishLine(); err != nil {
+		debugf("Failed to finish post-install output line for %s: %v\n", pkgName, err)
+	}
+	if runErr != nil {
+		return fmt.Errorf("post-install script %s failed: %v", hostScript, runErr)
 	}
 	return nil
 }

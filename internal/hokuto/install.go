@@ -542,7 +542,7 @@ func pkgInstallWithRemotePolicy(tarballPath, pkgName string, cfg *Config, execCt
 		}
 
 		// Always run post-install hook for glibc
-		if err := executePostInstall(pkgName, rootDir, execCtx, cfg, logger); err != nil {
+		if err := executePostInstall(pkgName, rootDir, execCtx, cfg, logger, fast); err != nil {
 			colArrow.Print("-> ")
 			color.Danger.Printf("post-install for %s returned error: %v\n", pkgName, err)
 		}
@@ -1367,7 +1367,7 @@ func pkgInstallWithRemotePolicy(tarballPath, pkgName string, cfg *Config, execCt
 		fmt.Fprint(logger, colArrow.Sprint("-> "))
 		fmt.Fprintln(logger, colSuccess.Sprint("Executing package post-install script"))
 	}
-	if err := executePostInstall(pkgName, rootDir, execCtx, cfg, logger); err != nil {
+	if err := executePostInstall(pkgName, rootDir, execCtx, cfg, logger, fast); err != nil {
 		fmt.Fprintf(logger, "warning: post-install for %s returned error: %v\n", pkgName, err)
 	}
 	if err := installMissingPackageRuntimeDependencies(pkgName, cfg, logger, fast, noRemote); err != nil {
