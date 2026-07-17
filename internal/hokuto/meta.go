@@ -103,22 +103,22 @@ func HandleMetaCommand(args []string, cfg *Config) error {
 		if foundSource, foundDir, ok := findSplitPackageSource(pkgName); ok {
 			pkgDir = foundDir
 			sourcePkg = foundSource
-		} else {
+		} else if editMode {
 			return err
 		}
 	}
 
-	metaPath := filepath.Join(pkgDir, "metadata.json")
 	var meta PackageMetadata
 	metadataExists := false
-
-	// Load existing metadata if available
-	if data, err := os.ReadFile(metaPath); err == nil {
-		_ = json.Unmarshal(data, &meta)
-		metadataExists = true
-	}
-	if splitNames := splitPackageNamesFromDir(pkgDir); len(splitNames) > 0 {
-		meta.Subpackages = splitNames
+	if pkgDir != "" {
+		metaPath := filepath.Join(pkgDir, "metadata.json")
+		if data, readErr := os.ReadFile(metaPath); readErr == nil {
+			_ = json.Unmarshal(data, &meta)
+			metadataExists = true
+		}
+		if splitNames := splitPackageNamesFromDir(pkgDir); len(splitNames) > 0 {
+			meta.Subpackages = splitNames
+		}
 	}
 
 	if editMode {
@@ -136,12 +136,53 @@ func HandleMetaCommand(args []string, cfg *Config) error {
 
 	displayMeta := effectiveMetadataForPackage(pkgName, sourcePkg, &meta)
 	if !metadataExists || !hasMetadataEntry(&displayMeta) {
-		colWarn.Printf("No metadata entry found for '%s'. Run 'hokuto meta %s -e' to create one.\n", pkgName, pkgName)
-		return nil
+		if entry, found, dbErr := lookupPackageMetadataDatabase(pkgName, cfg, true); dbErr == nil && found {
+			displayMeta = entry.Metadata
+			sourcePkg = entry.SourcePackage
+			metadataExists = true
+		} else if dbErr != nil {
+			debugf("Package metadata database lookup failed for %s: %v\n", pkgName, dbErr)
+		}
+	}
+	if !metadataExists || !hasMetadataEntry(&displayMeta) {
+		if pkgDir != "" {
+			colWarn.Printf("No metadata entry found for '%s'. Run 'hokuto meta %s -e' to create one.\n", pkgName, pkgName)
+			return nil
+		}
+		return fmt.Errorf("package %s has no metadata in the local or remote package database", pkgName)
 	}
 
 	displayMetadata(pkgName, sourcePkg, &displayMeta)
 	return nil
+}
+
+func findPackageDatabaseEntry(db *PkgDB, pkgName string) (PkgDBEntry, bool) {
+	if db == nil {
+		return PkgDBEntry{}, false
+	}
+	for _, entry := range db.Packages {
+		if entry.Name == pkgName {
+			return entry, true
+		}
+	}
+	return PkgDBEntry{}, false
+}
+
+func lookupPackageMetadataDatabase(pkgName string, cfg *Config, allowRemote bool) (PkgDBEntry, bool, error) {
+	if db, err := readPkgDB(PkgDBPath); err == nil {
+		if entry, found := findPackageDatabaseEntry(db, pkgName); found {
+			return entry, true, nil
+		}
+	}
+	if !allowRemote {
+		return PkgDBEntry{}, false, nil
+	}
+	db, err := getRemotePkgDB(cfg)
+	if err != nil {
+		return PkgDBEntry{}, false, err
+	}
+	entry, found := findPackageDatabaseEntry(db, pkgName)
+	return entry, found, nil
 }
 
 type MetadataCandidate struct {

@@ -807,8 +807,15 @@ func handleUploadCommand(args []string, cfg *Config) error {
 		colSuccess.Printf("Everything up to date.\n")
 	}
 
-	if *sync {
-		_ = uploadPkgDB(ctx, r2)
+	if *sync || *reindex {
+		if *reindex {
+			if err := generatePkgDBQuiet(cfg); err != nil {
+				return fmt.Errorf("failed to refresh global package database: %w", err)
+			}
+		}
+		if err := uploadPkgDB(ctx, r2); err != nil {
+			return err
+		}
 	}
 
 	return nil

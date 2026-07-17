@@ -1753,6 +1753,66 @@ func SyncPkgDB(cfg *Config) error {
 	return nil
 }
 
+var (
+	remotePkgDBMu     sync.Mutex
+	remotePkgDB       *PkgDB
+	remotePkgDBErr    error
+	remotePkgDBLoaded bool
+)
+
+// getRemotePkgDB returns the global metadata database without installing it on
+// the local system. This is used by read-only commands on binary-only systems
+// where HOKUTO_PATH is intentionally unavailable.
+func getRemotePkgDB(cfg *Config) (*PkgDB, error) {
+	remotePkgDBMu.Lock()
+	defer remotePkgDBMu.Unlock()
+	if remotePkgDBLoaded {
+		return remotePkgDB, remotePkgDBErr
+	}
+	remotePkgDBLoaded = true
+
+	tmpFile, err := os.CreateTemp("", "hokuto-pkg-db-*.json.zst")
+	if err != nil {
+		remotePkgDBErr = err
+		return nil, err
+	}
+	tmpPath := tmpFile.Name()
+	if err := tmpFile.Close(); err != nil {
+		os.Remove(tmpPath)
+		remotePkgDBErr = err
+		return nil, err
+	}
+	defer os.Remove(tmpPath)
+
+	filename := filepath.Base(PkgDBPath)
+	if BinaryMirror != "" {
+		url := fmt.Sprintf("%s/%s", strings.TrimRight(BinaryMirror, "/"), filename)
+		opts := downloadOptions{Quiet: true, NativeAttempts: 2, NativeOnly: true}
+		if err := downloadFileWithOptions(url, url, tmpPath, opts); err != nil {
+			remotePkgDBErr = fmt.Errorf("failed to download remote package database: %w", err)
+			return nil, remotePkgDBErr
+		}
+	} else {
+		r2, err := NewR2Client(cfg)
+		if err != nil {
+			remotePkgDBErr = fmt.Errorf("failed to connect to package database mirror: %w", err)
+			return nil, remotePkgDBErr
+		}
+		data, err := r2.DownloadFile(context.Background(), filename)
+		if err != nil {
+			remotePkgDBErr = fmt.Errorf("failed to download remote package database: %w", err)
+			return nil, remotePkgDBErr
+		}
+		if err := os.WriteFile(tmpPath, data, 0o600); err != nil {
+			remotePkgDBErr = err
+			return nil, err
+		}
+	}
+
+	remotePkgDB, remotePkgDBErr = readPkgDB(tmpPath)
+	return remotePkgDB, remotePkgDBErr
+}
+
 func readPkgDB(path string) (*PkgDB, error) {
 	f, err := os.Open(path)
 	if err != nil {

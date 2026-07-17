@@ -36,81 +36,96 @@ func printHelp() {
 		Args string
 		Desc string
 	}
-	// Restore detailed descriptions including command-specific options
-	cmds := []cmdInfo{
-		{"version, --version", "", "Version information"},
-		{"log", "[pkg]", "View saved build logs (TUI when no package is given)"},
-		{"list, ls", "<pkg>", "List installed packages, optionally filter by name"},
-		{"checksum, c", "<pkg>", "Fetch sources and generate checksum file"},
-		{"build, b", "<pkg>", "Build package(s)"},
-		{"install, i", "[-g] [-multi] <pkg>", "Install pre-built package(s)"},
-		{"uninstall, r", "<pkg>", "Uninstall package(s)"},
-		{"update, u", "[options]", "Update repositories and check for upgrades"},
-		{"manifest, m", "<pkg>", "Show the file list for an installed package"},
-		{"size", "<pkg>", "Show installed package disk usage"},
-		{"unmanaged", "", "Inspect, search, and delete unmanaged files in /etc and /usr"},
-		{"find, f", "<query>", "Find which package matches query string"},
-		{"new, n", "<pkg>", "Create a new package skeleton"},
-		{"edit, e", "<pkg>", "Edit a package's build files"},
-		{"bump", "[options] [pkg]", "Update package(s) or batch update sets"},
-		{"cd", "<pkg>", "Change directory to package repository directory"},
-		{"bootstrap", "<dir>", "Build a bootstrap rootfs in target directory"},
-		{"chroot", "<dir> [cmd]", "Enter chroot and run command (default: /bin/bash)"},
-		{"cleanup", "[options]", "Cleanup caches"},
-		{"python-rebuild", "", "Rebuild all python packages"},
-		{"alt", "<pkg>", "List packages with alternatives or show/switch alternatives for a package"},
-		{"settings", "", "Manage hokuto configuration interactively"},
-		{"init-repos", "", "Initialize repositories"},
-		{"upload", "[options] [pkgname...]", "Upload local binaries to remote mirror and update index"},
-		{"depends", "[--reverse] <pkg>", "Show package dependencies or reverse dependencies"},
-		{"meta", "pkgname [-e] [-db]", "Show/edit package metadata or generate global DB"},
-		{"search, s", "[query | pkg@MAJOR | -tag <tag>]", "Search packages and major version lines"},
-		{"sync", "", "Manually sync global package database from mirror"},
-		{"cross-sync", "[-native] [-jN] [-i]", "Identify and build missing native cross (or aarch64 native) packages"},
+	cmdGroups := [][]cmdInfo{
+		{
+			{"build, b", "<pkg>", "Build package(s)"},
+			{"install, i", "[-g] [-multi] <pkg>", "Install pre-built package(s)"},
+			{"list, ls", "<pkg>", "List installed packages, optionally filter by name"},
+			{"log", "[pkg]", "View saved build logs (TUI when no package is given)"},
+			{"search, s", "[query | pkg@MAJOR | -tag <tag>]", "Search packages and major version lines"},
+			{"uninstall, r", "<pkg>", "Uninstall package(s)"},
+			{"update, u", "[options]", "Update repositories and check for upgrades"},
+		},
+		{
+			{"alt", "<pkg>", "List packages with alternatives or show/switch alternatives for a package"},
+			{"cleanup", "[options]", "Cleanup caches"},
+			{"depends", "[--reverse] <pkg>", "Show package dependencies or reverse dependencies"},
+			{"find, f", "<query>", "Find which package matches query string"},
+			{"info", "", "View notices and additional information for installed packages"},
+			{"manifest, m", "<pkg>", "Show the file list for an installed package"},
+			{"size", "<pkg>", "Show installed package disk usage"},
+			{"sync", "", "Manually sync global package database from mirror"},
+			{"unmanaged", "", "Inspect, search, and delete unmanaged files in /etc and /usr"},
+		},
+		{
+			{"bump", "[options] [pkg]", "Update package(s) or batch update sets"},
+			{"cd", "<pkg>", "Change directory to package repository directory"},
+			{"checksum, c", "<pkg>", "Fetch sources and generate checksum file"},
+			{"edit, e", "<pkg>", "Edit a package's build files"},
+			{"meta", "pkgname [-e] [-db]", "Show/edit package metadata or generate global DB"},
+			{"new, n", "<pkg>", "Create a new package skeleton"},
+			{"upload", "[options] [pkgname...]", "Upload local binaries to remote mirror and update index"},
+		},
+		{
+			{"bootstrap", "<dir>", "Build a bootstrap rootfs in target directory"},
+			{"chroot", "<dir> [cmd]", "Enter chroot and run command (default: /bin/bash)"},
+			{"cross-sync", "[-native] [-jN] [-i]", "Identify and build missing native cross (or aarch64 native) packages"},
+			{"init-repos", "", "Initialize repositories"},
+			{"python-rebuild", "", "Rebuild all python packages"},
+			{"settings", "", "Manage hokuto configuration interactively"},
+			{"version, --version", "", "Version information"},
+		},
 	}
 
 	// --- Dynamic Padding Logic ---
 	// 1. Find the longest usage string to calculate the ideal width for the first column.
 	maxLen := 0
-	for _, c := range cmds {
-		length := len(c.Cmd) + len(c.Args)
-		if c.Args != "" {
-			length++ // Account for the space
-		}
-		if length > maxLen {
-			maxLen = length
+	for _, group := range cmdGroups {
+		for _, c := range group {
+			length := len(c.Cmd) + len(c.Args)
+			if c.Args != "" {
+				length++ // Account for the space
+			}
+			if length > maxLen {
+				maxLen = length
+			}
 		}
 	}
 	// The final column width is the longest command plus some buffer space.
 	columnWidth := maxLen + 4
 
 	// 2. Print the formatted list with calculated padding.
-	for _, c := range cmds {
-		// This will hold the uncolored string to measure its length for padding
-		var usageString string
-		if c.Args != "" {
-			usageString = fmt.Sprintf("  %s %s", c.Cmd, c.Args)
-		} else {
-			usageString = fmt.Sprintf("  %s", c.Cmd)
+	for groupIndex, group := range cmdGroups {
+		if groupIndex > 0 {
+			fmt.Println()
 		}
+		for _, c := range group {
+			// This will hold the uncolored string to measure its length for padding
+			var usageString string
+			if c.Args != "" {
+				usageString = fmt.Sprintf("  %s %s", c.Cmd, c.Args)
+			} else {
+				usageString = fmt.Sprintf("  %s", c.Cmd)
+			}
 
-		// Print the colored command and arguments
-		fmt.Print("  ") // Indent
-		color.Bold.Print(c.Cmd)
-		if c.Args != "" {
-			fmt.Print(" ")
-			color.Cyan.Print(c.Args)
+			// Print the colored command and arguments
+			fmt.Print("  ") // Indent
+			color.Bold.Print(c.Cmd)
+			if c.Args != "" {
+				fmt.Print(" ")
+				color.Cyan.Print(c.Args)
+			}
+
+			// Calculate the necessary padding and print it
+			pad := columnWidth - len(usageString)
+			if pad < 1 {
+				pad = 1
+			}
+			fmt.Print(strings.Repeat(" ", pad))
+
+			// Print the description
+			color.Info.Println(c.Desc)
 		}
-
-		// Calculate the necessary padding and print it
-		pad := columnWidth - len(usageString)
-		if pad < 1 {
-			pad = 1
-		}
-		fmt.Print(strings.Repeat(" ", pad))
-
-		// Print the description
-		color.Info.Println(c.Desc)
 	}
 
 	fmt.Println()
@@ -393,6 +408,12 @@ func Main() {
 		if err := handleAlternativesCommand(os.Args[2:]); err != nil {
 			fmt.Fprintf(os.Stderr, "Alternatives command failed: %v\n", err)
 			os.Exit(1)
+		}
+
+	case "info":
+		if err := handlePackageInfoCommand(cfg); err != nil {
+			fmt.Fprintf(os.Stderr, "Package info command failed: %v\n", err)
+			exitCode = 1
 		}
 
 	case "settings":
@@ -1688,6 +1709,7 @@ func Main() {
 		printHelp()
 		exitCode = 1
 	}
+	printPackageInfoReminderIfNeeded()
 	os.Exit(exitCode)
 }
 

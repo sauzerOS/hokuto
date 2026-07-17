@@ -554,6 +554,7 @@ func pkgInstallWithRemotePolicy(tarballPath, pkgName string, cfg *Config, execCt
 			}
 		}
 
+		registerInstalledPackageInfo(rootDir, pkgName, cfg)
 		collectPackageSuggestions(pkgName, rootDir)
 		return nil, nil
 	}
@@ -1589,6 +1590,7 @@ func pkgInstallWithRemotePolicy(tarballPath, pkgName string, cfg *Config, execCt
 			fmt.Fprintf(os.Stderr, "post-install tasks completed with warnings: %v\n", err)
 		}
 	}
+	registerInstalledPackageInfo(rootDir, pkgName, cfg)
 	collectPackageSuggestions(pkgName, rootDir)
 	return parallelRebuilds, nil
 }

@@ -6,6 +6,7 @@ package hokuto
 import (
 	"archive/tar"
 	"bufio"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -1368,6 +1369,33 @@ func copyPackageRecipeMetadata(pkgDir, installedDir string, execCtx *Executor) e
 	return nil
 }
 
+func copyEffectivePackageMetadata(pkgDir, packageName, sourcePackage, installedDir string, execCtx *Executor) error {
+	data, err := os.ReadFile(filepath.Join(pkgDir, "metadata.json"))
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	var metadata PackageMetadata
+	if err := json.Unmarshal(data, &metadata); err != nil {
+		return fmt.Errorf("failed to parse metadata.json: %w", err)
+	}
+	effective := effectiveMetadataForPackage(packageName, sourcePackage, &metadata)
+	effective.SplitMetadata = nil
+	if packageName == sourcePackage {
+		effective.Subpackages = splitPackageNamesFromDir(pkgDir)
+	} else {
+		effective.Subpackages = nil
+	}
+	encoded, err := json.MarshalIndent(effective, "", "  ")
+	if err != nil {
+		return err
+	}
+	encoded = append(encoded, '\n')
+	return writeRootFile(filepath.Join(installedDir, "metadata.json"), encoded, 0o644, execCtx)
+}
+
 func packageSplitOutputs(parentPkgName, pkgDir, splitRoot, version, revision, targetArch, cflagsVal string, isGeneric bool, shouldStrip bool, buildExec *Executor, cfg *Config, opts BuildOptions, elapsed time.Duration) error {
 	splitNames, err := discoverSplitOutputDirs(splitRoot)
 	if err != nil {
@@ -1426,6 +1454,9 @@ func packageSplitOutputs(parentPkgName, pkgDir, splitRoot, version, revision, ta
 
 		if err := copyPackageRecipeMetadata(pkgDir, installedDir, buildExec); err != nil {
 			return fmt.Errorf("failed to copy recipe metadata for split package %s: %w", outputSplitName, err)
+		}
+		if err := copyEffectivePackageMetadata(pkgDir, splitName, parentPkgName, installedDir, buildExec); err != nil {
+			return fmt.Errorf("failed to copy package metadata for split package %s: %w", outputSplitName, err)
 		}
 		postInstallSrc := findPackageMetadataFile(pkgDir, outputSplitName, "post-install")
 		if postInstallSrc != filepath.Join(pkgDir, "post-install") {
@@ -1627,6 +1658,9 @@ func finalizeBuiltPackage(in builtPackageFinalization) error {
 
 	if err := copyPackageRecipeMetadata(in.pkgDir, installedDir, in.buildExec); err != nil {
 		return err
+	}
+	if err := copyEffectivePackageMetadata(in.pkgDir, in.sourcePkgName, in.sourcePkgName, installedDir, in.buildExec); err != nil {
+		return fmt.Errorf("failed to copy package metadata: %w", err)
 	}
 	if err := copyOptionalMetadataFile(filepath.Join(in.pkgDir, "post-install"), filepath.Join(installedDir, "post-install"), in.buildExec); err != nil {
 		return fmt.Errorf("failed to copy post-install file: %w", err)

@@ -63,6 +63,7 @@ func needsRootPrivileges(args []string) bool {
 		"cleanup":   true,
 		"settings":  true,
 		"alt":       true,
+		"info":      true,
 	}
 
 	if rootCommands[cmd] {
