@@ -426,6 +426,42 @@ func linkSharedGitCheckout(pkgName, pkgLinkDir, repoName, sharedPath string) (st
 	return destPath, nil
 }
 
+func resolveGitCacheCommit(cacheRepoPath, ref string, quiet bool) (string, error) {
+	resolve := func() (string, error) {
+		cmd := exec.Command("git", "-C", cacheRepoPath, "rev-parse", "--verify", ref+"^{commit}")
+		output, err := cmd.Output()
+		if err != nil {
+			return "", err
+		}
+		return strings.TrimSpace(string(output)), nil
+	}
+
+	if commit, err := resolve(); err == nil {
+		return commit, nil
+	}
+
+	if !quiet {
+		cPrintf(colInfo, "Fetching unadvertised git revision %s\n", ref)
+	}
+	cmd := exec.Command("git", "-C", cacheRepoPath, "fetch", "--no-tags", "origin", ref)
+	if quiet && !Debug {
+		cmd.Stdout = io.Discard
+		cmd.Stderr = io.Discard
+	} else {
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+	}
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("failed to fetch git revision %s: %w", ref, err)
+	}
+
+	commit, err := resolve()
+	if err != nil {
+		return "", fmt.Errorf("git revision %s is unavailable after fetch: %w", ref, err)
+	}
+	return commit, nil
+}
+
 // downloadFile downloads a URL into the hokuto cache.
 
 type downloadOptions struct {
@@ -1331,6 +1367,7 @@ func fetchSourcesWithOptions(pkgName, pkgDir string, processGit bool, quiet bool
 
 			urlHash := hashString(gitURL)[:12]
 			cacheRepoPath := filepath.Join(gitCacheDir, repoName+"-"+urlHash)
+			resolvedCommit := ""
 
 			// Update/Clone bare cache
 			err = func() error {
@@ -1371,6 +1408,12 @@ func fetchSourcesWithOptions(pkgName, pkgDir string, processGit bool, quiet bool
 						debugf("Warning: failed to update git cache: %v\n", err)
 					}
 				}
+				if ref != "" {
+					resolvedCommit, err = resolveGitCacheCommit(cacheRepoPath, ref, quiet)
+					if err != nil {
+						return err
+					}
+				}
 				return nil
 			}()
 			if err != nil {
@@ -1408,27 +1451,25 @@ func fetchSourcesWithOptions(pkgName, pkgDir string, processGit bool, quiet bool
 						return fmt.Errorf("failed to create shared checkout from cache: %v", err)
 					}
 					// Reset the origin URL to the real one
-					exec.Command("git", "-C", sharedPath, "remote", "set-url", "origin", gitURL).Run()
+					if err := exec.Command("git", "-C", sharedPath, "remote", "set-url", "origin", gitURL).Run(); err != nil {
+						return fmt.Errorf("failed to set origin URL for shared checkout: %w", err)
+					}
 				}
 
 				// Finalize checkout state (ref and updates)
-				exec.Command("git", "-C", sharedPath, "config", "advice.detachedHead", "false").Run()
+				if err := exec.Command("git", "-C", sharedPath, "config", "advice.detachedHead", "false").Run(); err != nil {
+					return fmt.Errorf("failed to configure shared checkout: %w", err)
+				}
 				if ref != "" {
-					// Try to see if it's a branch first
-					checkBranch := exec.Command("git", "-C", sharedPath, "rev-parse", "--verify", "refs/heads/"+ref)
-					if err := checkBranch.Run(); err == nil {
-						exec.Command("git", "-C", sharedPath, "checkout", ref).Run()
-						// If it's a branch, we try to update
-						debugf("Updating shared branch %s from cache\n", ref)
-						exec.Command("git", "-C", sharedPath, "pull").Run()
-					} else {
-						// Fallback: checkout as a tag or commit hash
-						exec.Command("git", "-C", sharedPath, "checkout", ref).Run()
+					if err := exec.Command("git", "-C", sharedPath, "checkout", "--detach", resolvedCommit).Run(); err != nil {
+						return fmt.Errorf("failed to checkout git revision %s (%s): %w", ref, resolvedCommit, err)
 					}
 				} else {
 					// If no ref, we try to update the default branch
 					debugf("Updating shared default branch for %s from cache\n", gitURL)
-					exec.Command("git", "-C", sharedPath, "pull").Run()
+					if err := exec.Command("git", "-C", sharedPath, "pull").Run(); err != nil {
+						return fmt.Errorf("failed to update shared default branch for %s: %w", gitURL, err)
+					}
 				}
 				return nil
 			}()
