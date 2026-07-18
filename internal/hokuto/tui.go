@@ -35,7 +35,7 @@ var (
 	tuiFlex         *tview.Flex
 	tuiUpdateChan   chan []logInfo
 	tuiPrevContent  map[string]string // Track previous content per log path
-	tuiShouldScroll bool              // Flag to force scroll to end on next update
+	tuiFollowLog    bool              // Follow new output until the user scrolls manually
 	tuiSearchActive bool
 	tuiSearchQuery  string
 	tuiSearchStatus string
@@ -53,6 +53,7 @@ func runTUI() int {
 	tuiSearchQuery = ""
 	tuiSearchStatus = ""
 	tuiSearchRow = -1
+	tuiFollowLog = true
 
 	// Create the application
 	tuiApp = tview.NewApplication()
@@ -125,7 +126,6 @@ func runTUI() int {
 				if tuiActiveIdx < 0 {
 					tuiActiveIdx = len(tuiLogs) - 1
 				}
-				tuiShouldScroll = true
 				tuiSearchRow = -1
 				tuiSearchStatus = ""
 				updateTUI()
@@ -137,20 +137,22 @@ func runTUI() int {
 				if tuiActiveIdx >= len(tuiLogs) {
 					tuiActiveIdx = 0
 				}
-				tuiShouldScroll = true
 				tuiSearchRow = -1
 				tuiSearchStatus = ""
 				updateTUI()
 			}
 			return nil
 		case tcell.KeyHome:
+			tuiFollowLog = false
 			tuiLogView.ScrollToBeginning()
 			return nil
 		case tcell.KeyEnd:
+			tuiFollowLog = true
 			tuiLogView.ScrollToEnd()
 			return nil
 		case tcell.KeyUp:
 			// Scroll log view up
+			tuiFollowLog = false
 			row, _ := tuiLogView.GetScrollOffset()
 			if row > 0 {
 				tuiLogView.ScrollTo(row-1, 0)
@@ -158,10 +160,12 @@ func runTUI() int {
 			return nil
 		case tcell.KeyDown:
 			// Scroll log view down
+			tuiFollowLog = false
 			row, _ := tuiLogView.GetScrollOffset()
 			tuiLogView.ScrollTo(row+1, 0)
 			return nil
 		case tcell.KeyPgUp:
+			tuiFollowLog = false
 			row, _ := tuiLogView.GetScrollOffset()
 			if row > 10 {
 				tuiLogView.ScrollTo(row-10, 0)
@@ -170,6 +174,7 @@ func runTUI() int {
 			}
 			return nil
 		case tcell.KeyPgDn:
+			tuiFollowLog = false
 			row, _ := tuiLogView.GetScrollOffset()
 			tuiLogView.ScrollTo(row+10, 0)
 			return nil
@@ -216,7 +221,6 @@ func runTUI() int {
 					if tuiActiveIdx < 0 {
 						tuiActiveIdx = len(tuiLogs) - 1
 					}
-					tuiShouldScroll = true
 					tuiSearchRow = -1
 					tuiSearchStatus = ""
 					updateTUI()
@@ -228,7 +232,6 @@ func runTUI() int {
 					if tuiActiveIdx >= len(tuiLogs) {
 						tuiActiveIdx = 0
 					}
-					tuiShouldScroll = true
 					tuiSearchRow = -1
 					tuiSearchStatus = ""
 					updateTUI()
@@ -342,47 +345,23 @@ func updateTUI() {
 			// Save current scroll position before clearing
 			row, _ := tuiLogView.GetScrollOffset()
 
-			// Check if we're at the bottom (only relevant if not switching tabs)
-			wasAtBottom := false
-			if !switchedTabs && hadPrevContent {
-				tuiLogView.ScrollTo(row+1, 0)
-				newRow, _ := tuiLogView.GetScrollOffset()
-				wasAtBottom = (newRow == row)
-				tuiLogView.ScrollTo(row, 0)
-			}
-
 			// Clear the view first
 			tuiLogView.Clear()
 			// Use ANSIWriter to convert ANSI escape sequences to tview color tags
 			ansiWriter := tview.ANSIWriter(tuiLogView)
 			ansiWriter.Write(sanitizeTerminalLog([]byte(log.content)))
 
-			// Scroll logic:
-			// Newly opened logs must start at the first line. Previously this used
-			// ScrollToEnd during the initial draw, which left the top viewport
-			// incompletely painted until the user scrolled away and back.
-			// 2. If content updated and we were at bottom, scroll to end
-			// 3. Otherwise, try to maintain scroll position
-			if switchedTabs {
+			// Render a newly opened log from the beginning once; scrolling to the end
+			// during its initial draw can leave the top viewport incompletely painted.
+			// Follow remains armed, so the next content update moves to the end.
+			// Manual navigation disables following and preserves the exact viewport
+			// until End explicitly resumes it.
+			if switchedTabs && !hadPrevContent {
 				tuiLogView.ScrollToBeginning()
-				tuiShouldScroll = false
-			} else if tuiShouldScroll {
-				tuiLogView.ScrollToEnd()
-				tuiShouldScroll = false
-			} else if wasAtBottom {
+			} else if tuiFollowLog {
 				tuiLogView.ScrollToEnd()
 			} else if hadPrevContent {
-				// Try to restore scroll position
-				prevLines := strings.Count(prevContent, "\n")
-				newLines := strings.Count(log.content, "\n")
-				if newLines > prevLines {
-					// Content grew, adjust scroll position
-					linesAdded := newLines - prevLines
-					tuiLogView.ScrollTo(row+linesAdded, 0)
-				} else {
-					// Try to restore exact position
-					tuiLogView.ScrollTo(row, 0)
-				}
+				tuiLogView.ScrollTo(row, 0)
 			}
 
 			tuiPrevContent[logPath] = log.content
@@ -397,6 +376,11 @@ func updateTUI() {
 	footerSegments = append(footerSegments, "← → (or h/l) to switch panes")
 	footerSegments = append(footerSegments, "↑ ↓ to scroll")
 	footerSegments = append(footerSegments, "Home/End to jump to start/end")
+	if tuiFollowLog {
+		footerSegments = append(footerSegments, "Follow: on")
+	} else {
+		footerSegments = append(footerSegments, "Follow: off (End resumes)")
+	}
 	footerSegments = append(footerSegments, "/ search, n/N next/previous")
 	if tuiSearchQuery != "" {
 		searchInfo := fmt.Sprintf("Search: %s", tuiSearchQuery)
@@ -461,6 +445,7 @@ func findTUILogMatch(direction int, includeCurrent bool) bool {
 		}
 	}
 	tuiLogView.ScrollTo(matches[selected], 0)
+	tuiFollowLog = false
 	tuiSearchRow = matches[selected]
 	tuiSearchStatus = fmt.Sprintf("match %d/%d", selected+1, len(matches))
 	return true
