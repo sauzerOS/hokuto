@@ -274,6 +274,18 @@ func Main() {
 		printOptionalRebuildReminders()
 	}
 
+	// Authenticate before preparing versioned package arguments. The run0
+	// backend may re-execute Hokuto, so any in-memory historical source mapping
+	// created before this point would otherwise be lost while the rewritten
+	// pkg-MAJOR argument survives in os.Args.
+	requiresRoot := needsRootPrivileges(os.Args[1:])
+	if requiresRoot {
+		if err := authenticateOnce(false); err != nil {
+			fmt.Fprintf(os.Stderr, "Authentication failed: %v\n", err)
+			os.Exit(1)
+		}
+	}
+
 	// 4.5 Handle versioned package requests (pkg@version)
 	// This allows commands like 'build gcc@1.2.3' to work by extracting the old version from Git history.
 	if len(os.Args) >= 2 {
@@ -318,16 +330,7 @@ func Main() {
 		}
 	}
 
-	// 5. CHECK IF ROOT PRIVILEGES ARE NEEDED
-	requiresRoot := needsRootPrivileges(os.Args[1:])
-	if requiresRoot {
-		if err := authenticateOnce(false); err != nil {
-			fmt.Fprintf(os.Stderr, "Authentication failed: %v\n", err)
-			os.Exit(1)
-		}
-	}
-
-	// Ensure critical directories have correct ownership after establishing the
+	// 5. Ensure critical directories have correct ownership after establishing the
 	// operation-wide privilege session. This avoids separate run0 prompts.
 	if len(os.Args) > 1 && os.Args[1] != "check" && os.Args[1] != "__complete" && os.Args[1] != "__refresh-pkg-db" {
 		if err := ensureHokutoOwnership(cfg, requiresRoot); err != nil {

@@ -58,9 +58,10 @@ func ensureHokutoOwnership(cfg *Config, createCacheDirs bool) error {
 	// the host, so do not prefix them with HOKUTO_ROOT a second time.
 	var pathsToCheck []string
 	createIfMissing := make(map[string]bool)
+	shallowRepair := make(map[string]bool)
 	seenPaths := make(map[string]bool)
 
-	addPath := func(p string, create bool) {
+	addPath := func(p string, create, shallow bool) {
 		if p == "" {
 			return
 		}
@@ -74,25 +75,26 @@ func ensureHokutoOwnership(cfg *Config, createCacheDirs bool) error {
 			seenPaths[full] = true
 		}
 		createIfMissing[full] = createIfMissing[full] || create
+		shallowRepair[full] = shallowRepair[full] || shallow
 	}
 
 	// TMPDIRs
-	addPath(tmpDir, false)
+	addPath(tmpDir, false, false)
 	if HokutoTmpDir != "" && HokutoTmpDir != tmpDir {
-		addPath(HokutoTmpDir, false)
+		addPath(HokutoTmpDir, false, false)
 	}
 	if tmp2 := cfg.Values["TMPDIR2"]; tmp2 != "" {
-		addPath(tmp2, false)
+		addPath(tmp2, false, false)
 	}
 
 	// Repo and every independently used cache directory. Checking only the
 	// cache root misses a root-owned bin/ or sources/ directory below a correctly
 	// owned parent, which prevents lock-file creation during downloads.
-	addPath("/repo", false)
-	addPath(CacheDir, createCacheDirs)
-	addPath(BinDir, createCacheDirs)
-	addPath(SourcesDir, createCacheDirs)
-	addPath(CacheStore, createCacheDirs)
+	addPath("/repo", false, false)
+	addPath(CacheDir, createCacheDirs, true)
+	addPath(BinDir, createCacheDirs, true)
+	addPath(SourcesDir, createCacheDirs, true)
+	addPath(CacheStore, createCacheDirs, true)
 	//addPath("var/db/hokuto")
 
 	// 3. Check for mismatches
@@ -138,9 +140,14 @@ func ensureHokutoOwnership(cfg *Config, createCacheDirs bool) error {
 		}
 		covered := false
 		for _, parent := range compact {
-			// Recursive chown/chmod do not traverse a symlink passed as the
-			// command-line operand. Keep checking children through a symlinked
-			// cache root so the actual bin/ and sources/ directories are fixed.
+			// Cache paths are repaired one directory at a time. A shallow parent
+			// repair does not cover any of its children.
+			if shallowRepair[parent] {
+				continue
+			}
+			// Recursive ownership tools do not consistently traverse a symlink
+			// operand. Keep checking children through a symlinked cache root so
+			// the actual bin/ and sources/ directories are fixed.
 			if info, err := os.Lstat(parent); err == nil && info.Mode()&os.ModeSymlink != 0 {
 				continue
 			}
@@ -180,6 +187,21 @@ func ensureHokutoOwnership(cfg *Config, createCacheDirs bool) error {
 				if err := os.MkdirAll(path, 0o755); err != nil {
 					return fmt.Errorf("failed to create %s natively: %w", path, err)
 				}
+				if shallowRepair[path] {
+					info, err := os.Lstat(path)
+					if err != nil {
+						return fmt.Errorf("failed to inspect %s natively: %w", path, err)
+					}
+					if err := os.Lchown(path, uid, gid); err != nil {
+						return fmt.Errorf("failed to fix ownership of %s natively: %w", path, err)
+					}
+					if info.Mode()&os.ModeSymlink == 0 {
+						if err := os.Chmod(path, info.Mode().Perm()|0o700); err != nil {
+							return fmt.Errorf("failed to fix permissions of %s natively: %w", path, err)
+						}
+					}
+					continue
+				}
 				if err := filepath.Walk(path, func(p string, info os.FileInfo, err error) error {
 					if err != nil {
 						return err
@@ -206,6 +228,17 @@ func ensureHokutoOwnership(cfg *Config, createCacheDirs bool) error {
 			} else {
 				if err := newPrivilegedCommand("mkdir", "-p", path).Run(); err != nil {
 					return fmt.Errorf("failed to create %s: %w", path, err)
+				}
+				if shallowRepair[path] {
+					if err := newPrivilegedCommand("chown", "-h", fmt.Sprintf("%s:%s", targetUID, targetGID), path).Run(); err != nil {
+						return fmt.Errorf("failed to fix ownership of %s: %w", path, err)
+					}
+					if info, err := os.Lstat(path); err == nil && info.Mode()&os.ModeSymlink == 0 {
+						if err := newPrivilegedCommand("chmod", "u+rwx", path).Run(); err != nil {
+							return fmt.Errorf("failed to fix permissions of %s: %w", path, err)
+						}
+					}
+					continue
 				}
 				if err := newPrivilegedCommand("chown", "-R", fmt.Sprintf("%s:%s", targetUID, targetGID), path).Run(); err != nil {
 					return fmt.Errorf("failed to fix ownership of %s: %w", path, err)
