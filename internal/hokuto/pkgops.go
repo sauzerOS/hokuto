@@ -92,6 +92,22 @@ func copySourceContents(srcPath, targetDir, sourceKind string, execCtx *Executor
 	return nil
 }
 
+func gitPackageSourceName(rawSourceURL, filenameOverride string) (string, error) {
+	name := filenameOverride
+	if name == "" {
+		gitURL := strings.TrimPrefix(rawSourceURL, "git+")
+		parsedURL, err := url.Parse(gitURL)
+		if err != nil {
+			return "", fmt.Errorf("invalid git URL in sources file: %w", err)
+		}
+		name = strings.TrimSuffix(filepath.Base(parsedURL.Path), ".git")
+	}
+	if name == "" || name == "." || name == ".." || filepath.Base(name) != name {
+		return "", fmt.Errorf("invalid git source filename override %q", name)
+	}
+	return name, nil
+}
+
 func prepareSources(pkgName, pkgDir, buildDir string, execCtx *Executor) error {
 	// Assuming CacheDir, SourcesDir, Executor, etc. are available in scope.
 	srcDir := filepath.Join(CacheDir, "sources", pkgName)
@@ -161,13 +177,10 @@ func prepareSources(pkgName, pkgDir, buildDir string, execCtx *Executor) error {
 			srcPath = filepath.Join(pkgDir, relPath)
 		case isGitSource:
 			// Git sources: Source path is the cloned directory in the cache (SourcesDir/pkgName/repoName)
-			gitURL := strings.TrimPrefix(relPath, "git+")
-			parsedURL, err := url.Parse(gitURL)
+			repoBase, err := gitPackageSourceName(relPath, filenameOverride)
 			if err != nil {
-				return fmt.Errorf("invalid git URL in sources file: %w", err)
+				return err
 			}
-			repoBase := filepath.Base(parsedURL.Path)
-			repoBase = strings.TrimSuffix(repoBase, ".git")
 			// srcDir is SourcesDir/pkgName. We look for the cloned repo name inside it.
 			srcPath = filepath.Join(srcDir, repoBase)
 

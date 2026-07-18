@@ -1236,7 +1236,7 @@ func fetchSourcesWithOptions(pkgName, pkgDir string, processGit bool, quiet bool
 
 		// Declare all loop-scoped variables here.
 		var parts []string
-		var origFilename, hashName, cachePath, linkPath, rawSourceURL string
+		var origFilename, filenameOverride, hashName, cachePath, linkPath, rawSourceURL string
 
 		parts = strings.Fields(line)
 		if len(parts) == 0 {
@@ -1247,7 +1247,8 @@ func fetchSourcesWithOptions(pkgName, pkgDir string, processGit bool, quiet bool
 
 		// --- NEW: Support "URL -> filename" syntax ---
 		if len(parts) >= 3 && parts[1] == "->" {
-			origFilename = parts[2]
+			filenameOverride = parts[2]
+			origFilename = filenameOverride
 		}
 
 		// --- FIX START: Skip local files defined with the 'files/' prefix ---
@@ -1273,6 +1274,10 @@ func fetchSourcesWithOptions(pkgName, pkgDir string, processGit bool, quiet bool
 			}
 			parts = strings.Split(strings.TrimSuffix(gitURL, ".git"), "/")
 			repoName := parts[len(parts)-1]
+			packageSourceName, err := gitPackageSourceName(rawSourceURL, filenameOverride)
+			if err != nil {
+				return err
+			}
 
 			// --- SHARED CHECKOUT (Working Tree) ---
 			// We share the checkout between packages if they use the same URL and ref.
@@ -1310,7 +1315,7 @@ func fetchSourcesWithOptions(pkgName, pkgDir string, processGit bool, quiet bool
 					return err
 				}
 
-				destPath, err := linkSharedGitCheckout(pkgName, pkgLinkDir, repoName, sharedPath)
+				destPath, err := linkSharedGitCheckout(pkgName, pkgLinkDir, packageSourceName, sharedPath)
 				if err != nil {
 					return err
 				}
@@ -1328,7 +1333,7 @@ func fetchSourcesWithOptions(pkgName, pkgDir string, processGit bool, quiet bool
 			cacheRepoPath := filepath.Join(gitCacheDir, repoName+"-"+urlHash)
 
 			// Update/Clone bare cache
-			err := func() error {
+			err = func() error {
 				lockPath := cacheRepoPath + ".lock"
 				lFile, err := os.Create(lockPath)
 				if err != nil {
@@ -1432,7 +1437,7 @@ func fetchSourcesWithOptions(pkgName, pkgDir string, processGit bool, quiet bool
 			}
 
 			// --- 3. LINK PACKAGE TO SHARED CHECKOUT ---
-			destPath, err := linkSharedGitCheckout(pkgName, pkgLinkDir, repoName, sharedPath)
+			destPath, err := linkSharedGitCheckout(pkgName, pkgLinkDir, packageSourceName, sharedPath)
 			if err != nil {
 				return err
 			}
