@@ -5,20 +5,18 @@ import (
 	"os"
 	"os/user"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
 )
 
-// ensureHokutoOwnership checks if critical Hokuto directories are owned by the correct user
-// (SUDO_USER or current user) and group (wheel). If not, it attempts to fix them via chown.
-func ensureHokutoOwnership(cfg *Config) error {
-	// 0. Skip if already root
-	if os.Geteuid() == 0 {
-		return nil
-	}
-
-	// 1. Determine target user and group
+// ensureHokutoOwnership checks if critical Hokuto directories are owned by the
+// invoking user and that the owner can write to them. If not, it repairs them.
+func ensureHokutoOwnership(cfg *Config, createCacheDirs bool) error {
+	// 1. Determine target user and group. Do not skip an effective UID of zero:
+	// `sudo hokuto` must repair caches for SUDO_USER rather than leaving them
+	// owned by root.
 	targetUser := os.Getenv("SUDO_USER")
 	targetGroup := ""
 	var targetGID string
@@ -56,35 +54,45 @@ func ensureHokutoOwnership(cfg *Config) error {
 	}
 	targetUID := u.Uid
 
-	// 2. Identify Paths to check
-	// The user requested: HOKUTO_ROOT/$TMPDIR, HOKUTO_ROOT/$TMPDIR2, HOKUTO_ROOT/repo/,
-	// HOKUTO_ROOT/var/cache/hokuto, HOKUTO_ROOT/var/db/hokuto
+	// 2. Identify paths to check. These globals are the paths Hokuto accesses on
+	// the host, so do not prefix them with HOKUTO_ROOT a second time.
 	var pathsToCheck []string
+	createIfMissing := make(map[string]bool)
+	seenPaths := make(map[string]bool)
 
-	addPath := func(p string) {
+	addPath := func(p string, create bool) {
 		if p == "" {
 			return
 		}
-		full := filepath.Clean(filepath.Join(rootDir, strings.TrimPrefix(p, "/")))
+		full := filepath.Clean(p)
 		// NEVER try to chown root or standard system temp dirs
 		if full == "/" || full == "/tmp" || full == "/var/tmp" || full == "/home" || full == "/usr" {
 			return
 		}
-		pathsToCheck = append(pathsToCheck, full)
+		if !seenPaths[full] {
+			pathsToCheck = append(pathsToCheck, full)
+			seenPaths[full] = true
+		}
+		createIfMissing[full] = createIfMissing[full] || create
 	}
 
 	// TMPDIRs
-	addPath(tmpDir)
+	addPath(tmpDir, false)
 	if HokutoTmpDir != "" && HokutoTmpDir != tmpDir {
-		addPath(HokutoTmpDir)
+		addPath(HokutoTmpDir, false)
 	}
 	if tmp2 := cfg.Values["TMPDIR2"]; tmp2 != "" {
-		addPath(tmp2)
+		addPath(tmp2, false)
 	}
 
-	// Repo, Cache, DB
-	addPath("repo")
-	addPath("var/cache/hokuto")
+	// Repo and every independently used cache directory. Checking only the
+	// cache root misses a root-owned bin/ or sources/ directory below a correctly
+	// owned parent, which prevents lock-file creation during downloads.
+	addPath("/repo", false)
+	addPath(CacheDir, createCacheDirs)
+	addPath(BinDir, createCacheDirs)
+	addPath(SourcesDir, createCacheDirs)
+	addPath(CacheStore, createCacheDirs)
 	//addPath("var/db/hokuto")
 
 	// 3. Check for mismatches
@@ -93,7 +101,9 @@ func ensureHokutoOwnership(cfg *Config) error {
 		// Use Lstat to check the link itself if it's a symlink
 		info, err := os.Lstat(path)
 		if err != nil {
-			// If it doesn't exist, we don't need to fix it.
+			if os.IsNotExist(err) && createIfMissing[path] {
+				pathsToFix = append(pathsToFix, path)
+			}
 			continue
 		}
 
@@ -105,17 +115,9 @@ func ensureHokutoOwnership(cfg *Config) error {
 		uidMatch := fmt.Sprint(stat.Uid) == targetUID
 		gidMatch := fmt.Sprint(stat.Gid) == targetGID
 
-		// Mismatch detection
-		mismatch := false
-		if !uidMatch {
+		mismatch := !uidMatch || !gidMatch
+		if info.IsDir() && info.Mode().Perm()&0o700 != 0o700 {
 			mismatch = true
-		} else if !gidMatch {
-			// Special case: ignore group mismatch for cache directory
-			// (often a symlink to external drive with different group permissions)
-			isCache := strings.Contains(path, "var/cache/hokuto")
-			if !isCache {
-				mismatch = true
-			}
 		}
 
 		if mismatch {
@@ -123,12 +125,43 @@ func ensureHokutoOwnership(cfg *Config) error {
 		}
 	}
 
+	// If a parent is already being repaired recursively, avoid traversing its
+	// children a second time.
+	sort.Slice(pathsToFix, func(i, j int) bool { return len(pathsToFix[i]) < len(pathsToFix[j]) })
+	compact := pathsToFix[:0]
+	for _, path := range pathsToFix {
+		// Repairing a parent recursively does not create requested child
+		// directories. Keep every missing cache directory in the work list.
+		if _, err := os.Lstat(path); os.IsNotExist(err) {
+			compact = append(compact, path)
+			continue
+		}
+		covered := false
+		for _, parent := range compact {
+			// Recursive chown/chmod do not traverse a symlink passed as the
+			// command-line operand. Keep checking children through a symlinked
+			// cache root so the actual bin/ and sources/ directories are fixed.
+			if info, err := os.Lstat(parent); err == nil && info.Mode()&os.ModeSymlink != 0 {
+				continue
+			}
+			rel, err := filepath.Rel(parent, path)
+			if err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+				covered = true
+				break
+			}
+		}
+		if !covered {
+			compact = append(compact, path)
+		}
+	}
+	pathsToFix = compact
+
 	// 4. Fix if needed
 	if len(pathsToFix) > 0 {
 		// Inform the user what we are doing (only in debug mode)
 		if Debug {
 			colArrow.Print("-> ")
-			fmt.Printf("Ensuring ownership for Hokuto directories (current user:user)\n")
+			fmt.Printf("Ensuring ownership for Hokuto directories (%s:%s)\n", targetUser, targetGroup)
 			for _, p := range pathsToFix {
 				fmt.Printf("   Fixing: %s\n", p)
 			}
@@ -144,24 +177,41 @@ func ensureHokutoOwnership(cfg *Config) error {
 			gid, _ := strconv.Atoi(targetGID)
 
 			if os.Geteuid() == 0 {
-				if err := os.Chown(path, uid, gid); err != nil {
-					return fmt.Errorf("failed to fix ownership of %s natively: %w", path, err)
+				if err := os.MkdirAll(path, 0o755); err != nil {
+					return fmt.Errorf("failed to create %s natively: %w", path, err)
 				}
-				// Also handle recursive if it was -R, but pathsToFix are individual identified paths?
-				// Actually pathsToCheck are only the top level dirs. chown -R was used.
-				// If we want to replace chown -R we need a recursive walk.
 				if err := filepath.Walk(path, func(p string, info os.FileInfo, err error) error {
 					if err != nil {
 						return err
 					}
-					return os.Chown(p, uid, gid)
+					if err := os.Lchown(p, uid, gid); err != nil {
+						return err
+					}
+					if info.Mode()&os.ModeSymlink != 0 {
+						return nil
+					}
+					mode := info.Mode()
+					if info.IsDir() {
+						mode |= 0o700
+					} else {
+						mode |= 0o600
+						if info.Mode()&0o111 != 0 {
+							mode |= 0o100
+						}
+					}
+					return os.Chmod(p, mode)
 				}); err != nil {
-					return fmt.Errorf("failed to fix recursive ownership of %s natively: %w", path, err)
+					return fmt.Errorf("failed to repair permissions for %s natively: %w", path, err)
 				}
 			} else {
-				cmd := newPrivilegedCommand("chown", "-R", fmt.Sprintf("%s:%s", targetUser, targetGroup), path)
-				if err := cmd.Run(); err != nil {
+				if err := newPrivilegedCommand("mkdir", "-p", path).Run(); err != nil {
+					return fmt.Errorf("failed to create %s: %w", path, err)
+				}
+				if err := newPrivilegedCommand("chown", "-R", fmt.Sprintf("%s:%s", targetUID, targetGID), path).Run(); err != nil {
 					return fmt.Errorf("failed to fix ownership of %s: %w", path, err)
+				}
+				if err := newPrivilegedCommand("chmod", "-R", "u+rwX", path).Run(); err != nil {
+					return fmt.Errorf("failed to fix permissions of %s: %w", path, err)
 				}
 			}
 		}

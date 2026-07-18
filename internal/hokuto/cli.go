@@ -319,7 +319,8 @@ func Main() {
 	}
 
 	// 5. CHECK IF ROOT PRIVILEGES ARE NEEDED
-	if needsRootPrivileges(os.Args[1:]) {
+	requiresRoot := needsRootPrivileges(os.Args[1:])
+	if requiresRoot {
 		if err := authenticateOnce(false); err != nil {
 			fmt.Fprintf(os.Stderr, "Authentication failed: %v\n", err)
 			os.Exit(1)
@@ -329,7 +330,11 @@ func Main() {
 	// Ensure critical directories have correct ownership after establishing the
 	// operation-wide privilege session. This avoids separate run0 prompts.
 	if len(os.Args) > 1 && os.Args[1] != "check" && os.Args[1] != "__complete" && os.Args[1] != "__refresh-pkg-db" {
-		if err := ensureHokutoOwnership(cfg); err != nil {
+		if err := ensureHokutoOwnership(cfg, requiresRoot); err != nil {
+			if requiresRoot {
+				fmt.Fprintf(os.Stderr, "Error: failed to prepare Hokuto directories: %v\n", err)
+				os.Exit(1)
+			}
 			fmt.Fprintf(os.Stderr, "Warning: Ownership check failed: %v\n", err)
 		}
 	}
@@ -1006,6 +1011,7 @@ func Main() {
 				if !tarballFoundDirectly {
 					if _, err := os.Stat(tarballPath); err != nil || *remote {
 						foundOnMirror := false
+						var mirrorFetchErr error
 
 						// 2. Not in local cache? Try Mirror.
 						if !*noRemote && BinaryMirror != "" {
@@ -1040,6 +1046,7 @@ func Main() {
 								if err := fetchBinaryPackage(archivePkgName, version, revision, cfg, effectiveFast, expectedSum, *remote); err == nil {
 									foundOnMirror = true
 								} else {
+									mirrorFetchErr = err
 									debugf("Mirror fetch failed for %s: %v\n", pkgName, err)
 								}
 							} else {
@@ -1088,6 +1095,8 @@ func Main() {
 											// Update tarballPath for installation
 											arch := GetSystemArchForPackage(cfg, pkgName)
 											tarballPath = filepath.Join(BinDir, StandardizeRemoteName(archivePkgName, version, revision, arch, fallbackVariant))
+										} else {
+											mirrorFetchErr = err
 										}
 										cfg.Values["HOKUTO_GENERIC"] = oldGeneric
 									}
@@ -1124,6 +1133,8 @@ func Main() {
 											arch := GetSystemArchForPackage(cfg, pkgName)
 											variant := GetSystemVariantForPackage(cfg, pkgName)
 											tarballPath = filepath.Join(BinDir, StandardizeRemoteName(archivePkgName, version, revision, arch, variant))
+										} else {
+											mirrorFetchErr = err
 										}
 									}
 
@@ -1157,6 +1168,8 @@ func Main() {
 													arch := GetSystemArchForPackage(cfg, pkgName)
 													variant := GetSystemVariantForPackage(cfg, pkgName)
 													tarballPath = filepath.Join(BinDir, StandardizeRemoteName(archivePkgName, version, revision, arch, variant))
+												} else {
+													mirrorFetchErr = err
 												}
 												cfg.Values["HOKUTO_GENERIC"] = oldGeneric
 											}
@@ -1169,6 +1182,11 @@ func Main() {
 
 						// 3. If still not found, error out.
 						if !foundOnMirror {
+							if mirrorFetchErr != nil {
+								cPrintf(colWarn, "Error fetching binary package %s: %v\n", pkgName, mirrorFetchErr)
+								allSucceeded = false
+								continue
+							}
 							cPrintf(colWarn, "Error: Binary package not found for %s.\n", pkgName)
 							cPrintf(colInfo, "Expected path: %s\n", tarballPath)
 							if BinaryMirror != "" {
@@ -1368,7 +1386,7 @@ func Main() {
 		}
 
 	case "update", "u":
-		if err := ensureHokutoOwnership(cfg); err != nil {
+		if err := ensureHokutoOwnership(cfg, true); err != nil {
 			fmt.Fprintf(os.Stderr, "Ownership check failed: %v\n", err)
 		}
 		// Preprocess arguments to handle custom flag formats (e.g. -j4)
