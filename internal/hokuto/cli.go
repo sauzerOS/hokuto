@@ -848,6 +848,13 @@ func Main() {
 		if effectiveFast && len(installPlan) > 0 {
 			bar = progressbar.Default(int64(len(installPlan)), colSuccess.Sprint("Installing Packages"))
 		}
+		installProgressLineActive := bar != nil
+		finishInstallProgressLine := func() {
+			if bar != nil && installProgressLineActive {
+				fmt.Fprintln(os.Stderr)
+				installProgressLineActive = false
+			}
+		}
 
 		for i, arg := range installPlan {
 			var tarballPath, pkgName, resolvedVersion string
@@ -865,6 +872,7 @@ func Main() {
 					// Fallback for old format: pkgname-version.tar.zst
 					lastDashIndex := strings.LastIndex(nameWithoutExt, "-")
 					if lastDashIndex == -1 {
+						finishInstallProgressLine()
 						fmt.Fprintf(os.Stderr, "Error: Could not determine package name from tarball file name: %s\n", arg)
 						allSucceeded = false
 						continue
@@ -898,6 +906,7 @@ func Main() {
 					}
 				}
 				if _, err := os.Stat(tarballPath); err != nil {
+					finishInstallProgressLine()
 					fmt.Fprintf(os.Stderr, "Error: Tarball not found or inaccessible: %s\n", tarballPath)
 					allSucceeded = false
 					continue
@@ -992,11 +1001,13 @@ func Main() {
 							revision = foundRevision
 							tarballFoundDirectly = true
 						} else {
+							finishInstallProgressLine()
 							fmt.Fprintf(os.Stderr, "Error determining version for %s: %v\n", pkgName, err)
 							allSucceeded = false
 							continue
 						}
 					} else {
+						finishInstallProgressLine()
 						fmt.Fprintf(os.Stderr, "Error determining version for %s: %v\n", pkgName, err)
 						allSucceeded = false
 						continue
@@ -1020,6 +1031,7 @@ func Main() {
 								if idx, rErr := getCachedRemoteIndex(cfg, effectiveFast); rErr == nil {
 									remoteIndex = idx
 								} else {
+									finishInstallProgressLine()
 									cPrintf(colWarn, "Warning: Failed to fetch remote index: %v\n", rErr)
 								}
 							}
@@ -1183,10 +1195,12 @@ func Main() {
 						// 3. If still not found, error out.
 						if !foundOnMirror {
 							if mirrorFetchErr != nil {
+								finishInstallProgressLine()
 								cPrintf(colWarn, "Error fetching binary package %s: %v\n", pkgName, mirrorFetchErr)
 								allSucceeded = false
 								continue
 							}
+							finishInstallProgressLine()
 							cPrintf(colWarn, "Error: Binary package not found for %s.\n", pkgName)
 							cPrintf(colInfo, "Expected path: %s\n", tarballPath)
 							if BinaryMirror != "" {
@@ -1209,6 +1223,7 @@ func Main() {
 
 			if effectiveFast && bar != nil {
 				bar.Describe(colSuccess.Sprint("Installing ") + colNote.Sprint(pkgName))
+				installProgressLineActive = true
 			} else {
 				colArrow.Print("-> ")
 				colSuccess.Printf("Installing:")
@@ -1216,6 +1231,7 @@ func Main() {
 			}
 
 			if _, err := pkgInstallWithRemotePolicy(tarballPath, pkgName, cfg, RootExec, effectiveYes, effectiveFast, false, *noRemote, nil); err != nil {
+				finishInstallProgressLine()
 				fmt.Fprintln(os.Stderr,
 					colArrow.Sprint("->"),
 					colSuccess.Sprintf("Error installing package"),
@@ -1230,18 +1246,28 @@ func Main() {
 			// Only if the user explicitly requested this package (not auto-deps)
 			if explicitlyRequested || userRequestedMap[pkgName] {
 				if err := addToWorld(pkgName); err != nil {
+					finishInstallProgressLine()
 					fmt.Fprintf(os.Stderr, "Warning: failed to add %s to world file: %v\n", pkgName, err)
 				}
 			}
 
 			if effectiveFast && bar != nil {
 				bar.Add(1)
+				installProgressLineActive = true
 			} else {
 				colArrow.Print("-> ")
 				colSuccess.Printf("Package ")
 				colNote.Printf("%s", pkgName)
 				colSuccess.Printf(" installed successfully.\n")
 			}
+		}
+
+		if effectiveFast && bar != nil {
+			if allSucceeded {
+				bar.Finish()
+				installProgressLineActive = true
+			}
+			finishInstallProgressLine()
 		}
 
 		if allSucceeded {
@@ -1266,10 +1292,6 @@ func Main() {
 		}
 
 		if effectiveFast && allSucceeded {
-			if bar != nil {
-				bar.Finish()
-				fmt.Println()
-			}
 			colArrow.Print("-> ")
 			colSuccess.Println("Running post-install tasks")
 			if err := PostInstallTasks(RootExec, os.Stdout); err != nil {
