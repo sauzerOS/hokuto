@@ -218,7 +218,7 @@ func checkInstalledPackageIntegrity(searchTerm string, cfg *Config) error {
 	return nil
 }
 
-func listPackages(searchTerm string) error {
+func listPackages(searchTerm string, sortBySize bool) error {
 	// Step 1: Always get the full list of installed package directories first.
 	entries, err := os.ReadDir(Installed)
 	if err != nil {
@@ -355,12 +355,12 @@ func listPackages(searchTerm string) error {
 		// Format: -> Name Version Arch Variant(multi) [BuildTime]
 		pkgStr := fmt.Sprintf("%s %s %s %s",
 			prefix,
-			colSuccess.Sprintf("%-25s", p),
-			colNote.Sprintf("%-15s", versionInfo),
+			colSuccess.Sprintf("%-25s", fitPackageListColumn(p, 25)),
+			colNote.Sprintf("%-15s", fitPackageListColumn(versionInfo, 15)),
 			color.Yellow.Sprintf("%10s", sizeInfo))
 		pkgStr += fmt.Sprintf(" %s",
 			color.Cyan.Sprintf("%-10s %s%s",
-				arch,
+				fitPackageListColumn(arch, 10),
 				variantDisplay,
 				multiSuffix))
 
@@ -376,7 +376,7 @@ func listPackages(searchTerm string) error {
 		})
 	}
 
-	return RunSortablePager("Installed Packages", output)
+	return RunSortablePager("Installed Packages", output, sortBySize)
 }
 
 func FetchRemoteIndex(cfg *Config) ([]RepoEntry, error) {
@@ -545,7 +545,7 @@ func IsPackageInIndex(index []RepoEntry, name, version, revision string, cfg *Co
 	return false
 }
 
-func listRemotePackages(searchTerm string, cfg *Config) error {
+func listRemotePackages(searchTerm string, cfg *Config, sortBySize bool) error {
 	remoteIndex, err := FetchRemoteIndex(cfg)
 	if err != nil {
 		return err
@@ -580,11 +580,11 @@ func listRemotePackages(searchTerm string, cfg *Config) error {
 
 		line := fmt.Sprintf("%s %s %s %s %s",
 			colArrow.Sprint("->"),
-			colSuccess.Sprintf("%-25s", entry.Name),
-			colNote.Sprintf("%-15s", fmt.Sprintf("%s-%s", entry.Version, entry.Revision)),
+			colSuccess.Sprintf("%-25s", fitPackageListColumn(entry.Name, 25)),
+			colNote.Sprintf("%-15s", fitPackageListColumn(fmt.Sprintf("%s-%s", entry.Version, entry.Revision), 15)),
 			color.Yellow.Sprintf("%10s", sizeInfo),
 			color.Cyan.Sprintf("%-10s %s%s",
-				entry.Arch,
+				fitPackageListColumn(entry.Arch, 10),
 				variantDisplay,
 				multiSuffix))
 		output = append(output, SortablePagerLine{
@@ -602,7 +602,21 @@ func listRemotePackages(searchTerm string, cfg *Config) error {
 		return nil
 	}
 
-	return RunSortablePager("Remote Packages", output)
+	return RunSortablePager("Remote Packages", output, sortBySize)
+}
+
+func fitPackageListColumn(value string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	runes := []rune(value)
+	if len(runes) <= width {
+		return value
+	}
+	if width == 1 {
+		return "…"
+	}
+	return string(runes[:width-1]) + "…"
 }
 
 // GetRemotePackageEntry searches the remote index for a package matching system criteria.

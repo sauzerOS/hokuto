@@ -93,14 +93,33 @@ func RunPager(title string, lines []string) error {
 	return nil
 }
 
-func RunSortablePager(title string, rows []SortablePagerLine) error {
+func RunSortablePager(title string, rows []SortablePagerLine, sortBySize bool) error {
 	if len(rows) == 0 {
 		return nil
 	}
 
+	sortMode := "original"
+	if sortBySize {
+		sortMode = "size-desc"
+	}
+	sortedRows := func() []SortablePagerLine {
+		result := append([]SortablePagerLine(nil), rows...)
+		switch sortMode {
+		case "size-desc":
+			sort.SliceStable(result, func(i, j int) bool {
+				return sortablePagerSizeLess(result[i], result[j], true)
+			})
+		case "size-asc":
+			sort.SliceStable(result, func(i, j int) bool {
+				return sortablePagerSizeLess(result[i], result[j], false)
+			})
+		}
+		return result
+	}
+
 	fd := int(os.Stdout.Fd())
 	if !term.IsTerminal(fd) {
-		for _, row := range rows {
+		for _, row := range sortedRows() {
 			fmt.Println(row.Line)
 		}
 		return nil
@@ -116,47 +135,70 @@ func RunSortablePager(title string, rows []SortablePagerLine) error {
 	footer := tview.NewTextView().
 		SetDynamicColors(true).
 		SetTextAlign(tview.AlignCenter).
-		SetText("[gray]s sort size, n original order, ↑/↓ PgUp/PgDn Home/End scroll, q/Esc quit[white]")
+		SetText("[gray]s sort size, n original order, / search, ↑/↓ PgUp/PgDn Home/End scroll, q/Esc quit[white]")
+	searchInput := tview.NewInputField().SetLabel("Search: ")
+	bottomPages := tview.NewPages().
+		AddPage("status", footer, true, true).
+		AddPage("search", searchInput, true, false)
 
-	sortMode := "original"
+	searchQuery := ""
+	searching := false
 	render := func() {
-		sortedRows := append([]SortablePagerLine(nil), rows...)
-		switch sortMode {
-		case "size-desc":
-			sort.SliceStable(sortedRows, func(i, j int) bool {
-				return sortablePagerSizeLess(sortedRows[i], sortedRows[j], true)
-			})
-		case "size-asc":
-			sort.SliceStable(sortedRows, func(i, j int) bool {
-				return sortablePagerSizeLess(sortedRows[i], sortedRows[j], false)
-			})
-		}
-
 		var lines []string
-		for _, row := range sortedRows {
+		query := strings.ToLower(strings.TrimSpace(searchQuery))
+		for _, row := range sortedRows() {
+			if query != "" && !strings.Contains(strings.ToLower(row.Name+" "+row.Line), query) {
+				continue
+			}
 			lines = append(lines, row.Line)
 		}
 
 		textView.Clear()
 		textView.SetTitle(" " + title + " " + sortablePagerTitleSuffix(sortMode) + " ")
 		ansiWriter := tview.ANSIWriter(textView)
-		fmt.Fprint(ansiWriter, strings.Join(lines, "\n"))
+		if len(lines) == 0 {
+			fmt.Fprint(ansiWriter, "No matching packages.")
+		} else {
+			fmt.Fprint(ansiWriter, strings.Join(lines, "\n"))
+		}
 		textView.ScrollToBeginning()
 	}
+	searchInput.SetChangedFunc(func(text string) {
+		searchQuery = text
+		render()
+	})
+	searchInput.SetDoneFunc(func(key tcell.Key) {
+		if key == tcell.KeyEscape {
+			searchInput.SetText("")
+			searchQuery = ""
+			render()
+		}
+		searching = false
+		bottomPages.SwitchToPage("status")
+		app.SetFocus(textView)
+	})
 	render()
 
 	flex := tview.NewFlex().
 		SetDirection(tview.FlexRow).
 		AddItem(textView, 0, 1, true).
-		AddItem(footer, 1, 0, false)
+		AddItem(bottomPages, 1, 0, false)
 
 	app.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		if searching {
+			return event
+		}
 		switch event.Key() {
 		case tcell.KeyEsc, tcell.KeyCtrlQ:
 			app.Stop()
 			return nil
 		case tcell.KeyRune:
 			switch event.Rune() {
+			case '/':
+				searching = true
+				bottomPages.SwitchToPage("search")
+				app.SetFocus(searchInput)
+				return nil
 			case 'q':
 				app.Stop()
 				return nil
