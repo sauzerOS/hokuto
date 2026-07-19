@@ -1,6 +1,7 @@
 package hokuto
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -33,37 +34,80 @@ type PKGBUILDFunction struct {
 }
 
 // fetchPKGBUILD downloads the PKGBUILD from Arch or AUR
-func fetchPKGBUILD(pkgName string, source string) (string, error) {
+func fetchPKGBUILD(pkgName string, source string) (string, string, error) {
 	client := &http.Client{Timeout: 15 * time.Second}
-	var url string
+	var packageURL, sourceRef string
 
 	if source == "AUR" {
 		// AUR PKGBUILD URL format
-		url = fmt.Sprintf("https://aur.archlinux.org/cgit/aur.git/plain/PKGBUILD?h=%s", pkgName)
+		packageURL = fmt.Sprintf("https://aur.archlinux.org/cgit/aur.git/plain/PKGBUILD?h=%s", pkgName)
 	} else {
-		// Arch Linux PKGBUILD - use GitLab packaging repo
-		url = fmt.Sprintf("https://gitlab.archlinux.org/archlinux/packaging/packages/%s/-/raw/main/PKGBUILD", pkgName)
+		pkgBase, releaseRef, err := fetchArchPackageRelease(client, pkgName)
+		if err != nil {
+			return "", "", err
+		}
+		sourceRef = releaseRef
+		packageURL = fmt.Sprintf("https://gitlab.archlinux.org/archlinux/packaging/packages/%s/-/raw/%s/PKGBUILD",
+			url.PathEscape(pkgBase), url.PathEscape(releaseRef))
 	}
 
-	resp, err := client.Get(url)
+	resp, err := client.Get(packageURL)
 	if err != nil {
-		return "", fmt.Errorf("failed to fetch PKGBUILD: %w", err)
+		return "", "", fmt.Errorf("failed to fetch PKGBUILD: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
-		return "", fmt.Errorf("PKGBUILD not found (HTTP %d)", resp.StatusCode)
+		return "", "", fmt.Errorf("PKGBUILD not found at release %s (HTTP %d)", sourceRef, resp.StatusCode)
 	}
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return "", fmt.Errorf("failed to read PKGBUILD: %w", err)
+		return "", "", fmt.Errorf("failed to read PKGBUILD: %w", err)
 	}
 
-	return string(body), nil
+	return string(body), sourceRef, nil
+}
+
+func fetchArchPackageRelease(client *http.Client, pkgName string) (string, string, error) {
+	apiURL := "https://archlinux.org/packages/search/json/?name=" + url.QueryEscape(pkgName)
+	resp, err := client.Get(apiURL)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to query Arch package release: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", "", fmt.Errorf("failed to query Arch package release (HTTP %d)", resp.StatusCode)
+	}
+
+	var result struct {
+		Results []struct {
+			PkgName string `json:"pkgname"`
+			PkgBase string `json:"pkgbase"`
+			PkgVer  string `json:"pkgver"`
+			PkgRel  string `json:"pkgrel"`
+		} `json:"results"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return "", "", fmt.Errorf("failed to decode Arch package release: %w", err)
+	}
+	for _, pkg := range result.Results {
+		if pkg.PkgName != pkgName {
+			continue
+		}
+		if pkg.PkgBase == "" || pkg.PkgVer == "" || pkg.PkgRel == "" {
+			return "", "", fmt.Errorf("Arch package release metadata for %s is incomplete", pkgName)
+		}
+		return pkg.PkgBase, pkg.PkgVer + "-" + pkg.PkgRel, nil
+	}
+	return "", "", fmt.Errorf("Arch package %s was not found in an official repository", pkgName)
 }
 
 func archPackageFileURL(pkgName, source, fileName string) (string, error) {
+	return archPackageFileURLAtRef(pkgName, source, fileName, "main")
+}
+
+func archPackageFileURLAtRef(pkgName, source, fileName, sourceRef string) (string, error) {
 	clean := filepath.ToSlash(filepath.Clean(fileName))
 	if clean == "." || clean == "" || strings.HasPrefix(clean, "../") || strings.HasPrefix(clean, "/") {
 		return "", fmt.Errorf("unsafe local PKGBUILD source path %q", fileName)
@@ -76,11 +120,15 @@ func archPackageFileURL(pkgName, source, fileName string) (string, error) {
 	if source == "AUR" {
 		return fmt.Sprintf("https://aur.archlinux.org/cgit/aur.git/plain/%s?h=%s", escapedPath, url.QueryEscape(pkgName)), nil
 	}
-	return fmt.Sprintf("https://gitlab.archlinux.org/archlinux/packaging/packages/%s/-/raw/main/%s", url.PathEscape(pkgName), escapedPath), nil
+	if sourceRef == "" {
+		sourceRef = "main"
+	}
+	return fmt.Sprintf("https://gitlab.archlinux.org/archlinux/packaging/packages/%s/-/raw/%s/%s",
+		url.PathEscape(pkgName), url.PathEscape(sourceRef), escapedPath), nil
 }
 
-func downloadArchPackageFile(pkgName, source, fileName, destination string) error {
-	fileURL, err := archPackageFileURL(pkgName, source, fileName)
+func downloadArchPackageFile(pkgName, source, sourceRef, fileName, destination string) error {
+	fileURL, err := archPackageFileURLAtRef(pkgName, source, fileName, sourceRef)
 	if err != nil {
 		return err
 	}
@@ -118,7 +166,7 @@ func downloadArchPackageFile(pkgName, source, fileName, destination string) erro
 	return nil
 }
 
-func materializeArchLocalSources(info *PKGBUILDInfo, pkgName, source, pkgDir string) error {
+func materializeArchLocalSources(info *PKGBUILDInfo, pkgName, source, sourceRef, pkgDir string) error {
 	for i, item := range info.Sources {
 		if isRemoteImportSource(item) || strings.HasPrefix(item, "files/") {
 			continue
@@ -131,7 +179,7 @@ func materializeArchLocalSources(info *PKGBUILDInfo, pkgName, source, pkgDir str
 		destination := filepath.Join(pkgDir, "files", filepath.FromSlash(clean))
 		colArrow.Print("-> ")
 		colSuccess.Printf("Downloading PKGBUILD file %s\n", item)
-		if err := downloadArchPackageFile(pkgName, source, clean, destination); err != nil {
+		if err := downloadArchPackageFile(pkgName, source, sourceRef, clean, destination); err != nil {
 			return err
 		}
 		info.Sources[i] = "files/" + clean
@@ -251,6 +299,35 @@ func extractPKGBUILDVariables(content string) map[string]string {
 }
 
 func expandPKGBUILDVariables(value string, variables map[string]string) string {
+	caseModification := regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_]*)(,,|\^\^|,|\^)\}`)
+	value = caseModification.ReplaceAllStringFunc(value, func(expr string) string {
+		parts := caseModification.FindStringSubmatch(expr)
+		resolved, ok := variables[parts[1]]
+		if !ok {
+			return expr
+		}
+		switch parts[2] {
+		case ",,":
+			return strings.ToLower(resolved)
+		case "^^":
+			return strings.ToUpper(resolved)
+		case ",":
+			runes := []rune(resolved)
+			if len(runes) > 0 {
+				runes[0] = []rune(strings.ToLower(string(runes[0])))[0]
+			}
+			return string(runes)
+		case "^":
+			runes := []rune(resolved)
+			if len(runes) > 0 {
+				runes[0] = []rune(strings.ToUpper(string(runes[0])))[0]
+			}
+			return string(runes)
+		default:
+			return expr
+		}
+	})
+
 	substring := regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_]*)::([0-9]+)\}`)
 	value = substring.ReplaceAllStringFunc(value, func(expr string) string {
 		parts := substring.FindStringSubmatch(expr)
@@ -349,6 +426,9 @@ func extractBashArray(content string, arrayName string) []string {
 	var current strings.Builder
 	inQuote := false
 	quoteChar := rune(0)
+	appendValue := func(value string) {
+		result = append(result, expandBashBraceWord(value)...)
+	}
 
 	for _, ch := range arrayContent {
 		if (ch == '"' || ch == '\'') && !inQuote {
@@ -359,7 +439,7 @@ func extractBashArray(content string, arrayName string) []string {
 			inQuote = false
 			quoteChar = 0
 			if current.Len() > 0 {
-				result = append(result, current.String())
+				appendValue(current.String())
 				current.Reset()
 			}
 			continue
@@ -370,16 +450,76 @@ func extractBashArray(content string, arrayName string) []string {
 		} else if ch != ' ' && ch != '\n' && ch != '\t' {
 			current.WriteRune(ch)
 		} else if current.Len() > 0 {
-			result = append(result, current.String())
+			appendValue(current.String())
 			current.Reset()
 		}
 	}
 
 	if current.Len() > 0 {
-		result = append(result, current.String())
+		appendValue(current.String())
 	}
 
 	return result
+}
+
+func expandBashBraceWord(word string) []string {
+	open := strings.IndexByte(word, '{')
+	if open < 0 {
+		return []string{word}
+	}
+
+	depth := 0
+	close := -1
+	for i := open; i < len(word); i++ {
+		switch word[i] {
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				close = i
+				i = len(word)
+			}
+		}
+	}
+	if close < 0 {
+		return []string{word}
+	}
+
+	var choices []string
+	start, nested := 0, 0
+	body := word[open+1 : close]
+	for i := 0; i <= len(body); i++ {
+		if i < len(body) {
+			switch body[i] {
+			case '{':
+				nested++
+			case '}':
+				nested--
+			case ',':
+				if nested != 0 {
+					continue
+				}
+			default:
+				continue
+			}
+			if body[i] != ',' || nested != 0 {
+				continue
+			}
+		}
+		choices = append(choices, body[start:i])
+		start = i + 1
+	}
+	if len(choices) < 2 {
+		return []string{word}
+	}
+
+	prefix, suffix := word[:open], word[close+1:]
+	var expanded []string
+	for _, choice := range choices {
+		expanded = append(expanded, expandBashBraceWord(prefix+choice+suffix)...)
+	}
+	return expanded
 }
 
 // extractBashFunction extracts the body of a bash function
@@ -481,7 +621,7 @@ func generatePackageFromArch(pkgName string, source string, targetDir string) er
 	colSuccess.Printf("Searching %s for '%s'\n", source, pkgName)
 
 	// Fetch PKGBUILD
-	pkgbuild, err := fetchPKGBUILD(pkgName, source)
+	pkgbuild, sourceRef, err := fetchPKGBUILD(pkgName, source)
 	if err != nil {
 		return fmt.Errorf("failed to fetch PKGBUILD: %w", err)
 	}
@@ -522,7 +662,7 @@ func generatePackageFromArch(pkgName string, source string, targetDir string) er
 	if err := os.MkdirAll(pkgDir, 0o755); err != nil {
 		return fmt.Errorf("failed to create package directory: %w", err)
 	}
-	if err := materializeArchLocalSources(info, info.PkgBase, source, pkgDir); err != nil {
+	if err := materializeArchLocalSources(info, info.PkgBase, source, sourceRef, pkgDir); err != nil {
 		return fmt.Errorf("failed to import local PKGBUILD source: %w", err)
 	}
 
