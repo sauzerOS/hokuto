@@ -108,15 +108,21 @@ func packageSetNeedsDevelPackages(pkgNames []string) bool {
 		pkgDir, err := findPackageDir(pkgName)
 		if err != nil {
 			// Be conservative when recipe metadata cannot be inspected.
-			debugf("Unable to check binary/nodevel options for %s: %v\n", pkgName, err)
+			debugf("Unable to check binary/nodevel/devel options for %s: %v\n", pkgName, err)
 			return true
 		}
 		options := loadBuildOptions(pkgDir)
-		if !options["binary"] && !options["nodevel"] {
+		if packageNeedsDevelPackages(options) {
 			return true
 		}
 	}
 	return false
+}
+
+func packageNeedsDevelPackages(options map[string]bool) bool {
+	// binary packages skip the standard toolchain by default, while devel lets
+	// source-built exceptions retain binary package dependency semantics.
+	return options["devel"] || (!options["binary"] && !options["nodevel"])
 }
 
 func missingDevelPackagesForBuildSet(cfg *Config, pkgNames []string) []string {
@@ -996,12 +1002,14 @@ func buildLogDependencies(pkgDir string, cfg *Config, optionalState optionalBuil
 		installed = append(installed, fmt.Sprintf("%s-%s-%s", name, version, revision))
 	}
 	options := loadBuildOptions(pkgDir)
-	for _, develPkg := range requiredDevelPackages(cfg, options["multilib"]) {
-		installedName := getOutputPackageName(develPkg, cfg)
-		if !checkPackageExactMatch(installedName) {
-			installedName = findInstalledPackageVariant(installedName)
+	if packageNeedsDevelPackages(options) {
+		for _, develPkg := range requiredDevelPackages(cfg, options["multilib"]) {
+			installedName := getOutputPackageName(develPkg, cfg)
+			if !checkPackageExactMatch(installedName) {
+				installedName = findInstalledPackageVariant(installedName)
+			}
+			addInstalled(installedName)
 		}
-		addInstalled(installedName)
 	}
 	for _, dep := range deps {
 		if dep.Optional {
@@ -4000,7 +4008,7 @@ func handleBuildCommand(args []string, cfg *Config) (err error) {
 			return nil
 		}
 		if !packageSetNeedsDevelPackages(pkgNames) {
-			debugf("Skipping devel package check: all packages in the build set use binary or nodevel\n")
+			debugf("Skipping devel package check: all packages in the build set suppress it via binary or nodevel\n")
 			return nil
 		}
 		includeMultilib := packageSetHasBuildOption(pkgNames, "multilib")
