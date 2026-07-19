@@ -400,14 +400,16 @@ func removeKernelBootloaderEntries(cfg *Config, release string) error {
 	if hRoot == "" {
 		hRoot = "/"
 	}
-	if err := removeMarkedBlock(filepath.Join(hRoot, "boot", "limine.conf"), release); err != nil {
-		return err
+	configPaths := []string{
+		filepath.Join(hRoot, "boot", "limine.conf"),
+		filepath.Join(hRoot, "boot", "EFI", "limine", "limine.conf"),
+		filepath.Join(hRoot, "boot", "EFI", "BOOT", "limine.conf"),
+		filepath.Join(hRoot, "boot", "refind_linux.conf"),
 	}
-	if err := removeMarkedBlock(filepath.Join(hRoot, "boot", "EFI", "BOOT", "limine.conf"), release); err != nil {
-		return err
-	}
-	if err := removeMarkedBlock(filepath.Join(hRoot, "boot", "refind_linux.conf"), release); err != nil {
-		return err
+	for _, path := range configPaths {
+		if err := removeMarkedBlock(path, release); err != nil {
+			return err
+		}
 	}
 	entriesDir := filepath.Join(hRoot, "boot", "loader", "entries")
 	if err := filepath.WalkDir(entriesDir, func(path string, d fs.DirEntry, err error) error {
@@ -429,7 +431,7 @@ func removeKernelBootloaderEntries(cfg *Config, release string) error {
 }
 
 func removeMarkedBlock(path, release string) error {
-	data, err := os.ReadFile(path)
+	data, err := readFileAsRoot(path)
 	if os.IsNotExist(err) {
 		return nil
 	}
@@ -460,23 +462,9 @@ func removeMarkedBlock(path, release string) error {
 		return nil
 	}
 	newData := []byte(strings.TrimRight(strings.Join(out, "\n"), "\n") + "\n")
-	if os.Geteuid() == 0 {
-		return os.WriteFile(path, newData, 0644)
+	perm := os.FileMode(0o644)
+	if info, statErr := os.Stat(path); statErr == nil {
+		perm = info.Mode().Perm()
 	}
-	tmp, err := os.CreateTemp(filepath.Dir(path), ".hokuto-kernel-cleanup-*")
-	if err != nil {
-		return err
-	}
-	tmpPath := tmp.Name()
-	if _, err := tmp.Write(newData); err != nil {
-		tmp.Close()
-		_ = os.Remove(tmpPath)
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		_ = os.Remove(tmpPath)
-		return err
-	}
-	mvCmd := exec.Command("mv", tmpPath, path)
-	return RootExec.Run(mvCmd)
+	return writeFileAsRoot(path, newData, perm, RootExec)
 }

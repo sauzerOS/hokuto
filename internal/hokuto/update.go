@@ -61,7 +61,14 @@ func getRepoVersion2(pkgName string) (version string, revision string, err error
 
 	pkgDir, err := findPackageMetadataDir(lookupName)
 	if err != nil {
-		return "", "", fmt.Errorf("package %s not found in HOKUTO_PATH: %v", lookupName, err)
+		// Split outputs do not have their own source directory or version file.
+		// Resolve their release through the parent recipe so install selects the
+		// current split output instead of falling back to an older remote entry.
+		if _, sourceDir, ok := findSplitPackageSource(lookupName); ok {
+			pkgDir = sourceDir
+		} else {
+			return "", "", fmt.Errorf("package %s not found in HOKUTO_PATH: %v", lookupName, err)
+		}
 	}
 
 	versionFile := filepath.Join(pkgDir, "version")
