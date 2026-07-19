@@ -44,6 +44,7 @@ func (w *tuiLogWriter) Write(p []byte) (int, error) {
 type uninstallListEntry struct {
 	Name      string
 	Size      int64
+	HasSize   bool
 	Meta      string
 	Protected bool
 }
@@ -69,7 +70,7 @@ func installedUninstallListEntries() ([]uninstallListEntry, error) {
 		if protected {
 			version += " | protected base filesystem"
 		}
-		result = append(result, uninstallListEntry{Name: name, Size: size, Meta: version, Protected: protected})
+		result = append(result, uninstallListEntry{Name: name, Size: size, HasSize: true, Meta: version, Protected: protected})
 	}
 	for _, name := range installedMetaPackageNames() {
 		meta := "metapackage"
@@ -80,6 +81,21 @@ func installedUninstallListEntries() ([]uninstallListEntry, error) {
 	}
 	sort.Slice(result, func(i, j int) bool { return result[i].Name < result[j].Name })
 	return result, nil
+}
+
+func sortUninstallListEntries(entries []uninstallListEntry, sortBySize bool) {
+	sort.SliceStable(entries, func(i, j int) bool {
+		if !sortBySize {
+			return entries[i].Name < entries[j].Name
+		}
+		if entries[i].HasSize != entries[j].HasSize {
+			return entries[i].HasSize
+		}
+		if entries[i].Size == entries[j].Size {
+			return entries[i].Name < entries[j].Name
+		}
+		return entries[i].Size > entries[j].Size
+	})
 }
 
 // orderPackagesForUninstall places dependents before their selected

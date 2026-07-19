@@ -1316,6 +1316,7 @@ func Main() {
 		var force = uninstallCmd.Bool("f", false, "Force uninstallation, ignoring dependency checks.")
 		var yes = uninstallCmd.Bool("y", false, "Assume 'yes' to all prompts.")
 		var list = uninstallCmd.Bool("list", false, "Select installed packages to uninstall in an interactive interface.")
+		var sortSize = uninstallCmd.Bool("size", false, "Sort the interactive package list by size, largest first.")
 		// Also support long flags for consistency
 		var forceLong = uninstallCmd.Bool("force", false, "Force uninstallation, ignoring dependency checks.")
 		var yesLong = uninstallCmd.Bool("yes", false, "Assume 'yes' to all prompts.")
@@ -1338,11 +1339,16 @@ func Main() {
 				fmt.Fprintln(os.Stderr, "Error listing installed packages:", err)
 				os.Exit(1)
 			}
+			sortUninstallListEntries(entries, *sortSize)
 			if err := selectPackagesToUninstall(entries, cfg, effectiveForce); err != nil {
 				fmt.Fprintln(os.Stderr, "Error selecting packages:", err)
 				os.Exit(1)
 			}
 			break
+		}
+		if *sortSize {
+			fmt.Fprintln(os.Stderr, "Error: --size can only be used with --list.")
+			os.Exit(1)
 		}
 
 		if len(packagesToUninstall) == 0 {

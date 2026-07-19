@@ -1458,11 +1458,15 @@ func packageSplitOutputs(parentPkgName, pkgDir, splitRoot, version, revision, ta
 		if err := copyEffectivePackageMetadata(pkgDir, splitName, parentPkgName, installedDir, buildExec); err != nil {
 			return fmt.Errorf("failed to copy package metadata for split package %s: %w", outputSplitName, err)
 		}
+		// A split-specific hook takes precedence. Recipes may explicitly opt all
+		// remaining split outputs into a shared hook with post-install.split;
+		// the parent post-install hook is deliberately not inherited implicitly.
 		postInstallSrc := findPackageMetadataFile(pkgDir, outputSplitName, "post-install")
-		if postInstallSrc != filepath.Join(pkgDir, "post-install") {
-			if err := copyOptionalMetadataFile(postInstallSrc, filepath.Join(installedDir, "post-install"), buildExec); err != nil {
-				return fmt.Errorf("failed to copy split post-install file for %s: %w", outputSplitName, err)
-			}
+		if postInstallSrc == filepath.Join(pkgDir, "post-install") {
+			postInstallSrc = filepath.Join(pkgDir, "post-install.split")
+		}
+		if err := copyOptionalMetadataFile(postInstallSrc, filepath.Join(installedDir, "post-install"), buildExec); err != nil {
+			return fmt.Errorf("failed to copy split post-install file for %s: %w", outputSplitName, err)
 		}
 
 		buildTimeFile := filepath.Join(installedDir, "buildtime")
