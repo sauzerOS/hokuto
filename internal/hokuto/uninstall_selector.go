@@ -83,9 +83,9 @@ func installedUninstallListEntries() ([]uninstallListEntry, error) {
 	return result, nil
 }
 
-func sortUninstallListEntries(entries []uninstallListEntry, sortBySize bool) {
+func sortUninstallListEntries(entries []uninstallListEntry, sortMode string) {
 	sort.SliceStable(entries, func(i, j int) bool {
-		if !sortBySize {
+		if sortMode == "alphabetical" {
 			return entries[i].Name < entries[j].Name
 		}
 		if entries[i].HasSize != entries[j].HasSize {
@@ -94,8 +94,22 @@ func sortUninstallListEntries(entries []uninstallListEntry, sortBySize bool) {
 		if entries[i].Size == entries[j].Size {
 			return entries[i].Name < entries[j].Name
 		}
+		if sortMode == "size-asc" {
+			return entries[i].Size < entries[j].Size
+		}
 		return entries[i].Size > entries[j].Size
 	})
+}
+
+func uninstallSortLabel(sortMode string) string {
+	switch sortMode {
+	case "size-desc":
+		return "size ↓"
+	case "size-asc":
+		return "size ↑"
+	default:
+		return "alphabetical"
+	}
 }
 
 // orderPackagesForUninstall places dependents before their selected
@@ -168,7 +182,8 @@ func selectPackagesToUninstall(entries []uninstallListEntry, cfg *Config, initia
 		return fmt.Errorf("no installed packages available for selection")
 	}
 
-	selected := make([]bool, len(entries))
+	selected := make(map[string]bool, len(entries))
+	sortMode := "alphabetical"
 	force := initialForce
 	busy := false
 	app := tview.NewApplication()
@@ -206,7 +221,7 @@ func selectPackagesToUninstall(entries []uninstallListEntry, cfg *Config, initia
 
 	refreshRow := func(row, entryIndex int) {
 		mark := "[ ]"
-		if selected[entryIndex] {
+		if selected[entries[entryIndex].Name] {
 			mark = "[X]"
 		}
 		markColor := tcell.ColorGreen
@@ -226,10 +241,11 @@ func selectPackagesToUninstall(entries []uninstallListEntry, cfg *Config, initia
 		if force {
 			mode = "[red]force[white]"
 		}
-		status.SetText(fmt.Sprintf("[gray]Space toggles, a selects all, n selects none, / searches, f toggles mode, u uninstalls, o cleans orphans, l toggles log, q quits.\nMode: %s", mode))
+		status.SetText(fmt.Sprintf("[gray]Space toggles, a selects all, n selects none, / searches, s sorts size, S sorts alphabetically, f toggles mode, u uninstalls, o cleans orphans, l toggles log, q quits.\nMode: %s | Sort: %s", mode, uninstallSortLabel(sortMode)))
 	}
 	refreshTable := func() {
 		table.Clear()
+		table.SetTitle(" Installed Packages | " + uninstallSortLabel(sortMode) + " ")
 		visibleIndices = visibleIndices[:0]
 		query := strings.ToLower(strings.TrimSpace(searchQuery))
 		for i := range entries {
@@ -340,7 +356,7 @@ func selectPackagesToUninstall(entries []uninstallListEntry, cfg *Config, initia
 				}
 			}
 			entries = remaining
-			selected = make([]bool, len(entries))
+			selected = make(map[string]bool, len(entries))
 			refreshTable()
 			busy = false
 			if failedCount > 0 {
@@ -392,19 +408,20 @@ func selectPackagesToUninstall(entries []uninstallListEntry, cfg *Config, initia
 						status.SetText("[yellow]sauzeros-base is protected and cannot be uninstalled.[white]")
 						return nil
 					}
-					selected[entryIndex] = !selected[entryIndex]
+					name := entries[entryIndex].Name
+					selected[name] = !selected[name]
 					refreshRow(row, entryIndex)
 				}
 				return nil
 			case 'a':
 				for row, entryIndex := range visibleIndices {
-					selected[entryIndex] = !entries[entryIndex].Protected
+					selected[entries[entryIndex].Name] = !entries[entryIndex].Protected
 					refreshRow(row, entryIndex)
 				}
 				return nil
 			case 'n':
 				for row, entryIndex := range visibleIndices {
-					selected[entryIndex] = false
+					selected[entries[entryIndex].Name] = false
 					refreshRow(row, entryIndex)
 				}
 				return nil
@@ -412,11 +429,27 @@ func selectPackagesToUninstall(entries []uninstallListEntry, cfg *Config, initia
 				force = !force
 				refreshStatus()
 				return nil
+			case 's':
+				if sortMode == "size-desc" {
+					sortMode = "size-asc"
+				} else {
+					sortMode = "size-desc"
+				}
+				sortUninstallListEntries(entries, sortMode)
+				refreshTable()
+				refreshStatus()
+				return nil
+			case 'S':
+				sortMode = "alphabetical"
+				sortUninstallListEntries(entries, sortMode)
+				refreshTable()
+				refreshStatus()
+				return nil
 			case 'u':
 				var packages []string
-				for i, chosen := range selected {
-					if chosen {
-						packages = append(packages, entries[i].Name)
+				for _, entry := range entries {
+					if selected[entry.Name] {
+						packages = append(packages, entry.Name)
 					}
 				}
 				if len(packages) == 0 {
