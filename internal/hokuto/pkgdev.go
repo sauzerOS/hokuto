@@ -508,39 +508,12 @@ func bumpPackage(pkgName, expectedOldVersion, newVersion string) (string, error)
 	return pkgDir, nil
 }
 
-// buildBumpedPackage encapsules the build logic for a bumped package.
+// buildBumpedPackage builds a bumped package through the regular build command
+// orchestration so dependency resolution, base-devel preparation, cleanup, and
+// recipe options stay consistent with `hokuto build`.
 func buildBumpedPackage(pkgName string, cfg *Config) error {
 	colNote.Printf(">> [BUILDING] %s (idle mode)\n", pkgName)
-
-	endBuildSession := registerHokutoBuildSession()
-	defer endBuildSession()
-
-	installedBuildDeps, depErr := installBuildDependencies(pkgName, cfg, false)
-	if depErr != nil {
-		return fmt.Errorf("failed to install build dependencies: %v", depErr)
-	}
-	defer func() {
-		if len(installedBuildDeps) > 0 {
-			uninstallBuildDependencies(installedBuildDeps, cfg)
-		}
-	}()
-
-	// Set build priority to idle for this process
-	originalPriority := buildPriority
-	buildPriority = "idle"
-	defer func() { buildPriority = originalPriority }()
-
-	// Create a non-interactive executor for the build
-	buildExec := *UserExec
-	buildExec.Interactive = false
-
-	// Execute build but skip installation (autoInstall = false)
-	_, buildErr := pkgBuild(pkgName, cfg, &buildExec, BuildOptions{
-		Quiet:         true,
-		UpdateWebsite: true,
-	})
-
-	return buildErr
+	return handleBuildCommand([]string{"-i", "--no-install", "--index", pkgName}, cfg)
 }
 
 func handleSingleBumpCommand(pkgName, newVersion string, build bool, cfg *Config) error {
