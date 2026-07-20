@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -92,6 +93,106 @@ func normalizeGitSourceRef(ref string) (string, string) {
 		}
 	}
 	return "", ref
+}
+
+func parseGitSourceFragment(fragment string) (string, int, error) {
+	fragment = strings.TrimSpace(fragment)
+	if fragment == "" {
+		return "", 0, nil
+	}
+
+	var ref string
+	depth := 0
+	for _, option := range strings.Split(fragment, "&") {
+		option = strings.TrimSpace(option)
+		if option == "" {
+			continue
+		}
+		if strings.HasPrefix(option, "depth=") {
+			if depth != 0 {
+				return "", 0, fmt.Errorf("duplicate git depth option")
+			}
+			value := strings.TrimSpace(strings.TrimPrefix(option, "depth="))
+			parsed, err := strconv.Atoi(value)
+			if err != nil || parsed < 1 {
+				return "", 0, fmt.Errorf("invalid git clone depth %q: expected a positive integer", value)
+			}
+			depth = parsed
+			continue
+		}
+		if ref != "" {
+			return "", 0, fmt.Errorf("multiple git ref selectors in source fragment %q", fragment)
+		}
+		ref = option
+	}
+	return ref, depth, nil
+}
+
+func runSystemGit(quiet bool, args ...string) error {
+	cmd := exec.Command("git", args...)
+	if quiet && !Debug {
+		cmd.Stdout = io.Discard
+		cmd.Stderr = io.Discard
+	} else {
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+	}
+	return cmd.Run()
+}
+
+func ensureShallowGitCheckout(gitURL, ref string, depth int, sharedPath string, quiet bool) error {
+	if depth < 1 {
+		return fmt.Errorf("invalid git clone depth %d", depth)
+	}
+
+	kind, cleanRef := normalizeGitSourceRef(ref)
+	if cleanRef != "" && kind != "branch" && kind != "tag" {
+		return fmt.Errorf("shallow git sources require an explicit branch= or tag= selector, got %q", ref)
+	}
+
+	if _, err := os.Stat(sharedPath); os.IsNotExist(err) {
+		args := []string{"clone", "--depth", strconv.Itoa(depth), "--single-branch"}
+		if cleanRef != "" {
+			args = append(args, "--branch", cleanRef)
+		}
+		args = append(args, gitURL, sharedPath)
+		if err := runSystemGit(quiet, args...); err != nil {
+			return fmt.Errorf("failed to shallow clone %s: %w", gitURL, err)
+		}
+		return nil
+	}
+
+	if err := runSystemGit(true, "-C", sharedPath, "rev-parse", "--git-dir"); err != nil {
+		if err := os.RemoveAll(sharedPath); err != nil {
+			return fmt.Errorf("failed to replace invalid shallow checkout %s: %w", sharedPath, err)
+		}
+		return ensureShallowGitCheckout(gitURL, ref, depth, sharedPath, quiet)
+	}
+
+	depthArg := strconv.Itoa(depth)
+	switch kind {
+	case "branch":
+		refspec := "+refs/heads/" + cleanRef + ":refs/remotes/origin/" + cleanRef
+		if err := runSystemGit(quiet, "-C", sharedPath, "fetch", "--depth", depthArg, "--prune", "origin", refspec); err != nil {
+			return fmt.Errorf("failed to update shallow branch %s: %w", cleanRef, err)
+		}
+		if err := runSystemGit(quiet, "-C", sharedPath, "reset", "--hard", "refs/remotes/origin/"+cleanRef); err != nil {
+			return fmt.Errorf("failed to reset shallow branch %s: %w", cleanRef, err)
+		}
+	case "tag":
+		refspec := "+refs/tags/" + cleanRef + ":refs/tags/" + cleanRef
+		if err := runSystemGit(quiet, "-C", sharedPath, "fetch", "--depth", depthArg, "--prune", "origin", refspec); err != nil {
+			return fmt.Errorf("failed to update shallow tag %s: %w", cleanRef, err)
+		}
+		if err := runSystemGit(quiet, "-C", sharedPath, "checkout", "--detach", "refs/tags/"+cleanRef); err != nil {
+			return fmt.Errorf("failed to checkout shallow tag %s: %w", cleanRef, err)
+		}
+	default:
+		if err := runSystemGit(quiet, "-C", sharedPath, "pull", "--ff-only", "--depth", depthArg); err != nil {
+			return fmt.Errorf("failed to update shallow default branch for %s: %w", gitURL, err)
+		}
+	}
+	return nil
 }
 
 func goGitRefCandidates(ref string) []goGitRefCandidate {
@@ -427,13 +528,30 @@ func linkSharedGitCheckout(pkgName, pkgLinkDir, repoName, sharedPath string) (st
 }
 
 func resolveGitCacheCommit(cacheRepoPath, ref string, quiet bool) (string, error) {
-	resolve := func() (string, error) {
-		cmd := exec.Command("git", "-C", cacheRepoPath, "rev-parse", "--verify", ref+"^{commit}")
-		output, err := cmd.Output()
-		if err != nil {
-			return "", err
+	kind, cleanRef := normalizeGitSourceRef(ref)
+	candidates := []string{cleanRef}
+	switch kind {
+	case "branch":
+		candidates = []string{"refs/heads/" + cleanRef}
+	case "tag":
+		candidates = []string{"refs/tags/" + cleanRef}
+	default:
+		if cleanRef != ref {
+			candidates = append(candidates, ref)
 		}
-		return strings.TrimSpace(string(output)), nil
+	}
+
+	resolve := func() (string, error) {
+		var lastErr error
+		for _, candidate := range candidates {
+			cmd := exec.Command("git", "-C", cacheRepoPath, "rev-parse", "--verify", candidate+"^{commit}")
+			output, err := cmd.Output()
+			if err == nil {
+				return strings.TrimSpace(string(output)), nil
+			}
+			lastErr = err
+		}
+		return "", lastErr
 	}
 
 	if commit, err := resolve(); err == nil {
@@ -443,7 +561,14 @@ func resolveGitCacheCommit(cacheRepoPath, ref string, quiet bool) (string, error
 	if !quiet {
 		cPrintf(colInfo, "Fetching unadvertised git revision %s\n", ref)
 	}
-	cmd := exec.Command("git", "-C", cacheRepoPath, "fetch", "--no-tags", "origin", ref)
+	fetchRef := cleanRef
+	switch kind {
+	case "branch":
+		fetchRef = "+refs/heads/" + cleanRef + ":refs/heads/" + cleanRef
+	case "tag":
+		fetchRef = "+refs/tags/" + cleanRef + ":refs/tags/" + cleanRef
+	}
+	cmd := exec.Command("git", "-C", cacheRepoPath, "fetch", "--no-tags", "origin", fetchRef)
 	if quiet && !Debug {
 		cmd.Stdout = io.Discard
 		cmd.Stderr = io.Discard
@@ -1303,10 +1428,15 @@ func fetchSourcesWithOptions(pkgName, pkgDir string, processGit bool, quiet bool
 			}
 			gitURL := strings.TrimPrefix(rawSourceURL, "git+")
 			ref := ""
+			depth := 0
 			if strings.Contains(gitURL, "#") {
 				subParts := strings.SplitN(gitURL, "#", 2)
 				gitURL = subParts[0]
-				ref = subParts[1]
+				parsedRef, parsedDepth, parseErr := parseGitSourceFragment(subParts[1])
+				if parseErr != nil {
+					return fmt.Errorf("invalid git source %s: %w", rawSourceURL, parseErr)
+				}
+				ref, depth = parsedRef, parsedDepth
 			}
 			parts = strings.Split(strings.TrimSuffix(gitURL, ".git"), "/")
 			repoName := parts[len(parts)-1]
@@ -1324,10 +1454,16 @@ func fetchSourcesWithOptions(pkgName, pkgDir string, processGit bool, quiet bool
 			if ref != "" {
 				checkoutHashInput += "#" + ref
 			}
+			if depth > 0 {
+				checkoutHashInput += "&depth=" + strconv.Itoa(depth)
+			}
 			checkoutHash := hashString(checkoutHashInput)[:12]
 			sharedPath := filepath.Join(checkoutsDir, repoName+"-"+checkoutHash)
 
 			if _, err := exec.LookPath("git"); err != nil {
+				if depth > 0 {
+					return fmt.Errorf("shallow git source %s requires the system git client", rawSourceURL)
+				}
 				err := func() error {
 					lockPath := sharedPath + ".lock"
 					lFile, err := os.Create(lockPath)
@@ -1357,6 +1493,37 @@ func fetchSourcesWithOptions(pkgName, pkgDir string, processGit bool, quiet bool
 				}
 				if !quiet {
 					cPrintf(colInfo, "Git repository ready (go-git): %s\n", destPath)
+				}
+				continue
+			}
+
+			if depth > 0 {
+				err := func() error {
+					lockPath := sharedPath + ".lock"
+					lFile, err := os.Create(lockPath)
+					if err != nil {
+						return fmt.Errorf("failed to create lock file for shallow git checkout: %v", err)
+					}
+					defer os.Remove(lockPath)
+					defer lFile.Close()
+
+					if err := unix.Flock(int(lFile.Fd()), unix.LOCK_EX); err != nil {
+						return fmt.Errorf("failed to lock shallow git checkout: %v", err)
+					}
+					defer unix.Flock(int(lFile.Fd()), unix.LOCK_UN)
+
+					return ensureShallowGitCheckout(gitURL, ref, depth, sharedPath, quiet)
+				}()
+				if err != nil {
+					return err
+				}
+
+				destPath, err := linkSharedGitCheckout(pkgName, pkgLinkDir, packageSourceName, sharedPath)
+				if err != nil {
+					return err
+				}
+				if !quiet {
+					cPrintf(colInfo, "Git repository ready (shallow, depth %d): %s\n", depth, destPath)
 				}
 				continue
 			}
