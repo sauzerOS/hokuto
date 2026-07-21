@@ -60,6 +60,16 @@ func getRepoVersion2(pkgName string) (version string, revision string, err error
 	}
 
 	pkgDir, err := findPackageMetadataDir(lookupName)
+	// An installed split output has its own database directory, so the generic
+	// metadata lookup above succeeds with the *installed* version.  That must not
+	// be mistaken for the repository version during an update check.  Prefer a
+	// real source recipe when this name is one of its split outputs.
+	installedMetadataDir := filepath.Join(Installed, lookupName)
+	if err != nil || filepath.Clean(pkgDir) == filepath.Clean(installedMetadataDir) {
+		if sourcePkg, sourceDir, ok := findSplitPackageSource(lookupName); ok && sourcePkg != lookupName {
+			pkgDir, err = sourceDir, nil
+		}
+	}
 	if err != nil {
 		// Split outputs do not have their own source directory or version file.
 		// Resolve their release through the parent recipe so install selects the
@@ -91,6 +101,135 @@ func getRepoVersion2(pkgName string) (version string, revision string, err error
 	}
 
 	return pkgVersion, pkgRevision, nil
+}
+
+func localUpgradeCandidates(installedPackages map[string]Package) []Package {
+	var upgrades []Package
+	for name, pkg := range installedPackages {
+		repoVersion, repoRevision, err := getRepoVersion2(name)
+		if err != nil {
+			debugf("Warning: Could not get repo version for %s: %v\n", name, err)
+			continue
+		}
+		pkg.RepoVersion = repoVersion
+		pkg.RepoRevision = repoRevision
+		if pkg.InstalledVersion != repoVersion || pkg.InstalledRevision != repoRevision {
+			upgrades = append(upgrades, pkg)
+		}
+	}
+	return upgrades
+}
+
+// normalizeSplitUpdateTargets makes one source build update all selected split
+// outputs.  Without this, selecting both a source package and an installed
+// split sibling could build the same recipe twice.
+func normalizeSplitUpdateTargets(pkgNames []string, userRequested map[string]bool) ([]string, map[string][]string) {
+	var targets []string
+	seen := make(map[string]bool)
+	splitTargets := make(map[string][]string)
+	for _, pkgName := range pkgNames {
+		target := pkgName
+		if sourcePkg, _, ok := findSplitPackageSource(pkgName); ok && sourcePkg != pkgName {
+			target = sourcePkg
+			addMappedSplitDependency(splitTargets, sourcePkg, pkgName)
+			userRequested[pkgName] = true
+		}
+		if !seen[target] {
+			seen[target] = true
+			targets = append(targets, target)
+		}
+	}
+	return targets, splitTargets
+}
+
+func mergeSplitUpdateTargets(dst, selected map[string][]string) {
+	for sourcePkg, splitPkgs := range selected {
+		for _, splitPkg := range splitPkgs {
+			addMappedSplitDependency(dst, sourcePkg, splitPkg)
+		}
+	}
+}
+
+func currentSplitUpdateTarball(sourcePkg, splitPkg string, cfg *Config, remoteIndex []RepoEntry) (string, bool, error) {
+	version, revision, err := getRepoVersion2(sourcePkg)
+	if err != nil {
+		return "", false, err
+	}
+	arch := GetSystemArchForPackage(cfg, sourcePkg)
+	archiveName := canonicalParallelPackageName(splitPkg)
+	variants := currentBinaryOutputVariants(sourcePkg, splitPkg, cfg)
+	for _, variant := range variants {
+		tarballPath := filepath.Join(BinDir, StandardizeRemoteName(archiveName, version, revision, arch, variant))
+		if _, err := os.Stat(tarballPath); err == nil {
+			return tarballPath, true, nil
+		}
+	}
+
+	for _, variant := range variants {
+		for _, entry := range remoteIndex {
+			if entry.Type == "meta" || entry.Name != archiveName || entry.Version != version ||
+				entry.Revision != revision || entry.Arch != arch || entry.Variant != variant {
+				continue
+			}
+			if err := fetchSpecificBinaryPackage(archiveName, version, revision, variant, cfg, false, entry.B3Sum, false); err != nil {
+				return "", false, fmt.Errorf("failed to fetch split update %s: %w", splitPkg, err)
+			}
+			tarballPath := filepath.Join(BinDir, StandardizeRemoteName(archiveName, version, revision, arch, variant))
+			return tarballPath, true, nil
+		}
+	}
+	return "", false, nil
+}
+
+// installAvailableSplitUpdates updates selected split outputs directly from
+// binaries. It returns false without installing anything unless every selected
+// output is available, allowing the caller to fall back to one source build.
+func installAvailableSplitUpdates(sourcePkg string, splitPkgs []string, cfg *Config, remoteIndex []RepoEntry, quiet bool) (bool, error) {
+	paths := make(map[string]string, len(splitPkgs))
+	for _, splitPkg := range splitPkgs {
+		path, available, err := currentSplitUpdateTarball(sourcePkg, splitPkg, cfg, remoteIndex)
+		if err != nil {
+			return false, err
+		}
+		if !available {
+			return false, nil
+		}
+		paths[splitPkg] = path
+	}
+
+	logger, fast := dependencyInstallLogger(quiet)
+	for _, splitPkg := range splitPkgs {
+		colArrow.Print("-> ")
+		colSuccess.Printf("Installing split package")
+		colNote.Printf(" %s\n", splitPkg)
+		if err := installSplitPackageTarballWithLogger(splitPkg, paths[splitPkg], cfg, logger, fast); err != nil {
+			return true, err
+		}
+		addToWorld(splitPkg)
+	}
+	return true, nil
+}
+
+func removeUpdateTarget(targets []string, remove string) []string {
+	filtered := targets[:0]
+	for _, target := range targets {
+		if target != remove {
+			filtered = append(filtered, target)
+		}
+	}
+	return filtered
+}
+
+func updatePlanRequiresSourceBuild(plan *BuildPlan, binaryAvailable map[string]bool, selectedSplitUpdates map[string][]string) bool {
+	if plan == nil {
+		return false
+	}
+	for _, pkgName := range plan.Order {
+		if plan.RebuildPackages[pkgName] || len(selectedSplitUpdates[pkgName]) > 0 || !binaryAvailable[pkgName] {
+			return true
+		}
+	}
+	return false
 }
 
 func currentBinaryOutputVariants(sourcePkg, outputPkg string, cfg *Config) []string {
@@ -958,7 +1097,7 @@ func checkDependencyBlocks(pkgName string, newVersion string, installedPackages 
 
 // checkForUpgrades is the main function for the upgrade logic.
 
-func checkForUpgrades(_ context.Context, cfg *Config, maxJobs int, yes bool) error {
+func checkForUpgrades(ctx context.Context, cfg *Config, maxJobs int, yes bool) error {
 	defer flushPackageSuggestions(os.Stdout, cfg, false, true, yes)
 	defer binaryOnlyRuntimeDependencyInstallScope()()
 
@@ -976,33 +1115,8 @@ func checkForUpgrades(_ context.Context, cfg *Config, maxJobs int, yes bool) err
 		return fmt.Errorf("failed to parse package list: %w", err)
 	}
 
-	var upgradeList []Package
-
 	// 2. Compare installed version + revision vs. repo version + revision
-	for name, pkg := range installedPackages {
-		// Updated call to getRepoVersion to capture both version and revision
-		repoVersion, repoRevision, err := getRepoVersion2(name)
-		if err != nil {
-			// Log error but continue to the next package
-			debugf("Warning: Could not get repo version for %s: %v\n", name, err)
-			continue
-		}
-
-		// Store repo information on the package struct
-		pkg.RepoVersion = repoVersion
-		pkg.RepoRevision = repoRevision
-
-		// Comparison Logic: Check for a mismatch in either version OR revision
-		isVersionMismatch := pkg.InstalledVersion != pkg.RepoVersion
-		isRevisionMismatch := pkg.InstalledRevision != pkg.RepoRevision
-
-		// NOTE: A more complex system would compare versions numerically,
-		// but for simple string equality checks, this is sufficient:
-		if isVersionMismatch || isRevisionMismatch {
-			// Add to upgrade list
-			upgradeList = append(upgradeList, pkg)
-		}
-	}
+	upgradeList := localUpgradeCandidates(installedPackages)
 
 	// 2.5. Filter upgrade list based on dependencies and lock file
 	lockedPackages := readLockFile()
@@ -1103,6 +1217,7 @@ func checkForUpgrades(_ context.Context, cfg *Config, maxJobs int, yes bool) err
 			hokutoInUpdates = true
 		}
 	}
+	pkgNames, selectedSplitUpdates := normalizeSplitUpdateTargets(pkgNames, userRequestedMap)
 
 	// If hokuto is in the list, we prioritize it and stop afterwards
 	if hokutoInUpdates {
@@ -1127,11 +1242,43 @@ func checkForUpgrades(_ context.Context, cfg *Config, maxJobs int, yes bool) err
 		}
 	}
 
+	// Prefer independent split binaries. A source build is needed only when at
+	// least one selected output is unavailable. This also keeps a split-only
+	// installation from pulling in or rebuilding its parent package.
+	directSplitUpdates := 0
+	for sourcePkg, splitPkgs := range selectedSplitUpdates {
+		installed, err := installAvailableSplitUpdates(sourcePkg, splitPkgs, cfg, remoteIndex, true)
+		if err != nil {
+			return fmt.Errorf("failed to update split package(s) from %s: %w", sourcePkg, err)
+		}
+		if !installed {
+			continue
+		}
+		directSplitUpdates += len(splitPkgs)
+		delete(selectedSplitUpdates, sourcePkg)
+		if !userRequestedMap[sourcePkg] {
+			pkgNames = removeUpdateTarget(pkgNames, sourcePkg)
+		}
+	}
+	if len(pkgNames) == 0 {
+		if err := PostInstallTasks(RootExec, os.Stdout); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: Global post-install tasks failed: %v\n", err)
+		}
+		colArrow.Print("-> ")
+		colSuccess.Printf("System update completed successfully (%d split package(s)).\n", directSplitUpdates)
+		return nil
+	}
+
 	if len(pkgNames) > 0 {
 		colArrow.Print("-> ")
 		colSuccess.Printf("Checking for binary availability\n")
 		// Use fetching logic to populate binaryAvailable
 		for _, pkgName := range pkgNames {
+			// A selected split output is produced by the source build.  Do not let
+			// the source binary suppress its make dependencies or the build itself.
+			if len(selectedSplitUpdates[pkgName]) > 0 {
+				continue
+			}
 			version, revision, err := getRepoVersion2(pkgName)
 			if err != nil {
 				continue
@@ -1233,16 +1380,7 @@ func checkForUpgrades(_ context.Context, cfg *Config, maxJobs int, yes bool) err
 	var manualPrereqs map[string][]string
 	pkgNames, manualPrereqs = applyUpdateOrder(pkgNames)
 	splitDepsBySource := prepareUpdateBuildPlan(plan, pkgNames, manualPrereqs, cfg)
-
-	// Launch background prefetcher for SUBSEQUENT packages.
-	if len(pkgNames) > 1 {
-		go prefetchSources(pkgNames[1:])
-	}
-
-	includeMultilibDevel := packageSetHasBuildOption(pkgNames, "multilib")
-	if _, err := ensureDevelPackagesInstalledWithOptions(cfg, includeMultilibDevel, false, quietDependencyInstalls); err != nil {
-		return fmt.Errorf("failed to prepare devel packages before update: %w", err)
-	}
+	mergeSplitUpdateTargets(splitDepsBySource, selectedSplitUpdates)
 
 	// Install binary dependencies referenced by the final plan, including split
 	// outputs such as lib32-*. Re-resolve after each pass so a source package
@@ -1262,10 +1400,28 @@ func checkForUpgrades(_ context.Context, cfg *Config, maxJobs int, yes bool) err
 		pkgNames = plan.Order
 		pkgNames, manualPrereqs = applyUpdateOrder(pkgNames)
 		splitDepsBySource = prepareUpdateBuildPlan(plan, pkgNames, manualPrereqs, cfg)
+		mergeSplitUpdateTargets(splitDepsBySource, selectedSplitUpdates)
+	}
+
+	// Compiler tooling and source prefetching are needed only if the final plan
+	// still contains something that cannot be installed from a binary. Runtime
+	// binary dependencies above must be resolved first because they can remove
+	// their source recipes from the plan.
+	if updatePlanRequiresSourceBuild(plan, binaryAvailable, selectedSplitUpdates) {
+		if len(pkgNames) > 1 {
+			go prefetchSources(pkgNames[1:])
+		}
+		includeMultilibDevel := packageSetHasBuildOption(pkgNames, "multilib")
+		if _, err := ensureDevelPackagesInstalledWithOptions(cfg, includeMultilibDevel, false, quietDependencyInstalls); err != nil {
+			return fmt.Errorf("failed to prepare devel packages before update: %w", err)
+		}
 	}
 
 	requiredSplitDepsInstalled := func(sourcePkg string) bool {
 		for _, splitPkg := range splitDepsBySource[sourcePkg] {
+			if userRequestedMap[splitPkg] {
+				return false
+			}
 			if !isPackageInstalled(splitPkg) {
 				return false
 			}
@@ -1526,33 +1682,51 @@ func checkForUpgrades(_ context.Context, cfg *Config, maxJobs int, yes bool) err
 			TotalCount:   totalToUpdate,
 		})
 		if err != nil {
+			if errors.Is(err, context.Canceled) || ctx.Err() != nil {
+				return fmt.Errorf("update canceled: %w", err)
+			}
 			color.Danger.Printf("Build failed for %s: %v\n", pkgName, err)
 			failedPackages = append(failedPackages, pkgName)
 			continue
 		}
 		totalUpdateDuration += duration
 
-		// B. If build is successful, install the package
-		isCriticalAtomic.Store(1)
-		handlePreInstallUninstall(outputPkgName, cfg, RootExec, false, nil)
-		colArrow.Print("-> ")
-		colSuccess.Printf("Installing")
-		colNote.Printf(" %s\n", outputPkgName)
-		if _, err := pkgInstall(tarballPath, outputPkgName, cfg, RootExec, false, false, false, nil); err != nil {
+		// B. Install the main output unless this transaction was requested only
+		// for one or more split outputs. Split packages may be installed without
+		// their parent, and an update must preserve that state.
+		installMainOutput := userRequestedMap[pkgName] || len(selectedSplitUpdates[pkgName]) == 0
+		if installMainOutput {
+			isCriticalAtomic.Store(1)
+			handlePreInstallUninstall(outputPkgName, cfg, RootExec, false, nil)
+			colArrow.Print("-> ")
+			colSuccess.Printf("Installing")
+			colNote.Printf(" %s\n", outputPkgName)
+			if _, err := pkgInstall(tarballPath, outputPkgName, cfg, RootExec, false, false, false, nil); err != nil {
+				isCriticalAtomic.Store(0)
+				color.Danger.Printf("Installation failed for %s: %v\n", outputPkgName, err)
+				failedPackages = append(failedPackages, pkgName)
+				continue
+			}
 			isCriticalAtomic.Store(0)
-			color.Danger.Printf("Installation failed for %s: %v\n", outputPkgName, err)
-			failedPackages = append(failedPackages, pkgName)
-			continue
 		}
-		isCriticalAtomic.Store(0)
 
 		splitInstallFailed := false
 		for _, splitPkg := range splitDepsBySource[pkgName] {
-			if err := installBuiltSplitDependencyWithOptions(pkgName, splitPkg, cfg, quietDependencyInstalls); err != nil {
-				color.Danger.Printf("Installation failed for split dependency %s from %s: %v\n", splitPkg, pkgName, err)
+			var installErr error
+			if userRequestedMap[splitPkg] {
+				logger, fast := dependencyInstallLogger(quietDependencyInstalls)
+				installErr = installBuiltSplitTargetWithLogger(pkgName, splitPkg, cfg, logger, fast)
+			} else {
+				installErr = installBuiltSplitDependencyWithOptions(pkgName, splitPkg, cfg, quietDependencyInstalls)
+			}
+			if installErr != nil {
+				color.Danger.Printf("Installation failed for split dependency %s from %s: %v\n", splitPkg, pkgName, installErr)
 				failedPackages = append(failedPackages, splitPkg)
 				splitInstallFailed = true
 				break
+			}
+			if userRequestedMap[splitPkg] {
+				addToWorld(splitPkg)
 			}
 		}
 		if splitInstallFailed {
@@ -1560,7 +1734,11 @@ func checkForUpgrades(_ context.Context, cfg *Config, maxJobs int, yes bool) err
 		}
 
 		colArrow.Print("-> ")
-		if userRequestedMap[pkgName] {
+		if !installMainOutput {
+			colSuccess.Printf("Split package(s)")
+			colNote.Printf(" %s ", strings.Join(selectedSplitUpdates[pkgName], ", "))
+			colSuccess.Printf("updated successfully.\n")
+		} else if userRequestedMap[pkgName] {
 			colSuccess.Printf("Package")
 			colNote.Printf(" %s ", outputPkgName)
 			colSuccess.Printf("updated successfully.\n")

@@ -399,6 +399,9 @@ func plannedBuildDisplayOrder(plan *BuildPlan, cfg *Config, noRemote bool) []str
 	}
 
 	canBuild := func(pkgName string) bool {
+		if plan.BinaryPackages[pkgName] {
+			return true
+		}
 		pkgDir, err := findPackageDir(pkgName)
 		if err != nil {
 			return true
@@ -484,6 +487,9 @@ func collectSplitDependenciesForPlan(plan *BuildPlan, cfg *Config) map[string][]
 	}
 
 	for _, pkgName := range plan.Order {
+		if plan.BinaryPackages[pkgName] {
+			continue
+		}
 		pkgDir, err := findPackageDir(pkgName)
 		if err != nil {
 			continue
@@ -551,7 +557,10 @@ func installBuiltSplitPackageWithLogger(sourcePkg, splitPkg string, cfg *Config,
 	if _, err := os.Stat(tarballPath); err != nil {
 		return fmt.Errorf("expected split package tarball missing: %s", tarballPath)
 	}
+	return installSplitPackageTarballWithLogger(splitPkg, tarballPath, cfg, logger, fast)
+}
 
+func installSplitPackageTarballWithLogger(splitPkg, tarballPath string, cfg *Config, logger io.Writer, fast bool) error {
 	isCriticalAtomic.Store(1)
 	defer isCriticalAtomic.Store(0)
 	installExec := RootExec

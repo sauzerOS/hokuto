@@ -1331,6 +1331,7 @@ type BuildPlan struct {
 	PostRebuilds      map[string][]string // Packages needing a rebuild for optional deps
 	PostBuildRebuilds map[string][]string // Stores post-build actions
 	ManualPrereqs     map[string][]string // pkgs that MUST be completed before this one (from /etc/hokuto/hokuto.update)
+	BinaryPackages    map[string]bool     // Targets whose archive metadata replaces source-recipe dependencies
 	NoDeps            bool                // Skip dependency checking during execution
 	NoInstall         bool                // Do not install deferred/final user targets
 }
@@ -1348,6 +1349,7 @@ func resolveBuildPlan(targetPackages []string, userRequestedPackages map[string]
 		PostRebuilds:      make(map[string][]string),
 		PostBuildRebuilds: make(map[string][]string),
 		ManualPrereqs:     make(map[string][]string),
+		BinaryPackages:    make(map[string]bool),
 	}
 
 	processed := make(map[string]bool)
@@ -1383,6 +1385,20 @@ func resolveBuildPlan(targetPackages []string, userRequestedPackages map[string]
 		if isInstalled && !sourceBuildPackages[pkgName] && !plan.RebuildPackages[pkgName] {
 			processed[pkgName] = true
 			plan.SkippedPackages[pkgName] = "already installed"
+			return nil
+		}
+
+		// A confirmed binary target must not pull dependencies from its source
+		// recipe into the build plan. Those entries include build-time tools and
+		// may not match the archive being installed. The binary's packaged depends
+		// metadata is authoritative and is handled by pkgInstall.
+		if binaryAvailable != nil && binaryAvailable[pkgName] && !plan.RebuildPackages[pkgName] {
+			plan.BinaryPackages[pkgName] = true
+			if (sourceBuildPackages[pkgName] || !isInstalled) && !alreadyInOrder[pkgName] {
+				plan.Order = append(plan.Order, pkgName)
+				alreadyInOrder[pkgName] = true
+			}
+			processed[pkgName] = true
 			return nil
 		}
 

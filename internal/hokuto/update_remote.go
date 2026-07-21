@@ -11,6 +11,71 @@ import (
 	"github.com/gookit/color"
 )
 
+func bestRemoteUpdateEntry(pkgName string, cfg *Config, remoteIndex []RepoEntry) (RepoEntry, bool, bool) {
+	targetArch := GetSystemArchForPackage(cfg, pkgName)
+	preferredVariant := GetSystemVariantForPackage(cfg, pkgName)
+	fallbackVariant := ""
+	if !strings.Contains(preferredVariant, "generic") {
+		fallbackVariant = "generic"
+		if strings.HasPrefix(preferredVariant, "multi-") {
+			fallbackVariant = "multi-generic"
+		}
+	}
+
+	var best *RepoEntry
+	archiveName := canonicalParallelPackageName(pkgName)
+	for _, entry := range remoteIndex {
+		if entry.Type == "meta" || entry.Name != archiveName || entry.Arch != targetArch {
+			continue
+		}
+		if entry.Variant != preferredVariant && (fallbackVariant == "" || entry.Variant != fallbackVariant) {
+			continue
+		}
+		if best == nil || isNewer(entry, *best) ||
+			(entry.Version == best.Version && entry.Revision == best.Revision &&
+				entry.Variant == preferredVariant && best.Variant != preferredVariant) {
+			candidate := entry
+			best = &candidate
+		}
+	}
+	if best == nil {
+		return RepoEntry{}, false, false
+	}
+	return *best, true, fallbackVariant != "" && best.Variant == fallbackVariant
+}
+
+func remoteUpgradeCandidates(installedPackages map[string]Package, cfg *Config, remoteIndex []RepoEntry) ([]Package, map[string]RepoEntry, map[string]bool) {
+	var upgrades []Package
+	targets := make(map[string]RepoEntry)
+	fallbacks := make(map[string]bool)
+	for name, pkg := range installedPackages {
+		// ABI/version-line packages are historical dependency instances created
+		// to satisfy a constraint (for example glibmm-2.66). They are not rolling
+		// update targets: replacing one from the canonical remote archive can jump
+		// to another ABI line and defeat the constraint that kept it installed.
+		// Normal source updates already leave these instances alone.
+		if _, _, versioned := splitVersionedPackageName(name); versioned {
+			continue
+		}
+		remoteEntry, found, usingFallback := bestRemoteUpdateEntry(name, cfg, remoteIndex)
+		if !found {
+			continue
+		}
+		targets[name] = remoteEntry
+		pkg.RepoVersion = remoteEntry.Version
+		pkg.RepoRevision = remoteEntry.Revision
+		if !isNewer(remoteEntry, RepoEntry{Version: pkg.InstalledVersion, Revision: pkg.InstalledRevision}) {
+			continue
+		}
+		if usingFallback {
+			pkg.RepoVersion += " (generic fallback)"
+			fallbacks[name] = true
+		}
+		upgrades = append(upgrades, pkg)
+	}
+	return upgrades, targets, fallbacks
+}
+
 // checkForRemoteUpgrades implements 'hokuto update --remote'
 // It compares installed packages against the remote index and updates them if newer versions exist.
 func checkForRemoteUpgrades(_ context.Context, cfg *Config) error {
@@ -34,76 +99,7 @@ func checkForRemoteUpgrades(_ context.Context, cfg *Config) error {
 	}
 
 	// 3. Identify Upgrades
-	var upgradeList []Package
-	targetPacketMap := make(map[string]RepoEntry)
-	fallbackMap := make(map[string]bool)
-
-	for name, pkg := range installedPackages {
-		// Find matching entry in remote index with correct Arch/Variant
-		// (Assume current system settings)
-		// We filter remote index to find the entry matching pkg.Name
-		var remoteEntry RepoEntry
-
-		// We need to match based on system arch/variant preferences
-		targetArch := GetSystemArchForPackage(cfg, name)
-		// Determine variant (generic/optimized/multilib)
-		preferredVariant := GetSystemVariantForPackage(cfg, name)
-		fallbackVariant := ""
-		if !strings.Contains(preferredVariant, "generic") {
-			fallbackVariant = "generic"
-			if strings.HasPrefix(preferredVariant, "multi-") {
-				fallbackVariant = "multi-generic"
-			}
-		}
-
-		var bestEntry *RepoEntry
-		for _, entry := range remoteIndex {
-			if entry.Name == name && entry.Arch == targetArch {
-				if entry.Variant == preferredVariant || (fallbackVariant != "" && entry.Variant == fallbackVariant) {
-					if bestEntry == nil || isNewer(entry, *bestEntry) ||
-						(entry.Version == bestEntry.Version && entry.Revision == bestEntry.Revision &&
-							entry.Variant == preferredVariant && bestEntry.Variant != preferredVariant) {
-						e := entry
-						bestEntry = &e
-					}
-				}
-			}
-		}
-
-		if bestEntry == nil {
-			continue // Package not in remote repo
-		}
-
-		remoteEntry = *bestEntry
-		usingFallback := remoteEntry.Variant == fallbackVariant && fallbackVariant != ""
-
-		// If using fallback, prompt now or mark it?
-		// Better to mark it in the version string or similar for the final table.
-		repoVersionDisplay := remoteEntry.Version
-		if usingFallback {
-			repoVersionDisplay += " (generic fallback)"
-		}
-
-		// Store for later use
-		targetPacketMap[name] = remoteEntry
-
-		// Compare versions
-		pkg.RepoVersion = remoteEntry.Version
-		pkg.RepoRevision = remoteEntry.Revision
-
-		currentEntry := RepoEntry{
-			Version:  pkg.InstalledVersion,
-			Revision: pkg.InstalledRevision,
-		}
-		if isNewer(remoteEntry, currentEntry) {
-			// If it's a fallback, we need to ask permission specifically for this or inform the user
-			pkg.RepoVersion = repoVersionDisplay // Hack to show fallback in the confirmation list
-			upgradeList = append(upgradeList, pkg)
-			if usingFallback {
-				fallbackMap[name] = true
-			}
-		}
-	}
+	upgradeList, _, fallbackMap := remoteUpgradeCandidates(installedPackages, cfg, remoteIndex)
 
 	if len(upgradeList) == 0 {
 		colArrow.Print("-> ")

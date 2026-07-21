@@ -333,6 +333,9 @@ func collectAvailableBinaryDependenciesForPlan(plan *BuildPlan, cfg *Config, noR
 	seen := make(map[string]bool)
 	var depsToInstall []binaryPlanDependency
 	for _, pkgName := range plan.Order {
+		if plan.BinaryPackages[pkgName] {
+			continue
+		}
 		pkgDir, err := findPackageDir(pkgName)
 		if err != nil {
 			continue
@@ -717,6 +720,9 @@ func (pm *ParallelManager) shouldDeferInstallLocked(pkgName string) bool {
 }
 
 func (pm *ParallelManager) packageDependsOn(pkgName, dependency string) bool {
+	if pm.BuildPlan.BinaryPackages[pkgName] {
+		return false
+	}
 	pkgDir, err := findPackageDir(pkgName)
 	if err != nil {
 		return false
@@ -755,7 +761,7 @@ func (pm *ParallelManager) installPackage(pkgName string, userRequestedMap map[s
 	if logger == nil {
 		logger = io.Discard
 	}
-	result := parallelInstallResult{Available: []string{pkgName}}
+	result := parallelInstallResult{}
 	version, revision, err := getRepoVersion2(pkgName)
 	if err != nil {
 		return result, err
@@ -805,9 +811,25 @@ func (pm *ParallelManager) installPackage(pkgName string, userRequestedMap map[s
 
 	beforeInstall := snapshotInstalledPackageNames()
 
-	// Check for conflicts before install
-	handlePreInstallUninstall(outputPkgName, pm.Config, installExec, pm.AutoYes, logger)
-	rebuilds, err := pkgInstall(tarballPath, outputPkgName, pm.Config, installExec, pm.AutoYes, true, true, logger)
+	// A source build may have been scheduled solely to refresh an explicitly
+	// selected split output. Preserve split-only installations by not installing
+	// the parent output in that case.
+	hasRequestedSplit := false
+	for _, splitPkg := range pm.SplitDepsBySource[pkgName] {
+		if userRequestedMap[splitPkg] {
+			hasRequestedSplit = true
+			break
+		}
+	}
+	installMainOutput := userRequestedMap[pkgName] || !hasRequestedSplit
+	var rebuilds []string
+	if installMainOutput {
+		handlePreInstallUninstall(outputPkgName, pm.Config, installExec, pm.AutoYes, logger)
+		rebuilds, err = pkgInstall(tarballPath, outputPkgName, pm.Config, installExec, pm.AutoYes, true, true, logger)
+		if err == nil {
+			result.Available = append(result.Available, pkgName)
+		}
+	}
 	isCriticalAtomic.Store(0)
 
 	if err == nil {
@@ -878,6 +900,9 @@ func (pm *ParallelManager) readyOptionalRebuildsLocked() []string {
 func (pm *ParallelManager) canBuild(pkgName string) bool {
 	// Simplified dependency check reusing logic similar to executeBuildPass
 	if pm.BuildPlan.NoDeps {
+		return true
+	}
+	if pm.BuildPlan.BinaryPackages[pkgName] {
 		return true
 	}
 
