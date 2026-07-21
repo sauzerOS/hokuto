@@ -773,6 +773,11 @@ func resolveBinaryDependencies(pkgName string, visited map[string]bool, plan *[]
 			return depErr
 		}
 		if !found {
+			if allowRemote && len(remoteIndex) > 0 {
+				arch := GetSystemArchForPackage(cfg, pkgName)
+				variant := GetSystemVariantForPackage(cfg, pkgName)
+				return fmt.Errorf("cannot resolve dependencies for %s: package is not available in the remote index for %s (%s), and source not found in HOKUTO_PATH", pkgName, arch, variant)
+			}
 			return fmt.Errorf("cannot resolve dependencies for %s: source not found in HOKUTO_PATH", pkgName)
 		}
 		if err := resolveDependencyList(pkgName, deps, visited, plan, force, yes, cfg, remoteIndex, allowRemote); err != nil {

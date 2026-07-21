@@ -76,6 +76,23 @@ func remoteUpgradeCandidates(installedPackages map[string]Package, cfg *Config, 
 	return upgrades, targets, fallbacks
 }
 
+func remoteUpdateDependencyPlan(pkgName string, cfg *Config, remoteIndex []RepoEntry) ([]string, error) {
+	deps, found, err := resolveBinaryDependenciesFromArchive(pkgName, cfg, remoteIndex, true)
+	if err != nil {
+		return nil, err
+	}
+	if !found {
+		return nil, fmt.Errorf("dependency metadata for %s is unavailable", pkgName)
+	}
+
+	visited := map[string]bool{pkgName: true}
+	var plan []string
+	if err := resolveDependencyList(pkgName, deps, visited, &plan, false, true, cfg, remoteIndex, true); err != nil {
+		return nil, err
+	}
+	return plan, nil
+}
+
 // checkForRemoteUpgrades implements 'hokuto update --remote'
 // It compares installed packages against the remote index and updates them if newer versions exist.
 func checkForRemoteUpgrades(_ context.Context, cfg *Config) error {
@@ -175,12 +192,11 @@ func checkForRemoteUpgrades(_ context.Context, cfg *Config) error {
 
 	// Track duplication to avoid re-checking in same run
 	processedDeps := make(map[string]bool)
-	visited := make(map[string]bool)
-
 	isCriticalAtomic.Store(1)
 	defer isCriticalAtomic.Store(0)
 
 	totalUpdated := 0
+	var failed []string
 	for i, pkgName := range pkgNames {
 		colArrow.Print("\n-> ")
 		colSuccess.Printf("Updating %s (%d/%d)\n", pkgName, i+1, len(pkgNames))
@@ -189,16 +205,15 @@ func checkForRemoteUpgrades(_ context.Context, cfg *Config) error {
 		// We can use resolveBinaryDependencies with force=false.
 		// It will add MISSING deps to 'depPlan'.
 		// We install them first.
-		var depPlan []string
-		// We need a fresh visited map for each root or shared? Shared is better to skip re-checks.
-		// But resolveBinaryDependencies with visited will skip.
-		// We can use the global visited for this run.
-		if err := resolveBinaryDependencies(pkgName, visited, &depPlan, false, true, cfg, remoteIndex, true); err != nil {
+		depPlan, err := remoteUpdateDependencyPlan(pkgName, cfg, remoteIndex)
+		if err != nil {
 			color.Danger.Printf("Failed to resolve dependencies for %s: %v\n", pkgName, err)
-			continue // Skip this update?
+			failed = append(failed, fmt.Sprintf("%s (dependency resolution: %v)", pkgName, err))
+			continue
 		}
 
 		// Install missing deps found
+		dependencyFailed := false
 		for _, dep := range depPlan {
 			if processedDeps[dep] {
 				continue
@@ -206,21 +221,30 @@ func checkForRemoteUpgrades(_ context.Context, cfg *Config) error {
 			// Install dep
 			if err := installRemotePackage(dep, cfg, remoteIndex); err != nil {
 				color.Danger.Printf("Failed to install dependency %s: %v\n", dep, err)
-				// Determine if we should abort or continue
+				failed = append(failed, fmt.Sprintf("%s (dependency %s: %v)", pkgName, dep, err))
+				dependencyFailed = true
+				break
 			} else {
 				processedDeps[dep] = true
 			}
+		}
+		if dependencyFailed {
+			continue
 		}
 
 		// 6b. Install the Package Update (Target)
 		if err := installRemotePackage(pkgName, cfg, remoteIndex); err != nil {
 			color.Danger.Printf("Failed to update %s: %v\n", pkgName, err)
+			failed = append(failed, fmt.Sprintf("%s: %v", pkgName, err))
 		} else {
 			processedDeps[pkgName] = true
 			totalUpdated++
 			colArrow.Print("-> ")
 			colSuccess.Printf("Package %s updated successfully.\n", pkgName)
 		}
+	}
+	if len(failed) > 0 {
+		return fmt.Errorf("some remote packages failed to update: %s", strings.Join(failed, "; "))
 	}
 
 	if hokutoInUpdates && len(upgradeList) > 1 {

@@ -41,15 +41,11 @@ func findOwnerPackage(filePath string) (string, error) {
 
 		scanner := bufio.NewScanner(bytes.NewReader(data))
 		for scanner.Scan() {
-			line := strings.TrimSpace(scanner.Text())
-			if line == "" || strings.HasSuffix(line, "/") {
+			entry, ok, parseErr := parseManifestLine(scanner.Text())
+			if parseErr != nil || !ok || strings.HasSuffix(entry.Path, "/") {
 				continue
 			}
-			fields := strings.Fields(line)
-			if len(fields) == 0 {
-				continue
-			}
-			manifestPath := fields[0]
+			manifestPath := entry.Path
 
 			// Normalize the path found in the manifest for an exact match check
 			cleanManifestPath := filepath.Clean(manifestPath)
@@ -94,15 +90,11 @@ func isOwnedByAnotherPackage(filePath, excludePkg string) bool {
 
 		scanner := bufio.NewScanner(bytes.NewReader(data))
 		for scanner.Scan() {
-			line := strings.TrimSpace(scanner.Text())
-			if line == "" || strings.HasSuffix(line, "/") {
+			entry, ok, parseErr := parseManifestLine(scanner.Text())
+			if parseErr != nil || !ok || strings.HasSuffix(entry.Path, "/") {
 				continue
 			}
-			fields := strings.Fields(line)
-			if len(fields) == 0 {
-				continue
-			}
-			manifestPath := fields[0]
+			manifestPath := entry.Path
 
 			// Normalize the path found in the manifest for an exact match check
 			cleanManifestPath := filepath.Clean(manifestPath)
@@ -186,16 +178,12 @@ func checkFileConflict(filePath, currentFileAbsPath, currentPackage, rootDir str
 
 		scanner := bufio.NewScanner(bytes.NewReader(data))
 		for scanner.Scan() {
-			line := strings.TrimSpace(scanner.Text())
-			if line == "" || strings.HasSuffix(line, "/") {
+			entry, ok, parseErr := parseManifestLine(scanner.Text())
+			if parseErr != nil || !ok || strings.HasSuffix(entry.Path, "/") {
 				continue
 			}
-			fields := strings.Fields(line)
-			if len(fields) < 2 {
-				continue
-			}
-			manifestPath := fields[0]
-			manifestChecksum := fields[1]
+			manifestPath := entry.Path
+			manifestChecksum := entry.Checksum
 
 			// Normalize the path found in the manifest for an exact match check
 			cleanManifestPath := filepath.Clean(manifestPath)

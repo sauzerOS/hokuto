@@ -130,35 +130,15 @@ func pkgUninstallWithRemovalSet(pkgName string, cfg *Config, execCtx *Executor, 
 
 	sc := bufio.NewScanner(strings.NewReader(string(manifestBytes)))
 	for sc.Scan() {
-		line := strings.TrimSpace(sc.Text())
-		if line == "" {
+		entry, ok, parseErr := parseManifestLine(sc.Text())
+		if parseErr != nil {
+			return fmt.Errorf("invalid manifest for %s: %w", pkgName, parseErr)
+		}
+		if !ok {
 			continue
 		}
-		// Use strings.Fields for robust parsing ---
-		pathInManifest := ""
-		expectedSum := ""
-
-		if strings.HasSuffix(line, "/") {
-			// This is a directory entry
-			pathInManifest = line
-		} else {
-			// Use strings.Fields() to robustly handle any amount of whitespace
-			fields := strings.Fields(line)
-			if len(fields) > 1 {
-				// The last field is the checksum
-				expectedSum = fields[len(fields)-1]
-				// Everything before is the path
-				pathInManifest = strings.Join(fields[:len(fields)-1], " ")
-			} else if len(fields) == 1 {
-				// Fallback/Error case: treat single field as path (no checksum?)
-				pathInManifest = fields[0]
-			}
-		}
-
-		// If after parsing, path is empty, it was a malformed line.
-		if pathInManifest == "" {
-			continue
-		}
+		pathInManifest := entry.Path
+		expectedSum := entry.Checksum
 
 		// Absolute path on disk
 		var absPath string

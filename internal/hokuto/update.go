@@ -10,7 +10,6 @@ import (
 	"io"
 	"os"
 	"os/exec"
-	"path"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -510,35 +509,29 @@ func buildMissingRepositoryBinaries(cfg *Config, buildArgs []string, yes bool) e
 	return handleBuildCommand(buildArgs, cfg)
 }
 
-// getBaseRepoPath extracts the base repository path (e.g., "/repo/reponame1")
-// from a longer path (e.g., "/repo/reponame1/one").
-
+// getBaseRepoPath finds the Git worktree containing a HOKUTO_PATH entry.
+// HOKUTO_PATH is not tied to a particular directory layout, and an entry may
+// point either at the worktree itself or at a package collection below it.
 func getBaseRepoPath(fullPath string) string {
-	parts := strings.Split(fullPath, "/")
-
-	// Example: for "/repo/reponame1/one", parts is ["", "repo", "reponame1", "one"]
-
-	// We need at least parts for "", "repo", "reponameX". Length >= 3.
-	if len(parts) < 3 {
-		return fullPath
+	fullPath = strings.TrimSpace(fullPath)
+	if fullPath == "" {
+		return ""
 	}
-
-	// We explicitly construct the path to ensure the leading '/' is present.
-	// parts[0] is "", parts[1] is "repo", parts[2] is "reponame1"
-	// We want to join "repo" and "reponame1" and prepend "/"
-
-	// Check if the path is absolute (starts with '/')
-	isAbs := strings.HasPrefix(fullPath, "/")
-
-	// The components we want to join are parts[1] and parts[2]
-	repoDir := path.Join(parts[1], parts[2])
-
-	if isAbs {
-		// Prepend the "/" to make it absolute again
-		return "/" + repoDir
+	dir := filepath.Clean(fullPath)
+	if abs, err := filepath.Abs(dir); err == nil {
+		dir = abs
 	}
-
-	return repoDir // Return the relative path if the original wasn't absolute (though it should be)
+	fallback := dir
+	for {
+		if _, err := os.Stat(filepath.Join(dir, ".git")); err == nil {
+			return dir
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return fallback
+		}
+		dir = parent
+	}
 }
 
 func updateRepoWithSystemGit(dir string) {

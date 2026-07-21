@@ -45,6 +45,8 @@ func loadConfig(path string) (*Config, error) {
 		if err := scanner.Err(); err != nil {
 			return cfg, err
 		}
+	} else if !os.IsNotExist(err) {
+		return cfg, fmt.Errorf("failed to open config %s: %w", path, err)
 	}
 
 	// Merge HOKUTO_* env overrides
@@ -223,6 +225,7 @@ func initConfig(cfg *Config) {
 	WorldFile = filepath.Join(rootDir, "/var/db/hokuto/world")
 	WorldMakeFile = filepath.Join(rootDir, "/var/db/hokuto/world_make")
 	LockFile = filepath.Join(rootDir, "/etc/hokuto/hokuto.lock")
+	PkgsetFile = filepath.Join(rootDir, "/etc/hokuto/hokuto.pkgset")
 	PkgDBPath = filepath.Join(rootDir, "/var/db/hokuto/pkg-db.json.zst")
 	BumpLogFile = filepath.Join(rootDir, "/var/log/hokuto-bump.log")
 	BumpIgnoreFile = filepath.Join(rootDir, "/var/db/hokuto/bump-ignore.json")

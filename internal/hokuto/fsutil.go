@@ -524,31 +524,15 @@ func getModifiedFiles(pkgName, rootDir string, execCtx *Executor) ([]string, err
 	scanner := bufio.NewScanner(strings.NewReader(string(data)))
 
 	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
+		entry, ok, parseErr := parseManifestLine(scanner.Text())
+		if parseErr != nil {
+			return nil, fmt.Errorf("invalid manifest: %w", parseErr)
+		}
+		if !ok || strings.HasSuffix(entry.Path, "/") {
 			continue
 		}
-
-		// Check if the line represents a directory (ends with /)
-		if strings.HasSuffix(line, "/") {
-			continue
-		}
-
-		// The manifest format is: FILENAME<whitespace>CHECKSUM
-		// or FILENAME<whitespace><whitespace>CHECKSUM
-		// Since filenames can contain spaces, we separate by the LAST whitespace.
-
-		lastSpace := strings.LastIndexAny(line, " \t")
-		if lastSpace == -1 {
-			continue // Skip invalid lines (e.g. malformed or empty)
-		}
-
-		path := strings.TrimSpace(line[:lastSpace])
-		checksum := strings.TrimSpace(line[lastSpace:])
-
-		if path == "" || checksum == "" {
-			continue
-		}
+		path := entry.Path
+		checksum := entry.Checksum
 
 		// Skip all metadata files under var/db/hokuto (internal package metadata)
 		// Handles both "var/db/hokuto/..." and "/var/db/hokuto/..." paths
@@ -598,27 +582,15 @@ func getModifiedFiles(pkgName, rootDir string, execCtx *Executor) ([]string, err
 	var modified []string
 	scanner = bufio.NewScanner(strings.NewReader(string(data)))
 	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
+		entry, ok, parseErr := parseManifestLine(scanner.Text())
+		if parseErr != nil {
+			return nil, fmt.Errorf("invalid manifest: %w", parseErr)
+		}
+		if !ok || strings.HasSuffix(entry.Path, "/") {
 			continue
 		}
-
-		// Check if the line represents a directory (ends with /)
-		if strings.HasSuffix(line, "/") {
-			continue
-		}
-
-		lastSpace := strings.LastIndexAny(line, " \t")
-		if lastSpace == -1 {
-			continue
-		}
-
-		relPath := strings.TrimSpace(line[:lastSpace])
-		expectedSum := strings.TrimSpace(line[lastSpace:])
-
-		if relPath == "" || expectedSum == "" {
-			continue
-		}
+		relPath := entry.Path
+		expectedSum := entry.Checksum
 
 		// Skip all metadata files under var/db/hokuto
 		cleanSlash := strings.TrimPrefix(filepath.ToSlash(relPath), "/")

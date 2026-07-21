@@ -239,7 +239,7 @@ func Main() {
 						// Give more time for graceful shutdown (increased from 500ms to 2s)
 						colArrow.Print("\n-> ")
 						color.Danger.Printf("Graceful shutdown timeout. Exiting.")
-						os.Exit(0)
+						os.Exit(130)
 					}
 				}
 
@@ -267,7 +267,8 @@ func Main() {
 	}
 	cfg, err := loadConfig(configPath)
 	if err != nil {
-		// handle error
+		fmt.Fprintf(os.Stderr, "Failed to load configuration: %v\n", err)
+		os.Exit(1)
 	}
 	mergeEnvOverrides(cfg)
 	initConfig(cfg)

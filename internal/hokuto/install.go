@@ -1630,15 +1630,11 @@ func checkStagingConflicts(pkgName, stagingDir, rootDir, stagingManifest string,
 	if data, err := os.ReadFile(installedManifestPath); err == nil {
 		scanner := bufio.NewScanner(bytes.NewReader(data))
 		for scanner.Scan() {
-			line := strings.TrimSpace(scanner.Text())
-			if line == "" || strings.HasSuffix(line, "/") {
+			entry, ok, parseErr := parseManifestLine(scanner.Text())
+			if parseErr != nil || !ok || strings.HasSuffix(entry.Path, "/") {
 				continue
 			}
-			fields := strings.Fields(line)
-			if len(fields) == 0 {
-				continue
-			}
-			manifestFilePath := fields[0]
+			manifestFilePath := entry.Path
 			cleanPath := canonicalizePath(rootDir, manifestFilePath)
 			cleanPathNoSlash := strings.TrimPrefix(cleanPath, "/")
 			currentPkgFiles[cleanPath] = true
@@ -1672,16 +1668,15 @@ func checkStagingConflicts(pkgName, stagingDir, rootDir, stagingManifest string,
 	// First pass: collect all conflicts
 	scanner := bufio.NewScanner(strings.NewReader(string(stagingData)))
 	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" || strings.HasSuffix(line, "/") {
+		entry, ok, parseErr := parseManifestLine(scanner.Text())
+		if parseErr != nil {
+			return fmt.Errorf("invalid staging manifest: %w", parseErr)
+		}
+		if !ok || strings.HasSuffix(entry.Path, "/") {
 			continue // Skip directories
 		}
 
-		parts := strings.Fields(line)
-		if len(parts) == 0 {
-			continue
-		}
-		filePath := parts[0] // Path from manifest (may have leading slash)
+		filePath := entry.Path // Path from manifest (may have leading slash)
 		// Normalize path: remove leading slash for comparison
 		filePathClean := canonicalizePath(rootDir, filePath)
 		filePathCleanNoSlash := strings.TrimPrefix(filePathClean, "/")

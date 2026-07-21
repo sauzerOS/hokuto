@@ -19,10 +19,33 @@ type ManifestEntry struct {
 	Checksum string
 }
 
-// parseManifest reads a manifest file and returns a map of file paths to their entries.
-// The map key is the file Path.
-// parseManifest reads a manifest file and returns a map of file paths to their entries.
-// It specifically skips entries that represent directories (end with '/').
+// parseManifestLine is the canonical parser for Hokuto manifest entries.
+// Directory entries end in a slash and have no checksum. File paths may
+// contain whitespace, so the checksum is split from the path at the final
+// whitespace boundary rather than with strings.Fields.
+func parseManifestLine(line string) (ManifestEntry, bool, error) {
+	line = strings.TrimSpace(line)
+	if line == "" || strings.HasPrefix(line, "#") {
+		return ManifestEntry{}, false, nil
+	}
+	if strings.HasSuffix(line, "/") {
+		return ManifestEntry{Path: line}, true, nil
+	}
+
+	lastSpace := strings.LastIndexAny(line, " \t")
+	if lastSpace == -1 {
+		return ManifestEntry{}, false, fmt.Errorf("invalid manifest line format (no checksum separator): %s", line)
+	}
+	path := strings.TrimSpace(line[:lastSpace])
+	checksum := strings.TrimSpace(line[lastSpace+1:])
+	if path == "" || checksum == "" {
+		return ManifestEntry{}, false, fmt.Errorf("invalid manifest line format: %s", line)
+	}
+	return ManifestEntry{Path: path, Checksum: checksum}, true, nil
+}
+
+// parseManifest reads a manifest file and returns all file and directory entries.
+// The map key is the entry path.
 
 func generateManifest(outputDir, installedDir string, execCtx *Executor) error {
 	manifestFile := filepath.Join(installedDir, "manifest")
@@ -196,36 +219,13 @@ func parseManifest(filePath string) (map[string]ManifestEntry, error) {
 
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue // Skip empty lines and comments
+		entry, ok, err := parseManifestLine(scanner.Text())
+		if err != nil {
+			return nil, err
 		}
-
-		// Check if the line represents a directory.
-		// We look for a line that ends with '/'.
-		if strings.HasSuffix(line, "/") {
-			// Directories in manifest are just paths ending in /
-			// We don't check for field count because paths can contain spaces.
-			continue
+		if ok {
+			entries[entry.Path] = entry
 		}
-
-		// The manifest format is: FILENAME<whitespace>CHECKSUM
-		// or FILENAME<whitespace><whitespace>CHECKSUM
-		// Since filenames can contain spaces, we separate by the LAST whitespace.
-
-		lastSpace := strings.LastIndexAny(line, " \t")
-		if lastSpace == -1 {
-			return nil, fmt.Errorf("invalid manifest line format (no separation): %s", line)
-		}
-
-		path := strings.TrimSpace(line[:lastSpace])
-		checksum := strings.TrimSpace(line[lastSpace:])
-
-		if path == "" || checksum == "" {
-			return nil, fmt.Errorf("invalid manifest line format: %s", line)
-		}
-
-		entries[path] = ManifestEntry{Path: path, Checksum: checksum}
 	}
 
 	if err := scanner.Err(); err != nil {
@@ -266,11 +266,10 @@ func updateManifestWithNewFiles(stagingManifest, stagingManifest2 string) error 
 
 		// Check if the file path exists in the original base manifest
 		if _, exists := baseEntries[path]; !exists {
-			// This is a new file! Add it to the list to be appended,
-			// but with the zero checksum.
-
 			entryToAdd := newEntry
-			entryToAdd.Checksum = zeroChecksum
+			if !strings.HasSuffix(entryToAdd.Path, "/") {
+				entryToAdd.Checksum = zeroChecksum
+			}
 			newFilesToTrack = append(newFilesToTrack, entryToAdd)
 		}
 	}
@@ -285,8 +284,11 @@ func updateManifestWithNewFiles(stagingManifest, stagingManifest2 string) error 
 	// First, format the data we want to append into an in-memory string.
 	var manifestLines strings.Builder
 	for _, entry := range newFilesToTrack {
-		// Append new entries in the specified format: path<space><space>checksum<newline>
-		manifestLines.WriteString(fmt.Sprintf("%s  %s\n", entry.Path, entry.Checksum))
+		if strings.HasSuffix(entry.Path, "/") {
+			manifestLines.WriteString(entry.Path + "\n")
+		} else {
+			manifestLines.WriteString(fmt.Sprintf("%s  %s\n", entry.Path, entry.Checksum))
+		}
 	}
 
 	if os.Geteuid() == 0 {

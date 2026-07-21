@@ -148,16 +148,12 @@ func readManifestOwnershipPaths(manifestPath, rootDir string, dirCache map[strin
 	pathSet := make(map[string]struct{})
 	scanner := bufio.NewScanner(strings.NewReader(string(data)))
 	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" || strings.HasSuffix(line, "/") {
-			continue
-		}
-		fields := strings.Fields(line)
-		if len(fields) == 0 {
+		entry, ok, err := parseManifestLine(scanner.Text())
+		if err != nil || !ok || strings.HasSuffix(entry.Path, "/") {
 			continue
 		}
 
-		addOwnershipPathVariants(pathSet, rootDir, fields[0], dirCache)
+		addOwnershipPathVariants(pathSet, rootDir, entry.Path, dirCache)
 	}
 
 	paths := make([]string, 0, len(pathSet))
@@ -246,13 +242,14 @@ func removeObsoleteFiles(pkgName, stagingDir, rootDir string) ([]string, error) 
 	if len(stagingData) > 0 {
 		sc := bufio.NewScanner(strings.NewReader(string(stagingData)))
 		for sc.Scan() {
-			line := strings.TrimSpace(sc.Text())
-			if line == "" || strings.HasSuffix(line, "/") {
+			entry, ok, err := parseManifestLine(sc.Text())
+			if err != nil {
+				return nil, fmt.Errorf("invalid staging manifest: %w", err)
+			}
+			if !ok || strings.HasSuffix(entry.Path, "/") {
 				continue
 			}
-			// Split into path and optional checksum: path is always first token
-			parts := strings.SplitN(line, "  ", 2) // manifest uses "␣␣" separator
-			path := strings.Fields(parts[0])[0]    // defensive: take first token
+			path := entry.Path
 			canonical := canonicalizePath(rootDir, path)
 			stagingSet[canonical] = struct{}{}
 			stagingSet[strings.TrimPrefix(canonical, "/")] = struct{}{}
@@ -275,12 +272,14 @@ func removeObsoleteFiles(pkgName, stagingDir, rootDir string) ([]string, error) 
 	iscanner := bufio.NewScanner(strings.NewReader(string(installedData)))
 	filesChecked := 0
 	for iscanner.Scan() {
-		line := strings.TrimSpace(iscanner.Text())
-		if line == "" || strings.HasSuffix(line, "/") {
+		entry, ok, err := parseManifestLine(iscanner.Text())
+		if err != nil {
+			return nil, fmt.Errorf("invalid installed manifest for %s: %w", pkgName, err)
+		}
+		if !ok || strings.HasSuffix(entry.Path, "/") {
 			continue
 		}
-		parts := strings.SplitN(line, "  ", 2)
-		path := strings.Fields(parts[0])[0]
+		path := entry.Path
 		if isPreservedKernelUpgradePath(path) {
 			continue
 		}

@@ -762,14 +762,11 @@ func generateDepends(pkgName, pkgDir, outputDir, rootDir string, execCtx *Execut
 
 				for _, lib := range libdeps {
 					for _, line := range lines {
-						// --- FIX: Isolate the path from the checksum/placeholder ---
-						// Split the line by whitespace. The path is always the first part.
-						fields := strings.Fields(line)
-						if len(fields) == 0 {
-							// Skip empty or malformed lines
+						entry, ok, parseErr := parseManifestLine(line)
+						if parseErr != nil || !ok || strings.HasSuffix(entry.Path, "/") {
 							continue
 						}
-						pathInManifest := fields[0]
+						pathInManifest := entry.Path
 
 						if libraryPathMatchesDep(pathInManifest, lib) {
 							if libDepIgnores.ignoresPackage(otherPkg) {
