@@ -2999,7 +2999,7 @@ func installSourceFallbackBuildDependencies(pkgName string, cfg *Config, noRemot
 }
 
 func installSourceFallbackBuildDependenciesWithOptions(pkgName string, cfg *Config, noRemote bool, quiet bool) error {
-	if cfg != nil && cfg.Values["HOKUTO_BOOTSTRAP"] != "1" && !isRequiredDevelPackage(pkgName, cfg) {
+	if cfg != nil && cfg.Values["HOKUTO_BOOTSTRAP"] != "1" && !isRequiredDevelPackage(pkgName, cfg) && packageSetNeedsDevelPackages([]string{pkgName}) {
 		includeMultilib := packageSetHasBuildOption([]string{pkgName}, "multilib")
 		if _, err := ensureDevelPackagesInstalledWithOptions(cfg, includeMultilib, noRemote, quiet); err != nil {
 			return fmt.Errorf("failed to prepare devel packages for %s: %w", pkgName, err)

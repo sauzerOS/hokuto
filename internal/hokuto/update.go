@@ -220,15 +220,20 @@ func removeUpdateTarget(targets []string, remove string) []string {
 }
 
 func updatePlanRequiresSourceBuild(plan *BuildPlan, binaryAvailable map[string]bool, selectedSplitUpdates map[string][]string) bool {
+	return len(updatePlanSourceBuildPackages(plan, binaryAvailable, selectedSplitUpdates)) > 0
+}
+
+func updatePlanSourceBuildPackages(plan *BuildPlan, binaryAvailable map[string]bool, selectedSplitUpdates map[string][]string) []string {
 	if plan == nil {
-		return false
+		return nil
 	}
+	var packages []string
 	for _, pkgName := range plan.Order {
 		if plan.RebuildPackages[pkgName] || len(selectedSplitUpdates[pkgName]) > 0 || !binaryAvailable[pkgName] {
-			return true
+			packages = append(packages, pkgName)
 		}
 	}
-	return false
+	return packages
 }
 
 func currentBinaryOutputVariants(sourcePkg, outputPkg string, cfg *Config) []string {
@@ -1361,6 +1366,11 @@ func checkForUpgrades(ctx context.Context, cfg *Config, maxJobs int, yes bool) e
 		if !installedBinaryDeps {
 			break
 		}
+		for pkgName := range acceptedBinaryDeps {
+			if !packageHasSelfBuildDependency(pkgName, cfg) {
+				binaryAvailable[pkgName] = true
+			}
+		}
 		plan, err = resolveBuildPlan(updateTargets, userRequestedMap, false, cfg, binaryAvailable)
 		if err != nil {
 			return fmt.Errorf("failed to refresh upgrade plan after installing build dependencies: %w", err)
@@ -1400,13 +1410,18 @@ func checkForUpgrades(ctx context.Context, cfg *Config, maxJobs int, yes bool) e
 	// still contains something that cannot be installed from a binary. Runtime
 	// binary dependencies above must be resolved first because they can remove
 	// their source recipes from the plan.
-	if updatePlanRequiresSourceBuild(plan, binaryAvailable, selectedSplitUpdates) {
+	sourceBuildPackages := updatePlanSourceBuildPackages(plan, binaryAvailable, selectedSplitUpdates)
+	if len(sourceBuildPackages) > 0 {
 		if len(pkgNames) > 1 {
 			go prefetchSources(pkgNames[1:])
 		}
-		includeMultilibDevel := packageSetHasBuildOption(pkgNames, "multilib")
-		if _, err := ensureDevelPackagesInstalledWithOptions(cfg, includeMultilibDevel, false, quietDependencyInstalls); err != nil {
-			return fmt.Errorf("failed to prepare devel packages before update: %w", err)
+		if packageSetNeedsDevelPackages(sourceBuildPackages) {
+			includeMultilibDevel := packageSetHasBuildOption(sourceBuildPackages, "multilib")
+			if _, err := ensureDevelPackagesInstalledWithOptions(cfg, includeMultilibDevel, false, quietDependencyInstalls); err != nil {
+				return fmt.Errorf("failed to prepare devel packages before update: %w", err)
+			}
+		} else {
+			debugf("Skipping devel package check: all source builds suppress it via binary or nodevel\n")
 		}
 	}
 

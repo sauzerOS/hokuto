@@ -117,6 +117,56 @@ func TestUpdatePlanSkipsBuildPreparationForBinaryOnlyTarget(t *testing.T) {
 	}
 }
 
+func TestUpdatePlanSourceBuildPackages(t *testing.T) {
+	plan := &BuildPlan{
+		Order:           []string{"binary-dependency", "nodevel-source", "rebuild-source", "split-source"},
+		RebuildPackages: map[string]bool{"rebuild-source": true},
+	}
+	available := map[string]bool{
+		"binary-dependency": true,
+		"nodevel-source":    false,
+		"rebuild-source":    true,
+		"split-source":      true,
+	}
+	selectedSplits := map[string][]string{
+		"split-source": {"split-output"},
+	}
+
+	got := updatePlanSourceBuildPackages(plan, available, selectedSplits)
+	want := []string{"nodevel-source", "rebuild-source", "split-source"}
+	if len(got) != len(want) {
+		t.Fatalf("source build packages = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("source build packages = %v, want %v", got, want)
+		}
+	}
+}
+
+func TestUpdateNodevelSourceBuildSkipsToolchain(t *testing.T) {
+	_, _ = withSplitUpdateFixture(t)
+	for name, options := range map[string]string{
+		"fonts-meta": "nodevel\n",
+		"regular":    "",
+	} {
+		pkgDir := filepath.Join(repoPaths, name)
+		if err := os.MkdirAll(pkgDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(pkgDir, "options"), []byte(options), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if packageSetNeedsDevelPackages([]string{"fonts-meta"}) {
+		t.Fatal("nodevel source build must not request the standard toolchain")
+	}
+	if !packageSetNeedsDevelPackages([]string{"fonts-meta", "regular"}) {
+		t.Fatal("a regular source build in a mixed plan must request the standard toolchain")
+	}
+}
+
 func TestBinaryUpdatePlanDoesNotTraverseSourceBuildDependencies(t *testing.T) {
 	cfg, _ := withSplitUpdateFixture(t)
 	for name, depends := range map[string]string{
