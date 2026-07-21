@@ -476,6 +476,7 @@ func stagedArchivePackageName(stagingDir, requestedName string) (string, error) 
 // mirror. Callers that do not explicitly opt in retain pkgInstall's historical
 // local-only behavior.
 func pkgInstallWithRemotePolicy(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes, fast, managed, noRemote bool, logger io.Writer) ([]string, error) {
+	wasInstalled := isPackageInstalled(pkgName)
 	if logger == nil {
 		logger = os.Stdout
 	}
@@ -1379,9 +1380,21 @@ func pkgInstallWithRemotePolicy(tarballPath, pkgName string, cfg *Config, execCt
 
 	// 7.5. Check for rebuild triggers from /etc/hokuto/hokuto.rebuild
 	rebuildTriggerPkgs := getRebuildTriggers(pkgName, rootDir)
+	for _, rebuildPkg := range automaticRebuildTriggers(pkgName, wasInstalled) {
+		found := false
+		for _, existing := range rebuildTriggerPkgs {
+			if existing == rebuildPkg {
+				found = true
+				break
+			}
+		}
+		if !found {
+			rebuildTriggerPkgs = append(rebuildTriggerPkgs, rebuildPkg)
+		}
+	}
 	if len(rebuildTriggerPkgs) > 0 {
 		fmt.Fprint(logger, colArrow.Sprint("-> "))
-		fmt.Fprint(logger, colSuccess.Sprint("DKMS trigger: "))
+		fmt.Fprint(logger, colSuccess.Sprint("Rebuild trigger: "))
 		fmt.Fprintf(logger, "%s", colNote.Sprintf("%s\n", strings.Join(rebuildTriggerPkgs, " ")))
 		if managed {
 			parallelRebuilds = append(parallelRebuilds, rebuildTriggerPkgs...)
