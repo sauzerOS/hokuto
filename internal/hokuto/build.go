@@ -523,6 +523,14 @@ func collectSplitDependenciesForPlan(plan *BuildPlan, cfg *Config) map[string][]
 	return splitDepsBySource
 }
 
+func addPlanSplitDependencies(plan *BuildPlan, splitDepsBySource map[string][]string, cfg *Config) {
+	for sourcePkg, splitPkgs := range collectSplitDependenciesForPlan(plan, cfg) {
+		for _, splitPkg := range splitPkgs {
+			addMappedSplitDependency(splitDepsBySource, sourcePkg, splitPkg)
+		}
+	}
+}
+
 func installBuiltSplitDependencyWithOptions(sourcePkg, splitPkg string, cfg *Config, quiet bool) error {
 	logger, fast := dependencyInstallLogger(quiet)
 	return installBuiltSplitDependencyWithLogger(sourcePkg, splitPkg, cfg, logger, fast)
@@ -4465,6 +4473,11 @@ func handleBuildCommand(args []string, cfg *Config) (err error) {
 			if maxJobs > 1 {
 				colArrow.Print("-> ")
 				colSuccess.Printf("Executing parallel build (jobs: %d)\n", maxJobs)
+				// The early missing-dependency pass may skip a split package when a
+				// binary is available at that point. Reconcile against the final plan
+				// so a source built later still installs and publishes every split
+				// output required by another parallel job.
+				addPlanSplitDependencies(initialPlan, splitDepsBySource, cfg)
 
 				// Define smart builder to check for binaries first
 				smartBuildBuilder := func(pkgName string, cfg *Config, exec *Executor, opts BuildOptions) (time.Duration, error) {

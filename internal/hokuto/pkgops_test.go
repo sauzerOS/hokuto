@@ -35,6 +35,53 @@ func TestGitPackageSourceNameRejectsPathOverride(t *testing.T) {
 	}
 }
 
+func TestPrepareSourcesPreservesURLFilenameOverride(t *testing.T) {
+	for _, noExtract := range []bool{false, true} {
+		name := "copy"
+		if noExtract {
+			name = "noextract"
+		}
+		t.Run(name, func(t *testing.T) {
+			oldCacheDir := CacheDir
+			t.Cleanup(func() { CacheDir = oldCacheDir })
+
+			tmp := t.TempDir()
+			CacheDir = filepath.Join(tmp, "cache")
+			pkgDir := filepath.Join(tmp, "recipe")
+			buildDir := filepath.Join(tmp, "build")
+			pkgSourceDir := filepath.Join(CacheDir, "sources", "example")
+			for _, dir := range []string{pkgDir, buildDir, pkgSourceDir} {
+				if err := os.MkdirAll(dir, 0o755); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			line := "https://example.invalid/commit/0123456789.patch -> descriptive.patch"
+			if noExtract {
+				line += " noextract"
+			}
+			if err := os.WriteFile(filepath.Join(pkgDir, "sources"), []byte(line+"\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(pkgSourceDir, "descriptive.patch"), []byte("patch payload\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			if err := prepareSources("example", pkgDir, buildDir, &Executor{Context: context.Background()}); err != nil {
+				t.Fatal(err)
+			}
+			if data, err := os.ReadFile(filepath.Join(buildDir, "descriptive.patch")); err != nil {
+				t.Fatalf("renamed source missing: %v", err)
+			} else if string(data) != "patch payload\n" {
+				t.Fatalf("unexpected renamed source contents: %q", data)
+			}
+			if _, err := os.Stat(filepath.Join(buildDir, "0123456789.patch")); !os.IsNotExist(err) {
+				t.Fatalf("URL basename should not be copied when an override is present: %v", err)
+			}
+		})
+	}
+}
+
 func TestCopyDirContentsFallbackPreservesSymlinks(t *testing.T) {
 	tmp := t.TempDir()
 	src := filepath.Join(tmp, "src")

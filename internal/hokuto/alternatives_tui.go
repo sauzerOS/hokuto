@@ -468,19 +468,19 @@ func runAlternativesTUI(hRoot string, db *GlobalAlternativesDB, targetPkg string
 				app.SetRoot(layout, true).SetFocus(table)
 				return
 			}
+			paths := make([]string, 0, len(indices))
 			for _, idx := range indices {
-				item := entries[idx]
-				changed, err := activateAlternativeForOwner(hRoot, item.path, item.entry, label, RootExec)
-				if err != nil {
-					setError(fmt.Errorf("%s: %w", item.path, err))
-					break
+				paths = append(paths, entries[idx].path)
+			}
+			changed, switchErr := activateAlternativesForOwnerBatch(hRoot, db, paths, label, RootExec)
+			if changed > 0 {
+				if err := saveAlternativesDB(hRoot, db, RootExec); err != nil {
+					setError(err)
+				} else if switchErr != nil {
+					setError(switchErr)
 				}
-				if changed {
-					if err := saveAlternativesDB(hRoot, db, RootExec); err != nil {
-						setError(err)
-						break
-					}
-				}
+			} else if switchErr != nil {
+				setError(switchErr)
 			}
 			app.SetRoot(layout, true).SetFocus(table)
 			refresh()

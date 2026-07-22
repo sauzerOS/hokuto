@@ -138,6 +138,10 @@ func prepareSources(pkgName, pkgDir, buildDir string, execCtx *Executor) error {
 			// Shift tokens so the rest of the logic (subdir, noextract) works
 			tokens = append([]string{tokens[0]}, tokens[3:]...)
 		}
+		preparedFilename := filepath.Base(relPath)
+		if filenameOverride != "" {
+			preparedFilename = filenameOverride
+		}
 
 		targetSubdir := ""
 		noExtract := false
@@ -280,7 +284,7 @@ func prepareSources(pkgName, pkgDir, buildDir string, execCtx *Executor) error {
 
 		// If flagged noextract, just copy the file
 		if noExtract {
-			destPath := filepath.Join(targetDir, filepath.Base(relPath))
+			destPath := filepath.Join(targetDir, preparedFilename)
 			if err := os.MkdirAll(filepath.Dir(destPath), 0o755); err != nil {
 				return fmt.Errorf("failed to create parent dir for %s: %v", destPath, err)
 			}
@@ -323,7 +327,7 @@ func prepareSources(pkgName, pkgDir, buildDir string, execCtx *Executor) error {
 			}
 		default:
 			// Copy file (e.g., patches/, simple local files)
-			destPath := filepath.Join(targetDir, filepath.Base(relPath))
+			destPath := filepath.Join(targetDir, preparedFilename)
 			if err := os.MkdirAll(filepath.Dir(destPath), 0o755); err != nil {
 				return fmt.Errorf("failed to create parent dir for %s: %v", destPath, err)
 			}

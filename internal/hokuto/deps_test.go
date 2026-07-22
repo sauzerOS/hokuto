@@ -1590,6 +1590,68 @@ func TestParallelBuildMarksSplitOutputsAvailable(t *testing.T) {
 	}
 }
 
+func TestParallelBuildRecoversSplitMappingsOmittedByEarlyBinaryCheck(t *testing.T) {
+	cfg, repo := withTempDependencyRepo(t)
+	cfg.Values["HOKUTO_MULTILIB"] = "1"
+	writeTestPackage(t, repo, "fluidsynth", "")
+	writeTestPackage(t, repo, "sdl2-compat", "")
+	writeTestPackage(t, repo, "openal", "lib32-fluidsynth make\n")
+	writeTestPackage(t, repo, "mpg123", "lib32-sdl2-compat make\n")
+	for pkg, split := range map[string]string{
+		"fluidsynth":  "lib32-fluidsynth",
+		"sdl2-compat": "lib32-sdl2-compat",
+	} {
+		if err := os.WriteFile(filepath.Join(repo, pkg, "depends."+split), nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	plan := &BuildPlan{
+		Order:             []string{"fluidsynth", "sdl2-compat", "openal", "mpg123"},
+		SkippedPackages:   make(map[string]string),
+		RebuildPackages:   make(map[string]bool),
+		PostRebuilds:      make(map[string][]string),
+		PostBuildRebuilds: make(map[string][]string),
+	}
+	// This starts empty to model the early dependency pass accepting already
+	// available split binaries without recording their source relationship.
+	splitDepsBySource := make(map[string][]string)
+	addPlanSplitDependencies(plan, splitDepsBySource, cfg)
+
+	pm := &ParallelManager{
+		MaxJobs:           4,
+		Config:            cfg,
+		BuildPlan:         plan,
+		Pending:           append([]string(nil), plan.Order...),
+		Running:           make(map[string]time.Time),
+		Completed:         make(map[string]bool),
+		Available:         make(map[string]bool),
+		Failed:            make(map[string]error),
+		LogFiles:          make(map[string]*os.File),
+		SplitDepsBySource: splitDepsBySource,
+		resultChan:        make(chan buildResult, 4),
+		promptPause:       make(chan bool),
+		promptAck:         make(chan struct{}),
+		AutoYes:           true,
+	}
+	pm.Builder = func(string, *Config, *Executor, BuildOptions) (time.Duration, error) {
+		return time.Millisecond, nil
+	}
+	pm.Installer = func(pkg string, _ io.Writer) (parallelInstallResult, error) {
+		available := append([]string{pkg}, splitDepsBySource[pkg]...)
+		return parallelInstallResult{Available: available}, nil
+	}
+
+	if err := pm.Run(); err != nil {
+		t.Fatalf("parallel build should publish split outputs recovered from the final plan: %v", err)
+	}
+	for _, pkg := range []string{"openal", "mpg123"} {
+		if !pm.Completed[pkg] {
+			t.Fatalf("expected %s to build after its split dependency became available; completed=%v available=%v", pkg, pm.Completed, pm.Available)
+		}
+	}
+}
+
 func TestParallelBuildRunsReadyOptionalRebuild(t *testing.T) {
 	cfg, repo := withTempDependencyRepo(t)
 	writeTestPackage(t, repo, "systemd", "")

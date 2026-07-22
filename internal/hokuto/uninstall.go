@@ -21,6 +21,34 @@ import (
 
 const protectedBasePackage = "sauzeros-base"
 
+// canonicalUninstallPath converts either a manifest/alternatives path or an
+// on-disk path into one canonical path below hRoot. Parent symlinks are
+// resolved so aliases such as /bin/X and /usr/bin/X compare equal without
+// following the final path component itself.
+func canonicalUninstallPath(hRoot, path string) string {
+	if hRoot == "" {
+		hRoot = "/"
+	}
+	hRoot = filepath.Clean(hRoot)
+	clean := filepath.Clean(path)
+	manifestPath := clean
+
+	if rel, err := filepath.Rel(hRoot, clean); err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+		manifestPath = "/" + strings.TrimPrefix(filepath.ToSlash(rel), "/")
+	}
+
+	canonical := canonicalizePath(hRoot, manifestPath)
+	return filepath.Clean(filepath.Join(hRoot, strings.TrimPrefix(canonical, "/")))
+}
+
+func addCanonicalUninstallPath(paths map[string]bool, hRoot, path string) {
+	paths[canonicalUninstallPath(hRoot, path)] = true
+}
+
+func containsCanonicalUninstallPath(paths map[string]bool, hRoot, path string) bool {
+	return paths[canonicalUninstallPath(hRoot, path)]
+}
+
 func pkgUninstall(pkgName string, cfg *Config, execCtx *Executor, force, yes bool, logger io.Writer) error {
 	return pkgUninstallWithRemovalSet(pkgName, cfg, execCtx, force, yes, logger, nil)
 }
@@ -202,8 +230,8 @@ func pkgUninstallWithRemovalSet(pkgName string, cfg *Config, execCtx *Executor, 
 		return fmt.Errorf("refusing to uninstall %s because alternatives could not be restored: %w", pkgName, err)
 	} else {
 		for f := range restoredMap {
-			restoredFilesToKeep[f] = true
-			alternativeFilePaths[f] = true // Also mark as alternative for skip check
+			addCanonicalUninstallPath(restoredFilesToKeep, hRoot, f)
+			addCanonicalUninstallPath(alternativeFilePaths, hRoot, f) // Also mark as alternative for skip check
 		}
 	}
 
@@ -224,7 +252,7 @@ func pkgUninstallWithRemovalSet(pkgName string, cfg *Config, execCtx *Executor, 
 		}
 
 		// Skip files that were restored from alternatives and should be kept
-		if restoredFilesToKeep[clean] {
+		if containsCanonicalUninstallPath(restoredFilesToKeep, hRoot, clean) {
 			debugf("Skipping removal of restored alternative file: %s\n", clean)
 			continue
 		}
@@ -233,7 +261,7 @@ func pkgUninstallWithRemovalSet(pkgName string, cfg *Config, execCtx *Executor, 
 		// Skip checksum verification if force=true or if it's internal metadata, but not for /etc files
 		// Also skip checksum verification for alternative files (they may have been modified by switching)
 		isEtcFile := strings.HasPrefix(clean, "/etc/") || strings.HasPrefix(clean, filepath.Join(hRoot, "etc/"))
-		isAlternativeFile := alternativeFilePaths[clean]
+		isAlternativeFile := containsCanonicalUninstallPath(alternativeFilePaths, hRoot, clean)
 
 		if (force || strings.HasPrefix(p, internalFilePrefix) || meta.B3Sum == "" || meta.B3Sum == "000000" || isAlternativeFile) && !isEtcFile {
 			filesToRemove = append(filesToRemove, clean)

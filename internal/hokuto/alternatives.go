@@ -39,6 +39,8 @@ type alternativeBatchContext struct {
 	ownerByPath   map[string]string
 }
 
+var alternativeStoreLocks sync.Map
+
 // GlobalAlternativesDBPath is the path to the global alternatives database
 const GlobalAlternativesDBPath = "var/db/hokuto/alternatives/db.json"
 
@@ -230,6 +232,14 @@ func getStashedFilePath(hRoot, b3sum string) string {
 // ensureStoreDir creates the store directory if it doesn't exist
 func ensureStoreDir(hRoot string, execCtx *Executor) error {
 	storeDir := filepath.Join(hRoot, GlobalAlternativesStoreDir)
+	if info, err := os.Stat(storeDir); err == nil {
+		if !info.IsDir() {
+			return fmt.Errorf("alternatives store path is not a directory: %s", storeDir)
+		}
+		return nil
+	} else if !os.IsNotExist(err) && !os.IsPermission(err) {
+		return err
+	}
 	if os.Geteuid() == 0 {
 		return os.MkdirAll(storeDir, 0755)
 	}
@@ -410,6 +420,11 @@ func copyAlternativeRegularFile(source, destination string, execCtx *Executor) e
 }
 
 func ensureAlternativeStored(hRoot, source string, info alternativeFileInfo, execCtx *Executor) error {
+	lockValue, _ := alternativeStoreLocks.LoadOrStore(info.Sum, &sync.Mutex{})
+	storeLock := lockValue.(*sync.Mutex)
+	storeLock.Lock()
+	defer storeLock.Unlock()
+
 	if err := ensureStoreDir(hRoot, execCtx); err != nil {
 		return err
 	}
@@ -650,6 +665,51 @@ func restoreAlternativeContent(hRoot, path string, alt *Alternative, execCtx *Ex
 	return nil
 }
 
+type alternativeRestoreJob struct {
+	Path        string
+	Entry       *FileEntry
+	Alternative *Alternative
+}
+
+const maxAlternativeWorkers = 8
+
+// restoreAlternativeContentsBatch restores independent paths concurrently.
+// Each individual restore still uses restoreAlternativeContent's atomic
+// sibling-temp-and-rename operation.
+func restoreAlternativeContentsBatch(hRoot string, jobs []alternativeRestoreJob, execCtx *Executor) error {
+	if len(jobs) == 0 {
+		return nil
+	}
+
+	workerLimit := maxAlternativeWorkers
+	if workerLimit > len(jobs) {
+		workerLimit = len(jobs)
+	}
+	sem := make(chan struct{}, workerLimit)
+	errs := make([]error, len(jobs))
+	var wg sync.WaitGroup
+	for i := range jobs {
+		wg.Add(1)
+		go func(index int) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			job := jobs[index]
+			if err := restoreAlternativeContent(hRoot, job.Path, job.Alternative, execCtx); err != nil {
+				errs[index] = fmt.Errorf("%s: %w", job.Path, err)
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	for _, err := range errs {
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func parseManifestFilePath(line string) string {
 	line = strings.TrimSpace(line)
 	if line == "" {
@@ -795,7 +855,16 @@ func BatchRegisterAlternatives(hRoot string, requests []AlternativeRequest, exec
 	if len(requests) == 0 {
 		return nil
 	}
-	for _, req := range requests {
+	normalizedRequests := make([]AlternativeRequest, len(requests))
+	for i, req := range requests {
+		if err := validateAlternativePath(req.FilePath); err != nil {
+			return err
+		}
+		// Conflict detection can encounter the same installed file through
+		// usr-merge aliases such as /bin/X and /usr/bin/X. Always key the
+		// alternatives database by the canonical parent path so subsequent
+		// installs update one conflict set instead of creating parallel sets.
+		req.FilePath = canonicalizePath(hRoot, req.FilePath)
 		if err := validateAlternativePath(req.FilePath); err != nil {
 			return err
 		}
@@ -805,7 +874,9 @@ func BatchRegisterAlternatives(hRoot string, requests []AlternativeRequest, exec
 		if req.IncomingPkg == "" {
 			return fmt.Errorf("missing incoming package for alternative %s", req.FilePath)
 		}
+		normalizedRequests[i] = req
 	}
+	requests = normalizedRequests
 
 	db, err := loadAlternativesDB(hRoot)
 	if err != nil {
@@ -968,6 +1039,7 @@ func restoreAlternativesOnUninstallSet(pkgName, hRoot string, execCtx *Executor,
 
 	restoredFiles := make(map[string]bool)
 	modified := false
+	var restoreJobs []alternativeRestoreJob
 
 	for path, entry := range db.Files {
 		var activeAlt *Alternative
@@ -1026,14 +1098,11 @@ func restoreAlternativesOnUninstallSet(pkgName, hRoot string, execCtx *Executor,
 				}
 
 				if candidate != nil {
-					if err := restoreAlternativeContent(hRoot, path, candidate, execCtx); err != nil {
-						return nil, fmt.Errorf("failed to restore alternative for %s: %w", path, err)
-					}
-					setActiveAlternative(entry, candidate)
-
-					// Mark as restored so uninstall doesn't delete it
-					restoredFiles[path] = true
-					fmt.Printf("-> Restored alternative for %s from %v\n", path, candidate.Owners)
+					restoreJobs = append(restoreJobs, alternativeRestoreJob{
+						Path:        path,
+						Entry:       entry,
+						Alternative: candidate,
+					})
 				} else {
 					// No candidates. File is orphaned.
 					// Uninstall process will naturally remove it since it's in the manifest of Pkg A.
@@ -1049,11 +1118,21 @@ func restoreAlternativesOnUninstallSet(pkgName, hRoot string, execCtx *Executor,
 			}
 		}
 
-		// Cleanup: Remove alternatives with 0 owners (unless it's the active one and we kept it?)
-		// Actually, if active has 0 owners and no candidates, it will be deleted by uninstall.
-		// So we can clean up the DB entry.
+	}
 
-		cleanAlts := []*Alternative{}
+	if err := restoreAlternativeContentsBatch(hRoot, restoreJobs, execCtx); err != nil {
+		return nil, fmt.Errorf("failed to restore alternative: %w", err)
+	}
+	for _, job := range restoreJobs {
+		setActiveAlternative(job.Entry, job.Alternative)
+		restoredFiles[job.Path] = true
+		fmt.Printf("-> Restored alternative for %s from %v\n", job.Path, job.Alternative.Owners)
+	}
+
+	// Drop alternatives whose final owner is being removed. Do this only after
+	// every replacement succeeds so a failed batch is never committed.
+	for _, entry := range db.Files {
+		cleanAlts := entry.Alternatives[:0]
 		for _, alt := range entry.Alternatives {
 			if len(alt.Owners) > 0 {
 				cleanAlts = append(cleanAlts, alt)
@@ -1454,4 +1533,65 @@ func activateAlternativeForOwner(hRoot, path string, entry *FileEntry, pkgName s
 	}
 	setActiveAlternative(entry, targetAlt)
 	return true, nil
+}
+
+// activateAlternativesForOwnerBatch switches distinct conflict paths in
+// parallel and leaves persistence to the caller, allowing one DB commit for a
+// multi-selection operation.
+func activateAlternativesForOwnerBatch(hRoot string, db *GlobalAlternativesDB, paths []string, pkgName string, execCtx *Executor) (int, error) {
+	seen := make(map[string]bool, len(paths))
+	type activationJob struct {
+		path  string
+		entry *FileEntry
+	}
+	jobs := make([]activationJob, 0, len(paths))
+	for _, path := range paths {
+		if seen[path] {
+			continue
+		}
+		seen[path] = true
+		entry := db.Files[path]
+		if entry == nil {
+			return 0, fmt.Errorf("no alternatives recorded for %s", path)
+		}
+		jobs = append(jobs, activationJob{path: path, entry: entry})
+	}
+	if len(jobs) == 0 {
+		return 0, nil
+	}
+
+	workerLimit := maxAlternativeWorkers
+	if workerLimit > len(jobs) {
+		workerLimit = len(jobs)
+	}
+	sem := make(chan struct{}, workerLimit)
+	changed := make([]bool, len(jobs))
+	errs := make([]error, len(jobs))
+	var wg sync.WaitGroup
+	for i := range jobs {
+		wg.Add(1)
+		go func(index int) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			job := jobs[index]
+			changed[index], errs[index] = activateAlternativeForOwner(hRoot, job.path, job.entry, pkgName, execCtx)
+			if errs[index] != nil {
+				errs[index] = fmt.Errorf("%s: %w", job.path, errs[index])
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	changedCount := 0
+	var firstErr error
+	for i := range jobs {
+		if changed[i] {
+			changedCount++
+		}
+		if firstErr == nil && errs[i] != nil {
+			firstErr = errs[i]
+		}
+	}
+	return changedCount, firstErr
 }
