@@ -1118,9 +1118,9 @@ func setEnvironmentValue(env []string, key, value string) []string {
 func getPackageDependenciesToUninstall(name string) []string {
 	switch name {
 	case "gcc":
-		return []string{"02-gcc-1", "20-gcc-2", "05-libstdc++"}
+		return []string{"02-gcc1", "20-gcc2", "05-libstdc++"}
 	case "binutils":
-		return []string{"01-binutils-1", "19-binutils-2"}
+		return []string{"01-binutils1", "19-binutils2"}
 	case "m4":
 		return []string{"06-m4"}
 	case "ncurses":
@@ -1153,10 +1153,10 @@ func getPackageDependenciesToUninstall(name string) []string {
 		return []string{"23-nano"}
 	case "bzip2":
 		return []string{"24-bzip2"}
-	case "mingw":
-		return []string{"mingw-headers"}
-	case "mingw-gcc":
-		return []string{"mingw-gcc-static"}
+	case "mingw-w64":
+		return []string{"mingw-w64-headers"}
+	case "mingw-w64-gcc":
+		return []string{"mingw-w64-gcc-static"}
 	case "cython":
 		return []string{name}
 	case "dbus-python":
