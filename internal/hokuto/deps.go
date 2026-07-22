@@ -61,6 +61,7 @@ var baseDevelPackages = []string{
 	"automake",
 	"binutils",
 	"bison",
+	"diffutils",
 	"file",
 	"findutils",
 	"flex",
