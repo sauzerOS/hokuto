@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -695,6 +696,65 @@ type AutoBumpCandidate struct {
 	IsPkgSet        bool
 }
 
+type autoBumpRepository struct {
+	DisplayName  string
+	Path         string
+	RepologyName string
+}
+
+var optionalAutoBumpRepositories = []autoBumpRepository{
+	{DisplayName: "Cosmic", Path: "/repo/cosmic", RepologyName: "sauzeros-cosmic"},
+	{DisplayName: "KDE", Path: "/repo/kde", RepologyName: "sauzeros-kde"},
+}
+
+func repologyURLForRepository(configuredURL, repository string) (string, error) {
+	parsed, err := url.Parse(configuredURL)
+	if err != nil {
+		return "", fmt.Errorf("invalid REPOLOGY_URL: %w", err)
+	}
+	query := parsed.Query()
+	query.Set("inrepo", repository)
+	parsed.RawQuery = query.Encode()
+	return parsed.String(), nil
+}
+
+func autoBumpRepositoryAvailable(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && info.IsDir()
+}
+
+func prioritizeAutoBumpRepository(path, currentPaths string) string {
+	paths := []string{path}
+	cleanPath := filepath.Clean(path)
+	for _, candidate := range filepath.SplitList(currentPaths) {
+		if candidate == "" || filepath.Clean(candidate) == cleanPath {
+			continue
+		}
+		paths = append(paths, candidate)
+	}
+	return strings.Join(paths, string(os.PathListSeparator))
+}
+
+func runOptionalAutoBumpRepositories(
+	assumeYes bool,
+	available func(string) bool,
+	confirm func(autoBumpRepository) bool,
+	run func(autoBumpRepository) error,
+) error {
+	for _, repository := range optionalAutoBumpRepositories {
+		if !available(repository.Path) {
+			continue
+		}
+		if !assumeYes && !confirm(repository) {
+			continue
+		}
+		if err := run(repository); err != nil {
+			return fmt.Errorf("%s repository auto-bump failed: %w", repository.DisplayName, err)
+		}
+	}
+	return nil
+}
+
 type bumpIgnoreEntry struct {
 	Package         string    `json:"package"`
 	Version         string    `json:"version"`
@@ -891,15 +951,45 @@ func askForAutoBumpSelection(prompt string, count int) (autoBumpSelection, bool)
 	}
 }
 
-// HandleAutoBumpCommand implements the logic of the automagic bump script.
+// HandleAutoBumpCommand runs the configured repository first, then offers
+// separate passes for optional desktop repositories that are present locally.
 func HandleAutoBumpCommand(cfg *Config, autoBuild bool, assumeYes bool) error {
-	GlobalAssumeYes = true
-	defer func() { GlobalAssumeYes = false }()
-
-	repoURL := cfg.Values["REPOLOGY_URL"]
-	if repoURL == "" {
+	configuredURL := cfg.Values["REPOLOGY_URL"]
+	if configuredURL == "" {
 		return fmt.Errorf("REPOLOGY_URL is not configured in hokuto.conf")
 	}
+
+	if err := handleAutoBumpRepository(cfg, autoBuild, assumeYes, configuredURL, "sauzeros", ""); err != nil {
+		return err
+	}
+
+	return runOptionalAutoBumpRepositories(
+		assumeYes,
+		autoBumpRepositoryAvailable,
+		func(repository autoBumpRepository) bool {
+			return askForConfirmation(colSuccess, "Process %s repo?", repository.DisplayName)
+		},
+		func(repository autoBumpRepository) error {
+			repositoryURL, err := repologyURLForRepository(configuredURL, repository.RepologyName)
+			if err != nil {
+				return err
+			}
+
+			colArrow.Print("-> ")
+			colSuccess.Printf("Processing %s repository\n", repository.DisplayName)
+
+			oldRepoPaths := repoPaths
+			repoPaths = prioritizeAutoBumpRepository(repository.Path, oldRepoPaths)
+			defer func() { repoPaths = oldRepoPaths }()
+
+			return handleAutoBumpRepository(cfg, autoBuild, assumeYes, repositoryURL, repository.RepologyName, repository.Path)
+		},
+	)
+}
+
+func handleAutoBumpRepository(cfg *Config, autoBuild bool, assumeYes bool, repoURL, currentRepo, repositoryPath string) error {
+	GlobalAssumeYes = true
+	defer func() { GlobalAssumeYes = false }()
 
 	// Ensure log directory and file exist with correct permissions
 	logDir := filepath.Dir(BumpLogFile)
@@ -1036,13 +1126,19 @@ func HandleAutoBumpCommand(cfg *Config, autoBuild bool, assumeYes bool) error {
 		case "xrdb":
 			pkgName = "xorg-xrdb"
 		case "xset":
-			pkgName	= "xorg-xset"
+			pkgName = "xorg-xset"
 		case "xsetroot":
 			pkgName = "xorg-xsetroot"
 		case "tcl-lang":
 			pkgName = "tcl"
 		case "adventuregamestudio":
 			pkgName = "ags"
+		case "cosmic-icons":
+			pkgName = "cosmic-icon-theme"
+		case "xmodmap":
+			pkgName = "xorg-xmodmap"
+		case "xwininfo":
+			pkgName = "xorg-xwininfo"
 		}
 
 		var newestVer string
@@ -1060,7 +1156,7 @@ func HandleAutoBumpCommand(cfg *Config, autoBuild bool, assumeYes bool) error {
 					develVer = e.Version
 				}
 			}
-			if e.Repo == "sauzeros" {
+			if e.Repo == currentRepo {
 				if repologyCurrent == "" || compareVersions(e.Version, repologyCurrent) > 0 {
 					repologyCurrent = e.Version
 				}
@@ -1086,9 +1182,19 @@ func HandleAutoBumpCommand(cfg *Config, autoBuild bool, assumeYes bool) error {
 		var curVer string
 		var isPkgSet bool
 		if pkgs, ok := sets[pkgName]; ok && len(pkgs) > 0 {
+			if repositoryPath != "" {
+				if _, err := os.Stat(filepath.Join(repositoryPath, pkgs[0], "version")); err != nil {
+					continue
+				}
+			}
 			isPkgSet = true
 			curVer, _, err = getRepoVersion2(pkgs[0])
 		} else {
+			if repositoryPath != "" {
+				if _, err := os.Stat(filepath.Join(repositoryPath, pkgName, "version")); err != nil {
+					continue
+				}
+			}
 			curVer, _, err = getRepoVersion2(pkgName)
 		}
 
