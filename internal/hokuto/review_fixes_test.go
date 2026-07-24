@@ -29,6 +29,13 @@ func TestParseManifestLinePreservesPathWhitespace(t *testing.T) {
 	}
 }
 
+func TestParseManifestFilePathPreservesDirectoryWhitespace(t *testing.T) {
+	const path = "/usr/share/Program Files/Common Files/"
+	if got := parseManifestFilePath(path); got != path {
+		t.Fatalf("got %q, want %q", got, path)
+	}
+}
+
 func TestParseManifestRetainsDirectories(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "manifest")
 	data := "/usr/share/My App/empty dir/\n/usr/share/My App/file.txt  abc123\n"
@@ -91,6 +98,22 @@ func TestFindOwnerPackageSupportsSpaces(t *testing.T) {
 		t.Fatal(err)
 	}
 	if owner != "demo" {
+		t.Fatalf("unexpected owner %q", owner)
+	}
+}
+
+func TestFindPackageOwningDirectorySupportsSpaces(t *testing.T) {
+	root := t.TempDir()
+	installed := filepath.Join(root, "var", "db", "hokuto", "installed", "demo")
+	if err := os.MkdirAll(installed, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	const manifestPath = "/usr/share/Program Files/Common Files/"
+	if err := os.WriteFile(filepath.Join(installed, "manifest"), []byte(manifestPath+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if owner := findPackageOwningFile(root, manifestPath); owner != "demo" {
 		t.Fatalf("unexpected owner %q", owner)
 	}
 }

@@ -711,15 +711,11 @@ func restoreAlternativeContentsBatch(hRoot string, jobs []alternativeRestoreJob,
 }
 
 func parseManifestFilePath(line string) string {
-	line = strings.TrimSpace(line)
-	if line == "" {
+	entry, ok, err := parseManifestLine(line)
+	if err != nil || !ok {
 		return ""
 	}
-	lastSpace := strings.LastIndexAny(line, " \t")
-	if lastSpace == -1 {
-		return line
-	}
-	return strings.TrimSpace(line[:lastSpace])
+	return entry.Path
 }
 
 func buildAlternativeOwnerCache(hRoot string) map[string]string {
@@ -980,26 +976,9 @@ func findPackageOwningFile(hRoot, targetAbsPath string) string {
 		scanner := bufio.NewScanner(f)
 		found := false
 		for scanner.Scan() {
-			line := strings.TrimSpace(scanner.Text())
-			if line == "" {
+			mPath := parseManifestFilePath(scanner.Text())
+			if mPath == "" {
 				continue
-			}
-			// Line format: path [checksum]
-			// or: path
-			// We need to match the path.
-
-			// Extract path part
-			parts := strings.Fields(line)
-			if len(parts) == 0 {
-				continue
-			}
-
-			lastSpace := strings.LastIndexAny(line, " \t")
-			var mPath string
-			if lastSpace == -1 {
-				mPath = line
-			} else {
-				mPath = strings.TrimSpace(line[:lastSpace])
 			}
 
 			// Normalize manifest path using canonicalizePath

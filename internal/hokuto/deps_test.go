@@ -1541,6 +1541,35 @@ func TestScanInstalledPackageIntegrityFindsMissingManifestPaths(t *testing.T) {
 	}
 }
 
+func TestScanInstalledPackageIntegrityPreservesDirectoryPathsWithSpaces(t *testing.T) {
+	cfg, _ := withTempDependencyRepo(t)
+	root := t.TempDir()
+	rootDir = root
+	Installed = filepath.Join(root, "var", "db", "hokuto", "installed")
+	cfg.Values["HOKUTO_ROOT"] = root
+
+	pkgDir := filepath.Join(Installed, "example")
+	if err := os.MkdirAll(pkgDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	directory := filepath.Join(root, "usr", "share", "Program Files", "Common Files")
+	if err := os.MkdirAll(directory, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	manifest := "/usr/\n/usr/share/\n/usr/share/Program Files/\n/usr/share/Program Files/Common Files/\n"
+	if err := os.WriteFile(filepath.Join(pkgDir, "manifest"), []byte(manifest), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	issues, err := scanInstalledPackageIntegrity("example", cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(issues) != 0 {
+		t.Fatalf("space-containing directories were reported as missing: %+v", issues)
+	}
+}
+
 func TestScanInstalledPackageIntegrityFindsModifiedManifestFiles(t *testing.T) {
 	cfg, _ := withTempDependencyRepo(t)
 	root := t.TempDir()
