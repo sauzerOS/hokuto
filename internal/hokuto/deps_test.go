@@ -1590,6 +1590,41 @@ func TestParallelBuildMarksSplitOutputsAvailable(t *testing.T) {
 	}
 }
 
+func TestPrepareDependencyProgressLogOutputTerminatesActiveLine(t *testing.T) {
+	oldStderr := os.Stderr
+	readPipe, writePipe, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stderr = writePipe
+	t.Cleanup(func() {
+		os.Stderr = oldStderr
+		_ = readPipe.Close()
+		_ = writePipe.Close()
+	})
+
+	bar := newDependencyInstallProgress(2, "Installing Build Dependencies", true)
+	deactivate := activateDependencyInstallProgress(bar)
+	describeDependencyInstallProgress(bar, "wget")
+	if err := bar.Add(1); err != nil {
+		t.Fatal(err)
+	}
+	prepareDependencyProgressLogOutput()
+	deactivate()
+
+	if err := writePipe.Close(); err != nil {
+		t.Fatal(err)
+	}
+	os.Stderr = oldStderr
+	output, err := io.ReadAll(readPipe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.HasSuffix(output, []byte("\n")) {
+		t.Fatalf("active dependency progress line was not terminated: %q", output)
+	}
+}
+
 func TestParallelBuildRecoversSplitMappingsOmittedByEarlyBinaryCheck(t *testing.T) {
 	cfg, repo := withTempDependencyRepo(t)
 	cfg.Values["HOKUTO_MULTILIB"] = "1"

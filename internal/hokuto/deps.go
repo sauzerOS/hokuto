@@ -2622,8 +2622,9 @@ func prepareDependencyProgressLogOutput() {
 		bar = dependencyInstallProgress.bars[len(dependencyInstallProgress.bars)-1]
 	}
 	dependencyInstallProgress.Unlock()
-	if bar != nil {
+	if bar != nil && !bar.IsFinished() {
 		_ = bar.Clear()
+		fmt.Fprintln(os.Stderr)
 	}
 }
 
@@ -3032,6 +3033,7 @@ func ensureDevelPackagesInstalledWithOptions(cfg *Config, includeMultilib bool, 
 		return nil, nil
 	}
 
+	prepareDependencyProgressLogOutput()
 	colArrow.Print("-> ")
 	colSuccess.Printf("Installing missing devel packages: %s\n", strings.Join(missing, ", "))
 
