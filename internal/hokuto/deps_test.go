@@ -1521,7 +1521,7 @@ func TestScanInstalledPackageIntegrityFindsMissingManifestPaths(t *testing.T) {
 	if err := os.Symlink("missing-target", filepath.Join(root, "usr", "bin", "present-link")); err != nil {
 		t.Fatal(err)
 	}
-	manifest := "/usr/\n/usr/bin/\n/usr/bin/present abc123\n/usr/bin/present-link 000000\n/usr/bin/missing def456\n"
+	manifest := "/usr/\n/usr/bin/\n/usr/bin/present " + hashString("ok") + "\n/usr/bin/present-link 000000\n/usr/bin/missing def456\n"
 	if err := os.WriteFile(filepath.Join(pkgDir, "manifest"), []byte(manifest), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -1535,6 +1535,47 @@ func TestScanInstalledPackageIntegrityFindsMissingManifestPaths(t *testing.T) {
 	}
 	if len(issues[0].Missing) != 1 || issues[0].Missing[0] != "/usr/bin/missing" {
 		t.Fatalf("unexpected missing paths: %v", issues[0].Missing)
+	}
+	if len(issues[0].Modified) != 0 {
+		t.Fatalf("unexpected modified paths: %v", issues[0].Modified)
+	}
+}
+
+func TestScanInstalledPackageIntegrityFindsModifiedManifestFiles(t *testing.T) {
+	cfg, _ := withTempDependencyRepo(t)
+	root := t.TempDir()
+	rootDir = root
+	Installed = filepath.Join(root, "var", "db", "hokuto", "installed")
+	cfg.Values["HOKUTO_ROOT"] = root
+
+	pkgDir := filepath.Join(Installed, "example")
+	if err := os.MkdirAll(pkgDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	payload := filepath.Join(root, "usr", "include", "example.h")
+	if err := os.MkdirAll(filepath.Dir(payload), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(payload, []byte("stale"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	manifest := "/usr/include/example.h " + hashString("expected") + "\n"
+	if err := os.WriteFile(filepath.Join(pkgDir, "manifest"), []byte(manifest), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	issues, err := scanInstalledPackageIntegrity("example", cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(issues) != 1 || issues[0].Package != "example" {
+		t.Fatalf("expected one affected package, got %+v", issues)
+	}
+	if len(issues[0].Missing) != 0 {
+		t.Fatalf("unexpected missing paths: %v", issues[0].Missing)
+	}
+	if len(issues[0].Modified) != 1 || issues[0].Modified[0] != "/usr/include/example.h" {
+		t.Fatalf("unexpected modified paths: %v", issues[0].Modified)
 	}
 }
 

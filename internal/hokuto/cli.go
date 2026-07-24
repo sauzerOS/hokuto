@@ -505,7 +505,7 @@ func Main() {
 		lsCmd := flag.NewFlagSet("list", flag.ExitOnError)
 		var remote = lsCmd.Bool("remote", false, "List packages from the remote repository.")
 		var sortSize = lsCmd.Bool("size", false, "Sort packages by size, largest first.")
-		var checkIntegrity = lsCmd.Bool("check-integrity", false, "Check installed manifests for missing files and offer to reinstall affected packages.")
+		var checkIntegrity = lsCmd.Bool("check-integrity", false, "Check installed manifests for missing or modified files and offer to reinstall affected packages.")
 		if err := lsCmd.Parse(os.Args[2:]); err != nil {
 			fmt.Fprintf(os.Stderr, "Error parsing ls flags: %v\n", err)
 			os.Exit(1)

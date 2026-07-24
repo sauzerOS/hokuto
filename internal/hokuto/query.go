@@ -22,8 +22,9 @@ import (
 )
 
 type packageIntegrityIssue struct {
-	Package string
-	Missing []string
+	Package  string
+	Missing  []string
+	Modified []string
 }
 
 func integrityPathExists(path string, privilegedExec *Executor) (bool, error) {
@@ -114,9 +115,19 @@ func scanInstalledPackageIntegrity(searchTerm string, cfg *Config) ([]packageInt
 		if scanErr != nil {
 			return nil, fmt.Errorf("failed to scan manifest for %s: %w", pkgName, scanErr)
 		}
-		if len(missing) > 0 {
-			sort.Strings(missing)
-			issues = append(issues, packageIntegrityIssue{Package: pkgName, Missing: missing})
+
+		modified, err := getModifiedFiles(pkgName, root, privilegedExec)
+		if err != nil {
+			return nil, fmt.Errorf("failed to verify checksums for %s: %w", pkgName, err)
+		}
+		sort.Strings(missing)
+		sort.Strings(modified)
+		if len(missing) > 0 || len(modified) > 0 {
+			issues = append(issues, packageIntegrityIssue{
+				Package:  pkgName,
+				Missing:  missing,
+				Modified: modified,
+			})
 		}
 	}
 
@@ -185,21 +196,39 @@ func checkInstalledPackageIntegrity(searchTerm string, cfg *Config) error {
 	}
 	if len(issues) == 0 {
 		colArrow.Print("-> ")
-		colSuccess.Println("All installed package files are present.")
+		colSuccess.Println("All installed package files match their manifests.")
 		return nil
 	}
 
 	colArrow.Print("-> ")
-	colWarn.Printf("Found %d package(s) with missing files.\n", len(issues))
+	colWarn.Printf("Found %d package(s) with integrity problems.\n", len(issues))
 	for _, issue := range issues {
-		colWarn.Printf("  %s: %d missing file(s)\n", issue.Package, len(issue.Missing))
-		limit := min(len(issue.Missing), 10)
-		for _, path := range issue.Missing[:limit] {
-			fmt.Printf("    %s\n", path)
+		colWarn.Printf("  %s:", issue.Package)
+		if len(issue.Missing) > 0 {
+			fmt.Printf(" %d missing file(s)", len(issue.Missing))
 		}
-		if len(issue.Missing) > limit {
-			fmt.Printf("    ... and %d more\n", len(issue.Missing)-limit)
+		if len(issue.Missing) > 0 && len(issue.Modified) > 0 {
+			fmt.Print(",")
 		}
+		if len(issue.Modified) > 0 {
+			fmt.Printf(" %d modified file(s)", len(issue.Modified))
+		}
+		fmt.Println()
+
+		printIntegrityPaths := func(label string, paths []string) {
+			if len(paths) == 0 {
+				return
+			}
+			limit := min(len(paths), 10)
+			for _, path := range paths[:limit] {
+				fmt.Printf("    %s: %s\n", label, path)
+			}
+			if len(paths) > limit {
+				fmt.Printf("    ... and %d more %s file(s)\n", len(paths)-limit, label)
+			}
+		}
+		printIntegrityPaths("missing", issue.Missing)
+		printIntegrityPaths("modified", issue.Modified)
 	}
 
 	for _, issue := range issues {
