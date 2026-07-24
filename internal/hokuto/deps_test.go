@@ -3,6 +3,7 @@ package hokuto
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"io"
 	"os"
 	"os/exec"
@@ -1605,6 +1606,76 @@ func TestScanInstalledPackageIntegrityFindsModifiedManifestFiles(t *testing.T) {
 	}
 	if len(issues[0].Modified) != 1 || issues[0].Modified[0] != "/usr/include/example.h" {
 		t.Fatalf("unexpected modified paths: %v", issues[0].Modified)
+	}
+}
+
+func TestScanInstalledPackageIntegrityAcceptsActiveAlternative(t *testing.T) {
+	cfg, _ := withTempDependencyRepo(t)
+	root := t.TempDir()
+	rootDir = root
+	Installed = filepath.Join(root, "var", "db", "hokuto", "installed")
+	cfg.Values["HOKUTO_ROOT"] = root
+
+	const path = "/usr/include/shared.h"
+	const inactivePackage = "provider-a"
+	inactiveContent := "provider a"
+	activeContent := "provider b"
+	inactiveSum := hashString(inactiveContent)
+	activeSum := hashString(activeContent)
+
+	pkgDir := filepath.Join(Installed, inactivePackage)
+	if err := os.MkdirAll(pkgDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(pkgDir, "manifest"), []byte(path+" "+inactiveSum+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	diskPath := filepath.Join(root, strings.TrimPrefix(path, "/"))
+	if err := os.MkdirAll(filepath.Dir(diskPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(diskPath, []byte(activeContent), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	db := &GlobalAlternativesDB{Files: map[string]*FileEntry{
+		path: {
+			Path: path,
+			Alternatives: []*Alternative{
+				{B3Sum: inactiveSum, Owners: []string{inactivePackage}, State: StateStashed, Mode: "0644", Type: AlternativeRegular},
+				{B3Sum: activeSum, Owners: []string{"provider-b"}, State: StateActive, Mode: "0644", Type: AlternativeRegular},
+			},
+		},
+	}}
+	dbData, err := json.Marshal(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dbPath := filepath.Join(root, GlobalAlternativesDBPath)
+	if err := os.MkdirAll(filepath.Dir(dbPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dbPath, dbData, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	issues, err := scanInstalledPackageIntegrity(inactivePackage, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(issues) != 0 {
+		t.Fatalf("active alternative was reported as a modification: %+v", issues)
+	}
+
+	if err := os.WriteFile(diskPath, []byte("corrupted"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	issues, err = scanInstalledPackageIntegrity(inactivePackage, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(issues) != 1 || len(issues[0].Modified) != 1 || issues[0].Modified[0] != path {
+		t.Fatalf("corruption did not remain detectable: %+v", issues)
 	}
 }
 

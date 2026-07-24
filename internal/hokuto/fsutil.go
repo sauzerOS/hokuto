@@ -580,6 +580,8 @@ func getModifiedFiles(pkgName, rootDir string, execCtx *Executor) ([]string, err
 
 	// Second pass: compare checksums and find modified files
 	var modified []string
+	var alternativesDB *GlobalAlternativesDB
+	alternativesLoaded := false
 	scanner = bufio.NewScanner(strings.NewReader(string(data)))
 	for scanner.Scan() {
 		entry, ok, parseErr := parseManifestLine(scanner.Text())
@@ -609,9 +611,23 @@ func getModifiedFiles(pkgName, rootDir string, execCtx *Executor) ([]string, err
 			continue // file doesn't exist or checksum failed
 		}
 
-		if expectedSum != currentSum {
-			modified = append(modified, relPath)
+		if expectedSum == currentSum {
+			continue
 		}
+
+		if !alternativesLoaded {
+			alternativesDB, err = loadAlternativesDB(rootDir)
+			if err != nil {
+				return nil, fmt.Errorf("failed to load alternatives DB: %w", err)
+			}
+			alternativesLoaded = true
+		}
+		alternativePath := canonicalizePath(rootDir, relPath)
+		if isRegisteredActiveAlternative(alternativesDB, pkgName, alternativePath, expectedSum, currentSum) {
+			continue
+		}
+
+		modified = append(modified, relPath)
 	}
 
 	if err := scanner.Err(); err != nil {
@@ -619,6 +635,36 @@ func getModifiedFiles(pkgName, rootDir string, execCtx *Executor) ([]string, err
 	}
 
 	return modified, nil
+}
+
+func isRegisteredActiveAlternative(db *GlobalAlternativesDB, pkgName, path, expectedSum, currentSum string) bool {
+	if db == nil {
+		return false
+	}
+	entry := db.Files[path]
+	if entry == nil {
+		return false
+	}
+
+	expectedProvider := false
+	activeMatchesDisk := false
+	for _, alternative := range entry.Alternatives {
+		if alternative == nil {
+			continue
+		}
+		if alternative.B3Sum == expectedSum {
+			for _, owner := range alternative.Owners {
+				if owner == pkgName {
+					expectedProvider = true
+					break
+				}
+			}
+		}
+		if alternative.State == StateActive && alternative.B3Sum == currentSum {
+			activeMatchesDisk = true
+		}
+	}
+	return expectedProvider && activeMatchesDisk
 }
 
 func isDirectoryPrivileged(path string, execCtx *Executor) (bool, error) {

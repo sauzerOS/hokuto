@@ -162,6 +162,53 @@ func TestRemoveObsoleteFilesDoesNotTruncateSpacePath(t *testing.T) {
 	}
 }
 
+func TestRemoveObsoleteFilesPreservesAnotherPackagesActiveAlternative(t *testing.T) {
+	tmp := t.TempDir()
+	root := filepath.Join(tmp, "root")
+	oldInstalled := Installed
+	Installed = filepath.Join(root, "var", "db", "hokuto", "installed")
+	globalFileOwnershipCache = fileOwnershipCache{}
+	t.Cleanup(func() {
+		Installed = oldInstalled
+		globalFileOwnershipCache = fileOwnershipCache{}
+	})
+
+	const path = "/usr/include/shared.h"
+	for _, pkgName := range []string{"provider-a", "provider-b"} {
+		pkgDir := filepath.Join(Installed, pkgName)
+		if err := os.MkdirAll(pkgDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(pkgDir, "manifest"), []byte(path+" "+hashString(pkgName)+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	diskPath := filepath.Join(root, strings.TrimPrefix(path, "/"))
+	if err := os.MkdirAll(filepath.Dir(diskPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(diskPath, []byte("provider-b"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	staging := filepath.Join(tmp, "staging")
+	stagingPkg := filepath.Join(staging, "var", "db", "hokuto", "installed", "provider-a")
+	if err := os.MkdirAll(stagingPkg, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(stagingPkg, "manifest"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	obsolete, err := removeObsoleteFiles("provider-a", staging, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(obsolete) != 0 {
+		t.Fatalf("another package's active alternative was scheduled for deletion: %v", obsolete)
+	}
+}
+
 func TestGetBaseRepoPathFindsContainingWorktree(t *testing.T) {
 	repo := filepath.Join(t.TempDir(), "arbitrary", "layout", "project")
 	packages := filepath.Join(repo, "collections", "core")
