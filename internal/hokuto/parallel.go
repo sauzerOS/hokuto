@@ -36,6 +36,8 @@ type ParallelManager struct {
 	TemporaryInstalls map[string]bool
 	LogFiles          map[string]*os.File
 	SplitDepsBySource map[string][]string
+	RebuildTriggers   map[string]map[string]bool // rebuild package -> packages that triggered it
+	rebuildDepPrep    map[string]bool            // dynamically discovered rebuilds need dependency preparation
 
 	// Dep injection for testing
 	Builder   func(string, *Config, *Executor, BuildOptions) (time.Duration, error)
@@ -98,6 +100,8 @@ func RunParallelBuilds(plan *BuildPlan, cfg *Config, maxJobs int, userRequestedM
 		TemporaryInstalls: make(map[string]bool),
 		LogFiles:          make(map[string]*os.File),
 		SplitDepsBySource: splitDepsBySource,
+		RebuildTriggers:   make(map[string]map[string]bool),
+		rebuildDepPrep:    make(map[string]bool),
 		UserRequested:     userRequestedMap,
 		resultChan:        make(chan buildResult, maxJobs),
 		promptPause:       make(chan bool),
@@ -553,8 +557,12 @@ func (pm *ParallelManager) Run() error {
 							triggerSet[parent] = true
 						}
 						// Add triggers returned by installer (e.g. library updates, filesystem triggers)
+						dynamicRebuilds := make(map[string]bool)
 						if len(installResult.Rebuilds) > 0 {
 							rebuilds = append(rebuilds, installResult.Rebuilds...)
+							for _, rebuildPkg := range installResult.Rebuilds {
+								dynamicRebuilds[rebuildPkg] = true
+							}
 						}
 
 						// Identify which ones are filesystem triggers (e.g. DKMS) to ensure force-rebuild
@@ -575,6 +583,13 @@ func (pm *ParallelManager) Run() error {
 
 							// First pass: filter already completed/pending/duplicate packages
 							for _, rPkg := range rebuilds {
+								pm.recordRebuildTriggerLocked(rPkg, res.pkgName)
+								if dynamicRebuilds[rPkg] {
+									if pm.rebuildDepPrep == nil {
+										pm.rebuildDepPrep = make(map[string]bool)
+									}
+									pm.rebuildDepPrep[rPkg] = true
+								}
 								// Filesystem triggers (e.g. DKMS) must override the completed
 								// status. If nvidia-modules was already installed from binary
 								// earlier in this update, but a kernel update now triggers a
@@ -642,16 +657,25 @@ func (pm *ParallelManager) Run() error {
 			// 3. Batch Process Rebuild Prompts
 			pm.mu.Lock()
 			if len(pm.pendingRebuilds) > 0 {
+				rebuilds := append([]string(nil), pm.pendingRebuilds...)
+				var rebuildsNeedingPrep []string
+				for _, pkgName := range rebuilds {
+					if pm.rebuildDepPrep[pkgName] {
+						rebuildsNeedingPrep = append(rebuildsNeedingPrep, pkgName)
+					}
+				}
 				shouldRebuild := pm.AutoYes
-				if !shouldRebuild {
-					pm.mu.Unlock()
-					WithPrompt(func() {
-						fmt.Print("\r\033[K")
-						cPrintf(colWarn, "\nThe following packages need to be rebuilt:\n")
-						for _, p := range pm.pendingRebuilds {
-							colArrow.Print("-> ")
-							colInfo.Println(p)
-						}
+				pm.mu.Unlock()
+				WithPrompt(func() {
+					fmt.Print("\r\033[K")
+					cPrintf(colWarn, "\nThe following packages need to be rebuilt:\n")
+					for _, p := range rebuilds {
+						colArrow.Print("-> ")
+						colInfo.Println(pm.formatRebuildCause(p))
+					}
+					if pm.AutoYes {
+						cPrintf(colInfo, "Proceeding with rebuild (--yes).\n")
+					} else {
 						cPrintf(colInfo, "Proceed with rebuild? [Y/n] ")
 						reader := bufio.NewReader(os.Stdin)
 						input, _ := reader.ReadString('\n')
@@ -659,16 +683,15 @@ func (pm *ParallelManager) Run() error {
 						if input == "" || input == "y" || input == "yes" {
 							shouldRebuild = true
 						}
-					})
-					pm.mu.Lock()
-				}
+					}
+				})
+				pm.mu.Lock()
 
 				if shouldRebuild {
-					pm.Pending = append(pm.Pending, pm.pendingRebuilds...)
 					if pm.BuildPlan.RebuildPackages == nil {
 						pm.BuildPlan.RebuildPackages = make(map[string]bool)
 					}
-					for _, p := range pm.pendingRebuilds {
+					for _, p := range rebuilds {
 						pm.BuildPlan.RebuildPackages[p] = true
 					}
 				} else {
@@ -677,6 +700,23 @@ func (pm *ParallelManager) Run() error {
 				// Clear pending rebuilds list since we've processed them
 				pm.pendingRebuilds = nil
 				pm.mu.Unlock()
+
+				if shouldRebuild {
+					if err := pm.prepareRebuildDependencies(rebuildsNeedingPrep); err != nil {
+						pm.mu.Lock()
+						for _, p := range rebuilds {
+							pm.Failed[p] = fmt.Errorf("failed to prepare rebuild dependencies: %w", err)
+						}
+						pm.mu.Unlock()
+						continue
+					}
+					pm.mu.Lock()
+					pm.Pending = append(pm.Pending, rebuilds...)
+					for _, pkgName := range rebuilds {
+						delete(pm.rebuildDepPrep, pkgName)
+					}
+					pm.mu.Unlock()
+				}
 				continue // Restart loop to immediately process the newly active pending jobs
 			}
 			pm.mu.Unlock()
@@ -689,6 +729,64 @@ func (pm *ParallelManager) Run() error {
 		} else {
 			// No running, no pending (or failed). Done.
 			break
+		}
+	}
+	return nil
+}
+
+func (pm *ParallelManager) recordRebuildTriggerLocked(rebuildPkg, triggerPkg string) {
+	if rebuildPkg == "" || triggerPkg == "" {
+		return
+	}
+	if pm.RebuildTriggers == nil {
+		pm.RebuildTriggers = make(map[string]map[string]bool)
+	}
+	if pm.RebuildTriggers[rebuildPkg] == nil {
+		pm.RebuildTriggers[rebuildPkg] = make(map[string]bool)
+	}
+	pm.RebuildTriggers[rebuildPkg][triggerPkg] = true
+}
+
+func (pm *ParallelManager) formatRebuildCause(pkgName string) string {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+
+	triggers := make([]string, 0, len(pm.RebuildTriggers[pkgName]))
+	for trigger := range pm.RebuildTriggers[pkgName] {
+		triggers = append(triggers, trigger)
+	}
+	sort.Strings(triggers)
+	if len(triggers) == 0 {
+		return pkgName
+	}
+	return fmt.Sprintf("%s (triggered by %s)", pkgName, strings.Join(triggers, ", "))
+}
+
+func (pm *ParallelManager) prepareRebuildDependencies(pkgNames []string) error {
+	if len(pkgNames) == 0 {
+		return nil
+	}
+	if pm.TemporaryInstalls == nil {
+		pm.TemporaryInstalls = make(map[string]bool)
+	}
+	if packageSetNeedsDevelPackages(pkgNames) {
+		includeMultilib := packageSetHasBuildOption(pkgNames, "multilib")
+		installed, err := ensureDevelPackagesInstalledWithOptions(pm.Config, includeMultilib, false, true)
+		if err != nil {
+			return fmt.Errorf("failed to prepare devel packages: %w", err)
+		}
+		for _, pkgName := range installed {
+			pm.TemporaryInstalls[pkgName] = true
+		}
+	}
+
+	for _, pkgName := range pkgNames {
+		installed, err := installBuildDependenciesWithOptions(pkgName, pm.Config, false, true)
+		if err != nil {
+			return fmt.Errorf("%s: %w", pkgName, err)
+		}
+		for _, depName := range installed {
+			pm.TemporaryInstalls[depName] = true
 		}
 	}
 	return nil
