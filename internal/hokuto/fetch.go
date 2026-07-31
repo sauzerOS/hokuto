@@ -839,7 +839,7 @@ func downloadFileWithOptions(originalURL, finalURL, destFile string, opt downloa
 			// This happens when servers return a "Click here to download" page or bot check page with 200 OK.
 			ct := resp.Header.Get("Content-Type")
 			isBinary := strings.HasSuffix(finalURL, ".gz") || strings.HasSuffix(finalURL, ".bz2") ||
-				strings.HasSuffix(finalURL, ".xz") || strings.HasSuffix(finalURL, ".zip") ||
+				strings.HasSuffix(finalURL, ".xz") || strings.HasSuffix(finalURL, ".lzma") || strings.HasSuffix(finalURL, ".zip") ||
 				strings.HasSuffix(finalURL, ".tgz") || strings.HasSuffix(finalURL, ".zst") ||
 				strings.HasSuffix(finalURL, ".tar") || strings.HasSuffix(finalURL, ".rpm") ||
 				strings.HasSuffix(finalURL, ".deb") || strings.HasSuffix(finalURL, ".pkg.tar.xz") ||

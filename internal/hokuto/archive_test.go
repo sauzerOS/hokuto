@@ -35,6 +35,65 @@ func TestSafeTarPathRejectsTraversal(t *testing.T) {
 	}
 }
 
+func TestExtractTarUsesExternalLZMASupport(t *testing.T) {
+	tmp := t.TempDir()
+	archivePath := filepath.Join(tmp, "source.tar.lzma")
+	if err := os.WriteFile(archivePath, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	fakeBin := filepath.Join(tmp, "bin")
+	if err := os.MkdirAll(fakeBin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	logPath := filepath.Join(tmp, "tar.log")
+	fakeTar := `#!/bin/sh
+printf '%s\n' "$*" >> "$FAKE_TAR_LOG"
+case " $* " in
+  *" tf "*)
+    printf 'source/\nsource/payload.txt\n'
+    exit 0
+    ;;
+  *" xf "*)
+    while [ "$#" -gt 0 ]; do
+      if [ "$1" = "-C" ]; then
+        mkdir -p "$2"
+        printf 'external lzma' > "$2/payload.txt"
+        exit 0
+      fi
+      shift
+    done
+    ;;
+esac
+exit 2
+`
+	if err := os.WriteFile(filepath.Join(fakeBin, "tar"), []byte(fakeTar), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("FAKE_TAR_LOG", logPath)
+
+	dest := filepath.Join(tmp, "dest")
+	if err := extractTar(archivePath, dest); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(dest, "payload.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "external lzma" {
+		t.Fatalf("unexpected extracted contents: %q", data)
+	}
+	logData, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	log := string(logData)
+	if !strings.Contains(log, "--lzma tf ") || !strings.Contains(log, "--lzma xf ") {
+		t.Fatalf("external tar was not explicitly given LZMA mode:\n%s", log)
+	}
+}
+
 func TestUnpackTarballFallbackCreatesHardlinks(t *testing.T) {
 	tmp := t.TempDir()
 	tarballPath := filepath.Join(tmp, "pkg.tar.zst")

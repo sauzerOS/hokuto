@@ -1,11 +1,15 @@
 package hokuto
 
 import (
+	"archive/tar"
 	"context"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/ulikunitz/xz/lzma"
 )
 
 func TestGitPackageSourceNameHonorsFilenameOverride(t *testing.T) {
@@ -79,6 +83,80 @@ func TestPrepareSourcesPreservesURLFilenameOverride(t *testing.T) {
 				t.Fatalf("URL basename should not be copied when an override is present: %v", err)
 			}
 		})
+	}
+}
+
+func TestPrepareSourcesExtractsLZMAWithInternalFallback(t *testing.T) {
+	oldCacheDir := CacheDir
+	t.Cleanup(func() { CacheDir = oldCacheDir })
+
+	tmp := t.TempDir()
+	CacheDir = filepath.Join(tmp, "cache")
+	pkgDir := filepath.Join(tmp, "recipe")
+	buildDir := filepath.Join(tmp, "build")
+	pkgSourceDir := filepath.Join(CacheDir, "sources", "example")
+	for _, dir := range []string{pkgDir, buildDir, pkgSourceDir} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	archivePath := filepath.Join(pkgSourceDir, "source.lzma")
+	f, err := os.Create(archivePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lw, err := lzma.NewWriter(f)
+	if err != nil {
+		f.Close()
+		t.Fatal(err)
+	}
+	tw := tar.NewWriter(lw)
+	payload := []byte("internal lzma")
+	now := time.Now()
+	if err := tw.WriteHeader(&tar.Header{
+		Name:       "source/payload.txt",
+		Mode:       0o644,
+		Size:       int64(len(payload)),
+		ModTime:    now,
+		AccessTime: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tw.Write(payload); err != nil {
+		t.Fatal(err)
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := lw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(filepath.Join(pkgDir, "sources"), []byte("https://example.invalid/source.lzma\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fakeBin := filepath.Join(tmp, "bin")
+	if err := os.MkdirAll(fakeBin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(fakeBin, "tar"), []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	if err := prepareSources("example", pkgDir, buildDir, &Executor{Context: context.Background()}); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(buildDir, "payload.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != string(payload) {
+		t.Fatalf("unexpected extracted contents: %q", data)
 	}
 }
 

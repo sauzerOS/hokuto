@@ -19,6 +19,7 @@ import (
 	"github.com/klauspost/compress/zstd"
 	"github.com/klauspost/pgzip"
 	"github.com/ulikunitz/xz"
+	"github.com/ulikunitz/xz/lzma"
 	"golang.org/x/sys/unix"
 )
 
@@ -83,7 +84,7 @@ func unzipGo(src, dest string) error {
 func shouldStripTar(archive string) (bool, error) {
 	debugf("Running strip check for tar extraction")
 
-	cmd := exec.Command("tar", "tf", archive)
+	cmd := exec.Command("tar", externalTarArgs("tf", archive)...)
 	cmd.Stderr = io.Discard
 
 	stdout, err := cmd.StdoutPipe()
@@ -146,6 +147,14 @@ func shouldStripTar(archive string) (bool, error) {
 	return true, nil
 }
 
+func externalTarArgs(operation, archive string) []string {
+	args := []string{operation, archive}
+	if strings.HasSuffix(strings.ToLower(archive), ".lzma") {
+		args = append([]string{"--lzma"}, args...)
+	}
+	return args
+}
+
 // extractTar extracts a tar archive (with possible compression) to targetDir,
 // stripping the top-level directory while handling PAX headers and preserving timestamps.
 
@@ -164,7 +173,7 @@ func extractTar(realPath, dest string) error {
 		debugf("shouldStripTar(%s) failed: %v\n", realPath, err)
 	}
 	debugf("strip check done \n")
-	args := []string{"xf", realPath, "-C", dest}
+	args := append(externalTarArgs("xf", realPath), "-C", dest)
 
 	if strip {
 		args = append(args, "--strip-components=1")
@@ -196,6 +205,12 @@ func extractTar(realPath, dest string) error {
 			return fmt.Errorf("failed to create xz reader for %s: %w", realPath, err)
 		}
 		r = xz
+	case strings.HasSuffix(strings.ToLower(realPath), ".lzma"):
+		lzmaReader, err := lzma.NewReader(f)
+		if err != nil {
+			return fmt.Errorf("failed to create lzma reader for %s: %w", realPath, err)
+		}
+		r = lzmaReader
 	case strings.HasSuffix(realPath, ".tar.zst"):
 		zst, err := zstd.NewReader(f)
 		if err != nil {

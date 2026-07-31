@@ -299,6 +299,7 @@ func prepareSources(pkgName, pkgDir, buildDir string, execCtx *Executor) error {
 		case strings.HasSuffix(realPath, ".tar.gz"),
 			strings.HasSuffix(realPath, ".tgz"),
 			strings.HasSuffix(realPath, ".tar.xz"),
+			strings.HasSuffix(strings.ToLower(realPath), ".lzma"),
 			strings.HasSuffix(realPath, ".tar.bz2"),
 			strings.HasSuffix(realPath, ".tar.zst"),
 			strings.HasSuffix(realPath, ".tar.lz"),
