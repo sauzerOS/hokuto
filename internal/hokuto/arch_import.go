@@ -17,6 +17,9 @@ import (
 type PKGBUILDInfo struct {
 	PkgBase     string
 	Version     string
+	URL         string
+	Description string
+	License     string
 	Sources     []string
 	Depends     []string
 	MakeDepends []string
@@ -34,50 +37,51 @@ type PKGBUILDFunction struct {
 }
 
 // fetchPKGBUILD downloads the PKGBUILD from Arch or AUR
-func fetchPKGBUILD(pkgName string, source string) (string, string, error) {
+func fetchPKGBUILD(pkgName string, source string) (string, string, string, error) {
 	client := &http.Client{Timeout: 15 * time.Second}
-	var packageURL, sourceRef string
+	var packageURL, sourceRef, repository string
 
 	if source == "AUR" {
 		// AUR PKGBUILD URL format
 		packageURL = fmt.Sprintf("https://aur.archlinux.org/cgit/aur.git/plain/PKGBUILD?h=%s", pkgName)
 	} else {
-		pkgBase, releaseRef, err := fetchArchPackageRelease(client, pkgName)
+		pkgBase, releaseRef, repo, err := fetchArchPackageRelease(client, pkgName)
 		if err != nil {
-			return "", "", err
+			return "", "", "", err
 		}
 		sourceRef = releaseRef
+		repository = repo
 		packageURL = fmt.Sprintf("https://gitlab.archlinux.org/archlinux/packaging/packages/%s/-/raw/%s/PKGBUILD",
 			url.PathEscape(pkgBase), url.PathEscape(releaseRef))
 	}
 
 	resp, err := client.Get(packageURL)
 	if err != nil {
-		return "", "", fmt.Errorf("failed to fetch PKGBUILD: %w", err)
+		return "", "", "", fmt.Errorf("failed to fetch PKGBUILD: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
-		return "", "", fmt.Errorf("PKGBUILD not found at release %s (HTTP %d)", sourceRef, resp.StatusCode)
+		return "", "", "", fmt.Errorf("PKGBUILD not found at release %s (HTTP %d)", sourceRef, resp.StatusCode)
 	}
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return "", "", fmt.Errorf("failed to read PKGBUILD: %w", err)
+		return "", "", "", fmt.Errorf("failed to read PKGBUILD: %w", err)
 	}
 
-	return string(body), sourceRef, nil
+	return string(body), sourceRef, repository, nil
 }
 
-func fetchArchPackageRelease(client *http.Client, pkgName string) (string, string, error) {
+func fetchArchPackageRelease(client *http.Client, pkgName string) (string, string, string, error) {
 	apiURL := "https://archlinux.org/packages/search/json/?name=" + url.QueryEscape(pkgName)
 	resp, err := client.Get(apiURL)
 	if err != nil {
-		return "", "", fmt.Errorf("failed to query Arch package release: %w", err)
+		return "", "", "", fmt.Errorf("failed to query Arch package release: %w", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return "", "", fmt.Errorf("failed to query Arch package release (HTTP %d)", resp.StatusCode)
+		return "", "", "", fmt.Errorf("failed to query Arch package release (HTTP %d)", resp.StatusCode)
 	}
 
 	var result struct {
@@ -86,21 +90,22 @@ func fetchArchPackageRelease(client *http.Client, pkgName string) (string, strin
 			PkgBase string `json:"pkgbase"`
 			PkgVer  string `json:"pkgver"`
 			PkgRel  string `json:"pkgrel"`
+			Repo    string `json:"repo"`
 		} `json:"results"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return "", "", fmt.Errorf("failed to decode Arch package release: %w", err)
+		return "", "", "", fmt.Errorf("failed to decode Arch package release: %w", err)
 	}
 	for _, pkg := range result.Results {
 		if pkg.PkgName != pkgName {
 			continue
 		}
 		if pkg.PkgBase == "" || pkg.PkgVer == "" || pkg.PkgRel == "" {
-			return "", "", fmt.Errorf("Arch package release metadata for %s is incomplete", pkgName)
+			return "", "", "", fmt.Errorf("Arch package release metadata for %s is incomplete", pkgName)
 		}
-		return pkg.PkgBase, pkg.PkgVer + "-" + pkg.PkgRel, nil
+		return pkg.PkgBase, pkg.PkgVer + "-" + pkg.PkgRel, pkg.Repo, nil
 	}
-	return "", "", fmt.Errorf("Arch package %s was not found in an official repository", pkgName)
+	return "", "", "", fmt.Errorf("Arch package %s was not found in an official repository", pkgName)
 }
 
 func archPackageFileURL(pkgName, source, fileName string) (string, error) {
@@ -198,6 +203,17 @@ func parsePKGBUILD(content string, pkgName string) (*PKGBUILDInfo, error) {
 
 	// Extract pkgver
 	info.Version = variables["pkgver"]
+	info.URL = variables["url"]
+	info.Description = variables["pkgdesc"]
+	licenses := extractBashArray(content, "license")
+	if len(licenses) > 0 {
+		for i := range licenses {
+			licenses[i] = expandPKGBUILDVariables(licenses[i], variables)
+		}
+		info.License = strings.Join(licenses, ", ")
+	} else {
+		info.License = variables["license"]
+	}
 
 	// Extract source array (handle multi-line)
 	info.Sources = extractBashArray(content, "source")
@@ -621,7 +637,7 @@ func generatePackageFromArch(pkgName string, source string, targetDir string) er
 	colSuccess.Printf("Searching %s for '%s'\n", source, pkgName)
 
 	// Fetch PKGBUILD
-	pkgbuild, sourceRef, err := fetchPKGBUILD(pkgName, source)
+	pkgbuild, sourceRef, repository, err := fetchPKGBUILD(pkgName, source)
 	if err != nil {
 		return fmt.Errorf("failed to fetch PKGBUILD: %w", err)
 	}
@@ -731,6 +747,13 @@ func generatePackageFromArch(pkgName string, source string, targetDir string) er
 		return fmt.Errorf("failed to create build file: %w", err)
 	}
 
+	// 6. Create metadata.json without prompting. Imported PKGBUILD metadata is
+	// authoritative for these basic fields; tags and additional info are left
+	// empty for the package maintainer to fill later.
+	if err := writeImportedPackageMetadata(pkgDir, info, source, repository); err != nil {
+		return err
+	}
+
 	// Success messages
 	colArrow.Print("-> ")
 	colSuccess.Printf("Package %s created in %s\n", pkgName, pkgDir)
@@ -749,6 +772,40 @@ func generatePackageFromArch(pkgName string, source string, targetDir string) er
 		colInfo.Printf("Split packages: %d preserved\n", len(info.SplitFuncs))
 	}
 
+	return nil
+}
+
+func importedPackageMetadata(info *PKGBUILDInfo, source, repository string) PackageMetadata {
+	category := "extra"
+	if source == "Arch" && strings.HasPrefix(repository, "core") {
+		category = "base"
+	}
+
+	metadata := PackageMetadata{
+		URL:         info.URL,
+		Category:    category,
+		Description: info.Description,
+		Info:        "",
+		License:     info.License,
+		Tags:        []string{},
+	}
+	for _, split := range info.SplitFuncs {
+		if split.Package != "" {
+			metadata.Subpackages = append(metadata.Subpackages, split.Package)
+		}
+	}
+	return metadata
+}
+
+func writeImportedPackageMetadata(pkgDir string, info *PKGBUILDInfo, source, repository string) error {
+	metadataData, err := json.MarshalIndent(importedPackageMetadata(info, source, repository), "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to encode metadata.json: %w", err)
+	}
+	metadataData = append(metadataData, '\n')
+	if err := os.WriteFile(filepath.Join(pkgDir, "metadata.json"), metadataData, 0o644); err != nil {
+		return fmt.Errorf("failed to create metadata.json: %w", err)
+	}
 	return nil
 }
 

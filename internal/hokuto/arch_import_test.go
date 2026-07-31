@@ -1,10 +1,78 @@
 package hokuto
 
 import (
+	"encoding/json"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
 )
+
+func TestImportedPackageMetadataWrittenWithoutPrompts(t *testing.T) {
+	pkgbuild := `
+pkgbase=demo
+pkgname=(demo demo-tools)
+pkgver=1.2.3
+pkgdesc='Imported package description'
+url='https://example.com/demo'
+_primary_license=GPL-3.0-or-later
+license=("$_primary_license" MIT)
+
+package_demo() {
+    make DESTDIR="$pkgdir" install
+}
+
+package_demo_tools() {
+    make DESTDIR="$pkgdir" install-tools
+}
+`
+	info, err := parsePKGBUILD(pkgbuild, "demo")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name       string
+		source     string
+		repository string
+		category   string
+	}{
+		{name: "arch", source: "Arch", repository: "core", category: "base"},
+		{name: "aur", source: "AUR", category: "extra"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pkgDir := t.TempDir()
+			if err := writeImportedPackageMetadata(pkgDir, info, tt.source, tt.repository); err != nil {
+				t.Fatal(err)
+			}
+			data, err := os.ReadFile(filepath.Join(pkgDir, "metadata.json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var metadata PackageMetadata
+			if err := json.Unmarshal(data, &metadata); err != nil {
+				t.Fatal(err)
+			}
+			if metadata.URL != "https://example.com/demo" || metadata.Description != "Imported package description" {
+				t.Fatalf("PKGBUILD metadata was not preserved: %+v", metadata)
+			}
+			if metadata.License != "GPL-3.0-or-later, MIT" || metadata.Category != tt.category {
+				t.Fatalf("unexpected imported license/category: %+v", metadata)
+			}
+			if metadata.Info != "" || len(metadata.Tags) != 0 {
+				t.Fatalf("info and tags must default to empty: %+v", metadata)
+			}
+			if !strings.Contains(string(data), `"info": ""`) || !strings.Contains(string(data), `"tags": []`) {
+				t.Fatalf("metadata.json must explicitly contain empty info and tags: %s", data)
+			}
+			if !reflect.DeepEqual(metadata.Subpackages, []string{"demo-tools"}) {
+				t.Fatalf("unexpected imported subpackages: %v", metadata.Subpackages)
+			}
+		})
+	}
+}
 
 func TestParsePKGBUILDExpandsDependencyBraces(t *testing.T) {
 	pkgbuild := `
