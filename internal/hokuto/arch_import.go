@@ -2,6 +2,7 @@ package hokuto
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -12,6 +13,12 @@ import (
 	"strings"
 	"time"
 )
+
+var errImportPackageNotFound = errors.New("import package not found")
+
+func isImportPackageNotFound(err error) bool {
+	return errors.Is(err, errImportPackageNotFound)
+}
 
 // PKGBUILDInfo holds parsed information from a PKGBUILD
 type PKGBUILDInfo struct {
@@ -62,6 +69,9 @@ func fetchPKGBUILD(pkgName string, source string) (string, string, string, error
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
+		if source == "AUR" && resp.StatusCode == http.StatusNotFound {
+			return "", "", "", fmt.Errorf("%w: AUR package %s", errImportPackageNotFound, pkgName)
+		}
 		return "", "", "", fmt.Errorf("PKGBUILD not found at release %s (HTTP %d)", sourceRef, resp.StatusCode)
 	}
 
@@ -105,7 +115,7 @@ func fetchArchPackageRelease(client *http.Client, pkgName string) (string, strin
 		}
 		return pkg.PkgBase, pkg.PkgVer + "-" + pkg.PkgRel, pkg.Repo, nil
 	}
-	return "", "", "", fmt.Errorf("Arch package %s was not found in an official repository", pkgName)
+	return "", "", "", fmt.Errorf("%w: Arch package %s was not found in an official repository", errImportPackageNotFound, pkgName)
 }
 
 func archPackageFileURL(pkgName, source, fileName string) (string, error) {
@@ -454,10 +464,6 @@ func extractBashArray(content string, arrayName string) []string {
 		} else if ch == quoteChar && inQuote {
 			inQuote = false
 			quoteChar = 0
-			if current.Len() > 0 {
-				appendValue(current.String())
-				current.Reset()
-			}
 			continue
 		}
 
@@ -479,54 +485,63 @@ func extractBashArray(content string, arrayName string) []string {
 }
 
 func expandBashBraceWord(word string) []string {
-	open := strings.IndexByte(word, '{')
-	if open < 0 {
-		return []string{word}
-	}
-
-	depth := 0
-	close := -1
-	for i := open; i < len(word); i++ {
-		switch word[i] {
-		case '{':
-			depth++
-		case '}':
-			depth--
-			if depth == 0 {
-				close = i
-				i = len(word)
+	open, close := -1, -1
+	var choices []string
+	for searchFrom := 0; searchFrom < len(word); {
+		relOpen := strings.IndexByte(word[searchFrom:], '{')
+		if relOpen < 0 {
+			break
+		}
+		candidateOpen := searchFrom + relOpen
+		depth := 0
+		candidateClose := -1
+		for i := candidateOpen; i < len(word); i++ {
+			switch word[i] {
+			case '{':
+				depth++
+			case '}':
+				depth--
+				if depth == 0 {
+					candidateClose = i
+					i = len(word)
+				}
 			}
 		}
-	}
-	if close < 0 {
-		return []string{word}
-	}
+		if candidateClose < 0 {
+			break
+		}
 
-	var choices []string
-	start, nested := 0, 0
-	body := word[open+1 : close]
-	for i := 0; i <= len(body); i++ {
-		if i < len(body) {
-			switch body[i] {
-			case '{':
-				nested++
-			case '}':
-				nested--
-			case ',':
-				if nested != 0 {
+		var candidateChoices []string
+		start, nested := 0, 0
+		body := word[candidateOpen+1 : candidateClose]
+		for i := 0; i <= len(body); i++ {
+			if i < len(body) {
+				switch body[i] {
+				case '{':
+					nested++
+				case '}':
+					nested--
+				case ',':
+					if nested != 0 {
+						continue
+					}
+				default:
 					continue
 				}
-			default:
-				continue
+				if body[i] != ',' || nested != 0 {
+					continue
+				}
 			}
-			if body[i] != ',' || nested != 0 {
-				continue
-			}
+			candidateChoices = append(candidateChoices, body[start:i])
+			start = i + 1
 		}
-		choices = append(choices, body[start:i])
-		start = i + 1
+		if len(candidateChoices) >= 2 {
+			open, close, choices = candidateOpen, candidateClose, candidateChoices
+			break
+		}
+		searchFrom = candidateClose + 1
 	}
-	if len(choices) < 2 {
+	if open < 0 {
 		return []string{word}
 	}
 
@@ -666,18 +681,68 @@ func generatePackageFromArch(pkgName string, source string, targetDir string) er
 		pkgDir = filepath.Join(newPackageDir, pkgName)
 	}
 
-	// Check if package already exists
+	if err := atomicPackageImport(pkgDir, pkgName, func(importDir string) error {
+		return writeImportedPackageFiles(importDir, pkgName, source, sourceRef, repository, info)
+	}); err != nil {
+		return err
+	}
+
+	// Success messages
+	colArrow.Print("-> ")
+	colSuccess.Printf("Package %s created in %s\n", pkgName, pkgDir)
+	colArrow.Print("-> ")
+	colInfo.Printf("Version: %s 1\n", info.Version)
+	if len(info.Sources) > 0 {
+		colArrow.Print("-> ")
+		colInfo.Printf("Sources: %d URLs added\n", len(info.Sources))
+	}
+	if len(info.Depends)+len(info.MakeDepends) > 0 {
+		colArrow.Print("-> ")
+		colInfo.Printf("Depends: %d packages\n", len(info.Depends)+len(info.MakeDepends))
+	}
+	if len(info.SplitFuncs) > 0 {
+		colArrow.Print("-> ")
+		colInfo.Printf("Split packages: %d preserved\n", len(info.SplitFuncs))
+	}
+
+	return nil
+}
+
+func atomicPackageImport(pkgDir, pkgName string, populate func(string) error) error {
 	if fi, err := os.Stat(pkgDir); err == nil {
 		if fi.IsDir() {
 			return fmt.Errorf("package %s already exists at %s", pkgName, pkgDir)
 		}
 		return fmt.Errorf("path %s exists and is not a directory", pkgDir)
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("failed to inspect package path %s: %w", pkgDir, err)
 	}
 
-	// Create package directory
-	if err := os.MkdirAll(pkgDir, 0o755); err != nil {
-		return fmt.Errorf("failed to create package directory: %w", err)
+	parentDir := filepath.Dir(pkgDir)
+	if err := os.MkdirAll(parentDir, 0o755); err != nil {
+		return fmt.Errorf("failed to create package parent directory: %w", err)
 	}
+	importDir, err := os.MkdirTemp(parentDir, "."+filepath.Base(pkgDir)+".import-")
+	if err != nil {
+		return fmt.Errorf("failed to create temporary package directory: %w", err)
+	}
+	defer os.RemoveAll(importDir)
+
+	if err := populate(importDir); err != nil {
+		return err
+	}
+	if _, err := os.Stat(pkgDir); err == nil {
+		return fmt.Errorf("package %s already exists at %s", pkgName, pkgDir)
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("failed to inspect package path %s: %w", pkgDir, err)
+	}
+	if err := os.Rename(importDir, pkgDir); err != nil {
+		return fmt.Errorf("failed to publish imported package: %w", err)
+	}
+	return nil
+}
+
+func writeImportedPackageFiles(pkgDir, pkgName, source, sourceRef, repository string, info *PKGBUILDInfo) error {
 	if err := materializeArchLocalSources(info, info.PkgBase, source, sourceRef, pkgDir); err != nil {
 		return fmt.Errorf("failed to import local PKGBUILD source: %w", err)
 	}
@@ -752,24 +817,6 @@ func generatePackageFromArch(pkgName string, source string, targetDir string) er
 	// empty for the package maintainer to fill later.
 	if err := writeImportedPackageMetadata(pkgDir, info, source, repository); err != nil {
 		return err
-	}
-
-	// Success messages
-	colArrow.Print("-> ")
-	colSuccess.Printf("Package %s created in %s\n", pkgName, pkgDir)
-	colArrow.Print("-> ")
-	colInfo.Printf("Version: %s 1\n", info.Version)
-	if len(info.Sources) > 0 {
-		colArrow.Print("-> ")
-		colInfo.Printf("Sources: %d URLs added\n", len(info.Sources))
-	}
-	if len(info.Depends)+len(info.MakeDepends) > 0 {
-		colArrow.Print("-> ")
-		colInfo.Printf("Depends: %d packages\n", len(info.Depends)+len(info.MakeDepends))
-	}
-	if len(info.SplitFuncs) > 0 {
-		colArrow.Print("-> ")
-		colInfo.Printf("Split packages: %d preserved\n", len(info.SplitFuncs))
 	}
 
 	return nil

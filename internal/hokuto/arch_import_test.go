@@ -2,6 +2,8 @@ package hokuto
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -108,6 +110,78 @@ func TestExpandBashBraceWordSupportsEmptyAndMultipleGroups(t *testing.T) {
 	want = []string{"python-build-a", "python-build-b", "python-wheel-a", "python-wheel-b"}
 	if got := expandBashBraceWord("python-{build,wheel}-{a,b}"); !reflect.DeepEqual(got, want) {
 		t.Fatalf("unexpected Cartesian expansion: got %v want %v", got, want)
+	}
+}
+
+func TestParsePKGBUILDConcatenatesQuotedSourceWithBraceExpansion(t *testing.T) {
+	pkgbuild := `
+pkgbase=php
+pkgname=(php php-cgi)
+pkgver=8.5.9
+source=("https://php.net/distributions/${pkgbase}-${pkgver}.tar.xz"{,.asc}
+        'apache.patch')
+`
+	info, err := parsePKGBUILD(pkgbuild, "php")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		"https://php.net/distributions/php-${version}.tar.xz",
+		"https://php.net/distributions/php-${version}.tar.xz.asc",
+		"apache.patch",
+	}
+	if !reflect.DeepEqual(info.Sources, want) {
+		t.Fatalf("unexpected PHP sources: got %v want %v", info.Sources, want)
+	}
+}
+
+func TestAtomicPackageImportCleansUpFailedImport(t *testing.T) {
+	parentDir := t.TempDir()
+	pkgDir := filepath.Join(parentDir, "php")
+	populateErr := errors.New("source download failed")
+	err := atomicPackageImport(pkgDir, "php", func(importDir string) error {
+		if err := os.WriteFile(filepath.Join(importDir, "partial"), []byte("partial"), 0o644); err != nil {
+			return err
+		}
+		return populateErr
+	})
+	if !errors.Is(err, populateErr) {
+		t.Fatalf("unexpected import error: %v", err)
+	}
+	if _, err := os.Stat(pkgDir); !os.IsNotExist(err) {
+		t.Fatalf("failed import left its final package directory behind: %v", err)
+	}
+	entries, err := os.ReadDir(parentDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("failed import left temporary files behind: %v", entries)
+	}
+}
+
+func TestAtomicPackageImportPublishesCompletedImport(t *testing.T) {
+	pkgDir := filepath.Join(t.TempDir(), "php")
+	if err := atomicPackageImport(pkgDir, "php", func(importDir string) error {
+		return os.WriteFile(filepath.Join(importDir, "version"), []byte("8.5.9 1\n"), 0o644)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(pkgDir, "version"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "8.5.9 1\n" {
+		t.Fatalf("unexpected published contents: %q", data)
+	}
+}
+
+func TestImportFuzzySearchOnlyForNotFoundErrors(t *testing.T) {
+	if !isImportPackageNotFound(fmt.Errorf("fetch failed: %w", errImportPackageNotFound)) {
+		t.Fatal("wrapped not-found error should permit fuzzy search")
+	}
+	if isImportPackageNotFound(errors.New("failed to parse PKGBUILD")) {
+		t.Fatal("conversion errors must not permit fuzzy search")
 	}
 }
 

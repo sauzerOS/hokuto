@@ -1599,6 +1599,10 @@ func Main() {
 
 			// Try exact match first
 			if err := generatePackageFromArch(pkg, source, targetDir); err != nil {
+				if !isImportPackageNotFound(err) {
+					fmt.Fprintln(os.Stderr, "Error:", err)
+					os.Exit(1)
+				}
 				// If exact match fails, try fuzzy search
 				colWarn.Printf("Exact match failed: %v\n", err)
 				colArrow.Print("-> ")
