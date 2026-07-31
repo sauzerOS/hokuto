@@ -594,6 +594,62 @@ func TestParseAlternativeDependencyMergesTrailingFlags(t *testing.T) {
 	}
 }
 
+func TestParsePostInstallAlternativeDependency(t *testing.T) {
+	deps, err := parseDependsData([]byte("dracut | mkinitcpio post-install\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(deps) != 1 {
+		t.Fatalf("expected one dependency, got %d", len(deps))
+	}
+	dep := deps[0]
+	if !dep.PostInstall {
+		t.Fatalf("expected trailing post-install tag to apply to alternative dependency: %+v", dep)
+	}
+	if len(dep.Alternatives) != 2 || dep.Alternatives[0] != "dracut" || dep.Alternatives[1] != "mkinitcpio" {
+		t.Fatalf("unexpected alternatives: %+v", dep.Alternatives)
+	}
+}
+
+func TestResolvePostInstallAlternativeFromRemoteIndexWithoutRepo(t *testing.T) {
+	cfg, _ := withTempDependencyRepo(t)
+	cfg.Values["HOKUTO_ARCH"] = "x86_64"
+	repoPaths = ""
+
+	oldIndex := GlobalRemoteIndex
+	oldIndexErr := GlobalRemoteIndexErr
+	oldIndexLoaded := GlobalRemoteIndexLoaded
+	GlobalRemoteIndex = []RepoEntry{{
+		Name:     "dracut",
+		Version:  "1.0",
+		Revision: "1",
+		Arch:     "x86_64",
+		Variant:  "optimized",
+	}}
+	GlobalRemoteIndexErr = nil
+	GlobalRemoteIndexLoaded = true
+	t.Cleanup(func() {
+		GlobalRemoteIndex = oldIndex
+		GlobalRemoteIndexErr = oldIndexErr
+		GlobalRemoteIndexLoaded = oldIndexLoaded
+	})
+
+	alternativeDepCache = make(map[string]string)
+	t.Cleanup(func() { alternativeDepCache = make(map[string]string) })
+	dep := DepSpec{
+		Name:         "dracut",
+		PostInstall:  true,
+		Alternatives: []string{"dracut", "mkinitcpio"},
+	}
+	resolved, err := resolveAlternativeDep(dep, true, cfg, "linux")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolved != "dracut" {
+		t.Fatalf("expected remote-only dracut alternative, got %q", resolved)
+	}
+}
+
 func TestResolveAlternativeDependencyFindsCachedSplitBinary(t *testing.T) {
 	cfg, _ := withTempDependencyRepo(t)
 	cfg.Values["HOKUTO_ARCH"] = "x86_64"
@@ -879,6 +935,28 @@ func TestBinaryRuntimeDependencySpecsPreferArchiveMetadata(t *testing.T) {
 	}
 }
 
+func TestPostInstallDependencyStaysInArchiveButNotRemoteRuntimeIndex(t *testing.T) {
+	cfg, _ := withTempDependencyRepo(t)
+	tarball := filepath.Join(BinDir, StandardizeRemoteName("linux", "1.0", "1", "x86_64", "optimized"))
+	writeTestBinaryTarballWithDepends(t, tarball, "linux", "1.0", "1", "dracut | mkinitcpio post-install\n")
+
+	specs, found, err := resolveBinaryDependenciesFromArchive("linux", cfg, nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found || len(specs) != 1 || !specs[0].PostInstall {
+		t.Fatalf("expected post-install dependency in archive metadata, got found=%v specs=%+v", found, specs)
+	}
+
+	_, indexedDeps, err := scanTarballMetadata(tarball)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(indexedDeps) != 0 {
+		t.Fatalf("post-install dependency must not be planned as a persistent remote runtime dependency, got %v", indexedDeps)
+	}
+}
+
 func TestResolveBinaryDependenciesUsesRemoteArchiveDependencyClosure(t *testing.T) {
 	cfg, repo := withTempDependencyRepo(t)
 	cfg.Values["HOKUTO_ARCH"] = "x86_64"
@@ -925,11 +1003,12 @@ func TestResolveBinaryDependenciesDoesNotFetchDependencyFreeIndexedPackage(t *te
 	}
 }
 
-func TestRuntimeOnlyAndSuggestDepsDoNotAffectSourceBuildGraph(t *testing.T) {
+func TestRuntimeOnlyPostInstallAndSuggestDepsDoNotAffectSourceBuildGraph(t *testing.T) {
 	cfg, repo := withTempDependencyRepo(t)
-	writeTestPackage(t, repo, "target", "build-dep\nruntime-dep runtime\nsuggested-dep suggest\n")
+	writeTestPackage(t, repo, "target", "build-dep\nruntime-dep runtime\nhook-dep post-install\nsuggested-dep suggest\n")
 	writeTestPackage(t, repo, "build-dep", "")
 	writeTestPackage(t, repo, "runtime-dep", "")
+	writeTestPackage(t, repo, "hook-dep", "")
 	writeTestPackage(t, repo, "suggested-dep", "")
 
 	plan, err := resolveBuildPlan([]string{"target"}, map[string]bool{"target": true}, false, cfg, nil)
@@ -941,6 +1020,9 @@ func TestRuntimeOnlyAndSuggestDepsDoNotAffectSourceBuildGraph(t *testing.T) {
 	}
 	if containsString(plan.Order, "suggested-dep") {
 		t.Fatalf("suggested dependency should not be in source build order, got %v", plan.Order)
+	}
+	if containsString(plan.Order, "hook-dep") {
+		t.Fatalf("post-install dependency should not be in source build order, got %v", plan.Order)
 	}
 	if !containsString(plan.Order, "build-dep") {
 		t.Fatalf("regular dependency should remain in source build order, got %v", plan.Order)
@@ -955,6 +1037,9 @@ func TestRuntimeOnlyAndSuggestDepsDoNotAffectSourceBuildGraph(t *testing.T) {
 	}
 	if containsString(missing, "suggested-dep") {
 		t.Fatalf("suggested dependency should not be a source build prerequisite, got %v", missing)
+	}
+	if containsString(missing, "hook-dep") {
+		t.Fatalf("post-install dependency should not be a source build prerequisite, got %v", missing)
 	}
 }
 
@@ -1065,9 +1150,10 @@ func TestParallelCanBuildWaitsForSplitSource(t *testing.T) {
 
 func TestRuntimeOnlyDepsRemainHardDepsForBinaryInstall(t *testing.T) {
 	cfg, repo := withTempDependencyRepo(t)
-	writeTestPackage(t, repo, "binary-pkg", "hard-dep\nruntime-dep runtime\nsuggested-dep suggest\nmake-dep make\n")
+	writeTestPackage(t, repo, "binary-pkg", "hard-dep\nruntime-dep runtime\nhook-dep post-install\nsuggested-dep suggest\nmake-dep make\n")
 	writeTestPackage(t, repo, "hard-dep", "")
 	writeTestPackage(t, repo, "runtime-dep", "")
+	writeTestPackage(t, repo, "hook-dep", "")
 	writeTestPackage(t, repo, "suggested-dep", "")
 	writeTestPackage(t, repo, "make-dep", "")
 
@@ -1088,6 +1174,9 @@ func TestRuntimeOnlyDepsRemainHardDepsForBinaryInstall(t *testing.T) {
 	}
 	if containsString(plan, "suggested-dep") {
 		t.Fatalf("suggested dependency should not be installed automatically, got %v", plan)
+	}
+	if containsString(plan, "hook-dep") {
+		t.Fatalf("post-install dependency should be deferred until the package hook, got %v", plan)
 	}
 	if containsString(plan, "make-dep") {
 		t.Fatalf("make dependency should not be installed for binary packages, got %v", plan)
@@ -2115,6 +2204,30 @@ func TestInstalledDependentsFindsPackagesUsingDependency(t *testing.T) {
 	dependents := installedDependents("libgcrypt", cfg, nil)
 	if len(dependents) != 1 || dependents[0] != "systemd" {
 		t.Fatalf("expected systemd to depend on libgcrypt, got %v", dependents)
+	}
+}
+
+func TestPostInstallDependencyIsNotAnInstalledRuntimeDependent(t *testing.T) {
+	cfg, _ := withTempDependencyRepo(t)
+	root := t.TempDir()
+	Installed = filepath.Join(root, "var", "db", "hokuto", "installed")
+	if err := os.MkdirAll(Installed, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfg.Values["HOKUTO_ROOT"] = root
+
+	writeInstalledTestPackageWithDepends(t, "dracut", "")
+	writeInstalledTestPackageWithDepends(t, "linux", "dracut | mkinitcpio post-install\n")
+
+	if dependents := installedDependents("dracut", cfg, nil); len(dependents) != 0 {
+		t.Fatalf("post-install dependency must be removable after the hook, got dependents %v", dependents)
+	}
+	deps, err := getInstalledDeps("linux")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if containsString(deps, "dracut") {
+		t.Fatalf("post-install dependency must not be retained as a runtime requirement, got %v", deps)
 	}
 }
 

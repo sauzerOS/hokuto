@@ -350,7 +350,7 @@ func installMissingPackageRuntimeDependencies(pkgName string, cfg *Config, logge
 	}
 
 	for _, dep := range deps {
-		if dep.Make || dep.Optional || dep.Rebuild || dep.Suggest {
+		if dep.Make || dep.Optional || dep.Rebuild || dep.PostInstall || dep.Suggest {
 			continue
 		}
 		if dep.Cross && cfg.Values["HOKUTO_CROSS_ARCH"] == "" {
@@ -409,6 +409,126 @@ func installMissingPackageRuntimeDependencies(pkgName string, cfg *Config, logge
 		}
 	}
 
+	return nil
+}
+
+func installPostInstallDependencies(pkgName string, cfg *Config, execCtx *Executor, logger io.Writer, quiet, noRemote, yes bool) ([]string, error) {
+	dependsPath := filepath.Join(Installed, pkgName, "depends")
+	data, err := os.ReadFile(dependsPath)
+	if err != nil {
+		data, err = readFileAsRoot(dependsPath)
+		if err != nil {
+			return nil, nil
+		}
+	}
+
+	deps, err := parseDependsData(data)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse installed dependencies for %s: %w", pkgName, err)
+	}
+
+	before := snapshotInstalledPackageNames()
+	cleanupOnError := func(installErr error) ([]string, error) {
+		newlyInstalled := newlyInstalledPackageNames(before)
+		if cleanupErr := cleanupPostInstallDependencies(newlyInstalled, cfg, execCtx, logger, quiet); cleanupErr != nil {
+			return nil, fmt.Errorf("%w (cleanup also failed: %v)", installErr, cleanupErr)
+		}
+		return nil, installErr
+	}
+
+	for _, dep := range deps {
+		if !dep.PostInstall {
+			continue
+		}
+		if dep.Cross && cfg.Values["HOKUTO_CROSS_ARCH"] == "" {
+			continue
+		}
+		if dep.CrossNative && (cfg.Values["HOKUTO_CROSS_ARCH"] == "" || cfg.Values["HOKUTO_CROSS_SYSTEM"] == "1") {
+			continue
+		}
+
+		depName := dep.Name
+		if len(dep.Alternatives) > 0 {
+			resolved, err := resolveAlternativeDep(dep, yes, cfg, pkgName)
+			if err != nil {
+				return cleanupOnError(fmt.Errorf("failed to resolve post-install dependency for %s: %w", pkgName, err))
+			}
+			depName = resolved
+		}
+		if depName == "" || depName == pkgName || shouldSkipMultilibMakeDep(dep, depName, cfg) {
+			continue
+		}
+		if findInstalledSatisfying(depName, dep.Op, dep.Version) != "" {
+			continue
+		}
+		depName = wildcardMajorDependencyName(depName, dep.Op, dep.Version)
+
+		if !quiet {
+			fmt.Fprint(logger, colArrow.Sprint("-> "))
+			fmt.Fprint(logger, colSuccess.Sprint("Installing post-install dependency: "))
+			fmt.Fprintln(logger, colNote.Sprint(depName))
+		}
+		if _, err := ensurePackageInstalledWithOptions(depName, cfg, noRemote, nil, quiet); err != nil {
+			return cleanupOnError(fmt.Errorf("failed to install post-install dependency %s for %s: %w", depName, pkgName, err))
+		}
+	}
+
+	return newlyInstalledPackageNames(before), nil
+}
+
+func newlyInstalledPackageNames(before map[string]bool) []string {
+	var packages []string
+	for pkgName := range snapshotInstalledPackageNames() {
+		if !before[pkgName] {
+			packages = append(packages, pkgName)
+		}
+	}
+	sort.Strings(packages)
+	return packages
+}
+
+func cleanupPostInstallDependencies(packages []string, cfg *Config, execCtx *Executor, logger io.Writer, quiet bool) error {
+	remaining := append([]string(nil), packages...)
+	var failures []string
+	for len(remaining) > 0 {
+		removedThisPass := false
+		var stillNeeded []string
+		for i := len(remaining) - 1; i >= 0; i-- {
+			pkgName := remaining[i]
+			if len(installedDependents(pkgName, cfg, nil)) > 0 {
+				stillNeeded = append(stillNeeded, pkgName)
+				continue
+			}
+			if !quiet {
+				fmt.Fprint(logger, colArrow.Sprint("-> "))
+				fmt.Fprint(logger, colSuccess.Sprint("Removing post-install dependency: "))
+				fmt.Fprintln(logger, colNote.Sprint(pkgName))
+			}
+			if err := pkgUninstallWithRemovalSet(pkgName, cfg, execCtx, false, true, logger, nil); err != nil {
+				fmt.Fprintf(logger, "warning: failed to remove post-install dependency %s: %v\n", pkgName, err)
+				stillNeeded = append(stillNeeded, pkgName)
+				continue
+			}
+			removeFromWorld(pkgName)
+			removeFromWorldMake(pkgName)
+			removedThisPass = true
+		}
+		if !removedThisPass {
+			for _, pkgName := range stillNeeded {
+				dependents := installedDependents(pkgName, cfg, nil)
+				if len(dependents) > 0 {
+					failures = append(failures, fmt.Sprintf("%s is still required by %s", pkgName, strings.Join(dependents, ", ")))
+				} else {
+					failures = append(failures, pkgName)
+				}
+			}
+			break
+		}
+		remaining = stillNeeded
+	}
+	if len(failures) > 0 {
+		return fmt.Errorf("failed to remove temporary post-install dependencies: %s", strings.Join(failures, "; "))
+	}
 	return nil
 }
 
@@ -542,10 +662,18 @@ func pkgInstallWithRemotePolicy(tarballPath, pkgName string, cfg *Config, execCt
 			return nil, fmt.Errorf("failed to extract glibc tarball: %v", extractErr)
 		}
 
+		postInstallDeps, err := installPostInstallDependencies(pkgName, cfg, execCtx, logger, fast, noRemote, yes)
+		if err != nil {
+			return nil, err
+		}
+
 		// Always run post-install hook for glibc
 		if err := executePostInstall(pkgName, rootDir, execCtx, cfg, logger, fast); err != nil {
 			colArrow.Print("-> ")
 			color.Danger.Printf("post-install for %s returned error: %v\n", pkgName, err)
+		}
+		if err := cleanupPostInstallDependencies(postInstallDeps, cfg, execCtx, logger, fast); err != nil {
+			return nil, err
 		}
 
 		if !fast {
@@ -1364,12 +1492,19 @@ func pkgInstallWithRemotePolicy(tarballPath, pkgName string, cfg *Config, execCt
 		logger = os.Stdout
 	}
 
+	postInstallDeps, err := installPostInstallDependencies(pkgName, cfg, execCtx, logger, fast, noRemote, yes)
+	if err != nil {
+		return nil, err
+	}
 	if !fast {
 		fmt.Fprint(logger, colArrow.Sprint("-> "))
 		fmt.Fprintln(logger, colSuccess.Sprint("Executing package post-install script"))
 	}
 	if err := executePostInstall(pkgName, rootDir, execCtx, cfg, logger, fast); err != nil {
 		fmt.Fprintf(logger, "warning: post-install for %s returned error: %v\n", pkgName, err)
+	}
+	if err := cleanupPostInstallDependencies(postInstallDeps, cfg, execCtx, logger, fast); err != nil {
+		return nil, err
 	}
 	if err := installMissingPackageRuntimeDependencies(pkgName, cfg, logger, fast, noRemote); err != nil {
 		return nil, err

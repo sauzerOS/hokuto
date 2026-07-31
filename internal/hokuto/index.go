@@ -217,7 +217,7 @@ func scanTarballMetadata(tarballPath string) (map[string]string, []string, error
 				continue
 			}
 			for _, d := range depSpecs {
-				if !d.Make && !d.Optional && !d.Rebuild && !d.Suggest { // Only store hard runtime dependencies
+				if !d.Make && !d.Optional && !d.Rebuild && !d.PostInstall && !d.Suggest { // Only store hard runtime dependencies
 					name := d.Name
 					if len(d.Alternatives) > 1 {
 						name = strings.Join(d.Alternatives, " | ")
@@ -355,7 +355,7 @@ func parseDependsData(content []byte) ([]DepSpec, error) {
 			dependencies = append(dependencies, altDeps...)
 		} else {
 			// Regular dependency parsing
-			name, op, ver, optional, rebuild, makeDep, cross, crossNative, runtimeOnly, suggest, suggestText := parseDepToken(line)
+			name, op, ver, optional, rebuild, makeDep, cross, crossNative, runtimeOnly, postInstall, suggest, suggestText := parseDepToken(line)
 			if name != "" {
 				dependencies = append(dependencies, DepSpec{
 					Name:         name,
@@ -367,6 +367,7 @@ func parseDependsData(content []byte) ([]DepSpec, error) {
 					Cross:        cross,
 					CrossNative:  crossNative,
 					RuntimeOnly:  runtimeOnly,
+					PostInstall:  postInstall,
 					Suggest:      suggest,
 					SuggestText:  suggestText,
 					Alternatives: nil,
@@ -385,12 +386,12 @@ func parseAlternativeDeps(line string) ([]DepSpec, error) {
 	parts := strings.Split(line, "|")
 	var alternatives []string
 	var commonOp, commonVer string
-	var commonOptional, commonRebuild, commonMake, commonCross, commonCrossNative, commonRuntimeOnly, commonSuggest bool
+	var commonOptional, commonRebuild, commonMake, commonCross, commonCrossNative, commonRuntimeOnly, commonPostInstall, commonSuggest bool
 	var commonSuggestText string
 
 	for _, part := range parts {
 		part = strings.TrimSpace(part)
-		name, op, ver, optional, rebuild, makeDep, cross, crossNative, runtimeOnly, suggest, suggestText := parseDepToken(part)
+		name, op, ver, optional, rebuild, makeDep, cross, crossNative, runtimeOnly, postInstall, suggest, suggestText := parseDepToken(part)
 		if name != "" {
 			alternatives = append(alternatives, name)
 			if commonOp == "" && op != "" {
@@ -403,6 +404,7 @@ func parseAlternativeDeps(line string) ([]DepSpec, error) {
 			commonCross = commonCross || cross
 			commonCrossNative = commonCrossNative || crossNative
 			commonRuntimeOnly = commonRuntimeOnly || runtimeOnly
+			commonPostInstall = commonPostInstall || postInstall
 			commonSuggest = commonSuggest || suggest
 			if commonSuggestText == "" && suggestText != "" {
 				commonSuggestText = suggestText
@@ -425,6 +427,7 @@ func parseAlternativeDeps(line string) ([]DepSpec, error) {
 		Cross:        commonCross,
 		CrossNative:  commonCrossNative,
 		RuntimeOnly:  commonRuntimeOnly,
+		PostInstall:  commonPostInstall,
 		Suggest:      commonSuggest,
 		SuggestText:  commonSuggestText,
 		Alternatives: alternatives,

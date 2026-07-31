@@ -409,6 +409,39 @@ func TestGenerateDependsPreservesAlternativeSuggestGroup(t *testing.T) {
 	}
 }
 
+func TestGenerateDependsPreservesPostInstallAlternativeGroup(t *testing.T) {
+	tmp := t.TempDir()
+	pkgDir := filepath.Join(tmp, "repo", "linux")
+	outputDir := filepath.Join(tmp, "out")
+	targetDir := filepath.Join(outputDir, "var", "db", "hokuto", "installed", "linux")
+
+	for _, dir := range []string{pkgDir, targetDir} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	line := "dracut | mkinitcpio post-install\n"
+	if err := os.WriteFile(filepath.Join(pkgDir, "depends"), []byte(line), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(targetDir, "libdeps"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	execCtx := &Executor{Context: context.Background()}
+	if err := generateDepends("linux", pkgDir, outputDir, outputDir, execCtx, false); err != nil {
+		t.Fatal(err)
+	}
+
+	data, err := os.ReadFile(filepath.Join(targetDir, "depends"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(data); got != line {
+		t.Fatalf("unexpected depends content: got %q want %q", got, line)
+	}
+}
+
 func TestGenerateDependsUsesVersionedRuntimePackageForConstraint(t *testing.T) {
 	tmp := t.TempDir()
 	pkgDir := filepath.Join(tmp, "repo", "gst-plugins-bad")

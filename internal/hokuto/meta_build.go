@@ -107,6 +107,9 @@ func collectMetaPackageMissingBinaryTargets(meta MetaPackage, cfg *Config, noRem
 }
 
 func walkMetaBuildDep(dep DepSpec, cfg *Config, walk func(string, string, string) error) error {
+	if dep.PostInstall {
+		return nil
+	}
 	if dep.Cross && cfg.Values["HOKUTO_CROSS_ARCH"] == "" {
 		return nil
 	}

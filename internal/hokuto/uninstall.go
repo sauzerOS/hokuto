@@ -81,6 +81,9 @@ func installedDependents(pkgName string, cfg *Config, removing map[string]bool) 
 			deps, _ = parseDependsData(b)
 		}
 		for _, dep := range deps {
+			if dep.PostInstall {
+				continue
+			}
 			if dep.Name == pkgName {
 				dependents = append(dependents, other)
 				break

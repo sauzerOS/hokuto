@@ -1023,7 +1023,7 @@ func (pm *ParallelManager) canBuild(pkgName string) bool {
 	}
 
 	for _, dep := range deps {
-		if dep.RuntimeOnly || dep.Suggest {
+		if dep.RuntimeOnly || dep.PostInstall || dep.Suggest {
 			continue
 		}
 		if dep.Optional {

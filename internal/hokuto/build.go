@@ -309,7 +309,7 @@ func resolveRequestedBuildTarget(pkgName string) (sourcePkg string, split bool, 
 }
 
 func activeBuildDependency(dep DepSpec, cfg *Config, includeOptional bool) bool {
-	if dep.RuntimeOnly || dep.Suggest {
+	if dep.RuntimeOnly || dep.PostInstall || dep.Suggest {
 		return false
 	}
 	if dep.Optional && !includeOptional {

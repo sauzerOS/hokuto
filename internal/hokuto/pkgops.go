@@ -805,7 +805,7 @@ func generateDepends(pkgName, pkgDir, outputDir, rootDir string, execCtx *Execut
 				}
 
 				// Extract package name to use as key in the map
-				name, op, ver, optional, rebuild, makeDep, _, _, runtimeOnly, suggest, suggestText := parseDepToken(line)
+				name, op, ver, optional, rebuild, makeDep, _, _, runtimeOnly, postInstall, suggest, suggestText := parseDepToken(line)
 				if name != "" {
 					cleanName := cleanManualDepName(name)
 					if cleanName == "" {
@@ -814,6 +814,9 @@ func generateDepends(pkgName, pkgDir, outputDir, rootDir string, execCtx *Execut
 					if cleanName != name {
 						name = cleanName
 						line = formatDepLine(name, op, ver)
+						if postInstall {
+							line += " post-install"
+						}
 					}
 
 					if suggest {
@@ -827,7 +830,7 @@ func generateDepends(pkgName, pkgDir, outputDir, rootDir string, execCtx *Execut
 						continue
 					}
 
-					if runtimeOnly {
+					if runtimeOnly && !postInstall {
 						line = formatDepLine(name, op, ver)
 					}
 
@@ -835,7 +838,7 @@ func generateDepends(pkgName, pkgDir, outputDir, rootDir string, execCtx *Execut
 					// ABI package (foo-1 satisfying foo<2). Store that real runtime
 					// identity so it deduplicates an auto-detected library owner and
 					// does not later request the repository's current foo release.
-					if op != "" && ver != "" {
+					if op != "" && ver != "" && !postInstall {
 						if resolved := findInstalledSatisfyingIn(runtimeDBRoot, name, op, ver); resolved != "" && resolved != name {
 							name = resolved
 							line = resolved

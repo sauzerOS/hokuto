@@ -1063,6 +1063,9 @@ func checkDependencyBlocks(pkgName string, newVersion string, installedPackages 
 		}
 
 		for _, dep := range deps {
+			if dep.PostInstall {
+				continue
+			}
 			// FILTER: skip cross dependencies if not cross-compiling
 			if dep.Cross && cfg.Values["HOKUTO_CROSS_ARCH"] == "" {
 				continue

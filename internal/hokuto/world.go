@@ -323,7 +323,7 @@ func addMetaRuntimeRequirements(meta MetaPackage, required map[string]bool, seen
 	}
 	seen[meta.Name] = true
 	for _, dep := range meta.Depends {
-		if dep.Make || dep.Optional || dep.Rebuild || dep.Suggest {
+		if dep.Make || dep.Optional || dep.Rebuild || dep.PostInstall || dep.Suggest {
 			continue
 		}
 		names := []string{dep.Name}

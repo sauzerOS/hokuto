@@ -51,6 +51,9 @@ func orderPerlModulePackages(candidates map[string]bool) []string {
 			if deps, err := parseDependsFile(pkgDir); err == nil {
 				var moduleDeps []string
 				for _, dep := range deps {
+					if dep.PostInstall {
+						continue
+					}
 					if candidates[dep.Name] {
 						moduleDeps = append(moduleDeps, dep.Name)
 					}

@@ -659,7 +659,7 @@ func dependencyBinaryAvailable(pkgName string, cfg *Config, noRemote bool) bool 
 
 func resolveDependencyList(parentPkg string, deps []DepSpec, visited map[string]bool, plan *[]string, force bool, yes bool, cfg *Config, remoteIndex []RepoEntry, allowRemote bool) error {
 	for _, dep := range deps {
-		if dep.Make || dep.Optional || dep.Rebuild || dep.Suggest {
+		if dep.Make || dep.Optional || dep.Rebuild || dep.PostInstall || dep.Suggest {
 			continue
 		}
 
@@ -827,7 +827,7 @@ func resolveMissingDeps(pkgName string, processed map[string]bool, missing *[]st
 
 	if meta, ok := findMetaPackage(pkgName); ok {
 		for _, dep := range meta.Depends {
-			if dep.Make || dep.Optional || dep.Rebuild || dep.Suggest {
+			if dep.Make || dep.Optional || dep.Rebuild || dep.PostInstall || dep.Suggest {
 				continue
 			}
 			depName := dep.Name
@@ -879,7 +879,7 @@ func resolveMissingDeps(pkgName string, processed map[string]bool, missing *[]st
 
 	// --- 5. Recursively check all dependencies ---
 	for _, dep := range dependencies {
-		if dep.RuntimeOnly || dep.Suggest {
+		if dep.RuntimeOnly || dep.PostInstall || dep.Suggest {
 			continue
 		}
 		if dep.Optional && !forceBuild[pkgName] {
@@ -1276,14 +1276,14 @@ func resolvedBuildDependencyCandidates(dep DepSpec, yes bool, cfg *Config) ([]st
 }
 
 // parseDepToken parses tokens like "pkg", "pkg<=1.2.3 optional", "pkg rebuild",
-// and "pkg suggest Optional support" and returns name, op, version, flags, and
-// optional suggestion text.
+// "pkg post-install", and "pkg suggest Optional support" and returns name, op,
+// version, flags, and optional suggestion text.
 
-func parseDepToken(token string) (name string, op string, ver string, optional bool, rebuild bool, makeDep bool, cross bool, crossNative bool, runtimeOnly bool, suggest bool, suggestText string) {
+func parseDepToken(token string) (name string, op string, ver string, optional bool, rebuild bool, makeDep bool, cross bool, crossNative bool, runtimeOnly bool, postInstall bool, suggest bool, suggestText string) {
 	// Split by whitespace to separate package spec from flags
 	parts := strings.Fields(token)
 	if len(parts) == 0 {
-		return "", "", "", false, false, false, false, false, false, false, ""
+		return "", "", "", false, false, false, false, false, false, false, false, ""
 	}
 
 	pkgSpec := parts[0]
@@ -1303,6 +1303,8 @@ func parseDepToken(token string) (name string, op string, ver string, optional b
 			cross = true // Implies cross because it's only for cross-compilation scenarios
 		case "runtime", "runtime-only", "runtimeonly":
 			runtimeOnly = true
+		case "post-install", "postinstall":
+			postInstall = true
 		case "suggest", "suggested", "optional-runtime", "runtime-optional":
 			suggest = true
 			if i+1 < len(parts) {
@@ -1322,10 +1324,10 @@ func parseDepToken(token string) (name string, op string, ver string, optional b
 		if idx := strings.Index(pkgSpec, op); idx != -1 {
 			name := pkgSpec[:idx]
 			ver := pkgSpec[idx+len(op):]
-			return strings.TrimSpace(name), op, strings.TrimSpace(ver), optional, rebuild, makeDep || cross, cross, crossNative, runtimeOnly, suggest, suggestText
+			return strings.TrimSpace(name), op, strings.TrimSpace(ver), optional, rebuild, makeDep || cross, cross, crossNative, runtimeOnly, postInstall, suggest, suggestText
 		}
 	}
-	return pkgSpec, "", "", optional, rebuild, makeDep || cross, cross, crossNative, runtimeOnly, suggest, suggestText
+	return pkgSpec, "", "", optional, rebuild, makeDep || cross, cross, crossNative, runtimeOnly, postInstall, suggest, suggestText
 }
 
 // BuildPlan represents the complete build plan with proper ordering
@@ -1428,7 +1430,7 @@ func resolveBuildPlan(targetPackages []string, userRequestedPackages map[string]
 
 		// Process all dependencies recursively first.
 		for _, dep := range deps {
-			if dep.RuntimeOnly || dep.Suggest {
+			if dep.RuntimeOnly || dep.PostInstall || dep.Suggest {
 				continue
 			}
 
@@ -1840,7 +1842,7 @@ func getPackageDependenciesForward(pkgName string, cfg *Config) ([]string, error
 
 		// --- Recursively collect dependencies in forward order ---
 		for _, dep := range dependencies {
-			if dep.RuntimeOnly || dep.Suggest {
+			if dep.RuntimeOnly || dep.PostInstall || dep.Suggest {
 				continue
 			}
 			// FILTER: skip cross dependencies if not cross-compiling
@@ -1950,7 +1952,10 @@ func getInstalledDeps(pkgName string) ([]string, error) {
 			continue
 		}
 		// Parse "pkgname>=1.0" -> "pkgname"
-		name, _, _, _, _, _, _, _, _, _, _ := parseDepToken(line)
+		name, _, _, _, _, _, _, _, _, postInstall, _, _ := parseDepToken(line)
+		if postInstall {
+			continue
+		}
 		if name != "" && name != pkgName && !seen[name] {
 			deps = append(deps, name)
 			seen[name] = true
@@ -1975,6 +1980,7 @@ type DepSpec struct {
 	Cross        bool     // True if dependency is only for cross-compilation
 	CrossNative  bool     // True if dependency is only for cross-compilation AND NOT cross-system
 	RuntimeOnly  bool     // True if dependency is needed after install but not for the build graph
+	PostInstall  bool     // True if dependency is needed only while running the post-install hook
 	Suggest      bool     // True if dependency should be suggested after install, not required
 	SuggestText  string   // Human-readable explanation shown with suggested dependencies
 	Alternatives []string // List of alternative package names (e.g., ["rust", "rustup"] for "rust | rustup")
@@ -2098,6 +2104,9 @@ func containsDep(dependsPath, targetPkg string) bool {
 		return false
 	}
 	for _, dep := range deps {
+		if dep.PostInstall {
+			continue
+		}
 		if dep.Name == targetPkg {
 			return true
 		}
@@ -2459,7 +2468,7 @@ func ensureBinaryRuntimeDependenciesInstalledWithOptions(pkgName string, cfg *Co
 	}
 
 	for _, dep := range deps {
-		if dep.Make || dep.Optional || dep.Rebuild || dep.Suggest {
+		if dep.Make || dep.Optional || dep.Rebuild || dep.PostInstall || dep.Suggest {
 			continue
 		}
 		if dep.Cross && cfg.Values["HOKUTO_CROSS_ARCH"] == "" {
