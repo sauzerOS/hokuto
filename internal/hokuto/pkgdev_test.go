@@ -9,6 +9,20 @@ import (
 	"testing"
 )
 
+func TestApplySubstitutionsCUnitVersion(t *testing.T) {
+	got := applySubstitutions(
+		"https://example.invalid/CUnit/${version-cunit}/CUnit-${version-cunit}.tar.bz2",
+		"2.1.3",
+		"1",
+		"cunit",
+		nil,
+	)
+	want := "https://example.invalid/CUnit/2.1-3/CUnit-2.1-3.tar.bz2"
+	if got != want {
+		t.Fatalf("unexpected CUnit source substitution: got %q want %q", got, want)
+	}
+}
+
 func TestRepologyURLForRepositoryReplacesInRepo(t *testing.T) {
 	got, err := repologyURLForRepository(
 		"https://repology.example/api/v1/projects/?inrepo=sauzeros&outdated=1",

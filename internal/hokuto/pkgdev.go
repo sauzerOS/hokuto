@@ -154,6 +154,12 @@ func applySubstitutions(content, version, revision, pkgName string, extraSubs ma
 		}
 	}
 
+	// CUnit publishes 2.1.3 under the upstream 2.1-3 directory/archive name.
+	versionCUnit := version
+	if lastDot := strings.LastIndex(version, "."); lastDot != -1 {
+		versionCUnit = version[:lastDot] + "-" + version[lastDot+1:]
+	}
+
 	args := []string{
 		"${version}", version,
 		"${version-clean}", strings.ReplaceAll(version, "_", "."),
@@ -168,6 +174,7 @@ func applySubstitutions(content, version, revision, pkgName string, extraSubs ma
 		"${version-last-only}", versionLastOnly,
 		"${version-kernel}", versionKernel,
 		"${version-libburnia}", versionLibburnia,
+		"${version-cunit}", versionCUnit,
 		"${revision}", revision,
 		"${pkgname}", pkgName,
 	}
