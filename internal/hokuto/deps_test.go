@@ -594,6 +594,27 @@ func TestParseAlternativeDependencyMergesTrailingFlags(t *testing.T) {
 	}
 }
 
+func TestParseMakeOptDependency(t *testing.T) {
+	deps, err := parseDependsData([]byte("cmake makeopt\nmeson | cmake makeopt\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(deps) != 2 {
+		t.Fatalf("expected two dependencies, got %d", len(deps))
+	}
+	for _, dep := range deps {
+		if !dep.MakeOpt || !dep.Make {
+			t.Fatalf("makeopt must be represented as an optional build-only dependency: %+v", dep)
+		}
+		if dep.Optional {
+			t.Fatalf("makeopt must not use optional-feature rebuild semantics: %+v", dep)
+		}
+	}
+	if len(deps[1].Alternatives) != 2 {
+		t.Fatalf("expected makeopt flag on alternative dependency: %+v", deps[1])
+	}
+}
+
 func TestParsePostInstallAlternativeDependency(t *testing.T) {
 	deps, err := parseDependsData([]byte("dracut | mkinitcpio post-install\n"))
 	if err != nil {
@@ -1086,6 +1107,28 @@ func TestSplitDependencySourceDiscoveredFromDependsSubpackage(t *testing.T) {
 	}
 }
 
+func TestResolveMissingRebuildDepsIncludesUninstalledSplitOutput(t *testing.T) {
+	cfg, repo := withTempDependencyRepo(t)
+	writeTestPackage(t, repo, "vhba-module", "linux-headers make\n")
+	writeTestPackage(t, repo, "linux", "")
+	if err := os.WriteFile(filepath.Join(repo, "linux", "depends.linux-headers"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	writeInstalledTestPackage(t, "linux")
+
+	var missing []string
+	forceBuild := map[string]bool{"vhba-module": true}
+	if err := resolveMissingDeps("vhba-module", map[string]bool{}, &missing, forceBuild, cfg, true); err != nil {
+		t.Fatal(err)
+	}
+	if !containsString(missing, "linux-headers") {
+		t.Fatalf("expected uninstalled split output linux-headers in rebuild dependencies, got %v", missing)
+	}
+	if containsString(missing, "linux") {
+		t.Fatalf("installed split source package linux must not satisfy or replace linux-headers: %v", missing)
+	}
+}
+
 func TestResolveBuildPlanUsesSplitDependencySource(t *testing.T) {
 	cfg, repo := withTempDependencyRepo(t)
 	writeTestPackage(t, repo, "target", "systemd-libs\n")
@@ -1419,7 +1462,7 @@ func TestEnsureDevelPackagesRequiresBinaryAvailability(t *testing.T) {
 
 func TestBinaryRuntimeDependencySpecsIncludeOnlyRuntimeDeps(t *testing.T) {
 	cfg, repo := withTempDependencyRepo(t)
-	writeTestPackage(t, repo, "meson", "python\nninja\npkgconf make\n")
+	writeTestPackage(t, repo, "meson", "python\nninja\npkgconf make\nmeson makeopt\n")
 
 	deps, err := binaryRuntimeDependencySpecs("meson", cfg, true)
 	if err != nil {
@@ -1439,6 +1482,9 @@ func TestBinaryRuntimeDependencySpecsIncludeOnlyRuntimeDeps(t *testing.T) {
 	}
 	if containsString(runtimeDeps, "pkgconf") {
 		t.Fatalf("make dependency should not be treated as runtime dependency, got %v", runtimeDeps)
+	}
+	if containsString(runtimeDeps, "meson") {
+		t.Fatalf("makeopt dependency should not be treated as runtime dependency, got %v", runtimeDeps)
 	}
 }
 
@@ -2125,6 +2171,40 @@ func TestBuildDependencyFallsBackToNewestOlderBinary(t *testing.T) {
 	}
 	if !ok || name != "gcc" || got != older {
 		t.Fatalf("expected newest older GCC binary %s, got name=%s path=%s ok=%v", older, name, got, ok)
+	}
+}
+
+func TestMakeOptSelfDependencyUsesOlderBinaryWithoutEnteringBuildPlan(t *testing.T) {
+	cfg, repo := withTempDependencyRepo(t)
+	writeTestPackage(t, repo, "cmake", "cmake makeopt\n")
+	if err := os.WriteFile(filepath.Join(repo, "cmake", "version"), []byte("4.2.0 1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	older := filepath.Join(BinDir, StandardizeRemoteName("cmake", "4.1.2", "1", "x86_64", "optimized"))
+	writeTestBinaryTarball(t, older, "cmake", "4.1.2", "1")
+
+	plan, err := resolveBuildPlan([]string{"cmake"}, map[string]bool{"cmake": true}, false, cfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Order) != 1 || plan.Order[0] != "cmake" {
+		t.Fatalf("makeopt self dependency must not create another build node: %v", plan.Order)
+	}
+
+	deps := collectAvailableBinaryDependenciesForPlan(plan, cfg, true)
+	if len(deps) != 1 || deps[0].Name != "cmake" || !deps[0].MakeOpt {
+		t.Fatalf("expected older cmake binary as makeopt bootstrap, got %+v", deps)
+	}
+
+	pm := &ParallelManager{
+		BuildPlan: plan,
+		Config:    cfg,
+		Completed: make(map[string]bool),
+		Available: make(map[string]bool),
+		Failed:    make(map[string]error),
+	}
+	if !pm.canBuild("cmake") {
+		t.Fatal("makeopt must not block a build when its binary was not installed")
 	}
 }
 

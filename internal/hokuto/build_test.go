@@ -47,3 +47,16 @@ func TestCopyPackageRecipeMetadataIncludesSources(t *testing.T) {
 		}
 	}
 }
+
+func TestPlannedPackageRequiresSourceBuildForSplitOutput(t *testing.T) {
+	plan := &BuildPlan{RebuildPackages: map[string]bool{}}
+	if plannedPackageRequiresSourceBuild("gstreamer", plan, nil, nil) {
+		t.Fatal("ordinary dependency may reuse its parent binary")
+	}
+	if !plannedPackageRequiresSourceBuild("gstreamer", plan, map[string]bool{"gstreamer": true}, nil) {
+		t.Fatal("explicitly requested source package must build from source")
+	}
+	if !plannedPackageRequiresSourceBuild("gstreamer", plan, nil, map[string][]string{"gstreamer": {"gst-plugins-bad"}}) {
+		t.Fatal("source package required to produce a split output must build from source")
+	}
+}

@@ -1139,6 +1139,14 @@ func handleAutoBumpRepository(cfg *Config, autoBuild bool, assumeYes bool, repoU
 			pkgName = "xorg-xmodmap"
 		case "xwininfo":
 			pkgName = "xorg-xwininfo"
+		case "tesseract-ocr":
+			pkgName = "tesseract"
+		case "vte":
+			pkgName = "vte3"
+		case "vulkan-loader":
+			pkgName = "vulkan-icd-loader"
+		case "udisks":
+			pkgName = "udisks2"
 		}
 
 		var newestVer string

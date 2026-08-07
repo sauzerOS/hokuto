@@ -2,8 +2,35 @@ package hokuto
 
 import (
 	"context"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 )
+
+func TestParallelUpdateDoesNotPromoteRequestedPackageToWorld(t *testing.T) {
+	oldWorldFile := WorldFile
+	WorldFile = filepath.Join(t.TempDir(), "world")
+	t.Cleanup(func() { WorldFile = oldWorldFile })
+
+	pm := &ParallelManager{UserRequested: map[string]bool{"vlc-plugin-foo": true}}
+	pm.recordRequestedWorldPackage("vlc-plugin-foo")
+	if data, err := os.ReadFile(WorldFile); err == nil && strings.TrimSpace(string(data)) != "" {
+		t.Fatalf("update policy must preserve world membership, got %q", data)
+	} else if err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+
+	pm.AddRequestedToWorld = true
+	pm.recordRequestedWorldPackage("vlc-plugin-foo")
+	data, err := os.ReadFile(WorldFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(string(data)) != "vlc-plugin-foo" {
+		t.Fatalf("normal build/install policy should record requested package, got %q", data)
+	}
+}
 
 func TestRunParallelBuildsClearsPromptHooksAfterUILoop(t *testing.T) {
 	oldUserExec := UserExec
@@ -25,6 +52,7 @@ func TestRunParallelBuildsClearsPromptHooksAfterUILoop(t *testing.T) {
 		2,
 		nil,
 		true,
+		false,
 		false,
 		nil,
 		nil,

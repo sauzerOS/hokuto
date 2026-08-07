@@ -15,14 +15,15 @@ import (
 
 // ParallelManager handles the execution of parallel builds
 type ParallelManager struct {
-	MaxJobs       int
-	Config        *Config
-	BuildPlan     *BuildPlan
-	Context       context.Context
-	Cancel        context.CancelFunc
-	AutoYes       bool
-	AutoInstall   bool
-	UserRequested map[string]bool
+	MaxJobs             int
+	Config              *Config
+	BuildPlan           *BuildPlan
+	Context             context.Context
+	Cancel              context.CancelFunc
+	AutoYes             bool
+	AutoInstall         bool
+	AddRequestedToWorld bool
+	UserRequested       map[string]bool
 
 	// State
 	mu                sync.Mutex
@@ -57,13 +58,20 @@ type buildResult struct {
 }
 
 type binaryPlanDependency struct {
-	Name string
-	Make bool
+	Name    string
+	Make    bool
+	MakeOpt bool
 }
 
 type parallelInstallResult struct {
 	Rebuilds  []string
 	Available []string
+}
+
+func (pm *ParallelManager) recordRequestedWorldPackage(pkgName string) {
+	if pm.AddRequestedToWorld && pm.UserRequested[pkgName] {
+		_ = addToWorld(pkgName)
+	}
 }
 
 func snapshotInstalledPackageNames() map[string]bool {
@@ -81,34 +89,35 @@ func snapshotInstalledPackageNames() map[string]bool {
 }
 
 // RunParallelBuilds executes the build plan in parallel
-func RunParallelBuilds(plan *BuildPlan, cfg *Config, maxJobs int, userRequestedMap map[string]bool, autoYes bool, autoInstall bool, splitDepsBySource map[string][]string, customBuilder func(string, *Config, *Executor, BuildOptions) (time.Duration, error)) ([]string, error) {
+func RunParallelBuilds(plan *BuildPlan, cfg *Config, maxJobs int, userRequestedMap map[string]bool, autoYes bool, autoInstall bool, addRequestedToWorld bool, splitDepsBySource map[string][]string, customBuilder func(string, *Config, *Executor, BuildOptions) (time.Duration, error)) ([]string, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	pm := &ParallelManager{
-		MaxJobs:           maxJobs,
-		Config:            cfg,
-		BuildPlan:         plan,
-		Context:           ctx,
-		Cancel:            cancel,
-		Pending:           make([]string, len(plan.Order)),
-		Running:           make(map[string]time.Time),
-		Completed:         make(map[string]bool),
-		Available:         make(map[string]bool),
-		Failed:            make(map[string]error),
-		DeferredInstalls:  make(map[string]bool),
-		TemporaryInstalls: make(map[string]bool),
-		LogFiles:          make(map[string]*os.File),
-		SplitDepsBySource: splitDepsBySource,
-		RebuildTriggers:   make(map[string]map[string]bool),
-		rebuildDepPrep:    make(map[string]bool),
-		UserRequested:     userRequestedMap,
-		resultChan:        make(chan buildResult, maxJobs),
-		promptPause:       make(chan bool),
-		promptAck:         make(chan struct{}),
-		Builder:           pkgBuild,
-		AutoYes:           autoYes,
-		AutoInstall:       autoInstall,
+		MaxJobs:             maxJobs,
+		Config:              cfg,
+		BuildPlan:           plan,
+		Context:             ctx,
+		Cancel:              cancel,
+		Pending:             make([]string, len(plan.Order)),
+		Running:             make(map[string]time.Time),
+		Completed:           make(map[string]bool),
+		Available:           make(map[string]bool),
+		Failed:              make(map[string]error),
+		DeferredInstalls:    make(map[string]bool),
+		TemporaryInstalls:   make(map[string]bool),
+		LogFiles:            make(map[string]*os.File),
+		SplitDepsBySource:   splitDepsBySource,
+		RebuildTriggers:     make(map[string]map[string]bool),
+		rebuildDepPrep:      make(map[string]bool),
+		UserRequested:       userRequestedMap,
+		resultChan:          make(chan buildResult, maxJobs),
+		promptPause:         make(chan bool),
+		promptAck:           make(chan struct{}),
+		Builder:             pkgBuild,
+		AutoYes:             autoYes,
+		AutoInstall:         autoInstall,
+		AddRequestedToWorld: addRequestedToWorld,
 	}
 
 	if customBuilder != nil {
@@ -313,9 +322,7 @@ func (pm *ParallelManager) installDeferredTargets() error {
 		}
 		isCriticalAtomic.Store(0)
 
-		if pm.UserRequested[pkgName] {
-			addToWorld(pkgName)
-		}
+		pm.recordRequestedWorldPackage(pkgName)
 		colArrow.Print("-> ")
 		colSuccess.Printf("Installing:")
 		colNote.Printf(" %s (%d/%d)\n", outputPkgName, i+1, len(targets))
@@ -363,7 +370,7 @@ func collectAvailableBinaryDependenciesForPlan(plan *BuildPlan, cfg *Config, noR
 				if shouldSkipMultilibMakeDep(dep, cand, cfg) {
 					continue
 				}
-				if seen[cand] || inPlan[cand] || isPackageInstalled(cand) {
+				if seen[cand] || (inPlan[cand] && !dep.MakeOpt) || isPackageInstalled(cand) {
 					continue
 				}
 				if !dependencyBinaryAvailable(cand, cfg, noRemote) {
@@ -372,7 +379,7 @@ func collectAvailableBinaryDependenciesForPlan(plan *BuildPlan, cfg *Config, noR
 					}
 				}
 				seen[cand] = true
-				depsToInstall = append(depsToInstall, binaryPlanDependency{Name: cand, Make: dep.Make})
+				depsToInstall = append(depsToInstall, binaryPlanDependency{Name: cand, Make: dep.Make, MakeOpt: dep.MakeOpt})
 				break
 			}
 		}
@@ -385,7 +392,21 @@ func installAvailableBinaryDependenciesForPlan(plan *BuildPlan, cfg *Config, noR
 }
 
 func installAvailableBinaryDependenciesForPlanWithOptions(plan *BuildPlan, cfg *Config, noRemote bool, quiet bool) ([]string, error) {
-	depsToInstall := collectAvailableBinaryDependenciesForPlan(plan, cfg, noRemote)
+	return installBinaryPlanDependencies(collectAvailableBinaryDependenciesForPlan(plan, cfg, noRemote), cfg, noRemote, quiet)
+}
+
+func installAvailableMakeOptDependenciesForPlanWithOptions(plan *BuildPlan, cfg *Config, noRemote bool, quiet bool) ([]string, error) {
+	all := collectAvailableBinaryDependenciesForPlan(plan, cfg, noRemote)
+	depsToInstall := make([]binaryPlanDependency, 0, len(all))
+	for _, dep := range all {
+		if dep.MakeOpt {
+			depsToInstall = append(depsToInstall, dep)
+		}
+	}
+	return installBinaryPlanDependencies(depsToInstall, cfg, noRemote, quiet)
+}
+
+func installBinaryPlanDependencies(depsToInstall []binaryPlanDependency, cfg *Config, noRemote bool, quiet bool) ([]string, error) {
 	if len(depsToInstall) == 0 {
 		return nil, nil
 	}
@@ -402,7 +423,10 @@ func installAvailableBinaryDependenciesForPlanWithOptions(plan *BuildPlan, cfg *
 			colSuccess.Printf("Installing available binary dependency:")
 			colNote.Printf(" %s\n", dep.Name)
 		}
-		ok, err := installAvailableBuildDependencyBinaryWithOptions(dep.Name, cfg, noRemote, quiet, false)
+		// Unlike required build dependencies, makeopt never contributes its own
+		// dependency graph to the plan. Install its packaged runtime dependencies
+		// so the optional bootstrap tool is actually runnable.
+		ok, err := installAvailableBuildDependencyBinaryWithOptions(dep.Name, cfg, noRemote, quiet, dep.MakeOpt)
 		if err != nil {
 			return installed, fmt.Errorf("failed to install binary dependency %s: %w", dep.Name, err)
 		}
@@ -411,7 +435,7 @@ func installAvailableBinaryDependenciesForPlanWithOptions(plan *BuildPlan, cfg *
 			continue
 		}
 		installed = append(installed, dep.Name)
-		if dep.Make {
+		if dep.Make && !dep.MakeOpt {
 			addToWorldMake(dep.Name)
 		}
 	}
@@ -769,27 +793,11 @@ func (pm *ParallelManager) prepareRebuildDependencies(pkgNames []string) error {
 	if pm.TemporaryInstalls == nil {
 		pm.TemporaryInstalls = make(map[string]bool)
 	}
-	if packageSetNeedsDevelPackages(pkgNames) {
-		includeMultilib := packageSetHasBuildOption(pkgNames, "multilib")
-		installed, err := ensureDevelPackagesInstalledWithOptions(pm.Config, includeMultilib, false, true)
-		if err != nil {
-			return fmt.Errorf("failed to prepare devel packages: %w", err)
-		}
-		for _, pkgName := range installed {
-			pm.TemporaryInstalls[pkgName] = true
-		}
+	installed, err := installRebuildDependenciesWithOptions(pkgNames, pm.Config, false, true)
+	for _, pkgName := range installed {
+		pm.TemporaryInstalls[pkgName] = true
 	}
-
-	for _, pkgName := range pkgNames {
-		installed, err := installBuildDependenciesWithOptions(pkgName, pm.Config, false, true)
-		if err != nil {
-			return fmt.Errorf("%s: %w", pkgName, err)
-		}
-		for _, depName := range installed {
-			pm.TemporaryInstalls[depName] = true
-		}
-	}
-	return nil
+	return err
 }
 
 func (pm *ParallelManager) shouldDeferInstallLocked(pkgName string) bool {
@@ -900,9 +908,7 @@ func (pm *ParallelManager) installPackage(pkgName string, userRequestedMap map[s
 		// (those with the arch prefix). Everything else is a target package and should stay in BinDir.
 		if !isCrossSystem && !isCrossSystemPkg {
 			isCriticalAtomic.Store(0)
-			if userRequestedMap[pkgName] {
-				addToWorld(pkgName)
-			}
+			pm.recordRequestedWorldPackage(pkgName)
 			return result, nil
 		}
 	}
@@ -931,9 +937,7 @@ func (pm *ParallelManager) installPackage(pkgName string, userRequestedMap map[s
 	isCriticalAtomic.Store(0)
 
 	if err == nil {
-		if userRequestedMap[pkgName] {
-			addToWorld(pkgName)
-		}
+		pm.recordRequestedWorldPackage(pkgName)
 
 		for _, splitPkg := range pm.SplitDepsBySource[pkgName] {
 			var err error
@@ -945,9 +949,7 @@ func (pm *ParallelManager) installPackage(pkgName string, userRequestedMap map[s
 			if err != nil {
 				return result, fmt.Errorf("split dependency install failed for %s: %w", splitPkg, err)
 			}
-			if userRequestedMap[splitPkg] {
-				addToWorld(splitPkg)
-			}
+			pm.recordRequestedWorldPackage(splitPkg)
 			if logger != nil {
 				fmt.Fprintf(logger, "Installing split dependency: %s\n", splitPkg)
 			}
@@ -1024,6 +1026,9 @@ func (pm *ParallelManager) canBuild(pkgName string) bool {
 
 	for _, dep := range deps {
 		if dep.RuntimeOnly || dep.PostInstall || dep.Suggest {
+			continue
+		}
+		if dep.MakeOpt {
 			continue
 		}
 		if dep.Optional {

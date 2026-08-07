@@ -673,7 +673,7 @@ func resolveDependencyList(parentPkg string, deps []DepSpec, visited map[string]
 		}
 
 		if !force {
-			if findInstalledSatisfying(depName, dep.Op, dep.Version) != "" {
+			if findInstalledDependencySatisfying(depName, dep.Op, dep.Version) != "" {
 				continue
 			}
 		}
@@ -882,6 +882,11 @@ func resolveMissingDeps(pkgName string, processed map[string]bool, missing *[]st
 		if dep.RuntimeOnly || dep.PostInstall || dep.Suggest {
 			continue
 		}
+		// makeopt is satisfied only by an already installed package or an
+		// available binary. It must never pull source into the build graph.
+		if dep.MakeOpt {
+			continue
+		}
 		if dep.Optional && !forceBuild[pkgName] {
 			continue
 		}
@@ -945,7 +950,7 @@ func resolveMissingDeps(pkgName string, processed map[string]bool, missing *[]st
 		// CHECK VERSION CONSTRAINTS & FETCH IF NEEDED
 		if dep.Op != "" && dep.Version != "" {
 			// 1. Check if any satisfying package is ALREADY INSTALLED (including renamed ones)
-			satisfyingPkg := findInstalledSatisfying(depName, dep.Op, dep.Version)
+			satisfyingPkg := findInstalledDependencySatisfying(depName, dep.Op, dep.Version)
 			if satisfyingPkg != "" {
 				// Great, a satisfying version is already installed (maybe it's depName-MAJOR)
 				depName = satisfyingPkg
@@ -998,6 +1003,9 @@ func resolveMissingDeps(pkgName string, processed map[string]bool, missing *[]st
 // This is the function called by the dependency resolver (resolveMissingDeps).
 
 func parseDependsFile(pkgDir string) ([]DepSpec, error) {
+	if _, err := loadPackageEquivalentPairs(); err != nil {
+		return nil, err
+	}
 	dependsPath := filepath.Join(pkgDir, "depends")
 	content, err := os.ReadFile(dependsPath)
 	if err != nil {
@@ -1006,10 +1014,17 @@ func parseDependsFile(pkgDir string) ([]DepSpec, error) {
 		}
 		return nil, fmt.Errorf("failed to read depends file: %w", err)
 	}
-	return parseDependsData(content)
+	deps, err := parseDependsData(content)
+	if err != nil {
+		return nil, err
+	}
+	return expandPackageEquivalentDependencies(deps, filepath.Base(pkgDir)), nil
 }
 
 func parsePackageDependsFile(pkgDir, pkgName string) ([]DepSpec, error) {
+	if _, err := loadPackageEquivalentPairs(); err != nil {
+		return nil, err
+	}
 	dependsPath := findPackageMetadataFile(pkgDir, pkgName, "depends")
 	content, err := os.ReadFile(dependsPath)
 	if err != nil {
@@ -1018,7 +1033,11 @@ func parsePackageDependsFile(pkgDir, pkgName string) ([]DepSpec, error) {
 		}
 		return nil, fmt.Errorf("failed to read depends file: %w", err)
 	}
-	return parseDependsData(content)
+	deps, err := parseDependsData(content)
+	if err != nil {
+		return nil, err
+	}
+	return expandPackageEquivalentDependencies(deps, pkgName), nil
 }
 
 func resolveRemoteDependencies(pkgName string, visited map[string]bool, plan *[]string, force bool, yes bool, cfg *Config, remoteIndex []RepoEntry) error {
@@ -1146,6 +1165,14 @@ func resolveAlternativeDep(dep DepSpec, yes bool, cfg *Config, requestingPkg ...
 		return installed[0], nil
 	}
 
+	// Repository equivalence pairs have a declared preference order and do not
+	// need an interactive provider choice. The installed-provider preference
+	// above still wins when either equivalent is already present.
+	if isPackageEquivalentAlternative(dep) {
+		alternativeDepCache[cacheKey] = available[0]
+		return available[0], nil
+	}
+
 	// If only one is available (and not installed), use it automatically and cache it
 	if len(available) == 1 {
 		alternativeDepCache[cacheKey] = available[0]
@@ -1235,6 +1262,14 @@ func cachedAlternativeDep(dep DepSpec) (string, bool) {
 	if len(dep.Alternatives) < 2 {
 		return dep.Name, true
 	}
+	if isPackageEquivalentAlternative(dep) {
+		for _, candidate := range dep.Alternatives {
+			if installed := findInstalledPackageVariant(candidate); installed != "" {
+				alternativeDepCache[alternativeDepCacheKey(dep)] = installed
+				return installed, true
+			}
+		}
+	}
 	cacheKey := alternativeDepCacheKey(dep)
 	cached, ok := alternativeDepCache[cacheKey]
 	if !ok {
@@ -1264,7 +1299,7 @@ func resolvedBuildDependencyCandidates(dep DepSpec, yes bool, cfg *Config) ([]st
 		}
 	}
 	if dep.Op != "" && dep.Version != "" {
-		if installed := findInstalledSatisfying(resolved, dep.Op, dep.Version); installed != "" {
+		if installed := findInstalledDependencySatisfying(resolved, dep.Op, dep.Version); installed != "" {
 			return []string{installed}, nil
 		}
 		if source := findSourcePackageSatisfying(resolved, dep.Op, dep.Version); source != "" {
@@ -1295,6 +1330,8 @@ func parseDepToken(token string) (name string, op string, ver string, optional b
 		case "rebuild":
 			rebuild = true
 		case "make":
+			makeDep = true
+		case "makeopt":
 			makeDep = true
 		case "cross":
 			cross = true
@@ -1328,6 +1365,16 @@ func parseDepToken(token string) (name string, op string, ver string, optional b
 		}
 	}
 	return pkgSpec, "", "", optional, rebuild, makeDep || cross, cross, crossNative, runtimeOnly, postInstall, suggest, suggestText
+}
+
+func hasDependencyFlag(token, flag string) bool {
+	parts := strings.Fields(token)
+	for _, part := range parts[1:] {
+		if strings.EqualFold(part, flag) {
+			return true
+		}
+	}
+	return false
 }
 
 // BuildPlan represents the complete build plan with proper ordering
@@ -1433,6 +1480,12 @@ func resolveBuildPlan(targetPackages []string, userRequestedPackages map[string]
 			if dep.RuntimeOnly || dep.PostInstall || dep.Suggest {
 				continue
 			}
+			// Optional bootstrap tools are installed in a separate binary-only
+			// pass. They do not impose graph ordering and cannot create a
+			// self-cycle when a package bootstraps itself.
+			if dep.MakeOpt {
+				continue
+			}
 
 			// New filtering: skip cross dependencies if not cross-compiling
 			if dep.Cross && cfg.Values["HOKUTO_CROSS_ARCH"] == "" {
@@ -1521,7 +1574,7 @@ func resolveBuildPlan(targetPackages []string, userRequestedPackages map[string]
 			// and the current repo version doesn't match, we try to fetch it from history.
 			if dep.Op != "" && dep.Version != "" {
 				// 1. Check if any satisfying package is ALREADY INSTALLED (including renamed ones)
-				satisfyingPkg := findInstalledSatisfying(depName, dep.Op, dep.Version)
+				satisfyingPkg := findInstalledDependencySatisfying(depName, dep.Op, dep.Version)
 				if satisfyingPkg != "" {
 					// Great, a satisfying version is already installed (maybe it's depName-MAJOR)
 					depName = satisfyingPkg
@@ -1944,17 +1997,30 @@ func getInstalledDeps(pkgName string) ([]string, error) {
 		data = nil
 	}
 
+	parsed, err := parseDependsData(data)
+	if err != nil {
+		return nil, err
+	}
 	var deps []string
 	seen := make(map[string]bool)
-	for _, raw := range strings.Split(string(data), "\n") {
-		line := strings.TrimSpace(raw)
-		if line == "" || strings.HasPrefix(line, "#") {
+	for _, dep := range parsed {
+		if dep.Make || dep.Optional || dep.Rebuild || dep.PostInstall || dep.Suggest {
 			continue
 		}
-		// Parse "pkgname>=1.0" -> "pkgname"
-		name, _, _, _, _, _, _, _, _, postInstall, _, _ := parseDepToken(line)
-		if postInstall {
-			continue
+		name := findInstalledDependencySatisfying(dep.Name, dep.Op, dep.Version)
+		if len(dep.Alternatives) > 0 {
+			name = ""
+			for _, candidate := range dep.Alternatives {
+				if installed := findInstalledDependencySatisfying(candidate, dep.Op, dep.Version); installed != "" {
+					name = installed
+					break
+				}
+			}
+			if name == "" {
+				name = dep.Name
+			}
+		} else if name == "" {
+			name = dep.Name
 		}
 		if name != "" && name != pkgName && !seen[name] {
 			deps = append(deps, name)
@@ -1977,6 +2043,7 @@ type DepSpec struct {
 	Optional     bool
 	Rebuild      bool
 	Make         bool     // True if dependency is only needed at build time
+	MakeOpt      bool     // True if an available binary may be used as an optional build-time bootstrap
 	Cross        bool     // True if dependency is only for cross-compilation
 	CrossNative  bool     // True if dependency is only for cross-compilation AND NOT cross-system
 	RuntimeOnly  bool     // True if dependency is needed after install but not for the build graph
@@ -2133,12 +2200,22 @@ func installBuildDependenciesWithOptions(pkgName string, cfg *Config, noRemote b
 	masterProcessed := make(map[string]bool)
 	userRequested := map[string]bool{pkgName: true}
 
-	if err := resolveMissingDeps(pkgName, masterProcessed, &missing, userRequested, cfg, false); err != nil {
+	if err := resolveMissingDeps(pkgName, masterProcessed, &missing, userRequested, cfg, noRemote); err != nil {
 		return newlyInstalled, fmt.Errorf("failed to resolve dependencies for %s: %v", pkgName, err)
 	}
 
+	// makeopt dependencies never enter the source dependency graph. Install an
+	// exact or older available binary now, and silently leave the feature
+	// disabled when no binary exists.
+	makeOptPlan := &BuildPlan{Order: []string{pkgName}, BinaryPackages: make(map[string]bool)}
+	makeOptInstalled, err := installAvailableMakeOptDependenciesForPlanWithOptions(makeOptPlan, cfg, noRemote, quiet)
+	if err != nil {
+		return newlyInstalled, fmt.Errorf("failed to install optional build dependency for %s: %w", pkgName, err)
+	}
+	newlyInstalled = append(newlyInstalled, makeOptInstalled...)
+
 	if len(missing) == 0 {
-		return nil, nil
+		return newlyInstalled, nil
 	}
 
 	// Ensure base is first
@@ -2172,6 +2249,40 @@ func installBuildDependenciesWithOptions(pkgName string, cfg *Config, noRemote b
 		}
 	}
 
+	return newlyInstalled, nil
+}
+
+func installRebuildDependenciesWithOptions(pkgNames []string, cfg *Config, noRemote bool, quiet bool) ([]string, error) {
+	seen := make(map[string]bool)
+	var newlyInstalled []string
+	addInstalled := func(pkgName string) {
+		if pkgName == "" || seen[pkgName] {
+			return
+		}
+		seen[pkgName] = true
+		newlyInstalled = append(newlyInstalled, pkgName)
+	}
+
+	if packageSetNeedsDevelPackages(pkgNames) {
+		includeMultilib := packageSetHasBuildOption(pkgNames, "multilib")
+		installed, err := ensureDevelPackagesInstalledWithOptions(cfg, includeMultilib, noRemote, quiet)
+		for _, pkgName := range installed {
+			addInstalled(pkgName)
+		}
+		if err != nil {
+			return newlyInstalled, fmt.Errorf("failed to prepare devel packages: %w", err)
+		}
+	}
+
+	for _, pkgName := range pkgNames {
+		installed, err := installBuildDependenciesWithOptions(pkgName, cfg, noRemote, quiet)
+		for _, depName := range installed {
+			addInstalled(depName)
+		}
+		if err != nil {
+			return newlyInstalled, fmt.Errorf("%s: %w", pkgName, err)
+		}
+	}
 	return newlyInstalled, nil
 }
 
@@ -2489,7 +2600,7 @@ func ensureBinaryRuntimeDependenciesInstalledWithOptions(pkgName string, cfg *Co
 		if depName == "" || sameSourcePackage(depName, pkgName) || shouldSkipMultilibMakeDep(dep, depName, cfg) {
 			continue
 		}
-		if findInstalledSatisfying(depName, dep.Op, dep.Version) != "" {
+		if findInstalledDependencySatisfying(depName, dep.Op, dep.Version) != "" {
 			continue
 		}
 		depName = wildcardMajorDependencyName(depName, dep.Op, dep.Version)
@@ -2510,7 +2621,7 @@ func ensureBinaryRuntimeDependenciesInstalledWithOptions(pkgName string, cfg *Co
 		if err := ensureBinaryRuntimeDependenciesInstalledWithOptions(depName, cfg, noRemote, seen, quiet); err != nil {
 			return err
 		}
-		if findInstalledSatisfying(depName, dep.Op, dep.Version) != "" {
+		if findInstalledDependencySatisfying(depName, dep.Op, dep.Version) != "" {
 			continue
 		}
 		if _, err := ensurePackageInstalledWithOptions(depName, cfg, noRemote, seen, quiet); err != nil {

@@ -31,7 +31,7 @@ func installedOptionalDependencyNames(dep DepSpec) []string {
 	for _, candidate := range candidates {
 		name := ""
 		if dep.Op != "" && dep.Version != "" {
-			name = findInstalledSatisfying(candidate, dep.Op, dep.Version)
+			name = findInstalledDependencySatisfying(candidate, dep.Op, dep.Version)
 		} else if checkPackageExactMatch(candidate) {
 			name = candidate
 		} else {

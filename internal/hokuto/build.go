@@ -388,7 +388,7 @@ func plannedBuildDisplayOrder(plan *BuildPlan, cfg *Config, noRemote bool) []str
 					depBuilt = true
 				}
 			}
-			if depBuilt || findInstalledSatisfying(name, dep.Op, dep.Version) != "" {
+			if depBuilt || findInstalledDependencySatisfying(name, dep.Op, dep.Version) != "" {
 				return true
 			}
 			if !inPlan[name] && dependencyBinaryAvailable(name, cfg, noRemote) {
@@ -412,6 +412,9 @@ func plannedBuildDisplayOrder(plan *BuildPlan, cfg *Config, noRemote bool) []str
 		}
 		for _, dep := range deps {
 			if !activeBuildDependency(dep, cfg, false) {
+				continue
+			}
+			if dep.MakeOpt {
 				continue
 			}
 			if !depAvailable(dep) {
@@ -531,6 +534,10 @@ func addPlanSplitDependencies(plan *BuildPlan, splitDepsBySource map[string][]st
 	}
 }
 
+func plannedPackageRequiresSourceBuild(pkgName string, plan *BuildPlan, userRequested map[string]bool, splitDepsBySource map[string][]string) bool {
+	return userRequested[pkgName] || plan.RebuildPackages[pkgName] || len(splitDepsBySource[pkgName]) > 0
+}
+
 func installBuiltSplitDependencyWithOptions(sourcePkg, splitPkg string, cfg *Config, quiet bool) error {
 	logger, fast := dependencyInstallLogger(quiet)
 	return installBuiltSplitDependencyWithLogger(sourcePkg, splitPkg, cfg, logger, fast)
@@ -605,7 +612,7 @@ func packageHasSelfBuildDependency(pkgName string, cfg *Config) bool {
 		return false
 	}
 	for _, dep := range deps {
-		if !dep.Make || !activeBuildDependency(dep, cfg, false) {
+		if !dep.Make || dep.MakeOpt || !activeBuildDependency(dep, cfg, false) {
 			continue
 		}
 		candidates, err := resolvedBuildDependencyCandidates(dep, false, cfg)
@@ -1054,7 +1061,7 @@ func buildLogDependencies(pkgDir string, cfg *Config, optionalState optionalBuil
 		for _, candidate := range candidates {
 			installedName := candidate
 			if dep.Op != "" && dep.Version != "" {
-				installedName = findInstalledSatisfying(candidate, dep.Op, dep.Version)
+				installedName = findInstalledDependencySatisfying(candidate, dep.Op, dep.Version)
 			} else if !checkPackageExactMatch(candidate) {
 				installedName = findInstalledPackageVariant(candidate)
 			}
@@ -1483,6 +1490,9 @@ func packageSplitOutputs(parentPkgName, pkgDir, splitRoot, version, revision, ta
 		if err := copyEffectivePackageMetadata(pkgDir, splitName, parentPkgName, installedDir, buildExec); err != nil {
 			return fmt.Errorf("failed to copy package metadata for split package %s: %w", outputSplitName, err)
 		}
+		if err := writePackageEquivalentMetadata(splitName, installedDir, buildExec); err != nil {
+			return fmt.Errorf("failed to write equivalence metadata for split package %s: %w", outputSplitName, err)
+		}
 		// A split-specific hook takes precedence. Recipes may explicitly opt all
 		// remaining split outputs into a shared hook with post-install.split;
 		// the parent post-install hook is deliberately not inherited implicitly.
@@ -1690,6 +1700,9 @@ func finalizeBuiltPackage(in builtPackageFinalization) error {
 	}
 	if err := copyEffectivePackageMetadata(in.pkgDir, in.sourcePkgName, in.sourcePkgName, installedDir, in.buildExec); err != nil {
 		return fmt.Errorf("failed to copy package metadata: %w", err)
+	}
+	if err := writePackageEquivalentMetadata(in.sourcePkgName, installedDir, in.buildExec); err != nil {
+		return fmt.Errorf("failed to write package equivalence metadata: %w", err)
 	}
 	if err := copyOptionalMetadataFile(filepath.Join(in.pkgDir, "post-install"), filepath.Join(installedDir, "post-install"), in.buildExec); err != nil {
 		return fmt.Errorf("failed to copy post-install file: %w", err)
@@ -4374,6 +4387,13 @@ func handleBuildCommand(args []string, cfg *Config) (err error) {
 					colSuccess.Printf("Package '%s' is already built and up to date. Skipping.\n\n", pkgName)
 					continue
 				}
+				installedMakeOpt, err := installAvailableMakeOptDependenciesForPlanWithOptions(plan, cfg, *noRemote, quietDependencyInstalls)
+				if err != nil {
+					return err
+				}
+				for _, dep := range installedMakeOpt {
+					addTemporaryBuildDep(dep)
+				}
 
 				colInfo.Printf("Build order for this group: %s\n\n", strings.Join(plannedBuildDisplayOrder(plan, cfg, *noRemote), " -> "))
 
@@ -4467,6 +4487,13 @@ func handleBuildCommand(args []string, cfg *Config) (err error) {
 				colArrow.Print("-> ")
 				colWarn.Printf("Packages scheduled for inline rebuild with optional features: %s\n", strings.Join(rebuilds, ", "))
 			}
+			installedMakeOpt, err := installAvailableMakeOptDependenciesForPlanWithOptions(initialPlan, cfg, *noRemote, quietDependencyInstalls)
+			if err != nil {
+				return err
+			}
+			for _, dep := range installedMakeOpt {
+				addTemporaryBuildDep(dep)
+			}
 
 			progressCount := 0
 
@@ -4483,7 +4510,7 @@ func handleBuildCommand(args []string, cfg *Config) (err error) {
 				smartBuildBuilder := func(pkgName string, cfg *Config, exec *Executor, opts BuildOptions) (time.Duration, error) {
 					// 1. If user specifically requested this package, we usually force build
 					// unless -a logic implies otherwise. But generally build command means build.
-					if userRequestedMap[pkgName] || initialPlan.RebuildPackages[pkgName] {
+					if plannedPackageRequiresSourceBuild(pkgName, initialPlan, userRequestedMap, splitDepsBySource) {
 						return pkgBuild(pkgName, cfg, exec, opts)
 					}
 
@@ -4546,7 +4573,7 @@ func handleBuildCommand(args []string, cfg *Config) (err error) {
 				for _, dep := range installedBinaryDeps {
 					addTemporaryBuildDep(dep)
 				}
-				installedParallelDeps, err := RunParallelBuilds(initialPlan, cfg, maxJobs, userRequestedMap, true, *autoInstall, splitDepsBySource, smartBuildBuilder)
+				installedParallelDeps, err := RunParallelBuilds(initialPlan, cfg, maxJobs, userRequestedMap, true, *autoInstall, true, splitDepsBySource, smartBuildBuilder)
 				if err != nil {
 					return err
 				}
@@ -4729,7 +4756,7 @@ func executeBuildPass(plan *BuildPlan, _ string, installAllTargets bool, cfg *Co
 						}
 
 						// 2. Check if any satisfying package is installed (including renamed ones)
-						if sat := findInstalledSatisfying(name, op, ver); sat != "" {
+						if sat := findInstalledDependencySatisfying(name, op, ver); sat != "" {
 							return true
 						}
 
@@ -4764,7 +4791,7 @@ func executeBuildPass(plan *BuildPlan, _ string, installAllTargets bool, cfg *Co
 								addToWorldMake(name)
 							}
 						}
-						return findInstalledSatisfying(name, op, ver) != ""
+						return findInstalledDependencySatisfying(name, op, ver) != ""
 					}
 
 					candidates, err := resolvedBuildDependencyCandidates(dep, false, cfg)
@@ -5146,14 +5173,14 @@ func executeBuildPass(plan *BuildPlan, _ string, installAllTargets bool, cfg *Co
 					candidates, err := resolvedBuildDependencyCandidates(dep, false, cfg)
 					if err == nil {
 						for _, cand := range candidates {
-							if builtThisPass[cand] || findInstalledSatisfying(cand, dep.Op, dep.Version) != "" {
+							if builtThisPass[cand] || findInstalledDependencySatisfying(cand, dep.Op, dep.Version) != "" {
 								isSatisfied = true
 								break
 							}
 						}
 					}
 					if len(candidates) == 0 && len(dep.Alternatives) == 0 {
-						if builtThisPass[dep.Name] || findInstalledSatisfying(dep.Name, dep.Op, dep.Version) != "" {
+						if builtThisPass[dep.Name] || findInstalledDependencySatisfying(dep.Name, dep.Op, dep.Version) != "" {
 							isSatisfied = true
 						}
 					}

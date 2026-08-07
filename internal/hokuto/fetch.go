@@ -716,6 +716,67 @@ func downloadDestMatchesSourceBasename(originalURL, finalURL, destPath string) b
 	return false
 }
 
+var sourceCachePermissionRepairMu sync.Mutex
+
+func pathWithinSourceCache(path string) bool {
+	if SourcesDir == "" {
+		return false
+	}
+	root, err := filepath.Abs(SourcesDir)
+	if err != nil {
+		return false
+	}
+	target, err := filepath.Abs(path)
+	if err != nil {
+		return false
+	}
+	rel, err := filepath.Rel(root, target)
+	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && !filepath.IsAbs(rel)
+}
+
+func mkdirCachePath(path string) error {
+	return mkdirCachePathWithRepair(path, repairSourceCacheOwnership)
+}
+
+func mkdirCachePathWithRepair(path string, repair func() error) error {
+	err := os.MkdirAll(path, 0o755)
+	if err == nil || !os.IsPermission(err) || !pathWithinSourceCache(path) {
+		return err
+	}
+
+	sourceCachePermissionRepairMu.Lock()
+	defer sourceCachePermissionRepairMu.Unlock()
+	if err = os.MkdirAll(path, 0o755); err == nil || !os.IsPermission(err) {
+		return err
+	}
+	if err := repair(); err != nil {
+		return err
+	}
+	return os.MkdirAll(path, 0o755)
+}
+
+func openSourceCacheLockFile(lockPath string) (*os.File, error) {
+	return openSourceCacheLockFileWithRepair(lockPath, repairSourceCacheOwnership)
+}
+
+func openSourceCacheLockFileWithRepair(lockPath string, repair func() error) (*os.File, error) {
+	lFile, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o644)
+	if err == nil || !os.IsPermission(err) || !pathWithinSourceCache(lockPath) {
+		return lFile, err
+	}
+
+	sourceCachePermissionRepairMu.Lock()
+	defer sourceCachePermissionRepairMu.Unlock()
+	lFile, err = os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o644)
+	if err == nil || !os.IsPermission(err) {
+		return lFile, err
+	}
+	if err := repair(); err != nil {
+		return nil, err
+	}
+	return os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o644)
+}
+
 func downloadFileWithOptions(originalURL, finalURL, destFile string, opt downloadOptions) (retErr error) {
 	// If a GNU mirror is being used for this download, print the info message exactly once.
 	if !opt.Quiet && originalURL != finalURL {
@@ -733,7 +794,7 @@ func downloadFileWithOptions(originalURL, finalURL, destFile string, opt downloa
 		absPath = destFile
 	} else {
 		// Legacy behavior for fetchSources
-		if err := os.MkdirAll(CacheStore, 0o755); err != nil {
+		if err := mkdirCachePath(CacheStore); err != nil {
 			return fmt.Errorf("failed to create cache directory %s: %w", CacheStore, err)
 		}
 		absPath = filepath.Join(CacheStore, filepath.Base(destFile))
@@ -743,7 +804,7 @@ func downloadFileWithOptions(originalURL, finalURL, destFile string, opt downloa
 	}
 
 	// Ensure parent directory exists (critical for BinDir downloads)
-	if err := os.MkdirAll(filepath.Dir(absPath), 0o755); err != nil {
+	if err := mkdirCachePath(filepath.Dir(absPath)); err != nil {
 		return fmt.Errorf("failed to create parent directory for %s: %w", absPath, err)
 	}
 	lockPath := absPath + ".lock"
@@ -752,7 +813,7 @@ func downloadFileWithOptions(originalURL, finalURL, destFile string, opt downloa
 	defer os.Remove(tmpPath)
 
 	// Create/Open a lock file to prevent race conditions between background prefetcher and main builder
-	lFile, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o644)
+	lFile, err := openSourceCacheLockFile(lockPath)
 	if err != nil {
 		return fmt.Errorf("failed to create lock file: %w", err)
 	}
@@ -1382,10 +1443,10 @@ func fetchSourcesWithOptions(pkgName, pkgDir string, processGit bool, quiet bool
 	lines := strings.Split(string(data), "\n")
 	pkgLinkDir := filepath.Join(SourcesDir, pkgName)
 
-	if err := os.MkdirAll(pkgLinkDir, 0o755); err != nil {
+	if err := mkdirCachePath(pkgLinkDir); err != nil {
 		return fmt.Errorf("failed to create pkg source dir: %v", err)
 	}
-	if err := os.MkdirAll(CacheStore, 0o755); err != nil {
+	if err := mkdirCachePath(CacheStore); err != nil {
 		return fmt.Errorf("failed to create _cache dir: %v", err)
 	}
 
@@ -1448,7 +1509,9 @@ func fetchSourcesWithOptions(pkgName, pkgDir string, processGit bool, quiet bool
 			// --- SHARED CHECKOUT (Working Tree) ---
 			// We share the checkout between packages if they use the same URL and ref.
 			checkoutsDir := filepath.Join(CacheStore, "checkouts")
-			os.MkdirAll(checkoutsDir, 0o755)
+			if err := mkdirCachePath(checkoutsDir); err != nil {
+				return fmt.Errorf("failed to create shared checkout directory: %w", err)
+			}
 
 			checkoutHashInput := gitURL
 			if ref != "" {
@@ -1466,7 +1529,7 @@ func fetchSourcesWithOptions(pkgName, pkgDir string, processGit bool, quiet bool
 				}
 				err := func() error {
 					lockPath := sharedPath + ".lock"
-					lFile, err := os.Create(lockPath)
+					lFile, err := openSourceCacheLockFile(lockPath)
 					if err != nil {
 						return fmt.Errorf("failed to create lock file for go-git checkout: %v", err)
 					}
@@ -1500,7 +1563,7 @@ func fetchSourcesWithOptions(pkgName, pkgDir string, processGit bool, quiet bool
 			if depth > 0 {
 				err := func() error {
 					lockPath := sharedPath + ".lock"
-					lFile, err := os.Create(lockPath)
+					lFile, err := openSourceCacheLockFile(lockPath)
 					if err != nil {
 						return fmt.Errorf("failed to create lock file for shallow git checkout: %v", err)
 					}
@@ -1530,7 +1593,9 @@ func fetchSourcesWithOptions(pkgName, pkgDir string, processGit bool, quiet bool
 
 			// --- 1. SHARED BARE CACHE (objects only) ---
 			gitCacheDir := filepath.Join(CacheStore, "git")
-			os.MkdirAll(gitCacheDir, 0o755)
+			if err := mkdirCachePath(gitCacheDir); err != nil {
+				return fmt.Errorf("failed to create shared git cache directory: %w", err)
+			}
 
 			urlHash := hashString(gitURL)[:12]
 			cacheRepoPath := filepath.Join(gitCacheDir, repoName+"-"+urlHash)
@@ -1539,7 +1604,7 @@ func fetchSourcesWithOptions(pkgName, pkgDir string, processGit bool, quiet bool
 			// Update/Clone bare cache
 			err = func() error {
 				lockPath := cacheRepoPath + ".lock"
-				lFile, err := os.Create(lockPath)
+				lFile, err := openSourceCacheLockFile(lockPath)
 				if err != nil {
 					return fmt.Errorf("failed to create lock file for git cache: %v", err)
 				}
@@ -1589,7 +1654,7 @@ func fetchSourcesWithOptions(pkgName, pkgDir string, processGit bool, quiet bool
 
 			err = func() error {
 				lockPath := sharedPath + ".lock"
-				lFile, err := os.Create(lockPath)
+				lFile, err := openSourceCacheLockFile(lockPath)
 				if err != nil {
 					return fmt.Errorf("failed to create lock file for shared checkout: %v", err)
 				}
@@ -1673,14 +1738,16 @@ func fetchSourcesWithOptions(pkgName, pkgDir string, processGit bool, quiet bool
 
 			// --- SHARED SVN CHECKOUT LOGIC ---
 			checkoutsDir := filepath.Join(CacheStore, "checkouts")
-			os.MkdirAll(checkoutsDir, 0o755)
+			if err := mkdirCachePath(checkoutsDir); err != nil {
+				return fmt.Errorf("failed to create shared checkout directory: %w", err)
+			}
 
 			checkoutHash := hashString(rawSourceURL)[:12]
 			sharedPath := filepath.Join(checkoutsDir, dirName+"-"+checkoutHash)
 
 			err = func() error {
 				lockPath := sharedPath + ".lock"
-				lFile, err := os.Create(lockPath)
+				lFile, err := openSourceCacheLockFile(lockPath)
 				if err != nil {
 					return fmt.Errorf("failed to create lock file for SVN: %v", err)
 				}
@@ -1774,14 +1841,16 @@ func fetchSourcesWithOptions(pkgName, pkgDir string, processGit bool, quiet bool
 
 			// --- SHARED HG CHECKOUT LOGIC ---
 			checkoutsDir := filepath.Join(CacheStore, "checkouts")
-			os.MkdirAll(checkoutsDir, 0o755)
+			if err := mkdirCachePath(checkoutsDir); err != nil {
+				return fmt.Errorf("failed to create shared checkout directory: %w", err)
+			}
 
 			checkoutHash := hashString(rawSourceURL)[:12]
 			sharedPath := filepath.Join(checkoutsDir, dirName+"-"+checkoutHash)
 
 			err = func() error {
 				lockPath := sharedPath + ".lock"
-				lFile, err := os.Create(lockPath)
+				lFile, err := openSourceCacheLockFile(lockPath)
 				if err != nil {
 					return fmt.Errorf("failed to create lock file for HG: %v", err)
 				}

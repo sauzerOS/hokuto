@@ -204,7 +204,6 @@ func installAvailableSplitUpdates(sourcePkg string, splitPkgs []string, cfg *Con
 		if err := installSplitPackageTarballWithLogger(splitPkg, paths[splitPkg], cfg, logger, fast); err != nil {
 			return true, err
 		}
-		addToWorld(splitPkg)
 	}
 	return true, nil
 }
@@ -1544,7 +1543,7 @@ func checkForUpgrades(ctx context.Context, cfg *Config, maxJobs int, yes bool) e
 			return pkgBuild(pkgName, cfg, exec, opts)
 		}
 
-		if _, err := RunParallelBuilds(updatePlan, cfg, maxJobs, userRequestedMap, yes, true, splitDepsBySource, smartBuilder); err != nil {
+		if _, err := RunParallelBuilds(updatePlan, cfg, maxJobs, userRequestedMap, yes, true, false, splitDepsBySource, smartBuilder); err != nil {
 			return err
 		}
 
@@ -1678,10 +1677,6 @@ func checkForUpgrades(ctx context.Context, cfg *Config, maxJobs int, yes bool) e
 					colNote.Printf(" %s ", outputPkgName)
 					colSuccess.Printf("installed successfully.\n")
 				}
-				// If it was a requested update, add to world
-				if userRequestedMap[pkgName] {
-					addToWorld(pkgName)
-				}
 				continue // Successfully updated from binary, move to next package
 			}
 		}
@@ -1736,9 +1731,6 @@ func checkForUpgrades(ctx context.Context, cfg *Config, maxJobs int, yes bool) e
 				splitInstallFailed = true
 				break
 			}
-			if userRequestedMap[splitPkg] {
-				addToWorld(splitPkg)
-			}
 		}
 		if splitInstallFailed {
 			continue
@@ -1759,10 +1751,6 @@ func checkForUpgrades(ctx context.Context, cfg *Config, maxJobs int, yes bool) e
 			colSuccess.Printf("installed successfully.\n")
 		}
 
-		// Add to World if it was a requested update
-		if userRequestedMap[pkgName] {
-			addToWorld(pkgName)
-		}
 	}
 
 	if len(failedPackages) > 0 {

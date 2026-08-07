@@ -678,13 +678,16 @@ func isBootstrapOnlyPackageName(name string) bool {
 }
 
 func generateDepends(pkgName, pkgDir, outputDir, rootDir string, execCtx *Executor, bootstrap bool) error {
+	if _, err := loadPackageEquivalentPairs(); err != nil {
+		return fmt.Errorf("failed to load package equivalents: %w", err)
+	}
 	installedDir := filepath.Join(outputDir, "var", "db", "hokuto", "installed", pkgName)
 	dependsFile := filepath.Join(installedDir, "depends")
 	runtimeDBRoot := filepath.Join(rootDir, "var", "db", "hokuto", "installed")
 	libDepIgnores := loadLibDepIgnores(findPackageMetadataFile(pkgDir, pkgName, "libdeps.ignore"))
 
 	// Track library dependencies (auto-detected, just package names)
-	libDepSet := make(map[string]struct{})
+	libDepSet := make(map[string]string)
 	// Track repo dependencies (from depends file, preserve full specs with version constraints)
 	repoDepLines := make(map[string]string) // package name -> full dependency line
 	suggestLines := make(map[string]string)
@@ -777,7 +780,8 @@ func generateDepends(pkgName, pkgDir, outputDir, rootDir string, execCtx *Execut
 							if libDepIgnores.ignoresPackage(otherPkg) {
 								break
 							}
-							libDepSet[otherPkg] = struct{}{}
+							names := equivalentDependencyNames(otherPkg, pkgName)
+							libDepSet[otherPkg] = strings.Join(names, " | ")
 							break // Found the owner, move to the next library
 						}
 					}
@@ -835,6 +839,16 @@ func generateDepends(pkgName, pkgDir, outputDir, rootDir string, execCtx *Execut
 						line = formatDepLine(name, op, ver)
 					}
 
+					if op == "" && ver == "" {
+						names := equivalentDependencyNames(name, pkgName)
+						if len(names) > 1 {
+							line = strings.Join(names, " | ")
+							if postInstall {
+								line += " post-install"
+							}
+						}
+					}
+
 					// Constrained dependencies may resolve to a parallel-installable
 					// ABI package (foo-1 satisfying foo<2). Store that real runtime
 					// identity so it deduplicates an auto-detected library owner and
@@ -860,18 +874,20 @@ func generateDepends(pkgName, pkgDir, outputDir, rootDir string, execCtx *Execut
 	for name, line := range repoDepLines {
 		deps = append(deps, line)
 		// Remove from libDepSet if it's also a repo dep (repo deps take precedence)
-		delete(libDepSet, name)
+		for _, equivalentName := range equivalentDependencyNames(name, pkgName) {
+			delete(libDepSet, equivalentName)
+		}
 	}
 
 	// Then, add library-only dependencies (just package names)
-	for dep := range libDepSet {
+	for dep, line := range libDepSet {
 		// Ignore aarch64- and bootstrap-only packages in auto-detected dependencies (Part 1/libdeps)
 		// unless they were explicitly listed in the repo depends file (Part 2).
 		// repoDepLines packages have already been removed from libDepSet at this point.
 		if strings.HasPrefix(dep, "aarch64-") || isBootstrapOnlyPackageName(dep) {
 			continue
 		}
-		deps = append(deps, dep)
+		deps = append(deps, line)
 	}
 
 	if len(suggestLines) > 0 {

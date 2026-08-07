@@ -265,3 +265,96 @@ func ensureHokutoOwnership(cfg *Config, createCacheDirs bool) error {
 
 	return nil
 }
+
+func invokingUserIDs() (int, int, error) {
+	if uidText, gidText := os.Getenv("SUDO_UID"), os.Getenv("SUDO_GID"); os.Geteuid() == 0 && uidText != "" && gidText != "" {
+		uid, uidErr := strconv.Atoi(uidText)
+		gid, gidErr := strconv.Atoi(gidText)
+		if uidErr == nil && gidErr == nil {
+			return uid, gid, nil
+		}
+	}
+	currentUser, err := user.Current()
+	if err != nil {
+		return 0, 0, fmt.Errorf("failed to get invoking user: %w", err)
+	}
+	uid, err := strconv.Atoi(currentUser.Uid)
+	if err != nil {
+		return 0, 0, fmt.Errorf("invalid invoking user UID %q: %w", currentUser.Uid, err)
+	}
+	gid, err := strconv.Atoi(currentUser.Gid)
+	if err != nil {
+		return 0, 0, fmt.Errorf("invalid invoking user GID %q: %w", currentUser.Gid, err)
+	}
+	return uid, gid, nil
+}
+
+// repairSourceCacheOwnership is deliberately called only after a source-cache
+// operation fails with a permission error. The normal startup ownership check
+// remains shallow so every invocation does not traverse the complete cache.
+func repairSourceCacheOwnership() error {
+	repairPath := filepath.Clean(SourcesDir)
+	if resolved, err := filepath.EvalSymlinks(repairPath); err == nil {
+		repairPath = resolved
+	}
+	for _, unsafePath := range []string{"/", "/tmp", "/var/tmp", "/home", "/usr", "/var", "/var/cache"} {
+		if repairPath == unsafePath {
+			return fmt.Errorf("refusing broad source-cache ownership repair for %s", repairPath)
+		}
+	}
+	if repairPath == "." || repairPath == "" || !filepath.IsAbs(repairPath) {
+		return fmt.Errorf("refusing invalid source-cache ownership repair path %q", repairPath)
+	}
+
+	uid, gid, err := invokingUserIDs()
+	if err != nil {
+		return err
+	}
+	if err := authenticateOnce(true); err != nil {
+		return fmt.Errorf("failed to authenticate for source-cache ownership repair: %w", err)
+	}
+
+	if hasProcessPrivileges() {
+		if err := os.MkdirAll(repairPath, 0o755); err != nil {
+			return fmt.Errorf("failed to create source cache %s: %w", repairPath, err)
+		}
+		if err := filepath.Walk(repairPath, func(path string, info os.FileInfo, walkErr error) error {
+			if walkErr != nil {
+				return walkErr
+			}
+			if err := os.Lchown(path, uid, gid); err != nil {
+				return err
+			}
+			if info.Mode()&os.ModeSymlink != 0 {
+				return nil
+			}
+			mode := info.Mode()
+			if info.IsDir() {
+				mode |= 0o700
+			} else {
+				mode |= 0o600
+				if info.Mode()&0o111 != 0 {
+					mode |= 0o100
+				}
+			}
+			return os.Chmod(path, mode)
+		}); err != nil {
+			return fmt.Errorf("failed to repair source cache %s: %w", repairPath, err)
+		}
+	} else {
+		if err := newPrivilegedCommand("mkdir", "-p", repairPath).Run(); err != nil {
+			return fmt.Errorf("failed to create source cache %s: %w", repairPath, err)
+		}
+		owner := fmt.Sprintf("%d:%d", uid, gid)
+		if err := newPrivilegedCommand("chown", "-R", owner, repairPath).Run(); err != nil {
+			return fmt.Errorf("failed to repair source cache ownership for %s: %w", repairPath, err)
+		}
+		if err := newPrivilegedCommand("chmod", "-R", "u+rwX", repairPath).Run(); err != nil {
+			return fmt.Errorf("failed to repair source cache permissions for %s: %w", repairPath, err)
+		}
+	}
+
+	colArrow.Print("-> ")
+	colSuccess.Printf("Fixed source cache permissions for %s\n", SourcesDir)
+	return nil
+}

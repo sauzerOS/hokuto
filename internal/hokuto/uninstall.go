@@ -84,13 +84,16 @@ func installedDependents(pkgName string, cfg *Config, removing map[string]bool) 
 			if dep.PostInstall {
 				continue
 			}
-			if dep.Name == pkgName {
-				dependents = append(dependents, other)
-				break
+			dependencyNames := dep.Alternatives
+			if len(dependencyNames) == 0 {
+				dependencyNames = []string{dep.Name}
+				if dep.Op == "" && dep.Version == "" {
+					dependencyNames = equivalentDependencyNames(dep.Name, other)
+				}
 			}
 			found := false
-			for _, alt := range dep.Alternatives {
-				if alt == pkgName {
+			for _, candidate := range dependencyNames {
+				if candidate == pkgName {
 					dependents = append(dependents, other)
 					found = true
 					break
@@ -526,6 +529,7 @@ func pkgUninstallWithRemovalSet(pkgName string, cfg *Config, execCtx *Executor, 
 		}
 	}
 	invalidateFileOwnershipPackage(pkgName)
+	invalidatePackageEquivalentCache()
 	if err := removeAcceptedSuggestions(pkgName); err != nil {
 		debugf("Warning: failed to remove accepted suggestions for %s: %v\n", pkgName, err)
 	}

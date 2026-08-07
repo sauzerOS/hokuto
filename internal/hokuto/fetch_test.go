@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -206,6 +207,49 @@ func TestDownloadRefusesLockDestination(t *testing.T) {
 	dest := filepath.Join(t.TempDir(), "pkg.tar.zst.lock")
 	if err := downloadFileWithOptions("http://127.0.0.1/pkg.tar.zst", "http://127.0.0.1/pkg.tar.zst", dest, downloadOptions{Quiet: true}); err == nil {
 		t.Fatal("expected lock destination to be rejected")
+	}
+}
+
+func TestSourceCacheLockPermissionErrorRepairsAndRetries(t *testing.T) {
+	if runtime.GOOS == "windows" || os.Geteuid() == 0 {
+		t.Skip("requires Unix owner permission enforcement as a non-root user")
+	}
+	oldSourcesDir := SourcesDir
+	t.Cleanup(func() { SourcesDir = oldSourcesDir })
+
+	SourcesDir = filepath.Join(t.TempDir(), "sources")
+	cacheDir := filepath.Join(SourcesDir, "_cache")
+	if err := os.MkdirAll(cacheDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(cacheDir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(cacheDir, 0o700) })
+
+	repairs := 0
+	lockPath := filepath.Join(cacheDir, "archive.tar.gz.lock")
+	lFile, err := openSourceCacheLockFileWithRepair(lockPath, func() error {
+		repairs++
+		return os.Chmod(cacheDir, 0o700)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lFile.Close()
+	if repairs != 1 {
+		t.Fatalf("expected one permission-triggered repair, got %d", repairs)
+	}
+	secondLock, err := openSourceCacheLockFileWithRepair(filepath.Join(cacheDir, "second.lock"), func() error {
+		repairs++
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondLock.Close()
+	if repairs != 1 {
+		t.Fatalf("writable cache unexpectedly triggered another repair, total repairs %d", repairs)
 	}
 }
 

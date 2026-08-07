@@ -356,6 +356,7 @@ func parseDependsData(content []byte) ([]DepSpec, error) {
 		} else {
 			// Regular dependency parsing
 			name, op, ver, optional, rebuild, makeDep, cross, crossNative, runtimeOnly, postInstall, suggest, suggestText := parseDepToken(line)
+			makeOpt := hasDependencyFlag(line, "makeopt")
 			if name != "" {
 				dependencies = append(dependencies, DepSpec{
 					Name:         name,
@@ -363,7 +364,8 @@ func parseDependsData(content []byte) ([]DepSpec, error) {
 					Version:      ver,
 					Optional:     optional,
 					Rebuild:      rebuild,
-					Make:         makeDep,
+					Make:         makeDep || makeOpt,
+					MakeOpt:      makeOpt,
 					Cross:        cross,
 					CrossNative:  crossNative,
 					RuntimeOnly:  runtimeOnly,
@@ -386,12 +388,13 @@ func parseAlternativeDeps(line string) ([]DepSpec, error) {
 	parts := strings.Split(line, "|")
 	var alternatives []string
 	var commonOp, commonVer string
-	var commonOptional, commonRebuild, commonMake, commonCross, commonCrossNative, commonRuntimeOnly, commonPostInstall, commonSuggest bool
+	var commonOptional, commonRebuild, commonMake, commonMakeOpt, commonCross, commonCrossNative, commonRuntimeOnly, commonPostInstall, commonSuggest bool
 	var commonSuggestText string
 
 	for _, part := range parts {
 		part = strings.TrimSpace(part)
 		name, op, ver, optional, rebuild, makeDep, cross, crossNative, runtimeOnly, postInstall, suggest, suggestText := parseDepToken(part)
+		makeOpt := hasDependencyFlag(part, "makeopt")
 		if name != "" {
 			alternatives = append(alternatives, name)
 			if commonOp == "" && op != "" {
@@ -400,7 +403,8 @@ func parseAlternativeDeps(line string) ([]DepSpec, error) {
 			}
 			commonOptional = commonOptional || optional
 			commonRebuild = commonRebuild || rebuild
-			commonMake = commonMake || makeDep
+			commonMake = commonMake || makeDep || makeOpt
+			commonMakeOpt = commonMakeOpt || makeOpt
 			commonCross = commonCross || cross
 			commonCrossNative = commonCrossNative || crossNative
 			commonRuntimeOnly = commonRuntimeOnly || runtimeOnly
@@ -424,6 +428,7 @@ func parseAlternativeDeps(line string) ([]DepSpec, error) {
 		Optional:     commonOptional,
 		Rebuild:      commonRebuild,
 		Make:         commonMake,
+		MakeOpt:      commonMakeOpt,
 		Cross:        commonCross,
 		CrossNative:  commonCrossNative,
 		RuntimeOnly:  commonRuntimeOnly,

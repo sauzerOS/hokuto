@@ -150,12 +150,12 @@ func suggestionSatisfied(dep DepSpec) bool {
 		}
 		return false
 	}
-	return dep.Name != "" && findInstalledSatisfying(dep.Name, dep.Op, dep.Version) != ""
+	return dep.Name != "" && findInstalledDependencySatisfying(dep.Name, dep.Op, dep.Version) != ""
 }
 
 func suggestionAlternativesInstalled(item packageSuggestion) bool {
 	if len(item.Alternates) == 1 {
-		return findInstalledSatisfying(item.Alternates[0], item.Op, item.Version) != ""
+		return findInstalledDependencySatisfying(item.Alternates[0], item.Op, item.Version) != ""
 	}
 	for _, name := range item.Alternates {
 		if name != "" && isPackageInstalled(name) {
@@ -374,7 +374,7 @@ func installMissingPackageRuntimeDependencies(pkgName string, cfg *Config, logge
 		if _, inProgress := runtimeDependencyInstallInProgress.Load(depName); inProgress {
 			continue
 		}
-		if findInstalledSatisfying(depName, dep.Op, dep.Version) != "" {
+		if findInstalledDependencySatisfying(depName, dep.Op, dep.Version) != "" {
 			continue
 		}
 		depName = wildcardMajorDependencyName(depName, dep.Op, dep.Version)
@@ -458,7 +458,7 @@ func installPostInstallDependencies(pkgName string, cfg *Config, execCtx *Execut
 		if depName == "" || depName == pkgName || shouldSkipMultilibMakeDep(dep, depName, cfg) {
 			continue
 		}
-		if findInstalledSatisfying(depName, dep.Op, dep.Version) != "" {
+		if findInstalledDependencySatisfying(depName, dep.Op, dep.Version) != "" {
 			continue
 		}
 		depName = wildcardMajorDependencyName(depName, dep.Op, dep.Version)
@@ -597,6 +597,8 @@ func stagedArchivePackageName(stagingDir, requestedName string) (string, error) 
 // local-only behavior.
 func pkgInstallWithRemotePolicy(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes, fast, managed, noRemote bool, logger io.Writer) ([]string, error) {
 	wasInstalled := isPackageInstalled(pkgName)
+	transferEquivalentWorld := false
+	transferEquivalentWorldMake := false
 	if logger == nil {
 		logger = os.Stdout
 	}
@@ -1308,6 +1310,10 @@ func pkgInstallWithRemotePolicy(tarballPath, pkgName string, cfg *Config, execCt
 	// This handles cases where files exist on disk but are not tracked by any package
 	// (e.g., user chose to "keep existing" during a previous install)
 	debugf("Checking for conflicts with existing files\n")
+	transferEquivalentWorld, transferEquivalentWorldMake, err = removeInstalledEquivalentConflicts(stagingMetadataDir, pkgName, cfg, execCtx, yes, logger)
+	if err != nil {
+		return nil, err
+	}
 	if err := checkStagingConflicts(pkgName, stagingDir, rootDir, stagingManifest, execCtx, yes, fast, filesRemovedFromStaging, nil); err != nil {
 		return nil, err
 	}
@@ -1475,7 +1481,18 @@ func pkgInstallWithRemotePolicy(tarballPath, pkgName string, cfg *Config, execCt
 	if err := rsyncStaging(stagingDir, rootDir, execCtx); err != nil {
 		return nil, fmt.Errorf("failed to sync staging to %s: %v", rootDir, err)
 	}
+	invalidatePackageEquivalentCache()
 	invalidateFileOwnershipPackage(pkgName)
+	if transferEquivalentWorld {
+		if err := addToWorld(pkgName); err != nil {
+			return nil, fmt.Errorf("failed to transfer world entry to %s: %w", pkgName, err)
+		}
+	}
+	if transferEquivalentWorldMake {
+		if err := addToWorldMake(pkgName); err != nil {
+			return nil, fmt.Errorf("failed to transfer world_make entry to %s: %w", pkgName, err)
+		}
+	}
 
 	// 6. Remove files that were scheduled for deletion
 	for _, p := range filesToDelete {
@@ -1537,6 +1554,17 @@ func pkgInstallWithRemotePolicy(tarballPath, pkgName string, cfg *Config, execCt
 			shouldRebuild := yes // Default to true if --yes flag is set
 			if !yes {
 				shouldRebuild = askForConfirmation(colWarn, "%sRebuild the packages?", colArrow.Sprint("-> "))
+			}
+			if shouldRebuild {
+				temporaryBuildDeps, err := installRebuildDependenciesWithOptions(rebuildTriggerPkgs, cfg, noRemote, fast)
+				if len(temporaryBuildDeps) > 0 {
+					defer uninstallBuildDependenciesWithOptions(temporaryBuildDeps, cfg, fast)
+				}
+				if err != nil {
+					failed = append(failed, fmt.Sprintf("failed to prepare rebuild dependencies triggered by %s: %v", pkgName, err))
+					fmt.Fprintf(logger, "%s", colWarn.Sprintf("WARNING: Failed to prepare rebuild dependencies: %v\n", err))
+					shouldRebuild = false
+				}
 			}
 
 			if shouldRebuild {
@@ -1667,6 +1695,18 @@ func pkgInstallWithRemotePolicy(tarballPath, pkgName string, cfg *Config, execCt
 				// If --yes is passed explicitly, just rebuild all affected packages
 				fmt.Fprintf(logger, "%s", colInfo.Sprint("Rebuilding all affected packages due to --yes flag.\n"))
 				packagesToRebuild = affectedList
+			}
+
+			if len(packagesToRebuild) > 0 {
+				temporaryBuildDeps, err := installRebuildDependenciesWithOptions(packagesToRebuild, cfg, noRemote, fast)
+				if len(temporaryBuildDeps) > 0 {
+					defer uninstallBuildDependenciesWithOptions(temporaryBuildDeps, cfg, fast)
+				}
+				if err != nil {
+					failed = append(failed, fmt.Sprintf("failed to prepare library rebuild dependencies: %v", err))
+					fmt.Fprintf(logger, "%s", colWarn.Sprintf("WARNING: Failed to prepare rebuild dependencies: %v\n", err))
+					packagesToRebuild = nil
+				}
 			}
 
 			// 8b. Perform rebuild
