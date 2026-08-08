@@ -1169,6 +1169,7 @@ func TestParallelCanBuildWaitsForSplitSource(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(repo, "systemd", "depends.systemd-libs"), []byte("libcap\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	writeInstalledTestPackage(t, "systemd-libs")
 
 	pm := &ParallelManager{
 		Config:            cfg,
@@ -1188,6 +1189,30 @@ func TestParallelCanBuildWaitsForSplitSource(t *testing.T) {
 	pm.Available["systemd-libs"] = true
 	if !pm.canBuild("consumer") {
 		t.Fatal("consumer should build after systemd-libs is available")
+	}
+}
+
+func TestParallelCanBuildSourceWithInstalledSplitBootstrap(t *testing.T) {
+	cfg, repo := withTempDependencyRepo(t)
+	writeTestPackage(t, repo, "gcc", "libgcc\n")
+	if err := os.WriteFile(filepath.Join(repo, "gcc", "depends.libgcc"), []byte("glibc\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	writeInstalledTestPackage(t, "libgcc")
+
+	pm := &ParallelManager{
+		Config:            cfg,
+		BuildPlan:         &BuildPlan{Order: []string{"gcc"}},
+		Pending:           []string{"gcc"},
+		Running:           make(map[string]time.Time),
+		Completed:         make(map[string]bool),
+		Available:         make(map[string]bool),
+		Failed:            make(map[string]error),
+		SplitDepsBySource: map[string][]string{"gcc": {"libgcc"}},
+	}
+
+	if !pm.canBuild("gcc") {
+		t.Fatal("gcc should use its installed libgcc split output as a bootstrap")
 	}
 }
 

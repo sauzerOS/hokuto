@@ -1109,10 +1109,15 @@ func (pm *ParallelManager) canBuild(pkgName string) bool {
 				satisfied = true
 				break
 			}
-			// 2. Check if installed in system. A make-time self dependency is a
-			// bootstrap compiler/runtime deliberately installed before rebuilding
-			// the same package, so it remains valid while that package is pending.
+			// 2. Check if installed in system. A make-time self dependency or an
+			// output produced by this same source package is a bootstrap
+			// compiler/runtime deliberately installed before rebuilding the source,
+			// so it remains valid while that source package is pending. Consumers of
+			// the split output must still wait for the new output to be published.
 			selfBootstrap := dep.Make && cand == pkgName
+			if splitSource != "" && sameSourcePackage(splitSource, pkgName) {
+				selfBootstrap = true
+			}
 			if (!isBuilding || selfBootstrap) && isPackageInstalled(cand) {
 				satisfied = true
 				break
