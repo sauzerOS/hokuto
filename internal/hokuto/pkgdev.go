@@ -1182,6 +1182,8 @@ func handleAutoBumpRepository(cfg *Config, autoBuild bool, assumeYes bool, repoU
 			pkgName = "vulkan-icd-loader"
 		case "udisks":
 			pkgName = "udisks2"
+		case "spectacle-kde":
+      		pkgName = "spectacle"
 		}
 
 		var newestVer string
