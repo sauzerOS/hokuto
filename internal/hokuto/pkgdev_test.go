@@ -111,3 +111,47 @@ func TestPrioritizeAutoBumpRepository(t *testing.T) {
 		t.Fatalf("unexpected repository order: got %v want %v", got, want)
 	}
 }
+
+func TestAutoBumpLocalVersionReportsMissingOptionalRepositoryPackage(t *testing.T) {
+	repository := t.TempDir()
+	_, isPkgSet, err := autoBumpLocalVersion("spectacle-kde", nil, repository)
+	if err == nil {
+		t.Fatal("expected missing optional-repository package to return an error")
+	}
+	if isPkgSet {
+		t.Fatal("ordinary package must not be reported as a pkgset")
+	}
+	if !strings.Contains(err.Error(), "package spectacle-kde not found in repository "+repository) {
+		t.Fatalf("unexpected missing-package error: %v", err)
+	}
+}
+
+func TestAutoBumpLocalVersionReportsMissingOptionalRepositoryPkgsetMember(t *testing.T) {
+	repository := t.TempDir()
+	sets := map[string][]string{"plasma-set": {"plasma-workspace"}}
+	_, isPkgSet, err := autoBumpLocalVersion("plasma-set", sets, repository)
+	if err == nil {
+		t.Fatal("expected missing optional-repository pkgset member to return an error")
+	}
+	if !isPkgSet {
+		t.Fatal("pkgset must be identified before checking its first member")
+	}
+	if !strings.Contains(err.Error(), "package plasma-workspace not found in repository "+repository) {
+		t.Fatalf("unexpected missing-pkgset error: %v", err)
+	}
+}
+
+func TestParseAutoBumpSelectionSkipsRepository(t *testing.T) {
+	for _, input := range []string{"s", "skip", "SKIP", " skip "} {
+		selection, err := parseAutoBumpSelection(input, 2)
+		if err != nil {
+			t.Fatalf("parseAutoBumpSelection(%q) returned an error: %v", input, err)
+		}
+		if !selection.Skip {
+			t.Fatalf("parseAutoBumpSelection(%q) did not request a repository skip", input)
+		}
+		if len(selection.Selected) != 0 || len(selection.Blacklist) != 0 {
+			t.Fatalf("repository skip must not select or blacklist packages: %+v", selection)
+		}
+	}
+}

@@ -742,6 +742,25 @@ func prioritizeAutoBumpRepository(path, currentPaths string) string {
 	return strings.Join(paths, string(os.PathListSeparator))
 }
 
+func autoBumpLocalVersion(pkgName string, sets map[string][]string, repositoryPath string) (string, bool, error) {
+	lookupName := pkgName
+	isPkgSet := false
+	if pkgs, ok := sets[pkgName]; ok && len(pkgs) > 0 {
+		lookupName = pkgs[0]
+		isPkgSet = true
+	}
+
+	if repositoryPath != "" {
+		versionPath := filepath.Join(repositoryPath, lookupName, "version")
+		if _, err := os.Stat(versionPath); err != nil {
+			return "", isPkgSet, fmt.Errorf("package %s not found in repository %s: %w", lookupName, repositoryPath, err)
+		}
+	}
+
+	version, _, err := getRepoVersion2(lookupName)
+	return version, isPkgSet, err
+}
+
 func runOptionalAutoBumpRepositories(
 	assumeYes bool,
 	available func(string) bool,
@@ -843,11 +862,17 @@ func saveBumpIgnoreList(ignores map[string]bumpIgnoreEntry) error {
 type autoBumpSelection struct {
 	Selected  []int
 	Blacklist []int
+	Skip      bool
 }
 
 func parseAutoBumpSelection(input string, count int) (autoBumpSelection, error) {
 	var result autoBumpSelection
-	if strings.TrimSpace(input) == "" {
+	trimmed := strings.TrimSpace(input)
+	if strings.EqualFold(trimmed, "s") || strings.EqualFold(trimmed, "skip") {
+		result.Skip = true
+		return result, nil
+	}
+	if trimmed == "" {
 		for i := 0; i < count; i++ {
 			result.Selected = append(result.Selected, i)
 		}
@@ -949,6 +974,9 @@ func askForAutoBumpSelection(prompt string, count int) (autoBumpSelection, bool)
 		if err != nil {
 			colError.Printf("Error: %v\n", err)
 			continue
+		}
+		if selection.Skip {
+			return selection, true
 		}
 		if len(selection.Selected) == 0 && len(selection.Blacklist) == 0 {
 			colWarn.Println("No items selected.")
@@ -1194,25 +1222,7 @@ func handleAutoBumpRepository(cfg *Config, autoBuild bool, assumeYes bool, repoU
 		}
 
 		// Double check actual local version
-		var curVer string
-		var isPkgSet bool
-		if pkgs, ok := sets[pkgName]; ok && len(pkgs) > 0 {
-			if repositoryPath != "" {
-				if _, err := os.Stat(filepath.Join(repositoryPath, pkgs[0], "version")); err != nil {
-					continue
-				}
-			}
-			isPkgSet = true
-			curVer, _, err = getRepoVersion2(pkgs[0])
-		} else {
-			if repositoryPath != "" {
-				if _, err := os.Stat(filepath.Join(repositoryPath, pkgName, "version")); err != nil {
-					continue
-				}
-			}
-			curVer, _, err = getRepoVersion2(pkgName)
-		}
-
+		curVer, isPkgSet, err := autoBumpLocalVersion(pkgName, sets, repositoryPath)
 		if err != nil {
 			colWarn.Printf("Skipping %s: could not determine local version: %v\n", pkgName, err)
 			continue
@@ -1277,7 +1287,11 @@ func handleAutoBumpRepository(cfg *Config, autoBuild bool, assumeYes bool, repoU
 		ok = true
 	} else {
 		var selection autoBumpSelection
-		selection, ok = askForAutoBumpSelection("Bump (a)ll, (q)uit, pick packages (numbers or -numbers), or blacklist versions (!numbers):", len(candidates))
+		selection, ok = askForAutoBumpSelection("Bump (a)ll, (s)kip repo, (q)uit, pick packages (numbers or -numbers), or blacklist versions (!numbers):", len(candidates))
+		if selection.Skip {
+			colNote.Println("Skipping repository.")
+			return nil
+		}
 		indices = selection.Selected
 		if ok && len(selection.Blacklist) > 0 {
 			now := time.Now()
