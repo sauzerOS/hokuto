@@ -24,8 +24,9 @@ import (
 
 func getAntigravityString() (string, error) {
 	baseURL := "https://antigravity.google"
+	downloadURL := baseURL + "/download?app=antigravity-ide"
 	client := simpleHTTPClient()
-	resp, err := client.Get(baseURL + "/download/linux")
+	resp, err := client.Get(downloadURL)
 	if err != nil {
 		return "", fmt.Errorf("failed to fetch download page: %v", err)
 	}
@@ -36,19 +37,30 @@ func getAntigravityString() (string, error) {
 		return "", fmt.Errorf("failed to read response body: %v", err)
 	}
 
-	// Find the main JS file
+	// The download page currently includes the tarball URL directly. Older
+	// versions of the site kept it in the main JavaScript bundle instead.
+	if releaseString, ok := findAntigravityString(body); ok {
+		return releaseString, nil
+	}
+
+	// Find the main JS file used by older versions of the download page.
 	// <script src="main-UR65DTH6.js" type="module"></script>
-	reScript := regexp.MustCompile(`src="(main-[a-zA-Z0-9]+\.js)"`)
+	reScript := regexp.MustCompile(`(?i)src=["']([^"']*main-[a-z0-9_-]+\.js)["']`)
 	matchesScript := reScript.FindSubmatch(body)
 	if len(matchesScript) < 2 {
-		return "", fmt.Errorf("could not find main.js script in download page")
+		return "", fmt.Errorf("could not find Antigravity download link or main.js script in download page")
 	}
-	jsFile := string(matchesScript[1])
+	jsURL, err := url.Parse(string(matchesScript[1]))
+	if err != nil {
+		return "", fmt.Errorf("invalid main.js URL in download page: %v", err)
+	}
+	base, _ := url.Parse(downloadURL)
+	jsURL = base.ResolveReference(jsURL)
 
 	// Fetch main.js
-	respJS, err := client.Get(baseURL + "/" + jsFile)
+	respJS, err := client.Get(jsURL.String())
 	if err != nil {
-		return "", fmt.Errorf("failed to fetch JS file %s: %v", jsFile, err)
+		return "", fmt.Errorf("failed to fetch JS file %s: %v", jsURL, err)
 	}
 	defer respJS.Body.Close()
 
@@ -57,15 +69,24 @@ func getAntigravityString() (string, error) {
 		return "", fmt.Errorf("failed to read JS body: %v", err)
 	}
 
-	// Look for the version string in any link
-	// href:"https://edgedl.me.gvt1.com/edgedl/release2/j0qc3/antigravity/stable/2.0.3-6242596486512640/linux-x64/Antigravity%20IDE.tar.gz"
-	re := regexp.MustCompile(`/stable/[\d\.]+-(\d+)/linux-x64/Antigravity%20IDE\.tar\.gz`)
-	matches := re.FindSubmatch(jsBody)
-	if len(matches) < 2 {
-		return "", fmt.Errorf("could not find version string in JS file")
+	if releaseString, ok := findAntigravityString(jsBody); ok {
+		return releaseString, nil
 	}
 
-	return string(matches[1]), nil
+	return "", fmt.Errorf("could not find version string in JS file")
+}
+
+func findAntigravityString(content []byte) (string, bool) {
+	// The numeric suffix after the public version is the ${string} recipe
+	// substitution. Require the IDE filename because the page also contains a
+	// different Linux archive for the Antigravity 2.0 product.
+	re := regexp.MustCompile(`/stable/[0-9.]+-([0-9]+)/linux-x64/Antigravity(?:%20|\s)IDE\.tar\.gz`)
+	matches := re.FindSubmatch(content)
+	if len(matches) < 2 {
+		return "", false
+	}
+
+	return string(matches[1]), true
 }
 
 func getVSCodeString() (string, error) {
@@ -1184,6 +1205,8 @@ func handleAutoBumpRepository(cfg *Config, autoBuild bool, assumeYes bool, repoU
 			pkgName = "udisks2"
 		case "spectacle-kde":
       		pkgName = "spectacle"
+		case "procps":
+			pkgName = "procps-ng"
 		}
 
 		var newestVer string

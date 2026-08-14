@@ -23,6 +23,42 @@ func TestApplySubstitutionsCUnitVersion(t *testing.T) {
 	}
 }
 
+func TestFindAntigravityString(t *testing.T) {
+	tests := []struct {
+		name    string
+		content string
+		want    string
+		wantOK  bool
+	}{
+		{
+			name: "current direct download",
+			content: `<a href="https://edgedl.me.gvt1.com/edgedl/release2/j0qc3/antigravity/stable/2.8.1-1111111111111111/linux-x64/Antigravity.tar.gz">Antigravity 2.0</a>
+<a href="https://edgedl.me.gvt1.com/edgedl/release2/j0qc3/antigravity/stable/2.5.5-4923483625488384/linux-x64/Antigravity%20IDE.tar.gz">Antigravity IDE</a>`,
+			want:   "4923483625488384",
+			wantOK: true,
+		},
+		{
+			name:    "legacy IDE filename",
+			content: `href:"https://edgedl.me.gvt1.com/edgedl/release2/j0qc3/antigravity/stable/2.0.3-6242596486512640/linux-x64/Antigravity%20IDE.tar.gz"`,
+			want:    "6242596486512640",
+			wantOK:  true,
+		},
+		{
+			name:    "unrelated content",
+			content: `<script src="main-UR65DTH6.js"></script>`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := findAntigravityString([]byte(tt.content))
+			if got != tt.want || ok != tt.wantOK {
+				t.Fatalf("findAntigravityString() = %q, %v; want %q, %v", got, ok, tt.want, tt.wantOK)
+			}
+		})
+	}
+}
+
 func TestRepologyURLForRepositoryReplacesInRepo(t *testing.T) {
 	got, err := repologyURLForRepository(
 		"https://repology.example/api/v1/projects/?inrepo=sauzeros&outdated=1",
