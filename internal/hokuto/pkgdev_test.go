@@ -148,6 +148,64 @@ func TestPrioritizeAutoBumpRepository(t *testing.T) {
 	}
 }
 
+func TestResolveBumpSourcePackageMapsSplitOutputToRecipe(t *testing.T) {
+	repository := t.TempDir()
+	installed := t.TempDir()
+	oldRepoPaths := repoPaths
+	oldInstalled := Installed
+	repoPaths = repository
+	Installed = installed
+	t.Cleanup(func() {
+		repoPaths = oldRepoPaths
+		Installed = oldInstalled
+	})
+
+	elfutilsDir := filepath.Join(repository, "elfutils")
+	if err := os.MkdirAll(elfutilsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(elfutilsDir, ".sources"), []byte("source"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(elfutilsDir, "depends.libelf"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(installed, "libelf"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := resolveBumpSourcePackage("libelf"); got != "elfutils" {
+		t.Fatalf("split bump target resolved to %q, want %q", got, "elfutils")
+	}
+}
+
+func TestResolveBumpSourcePackagePrefersDirectRecipe(t *testing.T) {
+	repository := t.TempDir()
+	oldRepoPaths := repoPaths
+	repoPaths = repository
+	t.Cleanup(func() { repoPaths = oldRepoPaths })
+
+	directDir := filepath.Join(repository, "libelf")
+	if err := os.MkdirAll(directDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(directDir, ".sources"), []byte("source"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	otherDir := filepath.Join(repository, "elfutils")
+	if err := os.MkdirAll(otherDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(otherDir, "depends.libelf"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := resolveBumpSourcePackage("libelf"); got != "libelf" {
+		t.Fatalf("direct bump target resolved to %q, want %q", got, "libelf")
+	}
+}
+
 func TestAutoBumpLocalVersionReportsMissingOptionalRepositoryPackage(t *testing.T) {
 	repository := t.TempDir()
 	_, isPkgSet, err := autoBumpLocalVersion("spectacle-kde", nil, repository)

@@ -545,11 +545,32 @@ func buildBumpedPackage(pkgName string, cfg *Config) error {
 	return handleBuildCommand([]string{"-i", "--no-install", "--index", pkgName}, cfg)
 }
 
+// resolveBumpSourcePackage maps a split output back to the recipe that owns it.
+// Prefer a directly bumpable recipe so a source package and a split package with
+// the same name in another repository do not get conflated.
+func resolveBumpSourcePackage(pkgName string) string {
+	if pkgDir, err := findPackageDir(pkgName); err == nil {
+		if info, statErr := os.Stat(filepath.Join(pkgDir, ".sources")); statErr == nil && !info.IsDir() {
+			return pkgName
+		}
+	}
+
+	if sourcePkg, sourceDir, ok := findSplitPackageSource(pkgName); ok {
+		if info, err := os.Stat(filepath.Join(sourceDir, ".sources")); err == nil && !info.IsDir() {
+			return sourcePkg
+		}
+	}
+
+	return pkgName
+}
+
 func handleSingleBumpCommand(pkgName, newVersion string, build bool, cfg *Config) error {
+	bumpPkgName := resolveBumpSourcePackage(pkgName)
+
 	// If newVersion is empty, we infer it means "keep version, bump revision"
 	// So we need to look up the current version first.
 	if newVersion == "" {
-		pkgDir, err := findPackageDir(pkgName)
+		pkgDir, err := findPackageDir(bumpPkgName)
 		if err != nil {
 			return fmt.Errorf("%s: package not found", pkgName)
 		}
@@ -566,7 +587,7 @@ func handleSingleBumpCommand(pkgName, newVersion string, build bool, cfg *Config
 		newVersion = fields[0]
 	}
 
-	pkgDir, err := bumpPackage(pkgName, "", newVersion)
+	pkgDir, err := bumpPackage(bumpPkgName, "", newVersion)
 	if err != nil {
 		return err
 	}
@@ -1204,7 +1225,7 @@ func handleAutoBumpRepository(cfg *Config, autoBuild bool, assumeYes bool, repoU
 		case "udisks":
 			pkgName = "udisks2"
 		case "spectacle-kde":
-      		pkgName = "spectacle"
+			pkgName = "spectacle"
 		case "procps":
 			pkgName = "procps-ng"
 		}
