@@ -1228,6 +1228,8 @@ func handleAutoBumpRepository(cfg *Config, autoBuild bool, assumeYes bool, repoU
 			pkgName = "spectacle"
 		case "procps":
 			pkgName = "procps-ng"
+		case "solid-hardware-abstraction":
+			pkgName = "solid"
 		}
 
 		var newestVer string
