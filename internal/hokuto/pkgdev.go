@@ -1195,7 +1195,9 @@ func handleAutoBumpRepository(cfg *Config, autoBuild bool, assumeYes bool, repoU
 		case "elfutils":
 			pkgName = "libelf"
 		case "webkitgtk":
-			pkgName = "webkit2gtk-4.1"
+			// Repology's project covers the webkit2gtk source recipe. The
+			// "-4.1" name is an API/output identity, not the recipe directory.
+			pkgName = "webkit2gtk"
 		case "tiff":
 			pkgName = "libtiff"
 		case "catch":

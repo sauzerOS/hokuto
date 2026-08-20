@@ -235,6 +235,32 @@ func TestAutoBumpLocalVersionReportsMissingOptionalRepositoryPkgsetMember(t *tes
 	}
 }
 
+func TestAutoBumpLocalVersionReadsWebKitSourceRecipe(t *testing.T) {
+	repository := t.TempDir()
+	oldRepoPaths := repoPaths
+	repoPaths = repository
+	t.Cleanup(func() { repoPaths = oldRepoPaths })
+
+	pkgDir := filepath.Join(repository, "webkit2gtk")
+	if err := os.MkdirAll(pkgDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(pkgDir, "version"), []byte("2.52.5 1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	version, isPkgSet, err := autoBumpLocalVersion("webkit2gtk", nil, repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if isPkgSet {
+		t.Fatal("ordinary package must not be reported as a pkgset")
+	}
+	if version != "2.52.5" {
+		t.Fatalf("unexpected local version: %q", version)
+	}
+}
+
 func TestParseAutoBumpSelectionSkipsRepository(t *testing.T) {
 	for _, input := range []string{"s", "skip", "SKIP", " skip "} {
 		selection, err := parseAutoBumpSelection(input, 2)
