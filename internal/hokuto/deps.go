@@ -562,6 +562,63 @@ func splitPackageNamesFromDir(pkgDir string) []string {
 	return names
 }
 
+type splitSourceEntry struct {
+	sourcePkg string
+	sourceDir string
+}
+
+var (
+	splitPackageCacheMu  sync.RWMutex
+	splitPackageCacheKey string
+	splitPackageCacheMap map[string]splitSourceEntry
+)
+
+func getSplitPackageCache(repoPathsKey string) map[string]splitSourceEntry {
+	splitPackageCacheMu.RLock()
+	if splitPackageCacheKey == repoPathsKey && splitPackageCacheMap != nil {
+		m := splitPackageCacheMap
+		splitPackageCacheMu.RUnlock()
+		return m
+	}
+	splitPackageCacheMu.RUnlock()
+
+	splitPackageCacheMu.Lock()
+	defer splitPackageCacheMu.Unlock()
+	if splitPackageCacheKey == repoPathsKey && splitPackageCacheMap != nil {
+		return splitPackageCacheMap
+	}
+
+	newMap := make(map[string]splitSourceEntry)
+	paths := filepath.SplitList(repoPathsKey)
+	for _, repoPath := range paths {
+		repoPath = strings.TrimSpace(repoPath)
+		if repoPath == "" {
+			continue
+		}
+		entries, err := os.ReadDir(repoPath)
+		if err != nil {
+			continue
+		}
+		for _, entry := range entries {
+			if !entry.IsDir() {
+				continue
+			}
+			pkgDir := filepath.Join(repoPath, entry.Name())
+			for _, splitName := range splitPackageNamesFromDir(pkgDir) {
+				if _, exists := newMap[splitName]; !exists {
+					newMap[splitName] = splitSourceEntry{
+						sourcePkg: entry.Name(),
+						sourceDir: pkgDir,
+					}
+				}
+			}
+		}
+	}
+	splitPackageCacheKey = repoPathsKey
+	splitPackageCacheMap = newMap
+	return newMap
+}
+
 func findSplitPackageSource(pkgName string) (sourcePkg string, sourceDir string, ok bool) {
 	lookupNames := []string{pkgName}
 	if canonicalName := canonicalParallelPackageName(pkgName); canonicalName != pkgName {
@@ -583,28 +640,10 @@ func findSplitPackageSource(pkgName string) (sourcePkg string, sourceDir string,
 		}
 	}
 
-	paths := filepath.SplitList(repoPaths)
-	for _, repoPath := range paths {
-		repoPath = strings.TrimSpace(repoPath)
-		if repoPath == "" {
-			continue
-		}
-		entries, err := os.ReadDir(repoPath)
-		if err != nil {
-			continue
-		}
-		for _, entry := range entries {
-			if !entry.IsDir() {
-				continue
-			}
-			pkgDir := filepath.Join(repoPath, entry.Name())
-			for _, splitName := range splitPackageNamesFromDir(pkgDir) {
-				for _, lookupName := range lookupNames {
-					if splitName == lookupName {
-						return entry.Name(), pkgDir, true
-					}
-				}
-			}
+	cache := getSplitPackageCache(repoPaths)
+	for _, lookupName := range lookupNames {
+		if entry, found := cache[lookupName]; found {
+			return entry.sourcePkg, entry.sourceDir, true
 		}
 	}
 	return "", "", false

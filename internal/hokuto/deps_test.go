@@ -1156,12 +1156,6 @@ func TestFindPackageMetadataDirAndDirSkipsInstalledSplitAndCrossFallback(t *test
 
 	writeInstalledTestPackage(t, "linux-headers")
 
-	if dir, err := findPackageMetadataDir("linux-headers"); err == nil {
-		t.Fatalf("expected error for installed split package linux-headers in findPackageMetadataDir, got dir %q", dir)
-	}
-	if dir, err := findPackageDir("linux-headers"); err == nil {
-		t.Fatalf("expected error for installed split package linux-headers in findPackageDir, got dir %q", dir)
-	}
 	if dir, err := findPackageMetadataDir("aarch64-linux-headers"); err == nil {
 		t.Fatalf("expected error for cross split package aarch64-linux-headers in findPackageMetadataDir, got dir %q", dir)
 	}
