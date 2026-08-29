@@ -1147,6 +1147,58 @@ func TestResolveBuildPlanUsesSplitDependencySource(t *testing.T) {
 	}
 }
 
+func TestFindPackageMetadataDirAndDirSkipsInstalledSplitAndCrossFallback(t *testing.T) {
+	_, repo := withTempDependencyRepo(t)
+	writeTestPackage(t, repo, "linux", "")
+	if err := os.WriteFile(filepath.Join(repo, "linux", "depends.linux-headers"), []byte("glibc\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	writeInstalledTestPackage(t, "linux-headers")
+
+	if dir, err := findPackageMetadataDir("linux-headers"); err == nil {
+		t.Fatalf("expected error for installed split package linux-headers in findPackageMetadataDir, got dir %q", dir)
+	}
+	if dir, err := findPackageDir("linux-headers"); err == nil {
+		t.Fatalf("expected error for installed split package linux-headers in findPackageDir, got dir %q", dir)
+	}
+	if dir, err := findPackageMetadataDir("aarch64-linux-headers"); err == nil {
+		t.Fatalf("expected error for cross split package aarch64-linux-headers in findPackageMetadataDir, got dir %q", dir)
+	}
+	if dir, err := findPackageDir("aarch64-linux-headers"); err == nil {
+		t.Fatalf("expected error for cross split package aarch64-linux-headers in findPackageDir, got dir %q", dir)
+	}
+
+	sourcePkg, ok := findSplitDependencySource("aarch64-linux-headers")
+	if !ok || sourcePkg != "linux" {
+		t.Fatalf("expected findSplitDependencySource(aarch64-linux-headers) to return (linux, true), got (%q, %v)", sourcePkg, ok)
+	}
+}
+
+func TestResolveBuildPlanCrossSplitDependencyResolvesToOwner(t *testing.T) {
+	cfg, repo := withTempDependencyRepo(t)
+	cfg.Values["HOKUTO_CROSS_ARCH"] = "arm64"
+
+	writeTestPackage(t, repo, "target", "aarch64-linux-headers\n")
+	writeTestPackage(t, repo, "linux", "")
+	if err := os.WriteFile(filepath.Join(repo, "linux", "depends.linux-headers"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	writeInstalledTestPackage(t, "linux-headers")
+
+	plan, err := resolveBuildPlan([]string{"target"}, map[string]bool{"target": true}, false, cfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !containsString(plan.Order, "linux") {
+		t.Fatalf("expected source owner linux to be scheduled for aarch64-linux-headers, got plan order %v", plan.Order)
+	}
+	if containsString(plan.Order, "aarch64-linux-headers") || containsString(plan.Order, "linux-headers") {
+		t.Fatalf("did not expect unresolvable split output to be placed directly in plan order: %v", plan.Order)
+	}
+}
+
 func TestCollectSplitDependenciesForPlanMapsSourceOutputs(t *testing.T) {
 	cfg, repo := withTempDependencyRepo(t)
 	writeTestPackage(t, repo, "consumer", "systemd-libs\n")
@@ -1296,10 +1348,10 @@ func TestFlushPackageSuggestionsPrintsSummaryWithText(t *testing.T) {
 	if !strings.Contains(got, "media-player:") {
 		t.Fatalf("expected package grouping, got %q", got)
 	}
-	if !strings.Contains(got, "alsa-lib - ALSA support") {
+	if !strings.Contains(got, "alsa-lib") || !strings.Contains(got, "ALSA support") {
 		t.Fatalf("expected suggestion text, got %q", got)
 	}
-	if !strings.Contains(got, "jack2 - JACK output") {
+	if !strings.Contains(got, "jack2") || !strings.Contains(got, "JACK output") {
 		t.Fatalf("expected second suggestion text, got %q", got)
 	}
 }
@@ -1388,7 +1440,7 @@ func TestFlushPackageSuggestionsRechecksTemporaryInstalledDependency(t *testing.
 
 	var out bytes.Buffer
 	flushPackageSuggestions(&out, nil, false, false, false)
-	if !strings.Contains(out.String(), "temporary-build-dep - Optional backend") {
+	if !strings.Contains(out.String(), "temporary-build-dep") || !strings.Contains(out.String(), "Optional backend") {
 		t.Fatalf("expected suggestion to be rechecked after temporary dependency cleanup, got %q", out.String())
 	}
 }

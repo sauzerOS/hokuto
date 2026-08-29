@@ -1232,6 +1232,12 @@ func handleAutoBumpRepository(cfg *Config, autoBuild bool, assumeYes bool, repoU
 			pkgName = "procps-ng"
 		case "solid-hardware-abstraction":
 			pkgName = "solid"
+        case "dolphin-fm":
+            pkgName = "dolphin"
+		case "fd-find":
+			pkgName = "fd"
+		case "gstreamer-orc":
+			pkgName = "orc"
 		}
 
 		var newestVer string

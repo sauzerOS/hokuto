@@ -285,9 +285,21 @@ func findPackageMetadataDir(pkgName string) (string, error) {
 	}
 
 	// 3. Installed Check (Directly read from DB)
-	for _, name := range searchNames {
-		if checkPackageExactMatch(name) {
-			return filepath.Join(Installed, name), nil
+	// Never fallback to host packages for cross targets (aarch64-* / x86_64-*),
+	// and never treat installed split packages as standalone source/metadata directories.
+	if _, _, isSplit := findSplitPackageSource(pkgName); !isSplit {
+		installedSearch := []string{pkgName}
+		if !strings.HasPrefix(pkgName, "aarch64-") && !strings.HasPrefix(pkgName, "x86_64-") {
+			for _, name := range searchNames[1:] {
+				if _, _, split := findSplitPackageSource(name); !split {
+					installedSearch = append(installedSearch, name)
+				}
+			}
+		}
+		for _, name := range installedSearch {
+			if checkPackageExactMatch(name) {
+				return filepath.Join(Installed, name), nil
+			}
 		}
 	}
 
@@ -351,9 +363,21 @@ func findPackageDir(pkgName string) (string, error) {
 	// FALLBACK: Check if it's already installed.
 	// This is crucial for resolving dependencies of renamed packages (pkg-MAJOR)
 	// which only exist in the installed database and have no source in repositories.
-	for _, name := range searchNames {
-		if checkPackageExactMatch(name) {
-			return filepath.Join(Installed, name), nil
+	// Never match host installed packages for cross targets (aarch64-* / x86_64-*),
+	// and never treat installed split packages as source directories.
+	if _, _, isSplit := findSplitPackageSource(pkgName); !isSplit {
+		installedSearch := []string{pkgName}
+		if !strings.HasPrefix(pkgName, "aarch64-") && !strings.HasPrefix(pkgName, "x86_64-") {
+			for _, name := range searchNames[1:] {
+				if _, _, split := findSplitPackageSource(name); !split {
+					installedSearch = append(installedSearch, name)
+				}
+			}
+		}
+		for _, name := range installedSearch {
+			if checkPackageExactMatch(name) {
+				return filepath.Join(Installed, name), nil
+			}
 		}
 	}
 
