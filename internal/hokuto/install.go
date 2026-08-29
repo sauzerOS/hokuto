@@ -1578,23 +1578,27 @@ func pkgInstallWithRemotePolicy(tarballPath, pkgName string, cfg *Config, execCt
 						continue
 					}
 
-					rebuildOutputDir := filepath.Join(tmpDir, rebuildPkg, "output")
-
-					if err := rsyncStaging(rebuildOutputDir, rootDir, execCtx); err != nil {
-						failed = append(failed, fmt.Sprintf("failed to sync rebuilt package %s to root: %v", rebuildPkg, err))
-						fmt.Fprintf(logger, "%s", colWarn.Sprintf("WARNING: Failed to sync rebuilt package %s to root: %v\n", rebuildPkg, err))
+					version, revision, err := getRepoVersion2(rebuildPkg)
+					if err != nil {
+						failed = append(failed, fmt.Sprintf("failed to get repo version for rebuilt package %s: %v", rebuildPkg, err))
+						fmt.Fprintf(logger, "%s", colWarn.Sprintf("WARNING: Failed to get version for rebuilt package %s: %v\n", rebuildPkg, err))
 						continue
 					}
-					invalidateFileOwnershipPackage(rebuildPkg)
+					outputRebuildPkg := getOutputPackageName(rebuildPkg, cfg)
+					archiveRebuildPkg := getArchivePackageName(rebuildPkg, cfg)
+					arch := GetSystemArchForPackage(cfg, rebuildPkg)
+					variant := GetSystemVariantForPackage(cfg, rebuildPkg)
+					tarballPath := filepath.Join(BinDir, StandardizeRemoteName(archiveRebuildPkg, version, revision, arch, variant))
 
-					rmCmd := exec.Command("rm", "-rf", filepath.Join(tmpDir, rebuildPkg))
-					if err := execCtx.Run(rmCmd); err != nil {
-						fmt.Fprintf(os.Stderr, "failed to cleanup rebuild tmpdirs for %s: %v\n", rebuildPkg, err)
+					isCriticalAtomic.Store(1)
+					handlePreInstallUninstall(outputRebuildPkg, cfg, RootExec, true, logger)
+					if _, installErr := pkgInstallWithRemotePolicy(tarballPath, outputRebuildPkg, cfg, RootExec, true, fast, false, noRemote, logger); installErr != nil {
+						isCriticalAtomic.Store(0)
+						failed = append(failed, fmt.Sprintf("failed to install rebuilt package %s: %v", outputRebuildPkg, installErr))
+						fmt.Fprintf(logger, "%s", colWarn.Sprintf("WARNING: Failed to install rebuilt package %s: %v\n", outputRebuildPkg, installErr))
+						continue
 					}
-					colArrow.Print("-> ")
-					fmt.Fprintf(logger, "%s", colSuccess.Sprint("Rebuild of "))
-					colNote.Printf("%s ", rebuildPkg)
-					colSuccess.Printf("finished and installed.\n")
+					isCriticalAtomic.Store(0)
 				}
 			} else {
 				colArrow.Print("-> ")
@@ -1739,23 +1743,27 @@ func pkgInstallWithRemotePolicy(tarballPath, pkgName string, cfg *Config, execCt
 						continue // Skip to next package on failure, same as hokuto update
 					}
 
-					rebuildOutputDir := filepath.Join(tmpDir, pkg, "output")
-
-					if err := rsyncStaging(rebuildOutputDir, rootDir, execCtx); err != nil {
-						failed = append(failed, fmt.Sprintf("failed to sync rebuilt package %s to root: %v", pkg, err))
-						fmt.Fprintf(logger, "%s", colWarn.Sprintf("WARNING: Failed to sync rebuilt package %s to root: %v\n", pkg, err))
-						continue // Skip cleanup on sync failure
+					version, revision, err := getRepoVersion2(pkg)
+					if err != nil {
+						failed = append(failed, fmt.Sprintf("failed to get repo version for rebuilt package %s: %v", pkg, err))
+						fmt.Fprintf(logger, "%s", colWarn.Sprintf("WARNING: Failed to get version for rebuilt package %s: %v\n", pkg, err))
+						continue
 					}
-					invalidateFileOwnershipPackage(pkg)
+					outputRebuildPkg := getOutputPackageName(pkg, cfg)
+					archiveRebuildPkg := getArchivePackageName(pkg, cfg)
+					arch := GetSystemArchForPackage(cfg, pkg)
+					variant := GetSystemVariantForPackage(cfg, pkg)
+					tarballPath := filepath.Join(BinDir, StandardizeRemoteName(archiveRebuildPkg, version, revision, arch, variant))
 
-					rmCmd := exec.Command("rm", "-rf", filepath.Join(tmpDir, pkg))
-					if err := execCtx.Run(rmCmd); err != nil {
-						fmt.Fprintf(os.Stderr, "failed to cleanup rebuild tmpdirs for %s: %v\n", pkg, err)
+					isCriticalAtomic.Store(1)
+					handlePreInstallUninstall(outputRebuildPkg, cfg, RootExec, true, rebuildLogger)
+					if _, installErr := pkgInstallWithRemotePolicy(tarballPath, outputRebuildPkg, cfg, RootExec, true, fast, false, noRemote, rebuildLogger); installErr != nil {
+						isCriticalAtomic.Store(0)
+						failed = append(failed, fmt.Sprintf("failed to install rebuilt package %s: %v", outputRebuildPkg, installErr))
+						fmt.Fprintf(logger, "%s", colWarn.Sprintf("WARNING: Failed to install rebuilt package %s: %v\n", outputRebuildPkg, installErr))
+						continue
 					}
-					colArrow.Print("-> ")
-					colSuccess.Printf("Rebuild of ")
-					colNote.Printf("%s ", pkg)
-					colSuccess.Printf("finished and installed.\n")
+					isCriticalAtomic.Store(0)
 				}
 			}
 		}
