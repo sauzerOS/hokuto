@@ -6,6 +6,7 @@ package hokuto
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -18,6 +19,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/gookit/color"
 )
@@ -437,10 +439,159 @@ func pushGitRepo(repoPath string) error {
 	return nil
 }
 
+// isLikelyVersion determines if an argument looks like a target package version
+// rather than a commit message.
+func isLikelyVersion(s string) bool {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return false
+	}
+	// Commit messages often have spaces, tabs, or newlines; package versions never do.
+	if strings.ContainsAny(s, " \t\n\r") {
+		return false
+	}
+	// Versions typically start with a digit (e.g., "1.2.3", "2024.1") or 'v'/'V' followed by a digit (e.g., "v1.0").
+	if unicode.IsDigit(rune(s[0])) {
+		return true
+	}
+	if (strings.HasPrefix(s, "v") || strings.HasPrefix(s, "V")) && len(s) > 1 && unicode.IsDigit(rune(s[1])) {
+		return true
+	}
+	return false
+}
+
+// parseSingleBumpArgs parses positional and flag arguments for a single package bump.
+// Supported patterns:
+//   - hokuto bump <pkg>
+//   - hokuto bump <pkg> <message> (e.g. hokuto bump rust "rebuild for llvm 22.1.8")
+//   - hokuto bump <pkg> <newversion> (e.g. hokuto bump rust 1.85.0)
+//   - hokuto bump <pkg> <newversion> <message>
+//   - hokuto bump [-m <message>] <pkg> [<newversion>]
+func parseSingleBumpArgs(args []string, flagMsg string) (pkgName, newVersion, commitMsg string, err error) {
+	if len(args) == 0 {
+		return "", "", "", errors.New("missing package name")
+	}
+
+	pkgName = args[0]
+	commitMsg = strings.TrimSpace(flagMsg)
+	rest := args[1:]
+
+	var filteredRest []string
+	for i := 0; i < len(rest); i++ {
+		arg := rest[i]
+		if (arg == "-m" || arg == "--message" || arg == "-message") && i+1 < len(rest) {
+			if commitMsg == "" {
+				commitMsg = rest[i+1]
+			}
+			i++
+			continue
+		}
+		if strings.HasPrefix(arg, "-m=") {
+			if commitMsg == "" {
+				commitMsg = strings.TrimPrefix(arg, "-m=")
+			}
+			continue
+		}
+		if strings.HasPrefix(arg, "--message=") {
+			if commitMsg == "" {
+				commitMsg = strings.TrimPrefix(arg, "--message=")
+			}
+			continue
+		}
+		if strings.HasPrefix(arg, "-message=") {
+			if commitMsg == "" {
+				commitMsg = strings.TrimPrefix(arg, "-message=")
+			}
+			continue
+		}
+		filteredRest = append(filteredRest, arg)
+	}
+
+	if len(filteredRest) == 0 {
+		return pkgName, "", commitMsg, nil
+	}
+
+	if len(filteredRest) == 1 {
+		arg := filteredRest[0]
+		if commitMsg != "" {
+			newVersion = arg
+		} else if isLikelyVersion(arg) {
+			newVersion = arg
+		} else {
+			commitMsg = arg
+		}
+		return pkgName, newVersion, commitMsg, nil
+	}
+
+	if commitMsg != "" {
+		newVersion = filteredRest[0]
+		return pkgName, newVersion, commitMsg, nil
+	}
+
+	if isLikelyVersion(filteredRest[0]) {
+		newVersion = filteredRest[0]
+		commitMsg = strings.Join(filteredRest[1:], " ")
+	} else {
+		commitMsg = strings.Join(filteredRest, " ")
+	}
+	return pkgName, newVersion, commitMsg, nil
+}
+
+// parseSetBumpArgs parses positional and flag arguments for a package set bump.
+// Supported patterns:
+//   - hokuto bump -set <pkgset> <oldversion> <newversion> [<message>]
+//   - hokuto bump -set [-m <message>] <pkgset> <oldversion> <newversion>
+func parseSetBumpArgs(args []string, flagMsg string) (pkgsetName, oldVersion, newVersion, commitMsg string, err error) {
+	commitMsg = strings.TrimSpace(flagMsg)
+	var filtered []string
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if (arg == "-m" || arg == "--message" || arg == "-message") && i+1 < len(args) {
+			if commitMsg == "" {
+				commitMsg = args[i+1]
+			}
+			i++
+			continue
+		}
+		if strings.HasPrefix(arg, "-m=") {
+			if commitMsg == "" {
+				commitMsg = strings.TrimPrefix(arg, "-m=")
+			}
+			continue
+		}
+		if strings.HasPrefix(arg, "--message=") {
+			if commitMsg == "" {
+				commitMsg = strings.TrimPrefix(arg, "--message=")
+			}
+			continue
+		}
+		if strings.HasPrefix(arg, "-message=") {
+			if commitMsg == "" {
+				commitMsg = strings.TrimPrefix(arg, "-message=")
+			}
+			continue
+		}
+		filtered = append(filtered, arg)
+	}
+
+	if len(filtered) < 3 {
+		return "", "", "", "", errors.New("usage: hokuto bump -set <pkgset> <oldversion> <newversion> [message]")
+	}
+
+	pkgsetName = filtered[0]
+	oldVersion = filtered[1]
+	newVersion = filtered[2]
+	if commitMsg == "" && len(filtered) > 3 {
+		commitMsg = strings.Join(filtered[3:], " ")
+	}
+	return pkgsetName, oldVersion, newVersion, commitMsg, nil
+}
+
 // bumpPackage performs the bump operation on a single package.
 // If expectedOldVersion is empty, the version check is skipped.
+// If commitMsg is non-empty, it is passed to git commit.
 // Returns the package directory on success.
-func bumpPackage(pkgName, expectedOldVersion, newVersion string) (string, error) {
+func bumpPackage(pkgName, expectedOldVersion, newVersion, commitMsg string) (string, error) {
 	colArrow.Print("-> ")
 	if expectedOldVersion != "" {
 		colSuccess.Printf("Bumping %s: %s -> %s\n", pkgName, expectedOldVersion, newVersion)
@@ -522,16 +673,19 @@ func bumpPackage(pkgName, expectedOldVersion, newVersion string) (string, error)
 
 	// 6) git add . (within pkgDir)
 	gitAdd := exec.Command("git", "-C", pkgDir, "add", ".")
-	if err := gitAdd.Run(); err != nil {
-		return "", fmt.Errorf("%s: git add failed: %v", pkgName, err)
+	if out, err := gitAdd.CombinedOutput(); err != nil {
+		return "", fmt.Errorf("%s: git add failed: %v: %s", pkgName, err, strings.TrimSpace(string(out)))
 	}
 
-	// 7) git commit (use hook for message)
-	gitCommit := exec.Command("git", "-C", pkgDir, "commit", "--no-edit", ".")
-	// Depending on git config, --no-edit might fail if no message logic is hooked?
-	// The original code used this, so preserving it.
-	if err := gitCommit.Run(); err != nil {
-		return "", fmt.Errorf("%s: git commit failed: %v", pkgName, err)
+	// 7) git commit (use hook or custom commit message)
+	var gitCommit *exec.Cmd
+	if commitMsg != "" {
+		gitCommit = exec.Command("git", "-C", pkgDir, "commit", "-m", commitMsg, ".")
+	} else {
+		gitCommit = exec.Command("git", "-C", pkgDir, "commit", "--no-edit", ".")
+	}
+	if out, err := gitCommit.CombinedOutput(); err != nil {
+		return "", fmt.Errorf("%s: git commit failed: %v: %s", pkgName, err, strings.TrimSpace(string(out)))
 	}
 
 	return pkgDir, nil
@@ -564,7 +718,7 @@ func resolveBumpSourcePackage(pkgName string) string {
 	return pkgName
 }
 
-func handleSingleBumpCommand(pkgName, newVersion string, build bool, cfg *Config) error {
+func handleSingleBumpCommand(pkgName, newVersion, commitMsg string, build bool, cfg *Config) error {
 	bumpPkgName := resolveBumpSourcePackage(pkgName)
 
 	// If newVersion is empty, we infer it means "keep version, bump revision"
@@ -587,7 +741,7 @@ func handleSingleBumpCommand(pkgName, newVersion string, build bool, cfg *Config
 		newVersion = fields[0]
 	}
 
-	pkgDir, err := bumpPackage(bumpPkgName, "", newVersion)
+	pkgDir, err := bumpPackage(bumpPkgName, "", newVersion, commitMsg)
 	if err != nil {
 		return err
 	}
@@ -614,7 +768,7 @@ func handleSingleBumpCommand(pkgName, newVersion string, build bool, cfg *Config
 	return nil
 }
 
-func handleSetBumpCommand(pkgsetName, oldVersion, newVersion string, build bool, cfg *Config) error {
+func handleSetBumpCommand(pkgsetName, oldVersion, newVersion, commitMsg string, build bool, cfg *Config) error {
 	sets, err := loadPkgsets()
 	if err != nil {
 		return fmt.Errorf("failed to load pkgsets: %v", err)
@@ -629,7 +783,7 @@ func handleSetBumpCommand(pkgsetName, oldVersion, newVersion string, build bool,
 	repoRoots := make(map[string]bool)
 
 	for _, pkgName := range pkgs {
-		pkgDir, err := bumpPackage(pkgName, oldVersion, newVersion)
+		pkgDir, err := bumpPackage(pkgName, oldVersion, newVersion, commitMsg)
 		if err != nil {
 			failed = append(failed, err.Error())
 			continue
@@ -1232,12 +1386,14 @@ func handleAutoBumpRepository(cfg *Config, autoBuild bool, assumeYes bool, repoU
 			pkgName = "procps-ng"
 		case "solid-hardware-abstraction":
 			pkgName = "solid"
-        case "dolphin-fm":
-            pkgName = "dolphin"
+		case "dolphin-fm":
+			pkgName = "dolphin"
 		case "fd-find":
 			pkgName = "fd"
 		case "gstreamer-orc":
 			pkgName = "orc"
+		case "fonttools":
+			pkgName = "python-fonttools"
 		}
 
 		var newestVer string
@@ -1396,9 +1552,9 @@ func handleAutoBumpRepository(cfg *Config, autoBuild bool, assumeYes bool, repoU
 		colNote.Printf(">> [BUMPING] %s to %s\n", pkgName, newVer)
 		var bumpErr error
 		if isPkgSet {
-			bumpErr = handleSetBumpCommand(pkgName, curVer, newVer, false, cfg)
+			bumpErr = handleSetBumpCommand(pkgName, curVer, newVer, "", false, cfg)
 		} else {
-			bumpErr = handleSingleBumpCommand(pkgName, newVer, false, cfg)
+			bumpErr = handleSingleBumpCommand(pkgName, newVer, "", false, cfg)
 		}
 
 		if bumpErr != nil {

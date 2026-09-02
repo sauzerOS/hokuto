@@ -3,6 +3,7 @@ package hokuto
 import (
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -273,5 +274,284 @@ func TestParseAutoBumpSelectionSkipsRepository(t *testing.T) {
 		if len(selection.Selected) != 0 || len(selection.Blacklist) != 0 {
 			t.Fatalf("repository skip must not select or blacklist packages: %+v", selection)
 		}
+	}
+}
+
+func TestIsLikelyVersion(t *testing.T) {
+	tests := []struct {
+		input string
+		want  bool
+	}{
+		{"1.85.0", true},
+		{"2.0-rc1", true},
+		{"0.1.0_beta", true},
+		{"v1.2.3", true},
+		{"V2.0", true},
+		{"2024.01.01", true},
+		{"rebuild for llvm 22.1.8", false},
+		{"rebuild", false},
+		{"fix build issue", false},
+		{"soname bump", false},
+		{"", false},
+		{"   ", false},
+	}
+
+	for _, tt := range tests {
+		got := isLikelyVersion(tt.input)
+		if got != tt.want {
+			t.Errorf("isLikelyVersion(%q) = %v; want %v", tt.input, got, tt.want)
+		}
+	}
+}
+
+func TestParseSingleBumpArgs(t *testing.T) {
+	tests := []struct {
+		name        string
+		args        []string
+		flagMsg     string
+		wantPkg     string
+		wantVer     string
+		wantMsg     string
+		expectError bool
+	}{
+		{
+			name:    "pkg only",
+			args:    []string{"rust"},
+			wantPkg: "rust",
+		},
+		{
+			name:    "pkg and commit message without new version",
+			args:    []string{"rust", "rebuild for llvm 22.1.8"},
+			wantPkg: "rust",
+			wantVer: "",
+			wantMsg: "rebuild for llvm 22.1.8",
+		},
+		{
+			name:    "pkg and new version",
+			args:    []string{"rust", "1.85.0"},
+			wantPkg: "rust",
+			wantVer: "1.85.0",
+		},
+		{
+			name:    "pkg, new version, and commit message",
+			args:    []string{"rust", "1.85.0", "upgrade to 1.85.0"},
+			wantPkg: "rust",
+			wantVer: "1.85.0",
+			wantMsg: "upgrade to 1.85.0",
+		},
+		{
+			name:    "pkg with flag commit message",
+			args:    []string{"rust"},
+			flagMsg: "rebuild for llvm 22.1.8",
+			wantPkg: "rust",
+			wantVer: "",
+			wantMsg: "rebuild for llvm 22.1.8",
+		},
+		{
+			name:    "pkg and new version with flag commit message",
+			args:    []string{"rust", "1.85.0"},
+			flagMsg: "upgrade to 1.85.0",
+			wantPkg: "rust",
+			wantVer: "1.85.0",
+			wantMsg: "upgrade to 1.85.0",
+		},
+		{
+			name:    "pkg with inline -m flag",
+			args:    []string{"rust", "-m", "rebuild for llvm 22.1.8"},
+			wantPkg: "rust",
+			wantVer: "",
+			wantMsg: "rebuild for llvm 22.1.8",
+		},
+		{
+			name:    "pkg, version with inline --message flag",
+			args:    []string{"rust", "1.85.0", "--message=upgrade"},
+			wantPkg: "rust",
+			wantVer: "1.85.0",
+			wantMsg: "upgrade",
+		},
+		{
+			name:    "unquoted multi-word commit message",
+			args:    []string{"rust", "rebuild", "for", "llvm", "22.1.8"},
+			wantPkg: "rust",
+			wantVer: "",
+			wantMsg: "rebuild for llvm 22.1.8",
+		},
+		{
+			name:        "empty args",
+			args:        []string{},
+			expectError: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pkg, ver, msg, err := parseSingleBumpArgs(tt.args, tt.flagMsg)
+			if tt.expectError {
+				if err == nil {
+					t.Fatalf("expected error, got nil")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if pkg != tt.wantPkg || ver != tt.wantVer || msg != tt.wantMsg {
+				t.Errorf("parseSingleBumpArgs(%v, %q) = (%q, %q, %q); want (%q, %q, %q)",
+					tt.args, tt.flagMsg, pkg, ver, msg, tt.wantPkg, tt.wantVer, tt.wantMsg)
+			}
+		})
+	}
+}
+
+func TestParseSetBumpArgs(t *testing.T) {
+	tests := []struct {
+		name        string
+		args        []string
+		flagMsg     string
+		wantSet     string
+		wantOld     string
+		wantNew     string
+		wantMsg     string
+		expectError bool
+	}{
+		{
+			name:    "basic set bump",
+			args:    []string{"kde-set", "6.2.0", "6.3.0"},
+			wantSet: "kde-set",
+			wantOld: "6.2.0",
+			wantNew: "6.3.0",
+			wantMsg: "",
+		},
+		{
+			name:    "set bump with positional message",
+			args:    []string{"kde-set", "6.2.0", "6.3.0", "upgrade kde"},
+			wantSet: "kde-set",
+			wantOld: "6.2.0",
+			wantNew: "6.3.0",
+			wantMsg: "upgrade kde",
+		},
+		{
+			name:    "set bump with flag message",
+			args:    []string{"kde-set", "6.2.0", "6.3.0"},
+			flagMsg: "upgrade kde",
+			wantSet: "kde-set",
+			wantOld: "6.2.0",
+			wantNew: "6.3.0",
+			wantMsg: "upgrade kde",
+		},
+		{
+			name:    "set bump with inline -m flag",
+			args:    []string{"-m", "upgrade kde", "kde-set", "6.2.0", "6.3.0"},
+			wantSet: "kde-set",
+			wantOld: "6.2.0",
+			wantNew: "6.3.0",
+			wantMsg: "upgrade kde",
+		},
+		{
+			name:        "too few args",
+			args:        []string{"kde-set", "6.2.0"},
+			expectError: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			set, old, newVer, msg, err := parseSetBumpArgs(tt.args, tt.flagMsg)
+			if tt.expectError {
+				if err == nil {
+					t.Fatalf("expected error, got nil")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if set != tt.wantSet || old != tt.wantOld || newVer != tt.wantNew || msg != tt.wantMsg {
+				t.Errorf("parseSetBumpArgs(%v, %q) = (%q, %q, %q, %q); want (%q, %q, %q, %q)",
+					tt.args, tt.flagMsg, set, old, newVer, msg, tt.wantSet, tt.wantOld, tt.wantNew, tt.wantMsg)
+			}
+		})
+	}
+}
+
+func TestBumpPackageCustomCommitMessage(t *testing.T) {
+	repoDir := t.TempDir()
+	oldRepoPaths := repoPaths
+	oldSourcesDir := SourcesDir
+	oldCacheStore := CacheStore
+	repoPaths = repoDir
+	SourcesDir = filepath.Join(t.TempDir(), "sources")
+	CacheStore = filepath.Join(SourcesDir, "_cache")
+	t.Cleanup(func() {
+		repoPaths = oldRepoPaths
+		SourcesDir = oldSourcesDir
+		CacheStore = oldCacheStore
+	})
+
+	// Initialize git repo in repoDir
+	runGit := func(args ...string) {
+		cmd := exec.Command("git", append([]string{"-C", repoDir}, args...)...)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v failed: %v: %s", args, err, string(out))
+		}
+	}
+	runGit("init")
+	runGit("config", "user.name", "Hokuto Test")
+	runGit("config", "user.email", "test@sauzeros.invalid")
+
+	pkgDir := filepath.Join(repoDir, "testpkg")
+	if err := os.MkdirAll(pkgDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	filesDir := filepath.Join(pkgDir, "files")
+	if err := os.MkdirAll(filesDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	srcFile := filepath.Join(filesDir, "dummy.txt")
+	if err := os.WriteFile(srcFile, []byte("hello"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(filepath.Join(pkgDir, "version"), []byte("1.0.0 1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(pkgDir, ".sources"), []byte("files/dummy.txt\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(pkgDir, "sources"), []byte("files/dummy.txt\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	runGit("add", ".")
+	runGit("commit", "-m", "initial commit")
+
+	// Test revision bump with custom message
+	customMsg := "rebuild for llvm 22.1.8"
+	returnedPkgDir, err := bumpPackage("testpkg", "", "1.0.0", customMsg)
+	if err != nil {
+		t.Fatalf("bumpPackage failed: %v", err)
+	}
+	if returnedPkgDir != pkgDir {
+		t.Fatalf("expected %q, got %q", pkgDir, returnedPkgDir)
+	}
+
+	// Verify git commit message in git log
+	cmd := exec.Command("git", "-C", pkgDir, "log", "-1", "--pretty=%B")
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("git log failed: %v", err)
+	}
+	if !strings.Contains(string(out), customMsg) {
+		t.Fatalf("git log %q does not contain expected commit message %q", string(out), customMsg)
+	}
+
+	// Verify revision bumped to 2
+	verData, err := os.ReadFile(filepath.Join(pkgDir, "version"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(verData), "1.0.0 2") {
+		t.Fatalf("expected version file to contain '1.0.0 2', got %q", string(verData))
 	}
 }

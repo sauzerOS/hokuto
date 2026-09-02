@@ -1695,6 +1695,8 @@ func Main() {
 		var build = bumpCmd.Bool("build", false, "Automatically build bumped packages in --idle mode")
 		var yes = bumpCmd.Bool("y", false, "Assume 'yes' to all prompts")
 		var yesLong = bumpCmd.Bool("yes", false, "Assume 'yes' to all prompts")
+		var msg = bumpCmd.String("m", "", "Commit message")
+		var msgLong = bumpCmd.String("message", "", "Commit message")
 		if err := bumpCmd.Parse(os.Args[2:]); err != nil {
 			fmt.Fprintf(os.Stderr, "Error parsing bump flags: %v\n", err)
 			os.Exit(1)
@@ -1711,32 +1713,33 @@ func Main() {
 		}
 
 		args := bumpCmd.Args()
+		flagMsg := *msg
+		if flagMsg == "" {
+			flagMsg = *msgLong
+		}
 
 		if *isSet {
-			// Mode: Set Bump (hokuto bump -set <pkgset> <old> <new>)
-			if len(args) < 3 {
-				fmt.Println("Usage: hokuto bump -set <pkgset> <oldversion> <newversion>")
+			// Mode: Set Bump (hokuto bump -set <pkgset> <old> <new> [message])
+			pkgsetName, oldVersion, newVersion, commitMsg, err := parseSetBumpArgs(args, flagMsg)
+			if err != nil {
+				fmt.Println("Usage: hokuto bump -set <pkgset> <oldversion> <newversion> [message]")
 				os.Exit(1)
 			}
-			if err := handleSetBumpCommand(args[0], args[1], args[2], *build, cfg); err != nil {
+			if err := handleSetBumpCommand(pkgsetName, oldVersion, newVersion, commitMsg, *build, cfg); err != nil {
 				fmt.Fprintf(os.Stderr, "Bump failed: %v\n", err)
 				os.Exit(1)
 			}
 		} else {
-			// Mode: Single Bump (hokuto bump <pkg> [newversion])
-			if len(args) < 1 {
-				fmt.Println("Usage: hokuto bump <pkgname> [newversion]")
+			// Mode: Single Bump (hokuto bump <pkg> [newversion] [message] or hokuto bump <pkg> [message])
+			pkgName, newVersion, commitMsg, err := parseSingleBumpArgs(args, flagMsg)
+			if err != nil {
+				fmt.Println("Usage: hokuto bump <pkgname> [newversion] [message]")
+				fmt.Println("       hokuto bump <pkgname> [message]")
 				fmt.Println("       hokuto bump --auto")
 				os.Exit(1)
 			}
 
-			pkgName := args[0]
-			newVersion := ""
-			if len(args) >= 2 {
-				newVersion = args[1]
-			}
-
-			if err := handleSingleBumpCommand(pkgName, newVersion, *build, cfg); err != nil {
+			if err := handleSingleBumpCommand(pkgName, newVersion, commitMsg, *build, cfg); err != nil {
 				fmt.Fprintf(os.Stderr, "Bump failed: %v\n", err)
 				os.Exit(1)
 			}
