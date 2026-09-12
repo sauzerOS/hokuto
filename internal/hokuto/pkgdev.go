@@ -1396,6 +1396,8 @@ func handleAutoBumpRepository(cfg *Config, autoBuild bool, assumeYes bool, repoU
 			pkgName = "python-fonttools"
 		case "libfuse":
 			pkgName = "fuse3"
+		case "userspace-rcu":
+			pkgName = "liburcu"
 		}
 
 		var newestVer string
