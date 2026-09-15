@@ -17,6 +17,15 @@ type Config struct {
 	Values       map[string]string
 	DefaultStrip bool
 	DefaultLTO   bool
+
+	// CrossOutputPackages holds the bare (non arch-prefixed) recipe names that
+	// were explicitly requested for a -cross=<arch>[,system] build (populated
+	// once in resolveBuildPlan from userRequestedPackages). It lets code that
+	// only has a plain package name -- like "test" pulled in alongside a
+	// plain, non-cross "bash-completion make" dependency -- tell the actual
+	// cross target apart from an ordinary build-time tool that happens to be
+	// needed too, even though both are bare names with no arch prefix.
+	CrossOutputPackages map[string]bool
 }
 
 // Load /etc/hokuto/hokuto.conf and apply defaults

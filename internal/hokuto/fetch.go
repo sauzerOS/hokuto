@@ -1019,25 +1019,8 @@ func downloadFileWithOptions(originalURL, finalURL, destFile string, opt downloa
 	if opt.NativeOnly {
 		return nativeErr
 	}
-
-	// --- Fallback: Browser Download (chromedp) ---
-	debugf("Falling back to browser download (chromedp)\n")
-	browserErr := downloadViaBrowser(finalURL, tmpPath, opt.Quiet)
-	if browserErr == nil {
-		if err := os.Rename(tmpPath, absPath); err != nil {
-			return fmt.Errorf("failed to publish browser-downloaded file %s: %w", absPath, err)
-		}
-		if !opt.Quiet {
-			colArrow.Print("-> ")
-			displayFilename := filepath.Base(finalURL)
-			colSuccess.Printf("Download successful: %s\n", displayFilename)
-		}
-		debugf("Download successful with browser (chromedp).")
-		return nil
-	}
-
 	// --- Fallback: Wget ---
-	debugf("Browser download failed: %v. Falling back to wget...\n", browserErr)
+	debugf("Native download failed: %v. Falling back to wget...\n", nativeErr)
 	if err := downloadViaWget(finalURL, tmpPath, opt.Quiet, opt.WgetNoCheckCertificate); err == nil {
 		if err := os.Rename(tmpPath, absPath); err != nil {
 			return fmt.Errorf("failed to publish wget-downloaded file %s: %w", absPath, err)
@@ -1049,9 +1032,26 @@ func downloadFileWithOptions(originalURL, finalURL, destFile string, opt downloa
 		}
 		debugf("Download successful with wget.\n")
 		return nil
-	} else {
-		return fmt.Errorf("all download methods failed. Native error: %v; Browser error: %v; Wget error: %v", nativeErr, browserErr, err)
 	}
+
+	// --- Fallback: Browser Download (chromedp) ---
+    debugf("Falling back to browser download (chromedp)\n")
+    browserErr := downloadViaBrowser(finalURL, tmpPath, opt.Quiet)
+    if browserErr == nil {
+        if err := os.Rename(tmpPath, absPath); err != nil {
+            return fmt.Errorf("failed to publish browser-downloaded file %s: %w", absPath, err)
+        }
+        if !opt.Quiet {
+            colArrow.Print("-> ")
+            displayFilename := filepath.Base(finalURL)
+            colSuccess.Printf("Download successful: %s\n", displayFilename)
+        }
+        debugf("Download successful with browser (chromedp).")
+        return nil
+    }
+
+    // All fallbacks exhausted
+    return fmt.Errorf("all download methods failed. Native error: %v; Browser error: %v; Wget error: %v", nativeErr, browserErr, err)
 }
 
 func downloadViaWget(url, destPath string, quiet bool, noCheckCertificate bool) error {

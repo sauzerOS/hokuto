@@ -114,7 +114,16 @@ func isMultilibPackageDepName(name string) bool {
 }
 
 func shouldSkipMultilibMakeDep(dep DepSpec, name string, cfg *Config) bool {
-	return dep.Make && !multilibEnabled(cfg) && isMultilibPackageDepName(name)
+	if !dep.Make || !isMultilibPackageDepName(name) {
+		return false
+	}
+	// lib32-* make deps only exist to build the 32-bit x86 split package.
+	// They're irrelevant to a cross-arch sysroot build regardless of whether
+	// multilib is enabled for the host.
+	if cfg != nil && cfg.Values["HOKUTO_CROSS_ARCH"] != "" {
+		return true
+	}
+	return !multilibEnabled(cfg)
 }
 
 func dependencyVariantCandidates(pkgName string, cfg *Config) []string {
@@ -896,6 +905,16 @@ func resolveMissingDeps(pkgName string, processed map[string]bool, missing *[]st
 		}
 		if !found {
 			if sourcePkg, ok := findSplitDependencySource(pkgName); ok {
+				// pkgName (e.g. "aarch64-libelf") already carries the target
+				// arch prefix, so its source recipe ("elfutils") is a genuine
+				// cross target too -- not the redundant native duplicate a
+				// plain, unprefixed split dependency would resolve to.
+				if dependencyNameHasCrossPrefix(pkgName, cfg) {
+					if cfg.CrossOutputPackages == nil {
+						cfg.CrossOutputPackages = make(map[string]bool)
+					}
+					cfg.CrossOutputPackages[sourcePkg] = true
+				}
 				if err := resolveMissingDeps(sourcePkg, processed, missing, forceBuild, cfg, noRemote); err != nil {
 					return err
 				}
@@ -946,16 +965,18 @@ func resolveMissingDeps(pkgName string, processed map[string]bool, missing *[]st
 			}
 		}
 
-		// FILTER: When in cross-mode, ignore dependencies that don't match the target architecture
-		if cfg.Values["HOKUTO_CROSS_ARCH"] != "" {
-			normalizedArch := cfg.Values["HOKUTO_CROSS_ARCH"]
-			if normalizedArch == "arm64" {
-				normalizedArch = "aarch64"
-			}
-			prefix := normalizedArch + "-"
-			if !strings.HasPrefix(dep.Name, prefix) {
-				continue
-			}
+		// FILTER: ignore a cross-tagged dependency that names a *different*
+		// architecture (e.g. "x86_64-gcc cross make" while targeting arm64).
+		// A bare cross-tagged name is kept: it's a host tool the cross build
+		// needs. See crossDependencyTargetsOtherArch.
+		if dep.Cross && crossDependencyTargetsOtherArch(dep.Name, cfg) {
+			continue
+		}
+
+		// FILTER: a cross build only honors dependencies that say they're for
+		// the cross target. See crossBuildIgnoresDependency.
+		if crossBuildIgnoresDependency(dep, cfg) {
+			continue
 		}
 
 		// Make dependencies are only needed when the parent package will be
@@ -1400,10 +1421,10 @@ func parseDepToken(token string) (name string, op string, ver string, optional b
 		if idx := strings.Index(pkgSpec, op); idx != -1 {
 			name := pkgSpec[:idx]
 			ver := pkgSpec[idx+len(op):]
-			return strings.TrimSpace(name), op, strings.TrimSpace(ver), optional, rebuild, makeDep || cross, cross, crossNative, runtimeOnly, postInstall, suggest, suggestText
+			return strings.TrimSpace(name), op, strings.TrimSpace(ver), optional, rebuild, makeDep, cross, crossNative, runtimeOnly, postInstall, suggest, suggestText
 		}
 	}
-	return pkgSpec, "", "", optional, rebuild, makeDep || cross, cross, crossNative, runtimeOnly, postInstall, suggest, suggestText
+	return pkgSpec, "", "", optional, rebuild, makeDep, cross, crossNative, runtimeOnly, postInstall, suggest, suggestText
 }
 
 func hasDependencyFlag(token, flag string) bool {
@@ -1454,6 +1475,29 @@ func resolveBuildPlan(targetPackages []string, userRequestedPackages map[string]
 		sourceBuildPackages[pkgName] = true
 	}
 
+	// Record which bare (non arch-prefixed) package names are the actual
+	// -cross=<arch> targets the user asked for, so a plain build-time
+	// dependency pulled in alongside them (e.g. "bash-completion make", which
+	// is just as bare) isn't mistaken for one. See Config.CrossOutputPackages.
+	if cfg.Values["HOKUTO_CROSS_ARCH"] != "" {
+		if cfg.CrossOutputPackages == nil {
+			cfg.CrossOutputPackages = make(map[string]bool)
+		}
+		for pkgName, requested := range userRequestedPackages {
+			if !requested {
+				continue
+			}
+			cfg.CrossOutputPackages[pkgName] = true
+			// A requested target may actually be a split sub-package (e.g.
+			// "libelf" split from "elfutils"): what actually gets built and
+			// passed to pkgBuild is the *source* package name, so that needs
+			// to be recognized as a cross target too.
+			if sourcePkg, _, ok := findSplitPackageSource(pkgName); ok {
+				cfg.CrossOutputPackages[sourcePkg] = true
+			}
+		}
+	}
+
 	var processPkg func(pkgName string) error
 	processPkg = func(pkgName string) error {
 		// --- SMART CYCLE DETECTION ---
@@ -1499,6 +1543,16 @@ func resolveBuildPlan(targetPackages []string, userRequestedPackages map[string]
 		pkgDir, err := findPackageMetadataDir(pkgName)
 		if err != nil {
 			if sourcePkg, ok := findSplitDependencySource(pkgName); ok {
+				// pkgName (e.g. "aarch64-libelf") already carries the target
+				// arch prefix, so its source recipe ("elfutils") is a genuine
+				// cross target too -- not the redundant native duplicate a
+				// plain, unprefixed split dependency would resolve to.
+				if dependencyNameHasCrossPrefix(pkgName, cfg) {
+					if cfg.CrossOutputPackages == nil {
+						cfg.CrossOutputPackages = make(map[string]bool)
+					}
+					cfg.CrossOutputPackages[sourcePkg] = true
+				}
 				sourceBuildPackages[sourcePkg] = true
 				if processed[sourcePkg] && !alreadyInOrder[sourcePkg] {
 					delete(processed, sourcePkg)
@@ -1541,16 +1595,18 @@ func resolveBuildPlan(targetPackages []string, userRequestedPackages map[string]
 				}
 			}
 
-			// FILTER: When in cross-mode, ignore dependencies that don't match the target architecture
-			if cfg.Values["HOKUTO_CROSS_ARCH"] != "" {
-				normalizedArch := cfg.Values["HOKUTO_CROSS_ARCH"]
-				if normalizedArch == "arm64" {
-					normalizedArch = "aarch64"
-				}
-				prefix := normalizedArch + "-"
-				if !strings.HasPrefix(dep.Name, prefix) {
-					continue
-				}
+			// FILTER: ignore a cross-tagged dependency that names a *different*
+			// architecture (e.g. "x86_64-gcc cross make" while targeting
+			// arm64). A bare cross-tagged name is kept: it's a host tool the
+			// cross build needs. See crossDependencyTargetsOtherArch.
+			if dep.Cross && crossDependencyTargetsOtherArch(dep.Name, cfg) {
+				continue
+			}
+
+			// FILTER: a cross build only honors dependencies that say they're
+			// for the cross target. See crossBuildIgnoresDependency.
+			if crossBuildIgnoresDependency(dep, cfg) {
+				continue
 			}
 
 			// Resolve make-only dependencies only when this package is actually
@@ -1947,6 +2003,12 @@ func getPackageDependenciesForward(pkgName string, cfg *Config) ([]string, error
 				if cfg.Values["HOKUTO_CROSS_ARCH"] == "" || cfg.Values["HOKUTO_CROSS_SYSTEM"] == "1" {
 					continue
 				}
+			}
+
+			// FILTER: a cross build only honors dependencies that say they're
+			// for the cross target. See crossBuildIgnoresDependency.
+			if crossBuildIgnoresDependency(dep, cfg) {
+				continue
 			}
 
 			depName := dep.Name
@@ -2466,8 +2528,11 @@ func ensureSplitPackageInstalled(sourcePkg, splitPkg string, cfg *Config, noRemo
 		return false, err
 	}
 	options := loadBuildOptions(sourceDir)
-	isGeneric := cfg.Values["HOKUTO_GENERIC"] == "1" || options["generic"]
-	arch := GetSystemArchForPackage(cfg, sourcePkg)
+	arch := GetSystemArchForPackage(cfg, splitPkg)
+	// Must match how the split was actually finalized, or the expected
+	// tarball name won't exist and the owner gets needlessly rebuilt from
+	// source (arm64/cross builds finalize as "generic").
+	isGeneric := isGenericBuildVariant(arch, cfg, options)
 	variant := IdentifyVariant(splitPkg, isGeneric, isMultilibPackage(splitPkg))
 	archiveSplitName := canonicalParallelPackageName(splitPkg)
 	tarballName := StandardizeRemoteName(archiveSplitName, version, revision, arch, variant)
@@ -2535,8 +2600,11 @@ func installAvailableSplitDependencyBinary(sourcePkg, splitPkg string, cfg *Conf
 		return false, err
 	}
 	options := loadBuildOptions(sourceDir)
-	isGeneric := cfg.Values["HOKUTO_GENERIC"] == "1" || options["generic"]
-	arch := GetSystemArchForPackage(cfg, sourcePkg)
+	arch := GetSystemArchForPackage(cfg, splitPkg)
+	// Must match how the split was actually finalized, or the expected
+	// tarball name won't exist and the owner gets needlessly rebuilt from
+	// source (arm64/cross builds finalize as "generic").
+	isGeneric := isGenericBuildVariant(arch, cfg, options)
 	variant := IdentifyVariant(splitPkg, isGeneric, isMultilibPackage(splitPkg))
 	archiveSplitName := canonicalParallelPackageName(splitPkg)
 	tarballPath := filepath.Join(BinDir, StandardizeRemoteName(archiveSplitName, version, revision, arch, variant))
@@ -2917,11 +2985,11 @@ func availableBinaryPackageTarball(pkgName string, cfg *Config, noRemote bool) (
 			}
 
 			options := loadBuildOptions(sourceDir)
-			isGeneric := options["generic"]
-			if cfg != nil && cfg.Values["HOKUTO_GENERIC"] == "1" {
-				isGeneric = true
-			}
 			arch := GetSystemArchForPackage(cfg, lookupName)
+			isGeneric := options["generic"]
+			if cfg != nil {
+				isGeneric = isGenericBuildVariant(arch, cfg, options)
+			}
 			variant := IdentifyVariant(lookupName, isGeneric, isMultilibPackage(lookupName))
 			tarballName := StandardizeRemoteName(lookupName, version, revision, arch, variant)
 			tarballPath := filepath.Join(BinDir, tarballName)

@@ -69,9 +69,18 @@ type parallelInstallResult struct {
 }
 
 func (pm *ParallelManager) recordRequestedWorldPackage(pkgName string) {
-	if pm.AddRequestedToWorld && pm.UserRequested[pkgName] {
-		_ = addToWorld(pkgName)
+	if !pm.AddRequestedToWorld || !pm.UserRequested[pkgName] {
+		return
 	}
+	// pkgName is the bare name the user actually typed (matching how
+	// UserRequested is keyed), but what's actually installed -- and what
+	// belongs in the world file -- may be its cross-renamed output (e.g.
+	// "libelf" requested, "aarch64-libelf" installed).
+	worldName := pkgName
+	if pm.Config != nil {
+		worldName = getOutputPackageName(pkgName, pm.Config)
+	}
+	_ = addToWorld(worldName)
 }
 
 func snapshotInstalledPackageNames() map[string]bool {
@@ -873,10 +882,15 @@ func (pm *ParallelManager) installPackage(pkgName string, userRequestedMap map[s
 		return result, err
 	}
 
-	outputPkgName := getOutputPackageName(pkgName, pm.Config)
-	archivePkgName := getArchivePackageName(pkgName, pm.Config)
-	arch := GetSystemArchForPackage(pm.Config, pkgName)
-	variant := GetSystemVariantForPackage(pm.Config, pkgName)
+	// Use the per-package cross config: pkgName may have been built
+	// completely natively (a plain "make" dependency pulled in during a
+	// cross session), in which case its real output is the plain name, not
+	// the cross-renamed one the session-wide config would otherwise compute.
+	installCfg := packageBuildConfig(pkgName, pm.Config)
+	outputPkgName := getOutputPackageName(pkgName, installCfg)
+	archivePkgName := getArchivePackageName(pkgName, installCfg)
+	arch := GetSystemArchForPackage(installCfg, pkgName)
+	variant := GetSystemVariantForPackage(installCfg, pkgName)
 	tarballPath := filepath.Join(BinDir, StandardizeRemoteName(archivePkgName, version, revision, arch, variant))
 
 	// We use RootExec for installation as it requires privileges
@@ -928,8 +942,8 @@ func (pm *ParallelManager) installPackage(pkgName string, userRequestedMap map[s
 	installMainOutput := userRequestedMap[pkgName] || !hasRequestedSplit
 	var rebuilds []string
 	if installMainOutput {
-		handlePreInstallUninstall(outputPkgName, pm.Config, installExec, pm.AutoYes, logger)
-		rebuilds, err = pkgInstall(tarballPath, outputPkgName, pm.Config, installExec, pm.AutoYes, true, true, logger)
+		handlePreInstallUninstall(outputPkgName, installCfg, installExec, pm.AutoYes, logger)
+		rebuilds, err = pkgInstall(tarballPath, outputPkgName, installCfg, installExec, pm.AutoYes, true, true, logger)
 		if err == nil {
 			result.Available = append(result.Available, pkgName)
 		}

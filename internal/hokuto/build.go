@@ -321,6 +321,12 @@ func activeBuildDependency(dep DepSpec, cfg *Config, includeOptional bool) bool 
 	if dep.CrossNative && (cfg.Values["HOKUTO_CROSS_ARCH"] == "" || cfg.Values["HOKUTO_CROSS_SYSTEM"] == "1") {
 		return false
 	}
+	if dep.Cross && crossDependencyTargetsOtherArch(dep.Name, cfg) {
+		return false
+	}
+	if crossBuildIgnoresDependency(dep, cfg) {
+		return false
+	}
 	if shouldSkipMultilibMakeDep(dep, dep.Name, cfg) {
 		return false
 	}
@@ -538,6 +544,27 @@ func plannedPackageRequiresSourceBuild(pkgName string, plan *BuildPlan, userRequ
 	return userRequested[pkgName] || plan.RebuildPackages[pkgName] || len(splitDepsBySource[pkgName]) > 0
 }
 
+// isGenericBuildVariant reports whether a package finalizes under the
+// "generic" (as opposed to "optimized") tarball variant. arm64 cross builds
+// always finalize as generic unless CFLAGS_ARM64 tuning is actually in play
+// (cross-simple, cross-system, nocrossopt, or no CFLAGS_ARM64 configured);
+// any other cross build defaults to generic too. Anything that computes a
+// package's expected tarball name -- not just pkgBuild's own finalize step,
+// but also e.g. installBuiltSplitPackageWithLogger looking up an
+// already-built split's tarball -- must use this same rule, or it'll look
+// for a filename that doesn't match what was actually produced.
+func isGenericBuildVariant(arch string, cfg *Config, options map[string]bool) bool {
+	isGeneric := cfg.Values["HOKUTO_GENERIC"] == "1" || options["generic"]
+	if !isGeneric && arch == "aarch64" {
+		if options["nocrossopt"] || cfg.Values["HOKUTO_CROSS_SIMPLE"] == "1" || cfg.Values["HOKUTO_CROSS_SYSTEM"] == "1" || cfg.Values["CFLAGS_ARM64"] == "" {
+			isGeneric = true
+		}
+	} else if !isGeneric && cfg.Values["HOKUTO_CROSS_ARCH"] != "" {
+		isGeneric = true
+	}
+	return isGeneric
+}
+
 func installBuiltSplitDependencyWithOptions(sourcePkg, splitPkg string, cfg *Config, quiet bool) error {
 	logger, fast := dependencyInstallLogger(quiet)
 	return installBuiltSplitDependencyWithLogger(sourcePkg, splitPkg, cfg, logger, fast)
@@ -552,7 +579,12 @@ func installBuiltSplitTargetWithLogger(sourcePkg, splitPkg string, cfg *Config, 
 }
 
 func installBuiltSplitPackageWithLogger(sourcePkg, splitPkg string, cfg *Config, logger io.Writer, fast bool, force bool) error {
-	if !force && isPackageInstalled(splitPkg) {
+	// The split's own output name may be arch-prefixed too (e.g. "libelf"
+	// finalized as "aarch64-libelf" alongside its cross-built source
+	// "elfutils") -- everything from here on must key off that, not the bare
+	// split name from requiredSplitDeps/userRequestedMap.
+	outputSplitPkg := getOutputPackageName(splitPkg, cfg)
+	if !force && isPackageInstalled(outputSplitPkg) {
 		return nil
 	}
 	version, revision, err := getRepoVersion2(sourcePkg)
@@ -564,15 +596,15 @@ func installBuiltSplitPackageWithLogger(sourcePkg, splitPkg string, cfg *Config,
 		return err
 	}
 	options := loadBuildOptions(pkgDir)
-	isGeneric := cfg.Values["HOKUTO_GENERIC"] == "1" || options["generic"]
 	arch := GetSystemArchForPackage(cfg, sourcePkg)
-	variant := IdentifyVariant(splitPkg, isGeneric, isMultilibPackage(splitPkg))
-	archiveSplitName := canonicalParallelPackageName(splitPkg)
+	isGeneric := isGenericBuildVariant(arch, cfg, options)
+	variant := IdentifyVariant(outputSplitPkg, isGeneric, isMultilibPackage(splitPkg))
+	archiveSplitName := canonicalParallelPackageName(outputSplitPkg)
 	tarballPath := filepath.Join(BinDir, StandardizeRemoteName(archiveSplitName, version, revision, arch, variant))
 	if _, err := os.Stat(tarballPath); err != nil {
 		return fmt.Errorf("expected split package tarball missing: %s", tarballPath)
 	}
-	return installSplitPackageTarballWithLogger(splitPkg, tarballPath, cfg, logger, fast)
+	return installSplitPackageTarballWithLogger(outputSplitPkg, tarballPath, cfg, logger, fast)
 }
 
 func installSplitPackageTarballWithLogger(splitPkg, tarballPath string, cfg *Config, logger io.Writer, fast bool) error {
@@ -646,7 +678,7 @@ func installAvailableBinaryBuildDeps(plan *BuildPlan, userRequested, declined ma
 			continue
 		}
 
-		outputPkgName, tarballPath, ok, err := availableBuildDependencyBinaryTarball(pkgName, cfg, noRemote)
+		outputPkgName, tarballPath, ok, err := availableBuildDependencyBinaryTarball(pkgName, packageBuildConfig(pkgName, cfg), noRemote)
 		if err != nil || !ok {
 			continue
 		}
@@ -766,6 +798,118 @@ func getOutputPackageName(pkgName string, cfg *Config) string {
 		return prefix + pkgName
 	}
 	return pkgName
+}
+
+// isCrossTargetPackage reports whether pkgName is recognized as a cross
+// artifact: either its own name already carries the target arch prefix
+// (e.g. "aarch64-gcc", matching a "cross"/"cross make"/"crossnative"
+// dependency edge), or it's one of the packages the user explicitly asked
+// hokuto to build under -cross=<arch>[,system] (see
+// Config.CrossOutputPackages). Returns false when cfg isn't cross-compiling
+// at all.
+func isCrossTargetPackage(pkgName string, cfg *Config) bool {
+	crossArch := cfg.Values["HOKUTO_CROSS_ARCH"]
+	if crossArch == "" {
+		return false
+	}
+	normalizedArch := crossArch
+	if normalizedArch == "arm64" {
+		normalizedArch = "aarch64"
+	}
+	return strings.HasPrefix(pkgName, normalizedArch+"-") || cfg.CrossOutputPackages[pkgName]
+}
+
+// dependencyNameHasCrossPrefix reports whether name already carries the
+// current cross session's target arch prefix (e.g. "aarch64-linux-headers"),
+// which self-identifies it as cross-specific even on a depends line with no
+// explicit "cross"/"crossnative" tag.
+func dependencyNameHasCrossPrefix(name string, cfg *Config) bool {
+	crossArch := cfg.Values["HOKUTO_CROSS_ARCH"]
+	if crossArch == "" {
+		return false
+	}
+	normalizedArch := crossArch
+	if normalizedArch == "arm64" {
+		normalizedArch = "aarch64"
+	}
+	return strings.HasPrefix(name, normalizedArch+"-")
+}
+
+// crossDependencyTargetsOtherArch reports whether name carries an
+// architecture prefix belonging to some architecture other than the one
+// currently being cross-compiled for, e.g. "x86_64-gcc" while targeting
+// arm64 (a depends file may list one line per supported target).
+//
+// A name with no arch prefix at all is NOT another architecture's: a
+// cross-tagged bare name is a host tool that the cross build itself needs
+// (e.g. "mercurial cross make"), and there is no "aarch64-mercurial" to
+// name instead.
+func crossDependencyTargetsOtherArch(name string, cfg *Config) bool {
+	crossArch := cfg.Values["HOKUTO_CROSS_ARCH"]
+	if crossArch == "" {
+		return false
+	}
+	normalizedArch := crossArch
+	if normalizedArch == "arm64" {
+		normalizedArch = "aarch64"
+	}
+	for _, prefix := range []string{"aarch64-", "x86_64-"} {
+		if strings.HasPrefix(name, prefix) {
+			return prefix != normalizedArch+"-"
+		}
+	}
+	return false
+}
+
+// crossBuildIgnoresDependency reports whether dep should be ignored entirely
+// because this is a cross build and dep isn't cross-specific.
+//
+// During a cross build (-cross=<arch> with or without ",system") only
+// dependencies that explicitly say they're for the cross target apply: those
+// tagged "cross"/"crossnative", and those whose name already carries the
+// target arch prefix ("aarch64-foo"). Every other line in a depends file
+// describes the native build of that package and is skipped -- a cross build
+// is expected to declare what it needs explicitly rather than inheriting the
+// native dependency set.
+func crossBuildIgnoresDependency(dep DepSpec, cfg *Config) bool {
+	if cfg == nil || cfg.Values["HOKUTO_CROSS_ARCH"] == "" {
+		return false
+	}
+	if dep.Cross || dep.CrossNative {
+		return false
+	}
+	return !dependencyNameHasCrossPrefix(dep.Name, cfg)
+}
+
+// packageBuildConfig returns cfg unchanged, EXCEPT when pkgName is a plain,
+// non arch-prefixed name that also isn't one of the packages the user
+// explicitly asked to build under -cross=<arch> (see
+// Config.CrossOutputPackages) -- in which case it's an ordinary build-time
+// dependency (e.g. "bash-completion make", "mercurial make") pulled in
+// incidentally during a cross session, and this returns a cloned Config with
+// HOKUTO_CROSS_SYSTEM/HOKUTO_CROSS_SIMPLE/HOKUTO_CROSS_ARCH cleared so
+// lookups like getOutputPackageName and available-binary matching treat it
+// as the plain native package it actually is.
+//
+// This mirrors the per-package cross detection pkgBuild itself applies to
+// its own env (see the HOKUTO_CROSS_SYSTEM fallback-detection block there);
+// it exists separately so pre-build checks that only have a *Config, not a
+// package currently being built, can make the same distinction.
+func packageBuildConfig(pkgName string, cfg *Config) *Config {
+	if cfg.Values["HOKUTO_CROSS_ARCH"] == "" || isCrossTargetPackage(pkgName, cfg) {
+		return cfg
+	}
+	clone := &Config{
+		Values:              make(map[string]string, len(cfg.Values)),
+		DefaultStrip:        cfg.DefaultStrip,
+		DefaultLTO:          cfg.DefaultLTO,
+		CrossOutputPackages: cfg.CrossOutputPackages,
+	}
+	maps.Copy(clone.Values, cfg.Values)
+	clone.Values["HOKUTO_CROSS_SYSTEM"] = ""
+	clone.Values["HOKUTO_CROSS_SIMPLE"] = ""
+	clone.Values["HOKUTO_CROSS_ARCH"] = ""
+	return clone
 }
 
 // getArchivePackageName returns the stable package identity used by binary
@@ -1129,6 +1273,86 @@ func appendBuildLogStatus(path, pkgName, status string, started time.Time, execC
 
 func shellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'"
+}
+
+// targetPythonDirName picks the "python3.Y" directory name to use for the
+// target sysroot's PYTHONPATH. It prefers whatever version is actually
+// installed under the sysroot, so it never drifts from reality as the
+// distro's python version changes, and falls back to the host's python3
+// (a cross-built python is normally the same version as the host's) for
+// when the sysroot doesn't have one yet -- e.g. while python itself is
+// still being built.
+func targetPythonDirName(sysrootPrefix string) string {
+	if matches, err := filepath.Glob(filepath.Join(sysrootPrefix, "lib", "python3.*")); err == nil {
+		best := ""
+		bestMinor := -1
+		for _, m := range matches {
+			if info, err := os.Stat(m); err != nil || !info.IsDir() {
+				continue
+			}
+			name := filepath.Base(m)
+			minor, err := strconv.Atoi(strings.TrimPrefix(name, "python3."))
+			if err != nil {
+				continue
+			}
+			if minor > bestMinor {
+				bestMinor = minor
+				best = name
+			}
+		}
+		if best != "" {
+			return best
+		}
+	}
+
+	if out, err := exec.Command("python3", "-c", "import sys; print(f'python3.{sys.version_info.minor}')").Output(); err == nil {
+		if name := strings.TrimSpace(string(out)); name != "" {
+			return name
+		}
+	}
+
+	// Last-resort fallback if python3 isn't even available on the host.
+	return "python3.14"
+}
+
+// writeNativePkgConfigFile generates a pkg-config wrapper that strips the
+// cross PKG_CONFIG_SYSROOT_DIR / PKG_CONFIG_LIBDIR variables hokuto exports
+// for cross builds, plus a meson native-file pointing at it.
+//
+// hokuto sets those variables on the whole build-script environment, but
+// meson distinguishes "build machine" (native) dependencies from "host
+// machine" (cross) ones. A recipe that resolves a dependency with
+// `native: true` (e.g. wayland-protocols, whose pkgdatadir is only used by
+// the build machine's wayland-scanner) still inherits the ambient
+// PKG_CONFIG_* vars unless it's told otherwise, so pkgconf ends up
+// prepending the target sysroot to an already-absolute path and doubling it.
+//
+// Recipes that hit this should add `--native-file "$HOKUTO_NATIVE_FILE"` to
+// their `meson setup` invocation instead of hand-rolling the same wrapper.
+func writeNativePkgConfigFile(buildDir string) (string, error) {
+	toolsDir := filepath.Join(buildDir, ".hokuto-tools")
+	if err := os.MkdirAll(toolsDir, 0o755); err != nil {
+		return "", err
+	}
+
+	wrapperPath := filepath.Join(toolsDir, "native-pkg-config")
+	wrapper := `#!/bin/sh
+unset PKG_CONFIG_SYSROOT_DIR
+unset PKG_CONFIG_LIBDIR
+export PKG_CONFIG_PATH=/usr/lib/pkgconfig:/usr/share/pkgconfig
+exec pkg-config "$@"
+`
+	if err := os.WriteFile(wrapperPath, []byte(wrapper), 0o755); err != nil {
+		return "", err
+	}
+
+	iniPath := filepath.Join(toolsDir, "hokuto-native.ini")
+	ini := fmt.Sprintf("[binaries]\npkg-config = '%s'\n", wrapperPath)
+	if err := os.WriteFile(iniPath, []byte(ini), 0o644); err != nil {
+		return "", err
+	}
+
+	return iniPath, nil
 }
 
 func writeBuildHelperScripts(helperDir string) error {
@@ -1789,6 +2013,9 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, opts BuildOptions)
 		Values:       make(map[string]string, len(cfg.Values)),
 		DefaultStrip: cfg.DefaultStrip,
 		DefaultLTO:   cfg.DefaultLTO,
+		// Shared read-only reference: populated once during plan resolution,
+		// before any (possibly parallel) build call, and never mutated here.
+		CrossOutputPackages: cfg.CrossOutputPackages,
 	}
 	maps.Copy(cfgCopy.Values, cfg.Values)
 	cfg = cfgCopy // Use the copy for the rest of this function
@@ -1839,6 +2066,18 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, opts BuildOptions)
 				break
 			}
 		}
+	} else if origCrossArch != "" && !cfg.CrossOutputPackages[pkgName] {
+		// pkgName carries no arch prefix and matches its own recipe dir
+		// exactly, so it's not a cross artifact by naming. If it also isn't
+		// one of the packages the user explicitly asked to build under
+		// -cross=<arch>, it's a plain build-time dependency (e.g.
+		// "bash-completion make", "mercurial make") pulled in incidentally
+		// during a cross session -- build it completely natively rather than
+		// inheriting the session's cross toolchain/env.
+		debugf("Building plain (non-cross) dependency %s natively during a cross session\n", pkgName)
+		cfg.Values["HOKUTO_CROSS_SYSTEM"] = ""
+		cfg.Values["HOKUTO_CROSS_SIMPLE"] = ""
+		cfg.Values["HOKUTO_CROSS_ARCH"] = ""
 	}
 
 	// NEW: Check for 'cross-simple' option to override toolchain settings
@@ -2376,11 +2615,39 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, opts BuildOptions)
 			// BUT skip this if we are building a host tool (native), so we use host libraries/headers
 			if !shouldBuildHostNative {
 				defaults["PKG_CONFIG_LIBDIR"] = filepath.Join(sysrootPrefix, "lib", "pkgconfig") + ":" + filepath.Join(sysrootPrefix, "share", "pkgconfig")
-				defaults["PKG_CONFIG_SYSROOT_DIR"] = sysrootPrefix
 				defaults["PKG_CONFIG_PATH"] = "" // Clear to avoid host pollution
 
+				// Deliberately NOT setting PKG_CONFIG_SYSROOT_DIR here.
+				//
+				// Every cross-built package's build script passes
+				// --prefix="$CROSS_PREFIX" (e.g. /usr/aarch64-linux-gnu) directly
+				// to configure/meson, so its installed .pc files already carry
+				// that absolute path in `prefix=` -- they're self-contained, not
+				// sysroot-relative like a package built with --prefix=/usr and
+				// relocated via DESTDIR/install_root (the way glibc, which ships
+				// no .pc files, is built).
+				//
+				// pkgconf's normal -I/-L fragment handling tolerates this fine
+				// (it skips re-prepending a sysroot a path already starts with),
+				// but PKG_CONFIG_SYSROOT_DIR is also substituted verbatim into
+				// any custom .pc variable that references ${pc_sysrootdir}
+				// (e.g. wayland-protocols' pkgdatadir) with no such guard, which
+				// doubles the sysroot for those and breaks lookups like
+				// dependency('wayland-protocols').get_variable('pkgdatadir').
+				// PKG_CONFIG_LIBDIR above is sufficient to keep the search
+				// scoped to the target sysroot.
+
 				// Set PYTHONPATH to include target site-packages for build-time module detection
-				defaults["PYTHONPATH"] = filepath.Join(sysrootPrefix, "lib", "python3.14", "site-packages")
+				defaults["PYTHONPATH"] = filepath.Join(sysrootPrefix, "lib", targetPythonDirName(sysrootPrefix), "site-packages")
+			}
+
+			// Give recipes an escape hatch for meson `native: true` dependencies
+			// that need a genuinely different binary or search path than the
+			// host/cross one above (e.g. wayland/build's native wayland-scanner).
+			if nativeFile, err := writeNativePkgConfigFile(buildDir); err != nil {
+				return 0, fmt.Errorf("failed to write native pkg-config helper: %w", err)
+			} else {
+				defaults["HOKUTO_NATIVE_FILE"] = nativeFile
 			}
 
 			// Rust cross-compilation setup
@@ -2773,17 +3040,7 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, opts BuildOptions)
 	cflagsVal := defaults["CFLAGS"]
 
 	// Determine if this is a generic build
-	isGeneric := cfg.Values["HOKUTO_GENERIC"] == "1" || options["generic"]
-
-	// If ARM64, it's ONLY generic if cross-simple/nocrossopt/cross-system was used or CFLAGS_ARM64 was missing
-	if !isGeneric && targetArch == "aarch64" {
-		if options["nocrossopt"] || cfg.Values["HOKUTO_CROSS_SIMPLE"] == "1" || cfg.Values["HOKUTO_CROSS_SYSTEM"] == "1" || cfg.Values["CFLAGS_ARM64"] == "" {
-			isGeneric = true
-		}
-	} else if !isGeneric && cfg.Values["HOKUTO_CROSS_ARCH"] != "" {
-		// For other cross builds, default to generic for now
-		isGeneric = true
-	}
+	isGeneric := isGenericBuildVariant(targetArch, cfg, options)
 
 	if err := finalizeBuiltPackage(builtPackageFinalization{
 		sourcePkgName: pkgName,
@@ -2850,6 +3107,9 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 		Values:       make(map[string]string, len(cfg.Values)),
 		DefaultStrip: cfg.DefaultStrip,
 		DefaultLTO:   cfg.DefaultLTO,
+		// Shared read-only reference: populated once during plan resolution,
+		// before any (possibly parallel) build call, and never mutated here.
+		CrossOutputPackages: cfg.CrossOutputPackages,
 	}
 	maps.Copy(cfgCopy.Values, cfg.Values)
 	cfg = cfgCopy // Use the copy for the rest of this function
@@ -3884,6 +4144,29 @@ func handleBuildCommand(args []string, cfg *Config) (err error) {
 		buildCmd.Usage()
 		return fmt.Errorf("no packages specified")
 	}
+
+	// Record the literal CLI targets as the packages -cross=<arch> is meant
+	// to apply to, before any dependency discovery runs. See
+	// Config.CrossOutputPackages: it lets a plain, non-cross build-time
+	// dependency pulled in alongside the target (e.g. "bash-completion make"
+	// needed by "test") be told apart from the target itself, even though
+	// both are bare, non arch-prefixed names.
+	if cfg.Values["HOKUTO_CROSS_ARCH"] != "" {
+		if cfg.CrossOutputPackages == nil {
+			cfg.CrossOutputPackages = make(map[string]bool)
+		}
+		for _, pkg := range requestedPackages {
+			cfg.CrossOutputPackages[pkg] = true
+			// A requested target may actually be a split sub-package (e.g.
+			// "libelf" split from "elfutils"): what actually gets built and
+			// passed to pkgBuild is the *source* package name, so that needs
+			// to be recognized as a cross target too.
+			if sourcePkg, _, ok := findSplitPackageSource(pkg); ok {
+				cfg.CrossOutputPackages[sourcePkg] = true
+			}
+		}
+	}
+
 	userRequestedMap := make(map[string]bool)
 	forceBuildMap := make(map[string]bool)
 	directSplitTargetsBySource := make(map[string][]string)
@@ -3977,6 +4260,14 @@ func handleBuildCommand(args []string, cfg *Config) (err error) {
 	}
 	cleanupTemporaryBuildDeps := func() {
 		if *noCleanup || *bootstrap || *noDevel || !buildWorkStarted {
+			return
+		}
+		// A cross build installs into the target sysroot: the built package and
+		// the cross dependencies pulled in alongside it ARE the deliverable, not
+		// throwaway host build tools, and they must persist for later cross
+		// builds. Nothing installed during a cross session is temporary.
+		if cfg.Values["HOKUTO_CROSS_ARCH"] != "" {
+			temporaryBuildDeps = nil
 			return
 		}
 		cleanupAfterFailure := err != nil
@@ -4123,15 +4414,20 @@ func handleBuildCommand(args []string, cfg *Config) (err error) {
 				failedBuilds[pkgName] = fmt.Errorf("failed to get version/revision: %w", err)
 				break
 			}
-			// Use output package name for tarball and installation (may be renamed for cross-system)
-			outputPkgName := getOutputPackageName(pkgName, cfg)
-			archivePkgName := getArchivePackageName(pkgName, cfg)
-			arch := GetSystemArchForPackage(cfg, pkgName)
-			variant := GetSystemVariantForPackage(cfg, pkgName)
+			// Use output package name for tarball and installation (may be
+			// renamed for cross-system). Use the per-package cross config:
+			// pkgName may have been built completely natively (a plain
+			// "make" dependency pulled in during a cross session), in which
+			// case its real output is the plain name.
+			installCfg := packageBuildConfig(pkgName, cfg)
+			outputPkgName := getOutputPackageName(pkgName, installCfg)
+			archivePkgName := getArchivePackageName(pkgName, installCfg)
+			arch := GetSystemArchForPackage(installCfg, pkgName)
+			variant := GetSystemVariantForPackage(installCfg, pkgName)
 			tarballPath := filepath.Join(BinDir, StandardizeRemoteName(archivePkgName, version, revision, arch, variant))
 			isCriticalAtomic.Store(1)
-			handlePreInstallUninstall(outputPkgName, cfg, RootExec, false, nil)
-			if _, installErr := pkgInstall(tarballPath, outputPkgName, cfg, RootExec, true, false, false, nil); installErr != nil {
+			handlePreInstallUninstall(outputPkgName, installCfg, RootExec, false, nil)
+			if _, installErr := pkgInstall(tarballPath, outputPkgName, installCfg, RootExec, true, false, false, nil); installErr != nil {
 				isCriticalAtomic.Store(0)
 				colArrow.Print("-> ")
 				color.Danger.Printf("Installation failed for %s: %v\n", outputPkgName, installErr)
@@ -4241,14 +4537,20 @@ func handleBuildCommand(args []string, cfg *Config) (err error) {
 					if packagesThatMustBeBuilt[depPkg] {
 						return nil
 					}
+					// A plain build-time dependency pulled in during a cross
+					// session (e.g. "pahole make") is a native host tool: look
+					// its binary up under its own name, not the cross-renamed
+					// one, or it's never found and gets needlessly scheduled
+					// for a source build here.
+					depCfg := packageBuildConfig(depPkg, cfg)
 					if _, err := findPackageMetadataDir(depPkg); err != nil {
 						if isPackageInstalled(depPkg) {
 							return nil
 						}
 						if sourcePkg, ok := findSplitDependencySource(depPkg); ok {
-							if !binaryDeclined[depPkg] && dependencyBinaryAvailable(depPkg, cfg, *noRemote) {
+							if !binaryDeclined[depPkg] && dependencyBinaryAvailable(depPkg, depCfg, *noRemote) {
 								if useAvailableBuildDependencyBinary(*promptBinaryDeps, "Dependency '%s' is missing. Use available binary package?", depPkg) {
-									installed, installErr := installAvailableSplitDependencyBinary(sourcePkg, depPkg, cfg, *noRemote, nil, quietDependencyInstalls)
+									installed, installErr := installAvailableSplitDependencyBinary(sourcePkg, depPkg, depCfg, *noRemote, nil, quietDependencyInstalls)
 									if installErr == nil {
 										if installed {
 											addTemporaryBuildDep(depPkg)
@@ -4267,7 +4569,7 @@ func handleBuildCommand(args []string, cfg *Config) (err error) {
 							addMappedSplitDependency(splitDepsBySource, sourcePkg, depPkg)
 							return nil
 						}
-						installed, installErr := ensurePackageInstalledWithOptions(depPkg, cfg, *noRemote, nil, quietDependencyInstalls)
+						installed, installErr := ensurePackageInstalledWithOptions(depPkg, depCfg, *noRemote, nil, quietDependencyInstalls)
 						if installErr == nil {
 							if installed {
 								addTemporaryBuildDep(depPkg)
@@ -4277,7 +4579,7 @@ func handleBuildCommand(args []string, cfg *Config) (err error) {
 						return fmt.Errorf("error: dependency %s has no source package and could not be installed as a binary package: %w", depPkg, installErr)
 					}
 
-					outputDepPkg, tarballPath, binaryAvailable, binaryErr := availableBuildDependencyBinaryTarball(depPkg, cfg, *noRemote)
+					outputDepPkg, tarballPath, binaryAvailable, binaryErr := availableBuildDependencyBinaryTarball(depPkg, depCfg, *noRemote)
 					if binaryErr != nil {
 						debugf("Binary dependency lookup failed for %s; falling back to source build: %v\n", depPkg, binaryErr)
 						packagesThatMustBeBuilt[depPkg] = true
@@ -4296,8 +4598,8 @@ func handleBuildCommand(args []string, cfg *Config) (err error) {
 
 					logger, fast := dependencyInstallLogger(quietDependencyInstalls)
 					isCriticalAtomic.Store(1)
-					handlePreInstallUninstall(outputDepPkg, cfg, RootExec, false, logger)
-					if _, err := pkgInstall(tarballPath, outputDepPkg, cfg, RootExec, false, fast, false, logger); err != nil {
+					handlePreInstallUninstall(outputDepPkg, depCfg, RootExec, false, logger)
+					if _, err := pkgInstall(tarballPath, outputDepPkg, depCfg, RootExec, false, fast, false, logger); err != nil {
 						isCriticalAtomic.Store(0)
 						return fmt.Errorf("fatal error installing binary %s: %v", depPkg, err)
 					}
@@ -4920,13 +5222,19 @@ func executeBuildPass(plan *BuildPlan, _ string, installAllTargets bool, cfg *Co
 				shouldInstallNow := !userRequestedMap[pkgName] || isDependencyForThisPass || triggersRebuilds || triggersSplitDeps
 
 				if installAllTargets || shouldInstallNow {
-					// Install the package immediately.
+					// Install the package immediately. Use the per-package
+					// cross config: pkgName may have been built completely
+					// natively (e.g. a plain "make" dependency like "pahole"
+					// pulled in during a cross session), in which case its
+					// real output is the plain name, not the cross-renamed
+					// one the session-wide cfg would otherwise compute.
+					installCfg := packageBuildConfig(pkgName, cfg)
 					version, revision, _ := getRepoVersion2(pkgName)
-					outputPkgName := getOutputPackageName(pkgName, cfg)
-					archivePkgName := getArchivePackageName(pkgName, cfg)
+					outputPkgName := getOutputPackageName(pkgName, installCfg)
+					archivePkgName := getArchivePackageName(pkgName, installCfg)
 					wasInstalledBefore := isPackageInstalled(outputPkgName)
-					arch := GetSystemArchForPackage(cfg, pkgName)
-					variant := GetSystemVariantForPackage(cfg, pkgName)
+					arch := GetSystemArchForPackage(installCfg, pkgName)
+					variant := GetSystemVariantForPackage(installCfg, pkgName)
 					tarballPath := filepath.Join(BinDir, StandardizeRemoteName(archivePkgName, version, revision, arch, variant))
 					installLogger := io.Writer(nil)
 					installFast := false
@@ -4935,8 +5243,8 @@ func executeBuildPass(plan *BuildPlan, _ string, installAllTargets bool, cfg *Co
 						installFast = true
 					}
 					isCriticalAtomic.Store(1)
-					handlePreInstallUninstall(outputPkgName, cfg, RootExec, false, installLogger)
-					if _, installErr := pkgInstall(tarballPath, outputPkgName, cfg, RootExec, true, installFast, false, installLogger); installErr != nil {
+					handlePreInstallUninstall(outputPkgName, installCfg, RootExec, false, installLogger)
+					if _, installErr := pkgInstall(tarballPath, outputPkgName, installCfg, RootExec, true, installFast, false, installLogger); installErr != nil {
 						isCriticalAtomic.Store(0)
 						colArrow.Print("-> ")
 						color.Danger.Printf("Installation failed for %s: %v\n", outputPkgName, installErr)
@@ -4977,6 +5285,12 @@ func executeBuildPass(plan *BuildPlan, _ string, installAllTargets bool, cfg *Co
 											if cfg.Values["HOKUTO_CROSS_ARCH"] == "" || cfg.Values["HOKUTO_CROSS_SYSTEM"] == "1" {
 												continue
 											}
+										}
+
+										// FILTER: a cross build only honors deps
+										// that say they're for the cross target.
+										if crossBuildIgnoresDependency(d, cfg) {
+											continue
 										}
 
 										if d.Name == pkgName && d.Make {
