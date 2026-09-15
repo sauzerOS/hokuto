@@ -634,6 +634,18 @@ func libraryPathMatchesDep(path string, dep libDepRef) bool {
 	}
 }
 
+// isArchPrefixedPackageName reports whether name is a cross-system package
+// name (aarch64-foo, x86_64-foo), i.e. one installed into /usr/<triplet> on
+// the machine performing cross builds rather than onto a target system.
+func isArchPrefixedPackageName(name string) bool {
+	for _, prefix := range []string{"aarch64-", "x86_64-"} {
+		if strings.HasPrefix(name, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
 func splitMetadataCandidates(pkgName, baseName string) []string {
 	names := []string{pkgName}
 	for _, prefix := range []string{"aarch64-", "x86_64-"} {
@@ -810,7 +822,7 @@ func generateDepends(pkgName, pkgDir, outputDir, rootDir string, execCtx *Execut
 				}
 
 				// Extract package name to use as key in the map
-				name, op, ver, optional, rebuild, makeDep, _, _, runtimeOnly, postInstall, suggest, suggestText := parseDepToken(line)
+				name, op, ver, optional, rebuild, makeDep, cross, crossNative, runtimeOnly, postInstall, suggest, suggestText := parseDepToken(line)
 				if name != "" {
 					cleanName := cleanManualDepName(name)
 					if cleanName == "" {
@@ -832,6 +844,16 @@ func generateDepends(pkgName, pkgDir, outputDir, rootDir string, execCtx *Execut
 					// Skip non-runtime dependency hints. If an optional feature is
 					// actually linked, libdeps above will add the real runtime owner.
 					if makeDep || optional || rebuild {
+						continue
+					}
+
+					// Cross dependencies name host-side sysroot packages
+					// (aarch64-foo), which only exist on the machine doing the
+					// cross build. They belong in a sysroot package's own
+					// metadata, but a package built *for* the target -- a plain
+					// -cross=<arch> build, installed on the target itself --
+					// must record the target's own package names instead.
+					if (cross || crossNative) && !isArchPrefixedPackageName(pkgName) {
 						continue
 					}
 
