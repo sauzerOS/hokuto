@@ -5,6 +5,8 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -2719,4 +2721,96 @@ func containsString(values []string, needle string) bool {
 		}
 	}
 	return false
+}
+
+// End-to-end guard for the reported failure: a build dependency on llvm-libs
+// (a split of llvm, whose "nocrossopt" makes aarch64 output generic) must ask
+// the mirror for the generic tarball. Asking for the optimized name 404s and
+// silently demotes the dependency to a source build.
+func TestSplitDependencyBinaryDownloadUsesMatchedVariant(t *testing.T) {
+	cfg, repo := withTempDependencyRepo(t)
+	cfg.Values["HOKUTO_ARCH"] = "aarch64"
+
+	writeTestPackage(t, repo, "llvm", "")
+	writeTestSplitDeclaration(t, repo, "llvm", "llvm-libs")
+	if err := os.WriteFile(filepath.Join(repo, "llvm", "options"), []byte("nocrossopt\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	wantVariant := "generic"
+
+	var requested []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requested = append(requested, strings.TrimPrefix(r.URL.Path, "/"))
+		w.Write([]byte("not a real tarball"))
+	}))
+	defer srv.Close()
+
+	oldMirror := BinaryMirror
+	oldIndex, oldLoaded, oldErr := GlobalRemoteIndex, GlobalRemoteIndexLoaded, GlobalRemoteIndexErr
+	BinaryMirror = srv.URL
+	GlobalRemoteIndex = []RepoEntry{{
+		Name: "llvm-libs", Version: "1.0", Revision: "1", Arch: "aarch64", Variant: wantVariant,
+	}}
+	GlobalRemoteIndexLoaded = true
+	GlobalRemoteIndexErr = nil
+	t.Cleanup(func() {
+		BinaryMirror = oldMirror
+		GlobalRemoteIndex, GlobalRemoteIndexLoaded, GlobalRemoteIndexErr = oldIndex, oldLoaded, oldErr
+	})
+
+	// The install of the dummy payload is expected to fail; only the URL matters.
+	_, _ = installAvailableSplitDependencyBinary("llvm", "llvm-libs", cfg, false, nil, true)
+
+	want := StandardizeRemoteName("llvm-libs", "1.0", "1", "aarch64", wantVariant)
+	for _, got := range requested {
+		if got == want {
+			return
+		}
+	}
+	t.Fatalf("expected a request for the %s variant %q, got %v", wantVariant, want, requested)
+}
+
+// GetSystemVariantForPackage is asked about split packages all over the place,
+// and a split has no recipe directory of its own. Before it learned to fall
+// back to the recipe that produces it, every such lookup ignored the source's
+// build options: llvm carries "nocrossopt", so its aarch64 output is generic,
+// yet llvm-libs resolved as optimized.
+func TestGetSystemVariantForPackageResolvesSplitPackageOptions(t *testing.T) {
+	cfg, repo := withTempDependencyRepo(t)
+	cfg.Values["HOKUTO_ARCH"] = "aarch64"
+	cfg.Values["CFLAGS_ARM64"] = "-mcpu=cortex-a72"
+
+	writeTestPackage(t, repo, "llvm", "")
+	writeTestSplitDeclaration(t, repo, "llvm", "llvm-libs")
+	if err := os.WriteFile(filepath.Join(repo, "llvm", "options"), []byte("nocrossopt\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := GetSystemVariantForPackage(cfg, "llvm"); got != "generic" {
+		t.Fatalf("nocrossopt recipe on aarch64: want generic, got %q", got)
+	}
+	if got := GetSystemVariantForPackage(cfg, "llvm-libs"); got != "generic" {
+		t.Fatalf("split of a nocrossopt recipe: want generic, got %q", got)
+	}
+
+	// A recipe without nocrossopt is unaffected on the same host.
+	writeTestPackage(t, repo, "zlib-ng", "")
+	if got := GetSystemVariantForPackage(cfg, "zlib-ng"); got != "optimized" {
+		t.Fatalf("plain recipe on aarch64: want optimized, got %q", got)
+	}
+}
+
+// writeTestSplitDeclaration declares splitPkg as a split of sourcePkg the same
+// way the repository does, with a "depends.<split>" file next to the recipe.
+func writeTestSplitDeclaration(t *testing.T, repo, sourcePkg, splitPkg string) {
+	t.Helper()
+
+	if err := os.WriteFile(filepath.Join(repo, sourcePkg, "depends."+splitPkg), []byte("glibc\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	splitPackageCacheMu.Lock()
+	splitPackageCacheKey = ""
+	splitPackageCacheMap = nil
+	splitPackageCacheMu.Unlock()
 }

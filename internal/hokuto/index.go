@@ -80,13 +80,28 @@ func GetSystemVariantForPackage(cfg *Config, pkgName string) string {
 	// Cross-packages (prefixed with architecture) or forced generic logic
 	isCrossPkg := strings.HasPrefix(pkgName, "aarch64-") || strings.HasPrefix(pkgName, "x86_64-")
 
+	// A package's own build options decide which variant it is finalized as,
+	// so the lookup has to ask the same question the build did. Two gaps used
+	// to make it answer "optimized" for things that were published "generic":
+	//
+	//   - a split package has no recipe directory of its own, so its options
+	//     were never consulted at all; they live in the recipe that produces
+	//     it (llvm-libs -> llvm).
+	//   - only options["generic"] was honoured, while the build also turns
+	//     aarch64 output generic for "nocrossopt" recipes and the cross modes.
+	//
+	// isGenericBuildVariant is the function the build itself uses, so defer to
+	// it once the right options file has been located.
 	isGenericOpt := false
-	if pkgName != "" {
+	if pkgName != "" && cfg != nil {
+		optionsDir := ""
 		if pkgDir, err := findPackageMetadataDir(pkgName); err == nil && pkgDir != "" {
-			opts := loadBuildOptions(pkgDir)
-			if opts["generic"] {
-				isGenericOpt = true
-			}
+			optionsDir = pkgDir
+		} else if _, sourceDir, ok := findSplitPackageSource(pkgName); ok {
+			optionsDir = sourceDir
+		}
+		if optionsDir != "" {
+			isGenericOpt = isGenericBuildVariant(GetSystemArchForPackage(cfg, pkgName), cfg, loadBuildOptions(optionsDir))
 		}
 	}
 

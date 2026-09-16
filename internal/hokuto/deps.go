@@ -2469,7 +2469,7 @@ func ensurePackageInstalledWithOptions(pkgName string, cfg *Config, noRemote boo
 			}
 		}
 		if shouldTryDownload {
-			if err := fetchBinaryPackage(archivePkgName, version, revision, cfg, true, expectedSum, false); err == nil {
+			if err := fetchSpecificBinaryPackage(archivePkgName, version, revision, variant, cfg, true, expectedSum, false); err == nil {
 				foundBinary = true
 			}
 		}
@@ -2556,7 +2556,7 @@ func ensureSplitPackageInstalled(sourcePkg, splitPkg string, cfg *Config, noRemo
 			}
 		}
 		if shouldTryDownload {
-			if err := fetchBinaryPackage(archiveSplitName, version, revision, cfg, true, expectedSum, false); err == nil {
+			if err := fetchSpecificBinaryPackage(archiveSplitName, version, revision, variant, cfg, true, expectedSum, false); err == nil {
 				foundBinary = true
 			}
 		}
@@ -2630,7 +2630,7 @@ func installAvailableSplitDependencyBinary(sourcePkg, splitPkg string, cfg *Conf
 		if !shouldTryDownload {
 			return false, nil
 		}
-		if err := fetchBinaryPackage(archiveSplitName, version, revision, cfg, true, expectedSum, false); err != nil {
+		if err := fetchSpecificBinaryPackage(archiveSplitName, version, revision, variant, cfg, true, expectedSum, false); err != nil {
 			return false, err
 		}
 		if _, err := os.Stat(tarballPath); err != nil {

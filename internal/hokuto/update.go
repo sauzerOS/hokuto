@@ -1334,7 +1334,7 @@ func checkForUpgrades(ctx context.Context, cfg *Config, maxJobs int, yes bool) e
 				// Only attempt download if the package was found in the remote index
 				if foundInIndex {
 					// Use quiet mode for check
-					if err := fetchBinaryPackage(archivePkgName, version, revision, cfg, true, expectedSum, false); err == nil {
+					if err := fetchSpecificBinaryPackage(archivePkgName, version, revision, bestEntry.Variant, cfg, true, expectedSum, false); err == nil {
 						binaryAvailable[pkgName] = true
 					}
 				}
@@ -1505,7 +1505,7 @@ func checkForUpgrades(ctx context.Context, cfg *Config, maxJobs int, yes bool) e
 				if foundInIndex {
 					// Errors here are ignored, we just fail to find binary and proceed to build
 					// Parallel mode: pass quiet=true
-					_ = fetchBinaryPackage(archivePkgName, version, revision, cfg, true, expectedSum, false)
+					_ = fetchSpecificBinaryPackage(archivePkgName, version, revision, bestEntry.Variant, cfg, true, expectedSum, false)
 				}
 			}
 
@@ -1640,7 +1640,7 @@ func checkForUpgrades(ctx context.Context, cfg *Config, maxJobs int, yes bool) e
 
 			if foundInIndex {
 				// Sequential mode: output is fine (quiet=false)
-				if err := fetchBinaryPackage(archivePkgName, version, revision, cfg, false, expectedSum, false); err == nil {
+				if err := fetchSpecificBinaryPackage(archivePkgName, version, revision, bestEntry.Variant, cfg, false, expectedSum, false); err == nil {
 					foundBinary = true
 				} else {
 					colArrow.Print("-> ")
