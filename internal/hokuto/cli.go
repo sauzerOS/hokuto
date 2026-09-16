@@ -370,6 +370,28 @@ func Main() {
 		}
 		_ = generatePkgDBQuiet(cfg)
 
+	case "__zstd-frames":
+		// Internal filter used through tar's --use-compress-program: packs
+		// stdin into independent zstd frames so installs can decode in
+		// parallel, and unpacks with -d.
+		if err := runZstdFramesFilter(os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "hokuto: zstd filter failed: %v\n", err)
+			os.Exit(1)
+		}
+
+	case "__place-staging":
+		// Internal helper: hard links a staging tree into the target root.
+		// Split out as a subcommand so the privileged path can reuse the
+		// Executor's sudo/run0 handling instead of re-implementing it.
+		if len(os.Args) != 4 {
+			fmt.Fprintln(os.Stderr, "Usage: hokuto __place-staging <staging-dir> <root-dir>")
+			os.Exit(2)
+		}
+		if err := placeStagingByHardlink(os.Args[2], os.Args[3]); err != nil {
+			fmt.Fprintf(os.Stderr, "hokuto: staging placement failed: %v\n", err)
+			os.Exit(1)
+		}
+
 	case "__complete":
 		if len(os.Args) >= 3 {
 			switch os.Args[2] {

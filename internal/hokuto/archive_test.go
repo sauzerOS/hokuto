@@ -196,7 +196,24 @@ func TestCreatePackageTarballUsesHighCompressionZstd(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(args), "--use-compress-program=zstd -T0 -19 --long=25\n") {
-		t.Fatalf("expected high-compression zstd tar args with a 32 MiB window, got %q", string(args))
+	// Packing goes through hokuto's multi-frame filter when it is available and
+	// falls back to invoking zstd directly; either way the archive must be
+	// level 19 with a 32 MiB window.
+	got := string(args)
+	viaFilter := strings.Contains(got, "--use-compress-program="+zstdFramesProgram()+"\n") && zstdFramesProgram() != ""
+	viaZstd := strings.Contains(got, "--use-compress-program=zstd -T0 -19 --long=25\n")
+	if !viaFilter && !viaZstd {
+		t.Fatalf("expected the multi-frame filter or a high-compression zstd invocation, got %q", got)
+	}
+}
+
+func TestZstdFramesFilterSettingsMatchTheSingleFramePacker(t *testing.T) {
+	// The filter is only worth using if it does not quietly change how packages
+	// are compressed, so keep its settings pinned to the fallback's.
+	if zstdPackLevel != "-19" {
+		t.Errorf("zstdPackLevel = %q, want -19", zstdPackLevel)
+	}
+	if zstdPackWindow != "--long=25" {
+		t.Errorf("zstdPackWindow = %q, want --long=25", zstdPackWindow)
 	}
 }

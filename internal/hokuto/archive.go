@@ -493,9 +493,19 @@ func createPackageTarball(pkgName, pkgVer, pkgRev, arch, variant, outputDir stri
 			}
 		}
 
+		// Pack through hokuto's multi-frame compressor so the installer can
+		// decode the archive on several cores. The result is still an ordinary
+		// .tar.zst that any zstd reads, and a package small enough to fit in one
+		// chunk comes out exactly as it did before. Fall back to invoking zstd
+		// directly when the filter is unavailable.
+		//
 		// A 32 MiB window materially improves compression of large package
 		// members such as Java module and CDS images while retaining zstd -19.
-		args := []string{"--use-compress-program=zstd -T0 -19 --long=25", "-cf", tarballPath, "-C", outputDir, "."}
+		compressProgram := "zstd -T0 " + zstdPackLevel + " " + zstdPackWindow
+		if framesFilter := zstdFramesProgram(); framesFilter != "" {
+			compressProgram = framesFilter
+		}
+		args := []string{"--use-compress-program=" + compressProgram, "-cf", tarballPath, "-C", outputDir, "."}
 		if !execCtx.ShouldRunAsRoot {
 			args = append(args, "--owner=0", "--group=0", "--numeric-owner")
 		}

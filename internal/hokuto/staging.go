@@ -380,6 +380,21 @@ func rsyncStaging(stagingDir, rootDir string, execCtx *Executor) error {
 		}
 	}
 
+	// --- Fast path: hard link placement on a shared filesystem ---
+	// The tarball has already been written to staging on this filesystem, so
+	// linking its entries into rootDir costs metadata operations only instead
+	// of copying every byte a second time. This also halves the bytes an
+	// install writes to disk.
+	if canPlaceByHardlink(stagingPath, rootDir) {
+		err := runHardlinkPlacement(stagingPath, rootDir, execCtx)
+		if err == nil {
+			return removeStagingDir(stagingDir, execCtx)
+		}
+		// A partial placement is harmless: rsync below is idempotent and
+		// finishes whatever is left.
+		debugf("Hard link placement failed (%v), falling back to rsync\n", err)
+	}
+
 	// --- Try system rsync first ---
 	if _, err := exec.LookPath("rsync"); err == nil {
 		// Note: rsync needs trailing slash on source to copy contents, not the directory itself
@@ -397,17 +412,7 @@ func rsyncStaging(stagingDir, rootDir string, execCtx *Executor) error {
 		cmd.Stderr = os.Stderr
 
 		if err := execCtx.Run(cmd); err == nil {
-			if os.Geteuid() == 0 {
-				if err := os.RemoveAll(stagingDir); err != nil {
-					return fmt.Errorf("failed to remove staging dir %s natively: %v", stagingDir, err)
-				}
-			} else {
-				rmCmd := exec.Command("rm", "-rf", stagingDir)
-				if err := execCtx.Run(rmCmd); err != nil {
-					return fmt.Errorf("failed to remove staging dir %s: %v", stagingDir, err)
-				}
-			}
-			return nil
+			return removeStagingDir(stagingDir, execCtx)
 		}
 	}
 	// --- Fallback 1: Try system cp -aT ---
@@ -446,16 +451,21 @@ func rsyncStaging(stagingDir, rootDir string, execCtx *Executor) error {
 		return fmt.Errorf("internal tar fallback failed: %v", err)
 	}
 
+	return removeStagingDir(stagingDir, execCtx)
+}
+
+// removeStagingDir discards the staging tree once its contents have been
+// placed into the root.
+func removeStagingDir(stagingDir string, execCtx *Executor) error {
 	if os.Geteuid() == 0 {
 		if err := os.RemoveAll(stagingDir); err != nil {
 			return fmt.Errorf("failed to remove staging dir %s natively: %v", stagingDir, err)
 		}
-	} else {
-		rmCmd := exec.Command("rm", "-rf", stagingDir)
-		if err := execCtx.Run(rmCmd); err != nil {
-			return fmt.Errorf("failed to remove staging dir %s: %v", stagingDir, err)
-		}
+		return nil
 	}
-
+	rmCmd := exec.Command("rm", "-rf", stagingDir)
+	if err := execCtx.Run(rmCmd); err != nil {
+		return fmt.Errorf("failed to remove staging dir %s: %v", stagingDir, err)
+	}
 	return nil
 }

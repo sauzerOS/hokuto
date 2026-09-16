@@ -6,6 +6,7 @@ package hokuto
 import (
 	"bufio"
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -707,15 +708,27 @@ func pkgInstallWithRemotePolicy(tarballPath, pkgName string, cfg *Config, execCt
 
 	tarSuccess := false
 	if _, err := exec.LookPath("tar"); err == nil {
-		untarCmd := exec.Command("tar", "--zstd", "-xf", tarballPath, "-C", stagingDir)
-		if !Debug {
-			untarCmd.Stdout = io.Discard
-			untarCmd.Stderr = io.Discard
-		}
-		if err := execCtx.Run(untarCmd); err == nil {
+		// A package packed into several zstd frames can be decoded on all cores
+		// at once. Archives with a single frame -- everything packed by an older
+		// hokuto, and every package small enough to fit in one chunk -- fall
+		// through to the ordinary path.
+		if err := unpackMultiFrame(tarballPath, stagingDir, execCtx); err == nil {
 			tarSuccess = true
-		} else {
-			debugf("System tar failed for %s, falling back to internal tar+zstd: %v\n", tarballPath, err)
+		} else if !errors.Is(err, errSingleFrameArchive) {
+			debugf("Parallel unpack of %s failed, falling back to tar --zstd: %v\n", tarballPath, err)
+		}
+
+		if !tarSuccess {
+			untarCmd := exec.Command("tar", "--zstd", "-xf", tarballPath, "-C", stagingDir)
+			if !Debug {
+				untarCmd.Stdout = io.Discard
+				untarCmd.Stderr = io.Discard
+			}
+			if err := execCtx.Run(untarCmd); err == nil {
+				tarSuccess = true
+			} else {
+				debugf("System tar failed for %s, falling back to internal tar+zstd: %v\n", tarballPath, err)
+			}
 		}
 	}
 
