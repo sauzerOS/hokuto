@@ -76,9 +76,50 @@ func SuggestCFLAGS() string {
 
 		return fmt.Sprintf("-O2 -march=%s -mtune=generic -pipe", march)
 	} else if arch == "arm64" {
-		return "-O2 -march=armv8-a+crypto+crc -mtune=generic -pipe"
+		// The ARMv8 Crypto Extensions and even CRC are optional in the
+		// architecture, so they have to be read off the running CPU rather than
+		// assumed. The Raspberry Pi 4's Cortex-A72 has CRC but no crypto, and a
+		// binary built for crypto it does not have dies with SIGILL the first
+		// time it reaches that code.
+		features := readARMFeatures()
+		march := "armv8-a"
+		if features["crc32"] {
+			march += "+crc"
+		}
+		if features["aes"] && features["sha2"] {
+			march += "+crypto"
+		}
+		return fmt.Sprintf("-O2 -march=%s -mtune=generic -pipe", march)
 	}
 	return "-O2 -pipe"
+}
+
+// readARMFeatures returns the feature names the running ARM CPU advertises in
+// /proc/cpuinfo, as the kernel spells them (fp, asimd, crc32, aes, sha1, sha2).
+func readARMFeatures() map[string]bool {
+	features := make(map[string]bool)
+	file, err := os.Open("/proc/cpuinfo")
+	if err != nil {
+		return features
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if !strings.HasPrefix(line, "Features") {
+			continue
+		}
+		parts := strings.SplitN(line, ":", 2)
+		if len(parts) >= 2 {
+			for _, f := range strings.Fields(parts[1]) {
+				features[f] = true
+			}
+		}
+		// Every core reports the same set, so the first entry is enough.
+		break
+	}
+	return features
 }
 
 // DetectCPUFlags returns a string of detected hardware flags

@@ -995,6 +995,12 @@ func buildRustFlags(cflags string, cpuFlags string, buildDir string, isGeneric b
 	// Parse CFLAGS to extract -march and -mtune values
 	var targetCPU string
 
+	// LLVM's ARM core models assume the optional ARMv8 Crypto Extensions are
+	// present. They are optional in the architecture and the Raspberry Pi 4's
+	// Cortex-A72 does not implement them, so selecting the core by name has to
+	// be paired with turning those features back off.
+	armTargetCPU := false
+
 	// Check for -march flag in CFLAGS
 	if strings.Contains(cflags, "-march=native") {
 		targetCPU = "native"
@@ -1039,9 +1045,11 @@ func buildRustFlags(cflags string, cpuFlags string, buildDir string, isGeneric b
 					// armv8-a, armv8-a+crc, etc. -> use cortex-a72 for Raspberry Pi 4
 					// This provides proper optimizations for ARMv8-A architecture
 					targetCPU = "cortex-a72"
+					armTargetCPU = true
 				case marchValue == "cortex-a72", marchValue == "cortex-a53", marchValue == "cortex-a57":
 					// Specific ARM cores
 					targetCPU = "cortex-a72"
+					armTargetCPU = true
 				default:
 					// For unknown values, don't set target-cpu
 					targetCPU = ""
@@ -1111,7 +1119,35 @@ func buildRustFlags(cflags string, cpuFlags string, buildDir string, isGeneric b
 		}
 	}
 
+	rustflags = disableUnavailableArmCrypto(rustflags, cpuFlags, armTargetCPU)
+
 	return rustflags
+}
+
+// armCryptoFlags are the CPU flag names that mean "this machine really does
+// have the ARMv8 Crypto Extensions".
+var armCryptoFlags = map[string]bool{"crypto": true, "aes": true, "sha1": true, "sha2": true}
+
+// disableUnavailableArmCrypto turns off the AES and SHA2 target features that
+// naming an ARM core implicitly switches on.
+//
+// -C target-cpu=cortex-a72 enables aes and sha2 because LLVM models the core
+// with the optional Crypto Extensions. The Raspberry Pi 4's A72 ships without
+// them, and the cost of the mismatch is not merely a slower binary: crates that
+// gate on compile-time features rather than runtime detection -- sha2 through
+// cpufeatures, among others -- take the hardware path unconditionally and the
+// first sha256h executed kills the process with SIGILL. Only leave the features
+// on when CPU_FLAGS says the target actually has them.
+func disableUnavailableArmCrypto(rustflags, cpuFlags string, armTargetCPU bool) string {
+	if !armTargetCPU {
+		return rustflags
+	}
+	for _, flag := range strings.Fields(cpuFlags) {
+		if armCryptoFlags[flag] {
+			return rustflags
+		}
+	}
+	return "-C target-feature=-aes,-sha2 " + rustflags
 }
 
 // BuildOptions encapsulates parameters for the build process
