@@ -895,6 +895,19 @@ func crossBuildIgnoresDependency(dep DepSpec, cfg *Config) bool {
 // its own env (see the HOKUTO_CROSS_SYSTEM fallback-detection block there);
 // it exists separately so pre-build checks that only have a *Config, not a
 // package currently being built, can make the same distinction.
+// builtForAnotherRoot reports whether a package was built for a root other than
+// the one hokuto is running on, and so must not be installed here.
+//
+// A plain cross build (-cross=<arch>) produces packages for the target device.
+// A cross-system build (-cross=<arch>,system) produces sysroot packages that do
+// belong on this host, which is why it is excluded.
+func builtForAnotherRoot(cfg *Config) bool {
+	if cfg == nil {
+		return false
+	}
+	return cfg.Values["HOKUTO_CROSS_ARCH"] != "" && cfg.Values["HOKUTO_CROSS_SYSTEM"] != "1"
+}
+
 func packageBuildConfig(pkgName string, cfg *Config) *Config {
 	if cfg.Values["HOKUTO_CROSS_ARCH"] == "" || isCrossTargetPackage(pkgName, cfg) {
 		return cfg
@@ -2120,6 +2133,29 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, opts BuildOptions)
 	if options["cross-simple"] {
 		debugf("Cross-simple mode enabled for %s. Using host toolchain.\n", pkgName)
 		cfg.Values["HOKUTO_CROSS_SIMPLE"] = "1"
+	}
+
+	// Refuse to cross build a recipe that was never adapted for it. Such a
+	// build rarely fails outright: configure falls back to host defaults and
+	// the result looks like a package right up until it is linked against or
+	// installed on the target. This runs after the block above, which clears
+	// the cross flags for plain build dependencies compiled natively during a
+	// cross session, so those are not caught by it.
+	if cfg.Values["HOKUTO_CROSS_ARCH"] != "" || cfg.Values["HOKUTO_CROSS_SYSTEM"] == "1" {
+		if supported, reason := packageSupportsCrossBuild(pkgDir, options); !supported {
+			if !unconfiguredCrossBuildAllowed() {
+				return 0, fmt.Errorf(
+					"%s is not configured for cross builds: %s\n"+
+						"       Adapt its build script, or add %q to its options file if it needs no changes.\n"+
+						"       Set %s=1 to build it anyway while working on the recipe.",
+					pkgName, reason, crossSupportOption, allowUnconfiguredCrossEnv)
+			}
+			if !opts.Quiet {
+				colArrow.Print("-> ")
+				colWarn.Printf("%s is not configured for cross builds (%s); building anyway because %s is set\n",
+					pkgName, reason, allowUnconfiguredCrossEnv)
+			}
+		}
 	}
 
 	// Read version and revision early for lock check
@@ -4456,6 +4492,11 @@ func handleBuildCommand(args []string, cfg *Config) (err error) {
 			// "make" dependency pulled in during a cross session), in which
 			// case its real output is the plain name.
 			installCfg := packageBuildConfig(pkgName, cfg)
+			if builtForAnotherRoot(installCfg) {
+				// Cross built for the target root; nothing to install here.
+				debugf("Not installing cross built %s on the build host\n", pkgName)
+				continue
+			}
 			outputPkgName := getOutputPackageName(pkgName, installCfg)
 			archivePkgName := getArchivePackageName(pkgName, installCfg)
 			arch := GetSystemArchForPackage(installCfg, pkgName)
@@ -4936,7 +4977,7 @@ func handleBuildCommand(args []string, cfg *Config) (err error) {
 			if len(targetsPass1) > 0 {
 				// Skip installation prompt and installation for cross-compilation without system flag
 				// (cross-compiled packages without system are not meant to be installed on build host)
-				isCrossWithoutSystem := cfg.Values["HOKUTO_CROSS_ARCH"] != "" && cfg.Values["HOKUTO_CROSS_SYSTEM"] != "1"
+				isCrossWithoutSystem := builtForAnotherRoot(cfg)
 
 				shouldInstall := *autoInstall
 				if !*noInstall && !shouldInstall && !isCrossWithoutSystem {
@@ -5257,7 +5298,16 @@ func executeBuildPass(plan *BuildPlan, _ string, installAllTargets bool, cfg *Co
 				//  - It's a user target that triggers a post-build rebuild.
 				shouldInstallNow := !userRequestedMap[pkgName] || isDependencyForThisPass || triggersRebuilds || triggersSplitDeps
 
-				if installAllTargets || shouldInstallNow {
+				// A package cross built for the target root must not be
+				// installed here, even when something later in the plan depends
+				// on it: the host needs its own native copy, and installing the
+				// target build over it breaks the very tool the rest of the
+				// plan is about to use. The per-package config is what decides,
+				// so a plain "make" dependency compiled natively during a cross
+				// session is still installed normally.
+				if (installAllTargets || shouldInstallNow) && builtForAnotherRoot(packageBuildConfig(pkgName, cfg)) {
+					debugf("Not installing cross built %s on the build host\n", pkgName)
+				} else if installAllTargets || shouldInstallNow {
 					// Install the package immediately. Use the per-package
 					// cross config: pkgName may have been built completely
 					// natively (e.g. a plain "make" dependency like "pahole"

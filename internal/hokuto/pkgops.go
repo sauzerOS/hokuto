@@ -1249,6 +1249,17 @@ func handlePreInstallUninstall(pkgName string, cfg *Config, execCtx *Executor, f
 	if logger == nil {
 		logger = os.Stdout
 	}
+
+	// This hook exists to keep a native install working: removing a package
+	// before reinstalling it stops python modules from being left half
+	// upgraded, which is why every python-* package is set to uninstall itself
+	// first. None of that applies when cross building, because nothing is being
+	// installed on this machine -- and removing the host's own copy of a build
+	// tool part way through a cross build is actively destructive.
+	if builtForAnotherRoot(cfg) {
+		debugf("Skipping pre-install uninstall of %s during a cross build\n", pkgName)
+		return
+	}
 	// 1. Check if a -bin version of this package is already installed
 	// (e.g., if we are installing 'make', check for 'make-bin')
 	binPkgName := pkgName + "-bin"
