@@ -141,6 +141,32 @@ func normalizeSplitUpdateTargets(pkgNames []string, userRequested map[string]boo
 	return targets, splitTargets
 }
 
+// prioritizeHokutoUpdate narrows an update selection down to hokuto alone.
+//
+// hokuto updates itself ahead of everything else so that the rest of the run is
+// carried out by the new binary, and the caller re-runs the update afterwards.
+// Narrowing the package list is not enough on its own: selected split outputs
+// are installed from their own loop, which runs before the package list is
+// walked, so anything left in the split selection would slip past the very
+// check meant to hold it back. That is how an unrelated split such as
+// lib32-at-spi2-core came to be installed right after "Updating Hokuto".
+//
+// Splits produced by hokuto itself are kept, since they come out of the same
+// build as the update being applied.
+func prioritizeHokutoUpdate(selectedSplits map[string][]string) ([]string, map[string]bool, map[string][]string) {
+	userRequested := map[string]bool{"hokuto": true}
+	splits := make(map[string][]string)
+
+	if own := selectedSplits["hokuto"]; len(own) > 0 {
+		splits["hokuto"] = own
+		for _, splitPkg := range own {
+			userRequested[splitPkg] = true
+		}
+	}
+
+	return []string{"hokuto"}, userRequested, splits
+}
+
 func mergeSplitUpdateTargets(dst, selected map[string][]string) {
 	for sourcePkg, splitPkgs := range selected {
 		for _, splitPkg := range splitPkgs {
@@ -1223,9 +1249,7 @@ func checkForUpgrades(ctx context.Context, cfg *Config, maxJobs int, yes bool) e
 	if hokutoInUpdates {
 		colArrow.Printf("-> ")
 		colSuccess.Println("Updating Hokuto")
-		pkgNames = []string{"hokuto"}
-		// Re-initialize userRequestedMap for just hokuto
-		userRequestedMap = map[string]bool{"hokuto": true}
+		pkgNames, userRequestedMap, selectedSplitUpdates = prioritizeHokutoUpdate(selectedSplitUpdates)
 	}
 
 	// 4.5. Pre-check for available binaries to avoid pulling in build dependencies

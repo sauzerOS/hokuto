@@ -255,3 +255,70 @@ func TestAutomaticPerlRebuildDiscoversAndOrdersInstalledModules(t *testing.T) {
 		t.Fatalf("repository scan must include uninstalled Perl modules in dependency order, got %v", repoModules)
 	}
 }
+
+func TestPrioritizeHokutoUpdateDropsUnrelatedSplits(t *testing.T) {
+	// Reproduces the reported bug: picking "all" queues split outputs alongside
+	// hokuto, and they were installed from their own loop before the package
+	// list was walked -- so "Updating Hokuto" was immediately followed by
+	// "Installing split package lib32-at-spi2-core".
+	selected := map[string][]string{
+		"at-spi2-core":   {"lib32-at-spi2-core"},
+		"networkmanager": {"libnma"},
+	}
+
+	pkgNames, userRequested, splits := prioritizeHokutoUpdate(selected)
+
+	if len(pkgNames) != 1 || pkgNames[0] != "hokuto" {
+		t.Fatalf("pkgNames = %v, want just hokuto", pkgNames)
+	}
+	if len(splits) != 0 {
+		t.Errorf("splits = %v, want none: they must wait for the new hokuto", splits)
+	}
+	for _, name := range []string{"lib32-at-spi2-core", "libnma", "at-spi2-core", "networkmanager"} {
+		if userRequested[name] {
+			t.Errorf("%s is still marked as requested", name)
+		}
+	}
+	if !userRequested["hokuto"] {
+		t.Error("hokuto should remain requested")
+	}
+
+	// The caller's map must not be mutated; it is reused on the next run.
+	if len(selected) != 2 {
+		t.Errorf("the selection passed in was modified: %v", selected)
+	}
+}
+
+func TestPrioritizeHokutoUpdateKeepsHokutosOwnSplits(t *testing.T) {
+	// A split coming out of the hokuto build itself is part of the same update,
+	// so it stays.
+	selected := map[string][]string{
+		"hokuto":       {"hokuto-docs"},
+		"at-spi2-core": {"lib32-at-spi2-core"},
+	}
+
+	_, userRequested, splits := prioritizeHokutoUpdate(selected)
+
+	if got := splits["hokuto"]; len(got) != 1 || got[0] != "hokuto-docs" {
+		t.Errorf("splits[hokuto] = %v, want [hokuto-docs]", got)
+	}
+	if _, ok := splits["at-spi2-core"]; ok {
+		t.Error("unrelated split survived")
+	}
+	if !userRequested["hokuto-docs"] {
+		t.Error("hokuto's own split should be marked requested")
+	}
+}
+
+func TestPrioritizeHokutoUpdateHandlesNoSplits(t *testing.T) {
+	pkgNames, userRequested, splits := prioritizeHokutoUpdate(nil)
+	if len(pkgNames) != 1 || pkgNames[0] != "hokuto" {
+		t.Fatalf("pkgNames = %v, want just hokuto", pkgNames)
+	}
+	if len(splits) != 0 {
+		t.Errorf("splits = %v, want none", splits)
+	}
+	if !userRequested["hokuto"] {
+		t.Error("hokuto should be requested")
+	}
+}
