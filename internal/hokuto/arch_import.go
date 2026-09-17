@@ -72,7 +72,7 @@ func fetchPKGBUILD(pkgName string, source string) (string, string, string, error
 		if source == "AUR" && resp.StatusCode == http.StatusNotFound {
 			return "", "", "", fmt.Errorf("%w: AUR package %s", errImportPackageNotFound, pkgName)
 		}
-		return "", "", "", fmt.Errorf("PKGBUILD not found at release %s (HTTP %d)", sourceRef, resp.StatusCode)
+		return "", "", "", fmt.Errorf("PKGBUILD not found at release %s (HTTP %d): %s", sourceRef, resp.StatusCode, packageURL)
 	}
 
 	body, err := io.ReadAll(resp.Body)
@@ -100,6 +100,7 @@ func fetchArchPackageRelease(client *http.Client, pkgName string) (string, strin
 			PkgBase string `json:"pkgbase"`
 			PkgVer  string `json:"pkgver"`
 			PkgRel  string `json:"pkgrel"`
+			Epoch   int    `json:"epoch"`
 			Repo    string `json:"repo"`
 		} `json:"results"`
 	}
@@ -113,9 +114,24 @@ func fetchArchPackageRelease(client *http.Client, pkgName string) (string, strin
 		if pkg.PkgBase == "" || pkg.PkgVer == "" || pkg.PkgRel == "" {
 			return "", "", "", fmt.Errorf("Arch package release metadata for %s is incomplete", pkgName)
 		}
-		return pkg.PkgBase, pkg.PkgVer + "-" + pkg.PkgRel, pkg.Repo, nil
+		return pkg.PkgBase, archReleaseTag(pkg.Epoch, pkg.PkgVer, pkg.PkgRel), pkg.Repo, nil
 	}
 	return "", "", "", fmt.Errorf("%w: Arch package %s was not found in an official repository", errImportPackageNotFound, pkgName)
+}
+
+// archReleaseTag builds the git tag an Arch packaging repository uses for a
+// release.
+//
+// The tag is pkgver-pkgrel, prefixed with the epoch whenever the package has
+// one: zlib 1.3.2-3 at epoch 1 is tagged 1-1.3.2-3, not 1.3.2-3. Arch writes
+// the epoch with a trailing dash rather than the usual colon because a colon
+// cannot appear in a git ref. Omitting it does not fall back to anything, it
+// simply 404s.
+func archReleaseTag(epoch int, pkgver, pkgrel string) string {
+	if epoch > 0 {
+		return fmt.Sprintf("%d-%s-%s", epoch, pkgver, pkgrel)
+	}
+	return pkgver + "-" + pkgrel
 }
 
 func archPackageFileURL(pkgName, source, fileName string) (string, error) {
@@ -451,12 +467,23 @@ func extractBashArray(content string, arrayName string) []string {
 	// Split by whitespace and newlines, respecting quotes
 	var current strings.Builder
 	inQuote := false
+	inComment := false
 	quoteChar := rune(0)
 	appendValue := func(value string) {
 		result = append(result, expandBashBraceWord(value)...)
 	}
 
 	for _, ch := range arrayContent {
+		// A comment runs to the end of the line. Arch groups long source
+		// arrays with them, and without this every word of "# BEGIN managed
+		// sources" is taken for a source file name.
+		if inComment {
+			if ch == '\n' {
+				inComment = false
+			}
+			continue
+		}
+
 		if (ch == '"' || ch == '\'') && !inQuote {
 			inQuote = true
 			quoteChar = ch
@@ -464,6 +491,15 @@ func extractBashArray(content string, arrayName string) []string {
 		} else if ch == quoteChar && inQuote {
 			inQuote = false
 			quoteChar = 0
+			continue
+		}
+
+		// Outside quotes, '#' opens a comment only at the start of a word.
+		// Mid-word it is ordinary text, which matters because that is how a
+		// URL fragment is written: the git sources in the same arrays look
+		// like git+https://example.com/x.git#tag=v1.
+		if !inQuote && ch == '#' && current.Len() == 0 {
+			inComment = true
 			continue
 		}
 
