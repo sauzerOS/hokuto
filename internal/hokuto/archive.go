@@ -502,7 +502,7 @@ func createPackageTarball(pkgName, pkgVer, pkgRev, arch, variant, outputDir stri
 		// A 32 MiB window materially improves compression of large package
 		// members such as Java module and CDS images while retaining zstd -19.
 		compressProgram := "zstd -T0 " + zstdPackLevel + " " + zstdPackWindow
-		if framesFilter := zstdFramesProgram(); framesFilter != "" {
+		if framesFilter := zstdFramesProgram(directoryUncompressedSize(outputDir)); framesFilter != "" {
 			compressProgram = framesFilter
 		}
 		args := []string{"--use-compress-program=" + compressProgram, "-cf", tarballPath, "-C", outputDir, "."}

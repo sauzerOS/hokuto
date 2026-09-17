@@ -9,6 +9,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
 )
 
@@ -196,8 +198,8 @@ func TestScanZstdFramesRejectsGarbage(t *testing.T) {
 }
 
 func TestZstdWorkersIsBounded(t *testing.T) {
-	if n := zstdWorkers(); n < 1 || n > zstdMaxWorkers {
-		t.Errorf("zstdWorkers() = %d, want between 1 and %d", n, zstdMaxWorkers)
+	if n := zstdWorkers(); n < 1 || n > zstdMaxUnpackWorkers {
+		t.Errorf("zstdWorkers() = %d, want between 1 and %d", n, zstdMaxUnpackWorkers)
 	}
 }
 
@@ -292,5 +294,93 @@ func TestUnpackMultiFrameSkipsSingleFrameArchives(t *testing.T) {
 	err = unpackMultiFrame(pkg, dir, &Executor{Context: context.Background()})
 	if !errors.Is(err, errSingleFrameArchive) {
 		t.Fatalf("err = %v, want errSingleFrameArchive so the caller uses the ordinary path", err)
+	}
+}
+
+func TestZstdPackTargetWorkersIsHalfTheCores(t *testing.T) {
+	want := runtime.NumCPU() / 2
+	if want < 1 {
+		want = 1
+	}
+	if got := zstdPackTargetWorkers(); got != want {
+		t.Errorf("zstdPackTargetWorkers() = %d, want %d (half of %d cores)", got, want, runtime.NumCPU())
+	}
+}
+
+func TestZstdChunkSizeForInputSpreadsOverTheTarget(t *testing.T) {
+	target := int64(zstdPackTargetWorkers())
+
+	// A package large enough to fill every worker is cut into about that many
+	// frames, which is what lets packing use the cores at all: one process per
+	// frame is the only parallelism available.
+	big := zstdMaxChunkSize * target
+	chunk := zstdChunkSizeForInput(big)
+	frames := (big + chunk - 1) / chunk
+	if frames < target {
+		t.Errorf("a %d MiB package produced %d frames, want at least %d", big>>20, frames, target)
+	}
+
+	// Below the floor the package simply gets fewer frames rather than
+	// pathologically small ones.
+	if got := zstdChunkSizeForInput(1 << 20); got != zstdMinChunkSize {
+		t.Errorf("tiny input chunk = %d MiB, want the %d MiB floor", got>>20, zstdMinChunkSize>>20)
+	}
+
+	// And a huge package does not get frames so large that ratio is all that
+	// is left to gain.
+	if got := zstdChunkSizeForInput(1 << 40); got != zstdMaxChunkSize {
+		t.Errorf("huge input chunk = %d MiB, want the %d MiB ceiling", got>>20, zstdMaxChunkSize>>20)
+	}
+
+	// Unknown size falls back to the fixed default.
+	if got := zstdChunkSizeForInput(0); got != zstdFrameChunkSize {
+		t.Errorf("unknown size chunk = %d MiB, want %d MiB", got>>20, zstdFrameChunkSize>>20)
+	}
+}
+
+func TestZstdChunkSizeEnvOverridesTheComputedSize(t *testing.T) {
+	t.Setenv(zstdChunkSizeEnv, "64")
+	if got := zstdChunkSizeForInput(10 << 30); got != 64<<20 {
+		t.Errorf("chunk = %d MiB, want the configured 64 MiB", got>>20)
+	}
+	t.Setenv(zstdChunkSizeEnv, "0")
+	if got := zstdChunkSizeForInput(10 << 30); got < 1<<40 {
+		t.Errorf("chunk = %d, want a single frame for the whole archive", got)
+	}
+}
+
+func TestZstdFramesProgramCarriesTheChunkSize(t *testing.T) {
+	prog := zstdFramesProgram(4 << 30)
+	if prog == "" {
+		t.Skip("zstd or the hokuto binary is unavailable")
+	}
+	if !strings.Contains(prog, "__zstd-frames --chunk-size=") {
+		t.Errorf("program = %q, want a --chunk-size argument", prog)
+	}
+	// tar splits the program string on whitespace, so the argument itself must
+	// not contain any.
+	for _, field := range strings.Fields(prog) {
+		if strings.HasPrefix(field, "--chunk-size=") && strings.ContainsAny(field, " \t") {
+			t.Errorf("chunk size argument %q contains whitespace", field)
+		}
+	}
+}
+
+func TestDirectoryUncompressedSizeTotalsRegularFiles(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "sub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "a"), make([]byte, 1000), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "sub", "b"), make([]byte, 2000), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("a", filepath.Join(dir, "link")); err != nil {
+		t.Fatal(err)
+	}
+	if got := directoryUncompressedSize(dir); got != 3000 {
+		t.Errorf("directoryUncompressedSize = %d, want 3000 (symlink excluded)", got)
 	}
 }

@@ -19,20 +19,34 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
+	"math"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
 )
 
 const (
-	// zstdFrameChunkSize is how much uncompressed input goes into one frame.
-	// Cutting the stream costs ratio, because matches can no longer reach back
-	// across a boundary. Measured on the gcc package: 64 MiB costs +2.07%,
-	// 128 MiB +0.56%, 256 MiB +0.19%. 128 MiB keeps the loss small and the peak
-	// decode footprint at workers x 128 MiB, and anything that fits in one chunk
-	// -- which is most of the repository -- is packed exactly as before.
+	// Frames are compressed one per process, so the number of frames is what
+	// decides how many cores packing can use -- zstd's own -T threading is no
+	// help here, because --long=25 makes its internal jobs so large that a
+	// 128 MiB frame only ever splits into two of them, and below that into one.
+	// The chunk size is therefore derived from the size of the package so that
+	// it lands on roughly zstdPackTargetWorkers frames, clamped to this range.
+	//
+	// The bounds trade ratio against parallelism. Measured on the gcc package:
+	// 64 MiB chunks cost +2.07% over a single frame, 128 MiB +0.56%, 256 MiB
+	// +0.19%. The floor only comes into play for packages too small to fill
+	// that many chunks, where a few percent of a small archive is a few hundred
+	// kilobytes.
+	zstdMinChunkSize = 32 << 20
+	zstdMaxChunkSize = 256 << 20
+
+	// zstdFrameChunkSize is the fallback when the size of the input is not
+	// known ahead of time.
 	zstdFrameChunkSize = 128 << 20
 
 	// zstdPackLevel and zstdPackWindow mirror what the single-frame packer used.
@@ -41,10 +55,10 @@ const (
 	zstdPackLevel  = "-19"
 	zstdPackWindow = "--long=25"
 
-	// zstdMaxWorkers caps concurrency in both directions. Every worker holds a
-	// chunk in memory, and past a handful of them the archive is no longer the
-	// bottleneck anyway.
-	zstdMaxWorkers = 8
+	// zstdMaxUnpackWorkers caps concurrency when installing. Every worker holds
+	// a decoded chunk in memory, and past a handful of them the archive is no
+	// longer the bottleneck anyway.
+	zstdMaxUnpackWorkers = 8
 )
 
 const (
@@ -66,32 +80,73 @@ type zstdFrame struct {
 // to 0 to pack single-frame archives the way hokuto did before.
 const zstdChunkSizeEnv = "HOKUTO_ZSTD_CHUNK_MB"
 
-// zstdChunkSize returns the frame chunk size to pack with.
-func zstdChunkSize() int64 {
-	if v := os.Getenv(zstdChunkSizeEnv); v != "" {
-		mb, err := strconv.ParseInt(v, 10, 64)
-		if err != nil || mb < 0 {
-			debugf("Ignoring invalid %s=%q\n", zstdChunkSizeEnv, v)
-		} else if mb == 0 {
-			// A chunk larger than any package means one frame per archive.
-			return 1 << 62
-		} else {
-			return mb << 20
-		}
+// zstdChunkSizeOverride reports an explicitly configured chunk size.
+func zstdChunkSizeOverride() (int64, bool) {
+	v := os.Getenv(zstdChunkSizeEnv)
+	if v == "" {
+		return 0, false
 	}
-	return zstdFrameChunkSize
+	mb, err := strconv.ParseInt(v, 10, 64)
+	if err != nil || mb < 0 {
+		debugf("Ignoring invalid %s=%q\n", zstdChunkSizeEnv, v)
+		return 0, false
+	}
+	if mb == 0 {
+		// A chunk larger than any package means one frame per archive.
+		return 1 << 62, true
+	}
+	return mb << 20, true
 }
 
-// zstdWorkers returns the concurrency to use, capped by core count.
+// zstdChunkSize returns the frame chunk size to pack with when the size of the
+// input is not known.
+func zstdChunkSize() int64 {
+	return zstdChunkSizeForInput(0)
+}
+
+// zstdWorkers returns the concurrency to use when unpacking, capped by core
+// count.
 func zstdWorkers() int {
 	n := runtime.NumCPU()
-	if n > zstdMaxWorkers {
-		n = zstdMaxWorkers
+	if n > zstdMaxUnpackWorkers {
+		n = zstdMaxUnpackWorkers
 	}
 	if n < 1 {
 		n = 1
 	}
 	return n
+}
+
+// zstdPackTargetWorkers is how many cores packing aims to occupy: half of them,
+// leaving the rest of the machine usable while a package is being compressed.
+func zstdPackTargetWorkers() int {
+	if n := runtime.NumCPU() / 2; n > 1 {
+		return n
+	}
+	return 1
+}
+
+// zstdChunkSizeForInput picks a frame size that splits totalSize across the
+// cores packing is allowed to use. totalSize of 0 means the caller does not
+// know, in which case the fixed default applies.
+func zstdChunkSizeForInput(totalSize int64) int64 {
+	if override, ok := zstdChunkSizeOverride(); ok {
+		return override
+	}
+	if totalSize <= 0 {
+		return zstdFrameChunkSize
+	}
+
+	target := int64(zstdPackTargetWorkers())
+	chunk := (totalSize + target - 1) / target
+
+	if chunk < zstdMinChunkSize {
+		chunk = zstdMinChunkSize
+	}
+	if chunk > zstdMaxChunkSize {
+		chunk = zstdMaxChunkSize
+	}
+	return chunk
 }
 
 // Rough per-worker footprints, measured with a 32 MiB window: a zstd -19
@@ -101,23 +156,46 @@ const (
 	zstdUnpackWorkerOverhead = 64 << 20
 )
 
-// boundedWorkers caps concurrency so the workers together stay inside about
-// half of the memory currently available. Packing in particular runs on the
-// same machine as the build that produced the files, and a Pi has no headroom
-// to spare.
-func boundedWorkers(perWorker int64) int {
-	n := zstdWorkers()
-	avail := availableMemoryBytes()
-	if avail <= 0 || perWorker <= 0 {
-		return n
-	}
-	if fits := int(avail / 2 / perWorker); fits < n {
+// packWorkers is how many frames to compress at once: the target share of the
+// cores, reduced if there is not enough memory for that many.
+func packWorkers(chunkSize int64) int {
+	n := zstdPackTargetWorkers()
+	if fits := memoryBoundedWorkers(zstdPackWorkerOverhead + chunkSize); fits < n {
 		n = fits
 	}
 	if n < 1 {
 		n = 1
 	}
 	return n
+}
+
+// boundedWorkers caps concurrency so the workers together stay inside about
+// half of the memory currently available. Packing in particular runs on the
+// same machine as the build that produced the files, and a Pi has no headroom
+// to spare.
+func boundedWorkers(perWorker int64) int {
+	n := zstdWorkers()
+	if fits := memoryBoundedWorkers(perWorker); fits < n {
+		n = fits
+	}
+	if n < 1 {
+		n = 1
+	}
+	return n
+}
+
+// memoryBoundedWorkers reports how many workers of the given footprint fit in
+// about half of the memory currently available, or a very large number when
+// that cannot be determined.
+func memoryBoundedWorkers(perWorker int64) int {
+	avail := availableMemoryBytes()
+	if avail <= 0 || perWorker <= 0 {
+		return math.MaxInt32
+	}
+	if fits := int(avail / 2 / perWorker); fits > 0 {
+		return fits
+	}
+	return 1
 }
 
 // availableMemoryBytes reports MemAvailable, or 0 when it cannot be read.
@@ -505,9 +583,10 @@ func packageFrames(path string) ([]zstdFrame, error) {
 
 // zstdFramesProgram returns the `--use-compress-program` string that makes tar
 // pack through hokuto's multi-frame compressor, or "" when that is not
-// possible. tar splits the string on whitespace, so a path containing spaces
+// possible. uncompressedSize is how much tar is about to feed it, which decides
+// how the stream is cut into frames; pass 0 when it is unknown. tar splits the string on whitespace, so a path containing spaces
 // has to fall back to invoking zstd directly.
-func zstdFramesProgram() string {
+func zstdFramesProgram(uncompressedSize int64) string {
 	self, err := os.Executable()
 	if err != nil {
 		debugf("Cannot locate the hokuto binary for multi-frame packing: %v\n", err)
@@ -521,14 +600,47 @@ func zstdFramesProgram() string {
 		debugf("zstd binary unavailable for multi-frame packing: %v\n", err)
 		return ""
 	}
-	return self + " __zstd-frames"
+	// tar splits this on whitespace, so the argument carries no spaces.
+	return fmt.Sprintf("%s __zstd-frames --chunk-size=%d", self, zstdChunkSizeForInput(uncompressedSize))
+}
+
+// directoryUncompressedSize totals the regular files under root, which is close
+// enough to what tar will produce for choosing a frame size.
+func directoryUncompressedSize(root string) int64 {
+	var total int64
+	err := filepath.WalkDir(root, func(_ string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if !d.Type().IsRegular() {
+			return nil
+		}
+		if info, err := d.Info(); err == nil {
+			total += info.Size()
+		}
+		return nil
+	})
+	if err != nil {
+		debugf("Could not size %s for frame selection: %v\n", root, err)
+		return 0
+	}
+	return total
 }
 
 // runZstdFramesFilter implements the __zstd-frames subcommand, the filter tar
 // invokes through --use-compress-program. tar calls it with no arguments to
 // compress and with -d to decompress.
 func runZstdFramesFilter(args []string) error {
+	chunk := int64(0)
 	for _, a := range args {
+		if size, ok := strings.CutPrefix(a, "--chunk-size="); ok {
+			parsed, err := strconv.ParseInt(size, 10, 64)
+			if err != nil || parsed <= 0 {
+				return fmt.Errorf("invalid --chunk-size=%s", size)
+			}
+			chunk = parsed
+			continue
+		}
 		if a == "-d" || a == "--decompress" || a == "--uncompress" {
 			// tar only reaches this path when it drives extraction itself; the
 			// installer decodes in parallel without going through tar's filter.
@@ -539,8 +651,12 @@ func runZstdFramesFilter(args []string) error {
 			return cmd.Run()
 		}
 	}
-	chunk := zstdChunkSize()
-	return compressMultiFrame(os.Stdin, os.Stdout, chunk, boundedWorkers(zstdPackWorkerOverhead+chunk))
+	if chunk <= 0 {
+		chunk = zstdChunkSize()
+	} else if override, ok := zstdChunkSizeOverride(); ok {
+		chunk = override
+	}
+	return compressMultiFrame(os.Stdin, os.Stdout, chunk, packWorkers(chunk))
 }
 
 // errSingleFrameArchive reports that an archive has nothing to gain from the

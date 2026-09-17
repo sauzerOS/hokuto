@@ -199,8 +199,10 @@ func TestCreatePackageTarballUsesHighCompressionZstd(t *testing.T) {
 	// Packing goes through hokuto's multi-frame filter when it is available and
 	// falls back to invoking zstd directly; either way the archive must be
 	// level 19 with a 32 MiB window.
+	// The filter carries a --chunk-size derived from how much data is being
+	// packed, so only its invocation is pinned here, not the exact size.
 	got := string(args)
-	viaFilter := strings.Contains(got, "--use-compress-program="+zstdFramesProgram()+"\n") && zstdFramesProgram() != ""
+	viaFilter := strings.Contains(got, "--use-compress-program=") && strings.Contains(got, "__zstd-frames --chunk-size=")
 	viaZstd := strings.Contains(got, "--use-compress-program=zstd -T0 -19 --long=25\n")
 	if !viaFilter && !viaZstd {
 		t.Fatalf("expected the multi-frame filter or a high-compression zstd invocation, got %q", got)
