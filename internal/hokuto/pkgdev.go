@@ -1398,6 +1398,14 @@ func handleAutoBumpRepository(cfg *Config, autoBuild bool, assumeYes bool, repoU
 			pkgName = "fuse3"
 		case "userspace-rcu":
 			pkgName = "liburcu"
+		case "ark-archiver":
+			pkgName = "ark"
+		case "xfce-exo":
+			pkgName = "exo"
+		case "eden-emulator":
+			pkgName = "eden"
+		case "fast-float":
+			pkgName = "fast_float"
 		}
 
 		var newestVer string
