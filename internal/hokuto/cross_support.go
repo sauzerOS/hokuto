@@ -66,6 +66,15 @@ func packageSupportsCrossBuild(pkgDir string, options map[string]bool) (bool, st
 // buildScriptIsCrossAware reports whether a build script mentions any of the
 // variables that distinguish a cross build, ignoring comments so that a recipe
 // is not credited for merely talking about cross compilation.
+//
+// One idiom is deliberately not counted:
+//
+//	if [ "${HOKUTO_CROSS:-0}" != "1" ] && [ "$MULTILIB" = "1" ]; then
+//
+// That is a multilib guard. It only says "skip the 32-bit split when cross
+// building", which is about the *host* build being irrelevant to a cross one,
+// and says nothing about whether the main build was ever adapted. Crediting it
+// let packages such as libva through the gate and straight into a broken build.
 func buildScriptIsCrossAware(buildPath string) (string, bool) {
 	data, err := os.ReadFile(buildPath)
 	if err != nil {
@@ -75,12 +84,22 @@ func buildScriptIsCrossAware(buildPath string) (string, bool) {
 	for _, line := range strings.Split(string(data), "\n") {
 		code := stripShellComment(line)
 		for _, marker := range crossAwareBuildMarkers {
-			if strings.Contains(code, marker) {
-				return marker, true
+			if !strings.Contains(code, marker) {
+				continue
 			}
+			if marker == "HOKUTO_CROSS" && isMultilibGuard(code) {
+				continue
+			}
+			return marker, true
 		}
 	}
 	return "", false
+}
+
+// isMultilibGuard reports whether a line tests HOKUTO_CROSS only to decide
+// whether to build the 32-bit split package.
+func isMultilibGuard(code string) bool {
+	return strings.Contains(code, "MULTILIB")
 }
 
 // stripShellComment removes a trailing comment from a line of shell, leaving
