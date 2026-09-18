@@ -1500,6 +1500,16 @@ done
 	mesonScript := `#!/bin/sh
 set -e
 
+# A cross build installs into the target sysroot and must use the cross file
+# that names the target toolchain. Without this the wrapper silently configures
+# meson for the build machine, and every package using it produces host
+# binaries under the host's /usr.
+PREFIX="${CROSS_PREFIX:-/usr}"
+CROSS_ARGS=""
+if [ "${HOKUTO_CROSS:-0}" = "1" ]; then
+    CROSS_ARGS="--cross-file ${HOKUTO_ARCH}"
+fi
+
 for arg in "$@" .; do
     case "$arg" in
         -*) continue ;;
@@ -1514,7 +1524,7 @@ done
 
 set -x
 exec meson setup \
-    --prefix /usr \
+    --prefix "$PREFIX" \
     --libexecdir lib \
     --sbindir bin \
     --buildtype plain \
@@ -1522,6 +1532,7 @@ exec meson setup \
     -D b_pie=true \
 	-D b_ndebug=true \
     -D python.bytecompile=1 \
+    $CROSS_ARGS \
     "$@"
 `
 	if err := os.WriteFile(mesonPath, []byte(mesonScript), 0o755); err != nil {
