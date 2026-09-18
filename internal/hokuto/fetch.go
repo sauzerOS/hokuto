@@ -8,7 +8,6 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -21,9 +20,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/chromedp/cdproto/browser"
-	"github.com/chromedp/cdproto/network"
-	"github.com/chromedp/chromedp"
 	gogit "github.com/go-git/go-git/v5"
 	gogitconfig "github.com/go-git/go-git/v5/config"
 	"github.com/go-git/go-git/v5/plumbing"
@@ -31,6 +27,29 @@ import (
 	"github.com/schollz/progressbar/v3"
 	"golang.org/x/sys/unix"
 )
+
+// downloadUserAgents is the order in which User-Agent strings are tried.
+//
+// Measured against the hosts this project actually fetches from:
+//
+//	host          Chrome-UA   tool-UA   no-UA
+//	sourceforge      403        200      200
+//	ftp.gnu.org      200        200      403
+//	github           200        200      200
+//	gitlab           200        200      200
+//	cdn.kernel.org   200        200      200
+//	pagure           200        200      200
+//
+// An honest tool identity is the only one that works everywhere. Claiming to be
+// Chrome is actively harmful: SourceForge rejects a browser User-Agent that
+// arrives without the rest of a browser's fingerprint, which is exactly what a
+// plain Go HTTP client looks like. Sending no User-Agent at all trips
+// ftp.gnu.org instead. The Chrome string is kept only as a second attempt, for
+// sites that do insist on a browser.
+var downloadUserAgents = []string{
+	"hokuto (+https://github.com/sauzeros/hokuto)",
+	"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+}
 
 func newHttpClient() (*http.Client, error) {
 	// Create a new pool from the embedded asset.
@@ -856,6 +875,7 @@ func downloadFileWithOptions(originalURL, finalURL, destFile string, opt downloa
 	if opt.NativeAttempts > 0 {
 		maxRetries = opt.NativeAttempts - 1
 	}
+	uaIndex := 0
 	for i := 0; i <= maxRetries; i++ {
 		client, err := newHttpClient()
 		if err != nil {
@@ -872,10 +892,8 @@ func downloadFileWithOptions(originalURL, finalURL, destFile string, opt downloa
 			nativeErr = fmt.Errorf("failed to create http request: %w", err)
 			break
 		}
-		// Use a realistic browser User-Agent to avoid being flagged as a bot (e.g. by GitHub or SourceForge)
-		req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36")
+		req.Header.Set("User-Agent", downloadUserAgents[uaIndex])
 		req.Header.Set("Accept", "*/*")
-		req.Header.Set("Accept-Language", "en-US,en;q=0.9")
 		req.Header.Set("Connection", "keep-alive")
 
 		resp, err = client.Do(req)
@@ -886,12 +904,9 @@ func downloadFileWithOptions(originalURL, finalURL, destFile string, opt downloa
 				time.Sleep(backoff)
 				continue
 			}
-			// If we exhausted retries on network errors, we might still want to try browser?
-			// The user said "use chromedp as fallback".
-			// So if native fails completely, we fall back.
 			nativeErr = fmt.Errorf("native http get failed after %d attempts: %w", maxRetries+1, err)
 			debugf("Native download failed after %d attempts: %v\n", maxRetries+1, nativeErr)
-			break // Fall through to browser
+			break // fall through to wget
 		}
 
 		// Check status codes
@@ -908,8 +923,14 @@ func downloadFileWithOptions(originalURL, finalURL, destFile string, opt downloa
 
 			if strings.HasPrefix(ct, "text/html") && isBinary {
 				resp.Body.Close()
+				if uaIndex+1 < len(downloadUserAgents) {
+					uaIndex++
+					debugf("Got text/html for a binary URL; retrying as %q\n", downloadUserAgents[uaIndex])
+					i--
+					continue
+				}
 				nativeErr = fmt.Errorf("server returned text/html content for binary file (likely bot check or redirect page)")
-				debugf("Native download got text/html for binary, falling back to browser\n")
+				debugf("Native download got text/html for binary\n")
 				break
 			}
 
@@ -984,13 +1005,23 @@ func downloadFileWithOptions(originalURL, finalURL, destFile string, opt downloa
 			return nil
 		}
 
-		// If status is 418, 403, or 429, or 5xx, we might fallback or retry.
-		// 418/403 -> Fallback immediately (Bot check).
-		if resp.StatusCode == http.StatusTeapot || resp.StatusCode == http.StatusForbidden {
+		// 403/418/451 are usually aimed at *who we claim to be*, not at the
+		// request. SourceForge, for one, rejects a browser User-Agent that shows
+		// up without a browser's other fingerprints. Retry under the next
+		// identity before treating this as fatal.
+		if resp.StatusCode == http.StatusTeapot || resp.StatusCode == http.StatusForbidden ||
+			resp.StatusCode == http.StatusUnavailableForLegalReasons {
 			resp.Body.Close()
-			nativeErr = fmt.Errorf("native download failed with status %d (likely bot check)", resp.StatusCode)
-			debugf("Native download failed with status %d (likely bot check), falling back to browser...\n", resp.StatusCode)
-			break // Fall through to browser
+			if uaIndex+1 < len(downloadUserAgents) {
+				uaIndex++
+				debugf("Status %d; retrying as %q\n", resp.StatusCode, downloadUserAgents[uaIndex])
+				i-- // changing identity does not consume a retry
+				continue
+			}
+			nativeErr = fmt.Errorf("native download failed with status %d after trying %d user agents (likely bot check)",
+				resp.StatusCode, len(downloadUserAgents))
+			debugf("Native download failed with status %d (likely bot check)\n", resp.StatusCode)
+			break // fall through to wget
 		}
 
 		// 5xx / 429 -> Retry
@@ -1004,15 +1035,12 @@ func downloadFileWithOptions(originalURL, finalURL, destFile string, opt downloa
 			}
 			nativeErr = fmt.Errorf("native download failed with status %s after retries", resp.Status)
 			debugf("Native download failed with status %s after retries.\n", resp.Status)
-			break // Fall through to browser
+			break // fall through to wget
 		}
 
-		// 404 or other client errors -> Likely fatal, but maybe browser works?
-		// "Revert and use chromedp as fallback" implies general fallback.
-		// We will fall back for everything that fails native.
 		resp.Body.Close()
 		nativeErr = fmt.Errorf("native download failed with status: %s", resp.Status)
-		debugf("Native download failed with status: %s. Falling back to browser.\n", resp.Status)
+		debugf("Native download failed with status: %s\n", resp.Status)
 		break
 	}
 
@@ -1034,24 +1062,10 @@ func downloadFileWithOptions(originalURL, finalURL, destFile string, opt downloa
 		return nil
 	}
 
-	// --- Fallback: Browser Download (chromedp) ---
-    debugf("Falling back to browser download (chromedp)\n")
-    browserErr := downloadViaBrowser(finalURL, tmpPath, opt.Quiet)
-    if browserErr == nil {
-        if err := os.Rename(tmpPath, absPath); err != nil {
-            return fmt.Errorf("failed to publish browser-downloaded file %s: %w", absPath, err)
-        }
-        if !opt.Quiet {
-            colArrow.Print("-> ")
-            displayFilename := filepath.Base(finalURL)
-            colSuccess.Printf("Download successful: %s\n", displayFilename)
-        }
-        debugf("Download successful with browser (chromedp).")
-        return nil
-    }
-
-    // All fallbacks exhausted
-    return fmt.Errorf("all download methods failed. Native error: %v; Browser error: %v; Wget error: %v", nativeErr, browserErr, err)
+	// All download methods exhausted. wget is kept as the one fallback: it is
+	// a tiny dependency that already handles the redirect and cookie dances some
+	// mirrors require.
+	return fmt.Errorf("all download methods failed. Native error: %v; wget error: %v", nativeErr, err)
 }
 
 func downloadViaWget(url, destPath string, quiet bool, noCheckCertificate bool) error {
@@ -1091,203 +1105,6 @@ func downloadViaWget(url, destPath string, quiet bool, noCheckCertificate bool) 
 
 // downloadViaBrowser uses a headless browser to download the file, bypassing simple bot checks.
 // downloadViaBrowser uses a headless browser to download the file, bypassing simple bot checks.
-func downloadViaBrowser(url, destPath string, quiet bool) error {
-	// Create a temporary directory for the download
-	tmpDir, err := os.MkdirTemp("", "hokuto-dl-")
-	if err != nil {
-		return fmt.Errorf("failed to create temp dir: %w", err)
-	}
-	defer os.RemoveAll(tmpDir) // Cleanup temp dir after we are done
-
-	opts := append(chromedp.DefaultExecAllocatorOptions[:],
-		chromedp.Flag("headless", true),
-		chromedp.Flag("disable-gpu", true),
-		chromedp.Flag("no-sandbox", true), // Often needed in containerized environments
-		chromedp.Flag("disable-dev-shm-usage", true),
-
-		// Set a realistic User-Agent to avoid immediate blocking by some filters
-		chromedp.UserAgent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"),
-	)
-
-	allocCtx, cancel := chromedp.NewExecAllocator(context.Background(), opts...)
-	defer cancel()
-
-	ctx, cancel := chromedp.NewContext(allocCtx)
-	defer cancel()
-
-	// Timeout for the entire operation (10 minutes to be safe for large files, though we wait for file existence)
-	ctx, cancel = context.WithTimeout(ctx, 10*time.Minute)
-	defer cancel()
-
-	// Setup Progress Bar
-	var bar *progressbar.ProgressBar
-	var barLock sync.Mutex
-
-	// Channel to signal that we found the downloaded file
-	foundCh := make(chan string, 1)
-	// Channel to signal chromedp error (if any)
-	chromeErrCh := make(chan error, 1)
-
-	// Listen for download events and network responses
-	chromedp.ListenTarget(ctx, func(ev interface{}) {
-		switch e := ev.(type) {
-		case *browser.EventDownloadProgress:
-			barLock.Lock()
-			defer barLock.Unlock()
-
-			if !quiet {
-				if bar == nil && e.TotalBytes > 0 {
-					displayFilename := filepath.Base(url)
-					sizeStr := humanReadableSize(int64(e.TotalBytes))
-					colArrow.Print("-> ")
-					colSuccess.Printf("Downloading %s (%s) (browser)\n", displayFilename, sizeStr)
-
-					bar = progressbar.NewOptions64(
-						int64(e.TotalBytes),
-						progressbar.OptionSetDescription("   "),
-						progressbar.OptionSetWriter(os.Stderr),
-						progressbar.OptionShowBytes(true),
-						progressbar.OptionSetWidth(30),
-						progressbar.OptionThrottle(10*time.Millisecond),
-						progressbar.OptionShowCount(),
-						progressbar.OptionOnCompletion(func() {
-							fmt.Fprint(os.Stderr, "\n")
-						}),
-						progressbar.OptionSetTheme(progressbar.Theme{
-							Saucer:        "▓",
-							SaucerHead:    "▓",
-							SaucerPadding: "░",
-							BarStart:      "┃",
-							BarEnd:        "┃",
-						}),
-					)
-				}
-				if bar != nil {
-					bar.Set(int(e.ReceivedBytes))
-					if e.State == browser.DownloadProgressStateCompleted {
-						bar.Finish()
-						// Signal completion through foundCh
-						select {
-						case foundCh <- "completed":
-						default:
-						}
-					}
-				}
-			}
-
-		case *network.EventResponseReceived:
-			// Check for fatal status codes (404, 403, 429) on the main document
-			status := e.Response.Status
-			if status == http.StatusNotFound || status == http.StatusForbidden || status == http.StatusTooManyRequests {
-				if e.Type == network.ResourceTypeDocument {
-					select {
-					case chromeErrCh <- fmt.Errorf("browser received status %d %s", status, http.StatusText(int(status))):
-					default:
-					}
-				}
-			}
-		}
-	})
-
-	// 1. Run chromedp in a separate goroutine.
-	// We use an indefinite ActionFunc at the end so this goroutine BLOCKS until ctx is done.
-	// This prevents "browser finished" errors when a bot check page loads properly.
-	go func() {
-		err := chromedp.Run(ctx,
-			network.Enable(), // Enable network events to catch 404s
-			browser.SetDownloadBehavior(browser.SetDownloadBehaviorBehaviorAllow).
-				WithDownloadPath(tmpDir).
-				WithEventsEnabled(true), // Enable events for progress bar
-			chromedp.Navigate(url),
-			// Keep the browser open until the context is cancelled (by the poller finding the file)
-			chromedp.ActionFunc(func(ctx context.Context) error {
-				<-ctx.Done()
-				return nil
-			}),
-		)
-		chromeErrCh <- err
-	}()
-
-	// 2. Wait for completion or error.
-	var downloadedFile string
-
-	// Helper to find the completed file in tmpDir
-	findFile := func() string {
-		entries, err := os.ReadDir(tmpDir)
-		if err != nil {
-			return ""
-		}
-		for _, entry := range entries {
-			name := entry.Name()
-			// Check for completed file (not crdownload or tmp)
-			if !strings.HasSuffix(name, ".crdownload") && !strings.HasSuffix(name, ".tmp") {
-				return filepath.Join(tmpDir, name)
-			}
-		}
-		return ""
-	}
-
-	select {
-	case <-foundCh:
-		// Chromium says it's done. Now find the file.
-		downloadedFile = findFile()
-		if downloadedFile == "" {
-			return fmt.Errorf("browser reported download complete but no file found in %s", tmpDir)
-		}
-
-	case err := <-chromeErrCh:
-		// If Chrome exits, check error.
-		if err != nil && !errors.Is(err, context.Canceled) {
-			// Special handling for net::ERR_ABORTED
-			if strings.Contains(err.Error(), "net::ERR_ABORTED") {
-				debugf("Browser navigation aborted (likely download started), waiting for completion...\n")
-				select {
-				case <-foundCh:
-					downloadedFile = findFile()
-				case <-time.After(30 * time.Second): // Give it some time to finish if it was already progressing
-					// Check if it finished anyway
-					downloadedFile = findFile()
-				}
-				if downloadedFile == "" {
-					return fmt.Errorf("browser download failed (aborted and no file found): %w", err)
-				}
-			} else {
-				return fmt.Errorf("browser download failed: %w", err)
-			}
-		} else {
-			// If Chrome exited cleanly (nil error), check for file.
-			downloadedFile = findFile()
-			if downloadedFile == "" {
-				return fmt.Errorf("browser finished but no file was found")
-			}
-		}
-
-	case <-ctx.Done():
-		return fmt.Errorf("timeout or context cancelled: %w", ctx.Err())
-	}
-
-	// Move the downloaded file to the final destination
-	if err := os.Rename(downloadedFile, destPath); err != nil {
-		// Fallback copy if rename fails (cross-device)
-		src, err := os.Open(downloadedFile)
-		if err != nil {
-			return err
-		}
-		defer src.Close()
-
-		dst, err := os.Create(destPath)
-		if err != nil {
-			return err
-		}
-		defer dst.Close()
-
-		if _, err := io.Copy(dst, src); err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
 
 // fetchBinaryPackage attempts to download a binary package from the configured mirror.
 
@@ -1404,6 +1221,35 @@ func applyGnuMirror(originalURL string) string {
 		return strings.Replace(originalURL, gnuOriginalURL, gnuMirrorURL, 1)
 	}
 	return originalURL
+}
+
+// applySourceForgeDirect rewrites a SourceForge project-files URL into the
+// direct download form.
+//
+//	.../files/<path>/<file>            -> a 119 KB HTML "your download will start" page
+//	.../files/<path>/<file>/download   -> 302 to a mirror, application/octet-stream
+//
+// Measured against sourceforge.net: the /files/ URL hands the HTML interstitial
+// to every non-browser User-Agent, wget and curl included, and answers 403 to a
+// browser one. So no choice of User-Agent can retrieve the file from that form
+// -- the URL itself has to change. The /download suffix serves the real file
+// regardless of who asks.
+func applySourceForgeDirect(originalURL string) string {
+	if !strings.Contains(originalURL, "://sourceforge.net/projects/") ||
+		!strings.Contains(originalURL, "/files/") {
+		return originalURL
+	}
+	// Leave anything already pointing at the download endpoint, and anything
+	// carrying a query or fragment, exactly as the packager wrote it.
+	if strings.HasSuffix(originalURL, "/download") || strings.ContainsAny(originalURL, "?#") {
+		return originalURL
+	}
+	return originalURL + "/download"
+}
+
+// rewriteSourceURL applies every host-specific source URL fixup.
+func rewriteSourceURL(originalURL string) string {
+	return applySourceForgeDirect(applyGnuMirror(originalURL))
 }
 
 // Fetch sources (HTTP/FTP + Git)
@@ -1898,7 +1744,7 @@ func fetchSourcesWithOptions(pkgName, pkgDir string, processGit bool, quiet bool
 
 		// --- HTTP/FTP Source Logic ---
 		originalSourceURL := rawSourceURL
-		substitutedURL := applyGnuMirror(originalSourceURL)
+		substitutedURL := rewriteSourceURL(originalSourceURL)
 
 		// Create a version-aware hash key by combining the URL and the package version.
 		// This busts the cache for static URLs (like .../stable.deb) when the package version file is updated.

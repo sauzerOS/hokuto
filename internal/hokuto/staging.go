@@ -223,7 +223,7 @@ func appendUniqueOwner(owners []string, pkgName string) []string {
 
 // removeObsoleteFiles compares the installed manifest (under Installed/<pkg>/manifest)
 // with the manifest present in the staging tree. It returns a slice of absolute
-// paths (under rootDir) that should be deleted after the staging has been rsynced.
+// paths (under rootDir) that should be deleted after the staging has been placed.
 func removeObsoleteFiles(pkgName, stagingDir, rootDir string) ([]string, error) {
 	installedManifestPath := filepath.Join(Installed, pkgName, "manifest")
 	stagingManifestPath := filepath.Join(stagingDir, "var", "db", "hokuto", "installed", pkgName, "manifest")
@@ -363,9 +363,9 @@ func buildFileOwnerIndex(excludePkg, rootDir string) map[string]string {
 	return index
 }
 
-// rsyncStaging syncs the contents of stagingDir into rootDir.
-// It uses system rsync if available, otherwise falls back to a Go-native copy.
-func rsyncStaging(stagingDir, rootDir string, execCtx *Executor) error {
+// placeStaging moves the contents of stagingDir into rootDir, by hard link when
+// the two share a filesystem and by an internal tar copy otherwise.
+func placeStaging(stagingDir, rootDir string, execCtx *Executor) error {
 	stagingPath := filepath.Clean(stagingDir)
 
 	// Ensure rootDir exists
@@ -388,64 +388,26 @@ func rsyncStaging(stagingDir, rootDir string, execCtx *Executor) error {
 	if canPlaceByHardlink(stagingPath, rootDir) {
 		err := runHardlinkPlacement(stagingPath, rootDir, execCtx)
 		if err == nil {
+			debugf("Placed %s into %s by hard link (no bytes copied)\n", stagingPath, rootDir)
 			return removeStagingDir(stagingDir, execCtx)
 		}
-		// A partial placement is harmless: rsync below is idempotent and
+		// A partial placement is harmless: the tar copy below is idempotent and
 		// finishes whatever is left.
-		debugf("Hard link placement failed (%v), falling back to rsync\n", err)
+		debugf("Hard link placement failed (%v), falling back to the tar copy\n", err)
 	}
 
-	// --- Try system rsync first ---
-	if _, err := exec.LookPath("rsync"); err == nil {
-		// Note: rsync needs trailing slash on source to copy contents, not the directory itself
-		stagingPathWithSlash := stagingPath + string(os.PathSeparator)
-		args := []string{
-			"-aHAX",
-			"--numeric-ids",
-			"--no-implied-dirs",
-			"--keep-dirlinks",
-			stagingPathWithSlash,
-			rootDir,
-		}
-		cmd := exec.Command("rsync", args...)
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
+	// Placement has exactly two strategies now: hard links when staging shares a
+	// filesystem with the root (the normal case, since staging is deliberately
+	// created inside rootDir), and the internal tar copy for everything else.
+	//
+	// rsync used to sit between them. It is gone because the tar path now matches
+	// what `rsync -aHAX --keep-dirlinks` gave us: it writes through symlinked
+	// directories, relinks files that share an inode, and carries extended
+	// attributes such as security.capability across.
 
-		if err := execCtx.Run(cmd); err == nil {
-			return removeStagingDir(stagingDir, execCtx)
-		}
-	}
-	// --- Fallback 1: Try system cp -aT ---
-	if _, err := exec.LookPath("cp"); err == nil {
-		// The `cp -aT` command is a safer alternative to the tar pipe.
-		// -a preserves links, permissions, and ownership.
-		// -T prevents `cp` from creating a subdirectory inside rootDir.
-		cmd := exec.Command("cp", "-aT", stagingPath, rootDir)
-		cmd.Stderr = os.Stderr // Show potential errors.
-
-		debugf("Attempting to sync with 'cp -aT %s %s'\n", stagingPath, rootDir)
-		if err := execCtx.Run(cmd); err == nil {
-			// Success! Clean up and return.
-			if os.Geteuid() == 0 {
-				if err := os.RemoveAll(stagingDir); err != nil {
-					fmt.Fprintf(os.Stderr, "warning: failed to remove staging dir %s natively: %v\n", stagingDir, err)
-				}
-			} else {
-				rmCmd := exec.Command("rm", "-rf", stagingDir)
-				if err := execCtx.Run(rmCmd); err != nil {
-					fmt.Fprintf(os.Stderr, "warning: failed to remove staging dir %s: %v\n", stagingDir, err)
-				}
-			}
-			return nil
-		}
-		debugf("System 'cp -aT' failed, falling back to internal Go implementation.\n")
-	} else {
-		debugf("System 'cp' not found, falling back to internal Go implementation.\n")
-	}
-
-	// --- Fallback 2: Use internal Go tar implementation ---
+	// --- Fallback: internal tar copy ---
 	// This is resilient to broken system tools during updates
-	debugf("rsync not available, using internal Go tar fallback\n")
+	debugf("Falling back to the internal Go tar copy\n")
 
 	if err := copyTreeWithTar(stagingPath, rootDir, execCtx); err != nil {
 		return fmt.Errorf("internal tar fallback failed: %v", err)

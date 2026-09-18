@@ -691,8 +691,13 @@ func pkgInstallWithRemotePolicy(tarballPath, pkgName string, cfg *Config, execCt
 		return nil, nil
 	}
 
-	stagingDir := filepath.Join(tmpDir, pkgName, "staging")
-	pkgTmpDir := filepath.Join(tmpDir, pkgName)
+	// Stage on the destination's own filesystem so the package can be hard
+	// linked into place instead of copied. TMPDIR is unsuitable here: it is
+	// routinely a tmpfs or zram disk for fast builds, which is a different
+	// filesystem from the root and would force a full second copy.
+	stagingBase := installStagingBase(rootDir, tmpDir, cfg)
+	stagingDir := filepath.Join(stagingBase, pkgName, "staging")
+	pkgTmpDir := filepath.Join(stagingBase, pkgName)
 
 	// Declare and initialize the 'failed' slice for tracking non-fatal errors
 	var failed []string
@@ -1489,9 +1494,9 @@ func pkgInstallWithRemotePolicy(tarballPath, pkgName string, cfg *Config, execCt
 		}
 	}
 
-	// 5. Rsync staging into root
-	debugf("Rsync staging into root")
-	if err := rsyncStaging(stagingDir, rootDir, execCtx); err != nil {
+	// 5. Place staging into root
+	debugf("Placing staging into root")
+	if err := placeStaging(stagingDir, rootDir, execCtx); err != nil {
 		return nil, fmt.Errorf("failed to sync staging to %s: %v", rootDir, err)
 	}
 	invalidatePackageEquivalentCache()

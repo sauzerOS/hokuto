@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -48,6 +49,53 @@ func sameFilesystem(a, b string) (bool, error) {
 }
 
 // canPlaceByHardlink decides whether the hard link fast path applies.
+// installStagingBase picks a directory for install staging that sits on the
+// same filesystem as rootDir, so a package can be hard-linked into place rather
+// than copied byte for byte.
+//
+// This deliberately does not use TMPDIR. TMPDIR is commonly aimed at a tmpfs or
+// zram disk so that *builds* happen in RAM, and that is a different filesystem
+// from the root -- which silently disables hard-link placement and turns every
+// install into a second full copy of every byte. Build temp and install staging
+// want opposite things, so they no longer share a setting.
+//
+// The candidates are tried in order and the first one that lands on rootDir's
+// filesystem wins. If none does, the caller's fallback (historically TMPDIR) is
+// returned and placement degrades to a copy, exactly as before.
+func installStagingBase(rootDir, fallback string, cfg *Config) string {
+	if cfg != nil {
+		if v := strings.TrimSpace(cfg.Values["STAGINGDIR"]); v != "" {
+			if err := os.MkdirAll(v, 0o755); err == nil {
+				return v
+			}
+			debugf("STAGINGDIR %s is unusable, falling back to autodetection\n", v)
+		}
+	}
+
+	for _, candidate := range []string{
+		filepath.Join(rootDir, "var/cache/hokuto/staging"),
+		filepath.Join(rootDir, "var/lib/hokuto/staging"),
+		filepath.Join(rootDir, ".hokuto-staging"),
+	} {
+		if err := os.MkdirAll(candidate, 0o755); err != nil {
+			debugf("Staging candidate %s not creatable: %v\n", candidate, err)
+			continue
+		}
+		same, err := sameFilesystem(candidate, rootDir)
+		if err != nil {
+			debugf("Cannot compare %s with root %s: %v\n", candidate, rootDir, err)
+			continue
+		}
+		if same {
+			return candidate
+		}
+		debugf("Staging candidate %s is on a different filesystem than %s\n", candidate, rootDir)
+	}
+
+	debugf("No same-filesystem staging location found; using %s\n", fallback)
+	return fallback
+}
+
 func canPlaceByHardlink(stagingDir, rootDir string) bool {
 	if os.Getenv(noHardlinkPlacementEnv) == "1" {
 		debugf("Hard link placement disabled by %s\n", noHardlinkPlacementEnv)

@@ -217,7 +217,7 @@ func verifyOrCreateChecksums(pkgName, pkgDir string, force bool, logger io.Write
 		}
 
 		originalURL := src
-		substitutedURL := applyGnuMirror(originalURL)
+		substitutedURL := rewriteSourceURL(originalURL)
 
 		currentSum, sumExists := existing[fname]
 		computedSum, hasComputed := computedSums[filePath]

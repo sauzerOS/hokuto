@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 
 	"golang.org/x/sys/unix"
 )
@@ -224,10 +225,61 @@ func copyDir(src, dst string) error {
 
 // shouldStripTar inspects the tarball to check for a single top-level directory.
 
+// readXattrs returns every extended attribute set on path. These carry things
+// the file mode cannot express -- most importantly security.capability, which
+// is how file capabilities such as cap_sys_nice are stored.
+func readXattrs(path string) map[string]string {
+	sz, err := unix.Llistxattr(path, nil)
+	if err != nil || sz <= 0 {
+		return nil
+	}
+	buf := make([]byte, sz)
+	sz, err = unix.Llistxattr(path, buf)
+	if err != nil || sz <= 0 {
+		return nil
+	}
+	out := map[string]string{}
+	for _, name := range strings.Split(strings.TrimRight(string(buf[:sz]), "\x00"), "\x00") {
+		if name == "" {
+			continue
+		}
+		vsz, err := unix.Lgetxattr(path, name, nil)
+		if err != nil || vsz < 0 {
+			continue
+		}
+		val := make([]byte, vsz)
+		if _, err := unix.Lgetxattr(path, name, val); err != nil {
+			continue
+		}
+		out[name] = string(val)
+	}
+	return out
+}
+
+// applyXattrs restores attributes carried in the tar header's PAX records.
+// Best effort: security.* needs privileges, and a filesystem may not support
+// xattrs at all, neither of which should abort an install.
+func applyXattrs(target string, hdr *tar.Header) {
+	for k, v := range hdr.PAXRecords {
+		name, ok := strings.CutPrefix(k, "SCHILY.xattr.")
+		if !ok {
+			continue
+		}
+		if err := unix.Lsetxattr(target, name, []byte(v), 0); err != nil {
+			debugf("Could not restore xattr %s on %s: %v\n", name, target, err)
+		}
+	}
+}
+
 func copyTreeWithTar(src, dst string, execCtx *Executor) error {
 	// Create an in-memory tar archive of the source
 	var buf bytes.Buffer
 	tw := tar.NewWriter(&buf)
+
+	// A file with several names must be stored once and relinked on extraction,
+	// the way rsync -H does, or a package that hard links its binaries is
+	// silently duplicated on disk.
+	seenInodes := make(map[uint64]string)
 
 	// Walk the source directory and add everything to tar
 	err := filepath.Walk(src, func(path string, info os.FileInfo, err error) error {
@@ -282,13 +334,38 @@ func copyTreeWithTar(src, dst string, execCtx *Executor) error {
 		// Set the name to the relative path
 		hdr.Name = rel
 
+		// Second and later names for one inode become hard links.
+		isLink := false
+		if info.Mode().IsRegular() {
+			if st, ok := info.Sys().(*syscall.Stat_t); ok && st.Nlink > 1 {
+				if first, seen := seenInodes[uint64(st.Ino)]; seen {
+					hdr.Typeflag = tar.TypeLink
+					hdr.Linkname = first
+					hdr.Size = 0
+					isLink = true
+				} else {
+					seenInodes[uint64(st.Ino)] = rel
+				}
+			}
+		}
+
+		// Carry extended attributes (file capabilities, ACLs) across.
+		if xs := readXattrs(path); len(xs) > 0 {
+			if hdr.PAXRecords == nil {
+				hdr.PAXRecords = make(map[string]string, len(xs))
+			}
+			for k, v := range xs {
+				hdr.PAXRecords["SCHILY.xattr."+k] = v
+			}
+		}
+
 		// Write header
 		if err := tw.WriteHeader(hdr); err != nil {
 			return err
 		}
 
 		// For regular files, write the content
-		if info.Mode().IsRegular() {
+		if !isLink && info.Mode().IsRegular() {
 			if os.Geteuid() == 0 {
 				f, err := os.Open(path)
 				if err != nil {
@@ -493,6 +570,12 @@ func copyTreeWithTar(src, dst string, execCtx *Executor) error {
 
 		default:
 			debugf("Skipping unsupported tar entry type %c: %s\n", hdr.Typeflag, hdr.Name)
+		}
+
+		// Restore extended attributes last: writing content or chowning a file
+		// clears security.capability, so this has to come after both.
+		if len(hdr.PAXRecords) > 0 {
+			applyXattrs(target, hdr)
 		}
 	}
 
