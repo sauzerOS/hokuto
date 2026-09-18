@@ -89,6 +89,16 @@ func newHttpClient() (*http.Client, error) {
 			if len(via) > 0 {
 				req.Header.Set("User-Agent", via[0].Header.Get("User-Agent"))
 			}
+
+			// Go adds a Referer automatically when it follows a redirect. A
+			// download is not a link a browser was clicked on, and SourceForge
+			// treats the two differently: asked for
+			// /project/<p>/<f> with a Referer it answers with the "your download
+			// will start shortly" HTML page, and without one it answers with the
+			// 302 to the CDN that actually serves the file. Sending the Referer
+			// therefore saves a 115 KB web page as the tarball, or trips the bot
+			// check and fails outright.
+			req.Header.Del("Referer")
 			return nil
 		},
 	}, nil
@@ -1049,7 +1059,8 @@ func downloadFileWithOptions(originalURL, finalURL, destFile string, opt downloa
 	}
 	// --- Fallback: Wget ---
 	debugf("Native download failed: %v. Falling back to wget...\n", nativeErr)
-	if err := downloadViaWget(finalURL, tmpPath, opt.Quiet, opt.WgetNoCheckCertificate); err == nil {
+	wgetErr := downloadViaWget(finalURL, tmpPath, opt.Quiet, opt.WgetNoCheckCertificate)
+	if wgetErr == nil {
 		if err := os.Rename(tmpPath, absPath); err != nil {
 			return fmt.Errorf("failed to publish wget-downloaded file %s: %w", absPath, err)
 		}
@@ -1065,7 +1076,7 @@ func downloadFileWithOptions(originalURL, finalURL, destFile string, opt downloa
 	// All download methods exhausted. wget is kept as the one fallback: it is
 	// a tiny dependency that already handles the redirect and cookie dances some
 	// mirrors require.
-	return fmt.Errorf("all download methods failed. Native error: %v; wget error: %v", nativeErr, err)
+	return fmt.Errorf("all download methods failed. Native error: %v; wget error: %v", nativeErr, wgetErr)
 }
 
 func downloadViaWget(url, destPath string, quiet bool, noCheckCertificate bool) error {
