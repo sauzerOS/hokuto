@@ -9,6 +9,7 @@ package hokuto
 // check below refuses that build instead.
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -137,3 +138,85 @@ func setCrossBuildActive(v bool) { crossBuildActive = v }
 
 // crossBuildInProgress reports whether a cross build is running.
 func crossBuildInProgress() bool { return crossBuildActive }
+
+// Keeping a cross,system package inside its sysroot.
+//
+// A cross,system package is installed on the build host, so every path it
+// stages is a path on the host. A recipe that hardcodes --prefix=/usr instead
+// of honouring CROSS_PREFIX therefore packages its aarch64 libraries as
+// /usr/lib/..., and installing it replaces the host's native libraries of the
+// same name. Nothing fails at build time and the damage only shows up later,
+// when the dynamic loader rejects the foreign ELF.
+
+// crossSystemSysrootFor returns the sysroot a cross,system build must stay
+// inside, or "" when this build is not one. It reads the same CROSS_PREFIX the
+// build script was handed, so the check and the recipe cannot disagree.
+func crossSystemSysrootFor(cfg *Config, defaults map[string]string) string {
+	if cfg == nil || defaults == nil {
+		return ""
+	}
+	if cfg.Values["HOKUTO_CROSS_SYSTEM"] != "1" && cfg.Values["HOKUTO_CROSS_SIMPLE"] != "1" {
+		return ""
+	}
+	prefix := defaults["CROSS_PREFIX"]
+	if prefix == "" || prefix == "/usr" {
+		return ""
+	}
+	return strings.TrimSuffix(prefix, "/")
+}
+
+// crossContainmentExemptPrefixes are the paths a cross,system package may write
+// outside its sysroot: hokuto's own per-package bookkeeping, which is named
+// after the prefixed package and so never collides with a native one.
+var crossContainmentExemptPrefixes = []string{"/var/db/hokuto/"}
+
+// verifyCrossSystemContainment refuses to package a cross,system build that
+// staged files outside its sysroot.
+func verifyCrossSystemContainment(outputDir, sysroot string) error {
+	if sysroot == "" {
+		return nil
+	}
+	var stray []string
+	total := 0
+	walkErr := filepath.WalkDir(outputDir, func(path string, entry os.DirEntry, err error) error {
+		if err != nil || entry.IsDir() {
+			return nil
+		}
+		rel, relErr := filepath.Rel(outputDir, path)
+		if relErr != nil {
+			return nil
+		}
+		abs := "/" + filepath.ToSlash(rel)
+		if strings.HasPrefix(abs, sysroot+"/") {
+			return nil
+		}
+		for _, exempt := range crossContainmentExemptPrefixes {
+			if strings.HasPrefix(abs, exempt) {
+				return nil
+			}
+		}
+		total++
+		if len(stray) < 10 {
+			stray = append(stray, abs)
+		}
+		return nil
+	})
+	if walkErr != nil {
+		return fmt.Errorf("failed to inspect packaged output: %w", walkErr)
+	}
+	if total == 0 {
+		return nil
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "cross,system build staged %d file(s) outside %s.\n", total, sysroot)
+	fmt.Fprintf(&b, "Installing this package would overwrite host files with %s binaries.\n", filepath.Base(sysroot))
+	for _, p := range stray {
+		fmt.Fprintf(&b, "  %s\n", p)
+	}
+	if total > len(stray) {
+		fmt.Fprintf(&b, "  ... and %d more\n", total-len(stray))
+	}
+	b.WriteString("The recipe most likely hardcodes a prefix; make it use \"$CROSS_PREFIX\"\n")
+	b.WriteString("(or hokuto-meson / the generated cmake toolchain file, which already do).")
+	return fmt.Errorf("%s", b.String())
+}

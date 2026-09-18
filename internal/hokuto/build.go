@@ -1930,6 +1930,7 @@ type builtPackageFinalization struct {
 	isGeneric     bool
 	bootstrap     bool
 	updateWebsite bool
+	crossSysroot  string
 }
 
 func removePathFromOutput(outputDir, relPath string, execCtx *Executor) {
@@ -2089,6 +2090,9 @@ func finalizeBuiltPackage(in builtPackageFinalization) error {
 	}
 
 	cleanPackagedOutput(in.outputDir, in.buildExec, in.options)
+	if err := verifyCrossSystemContainment(in.outputDir, in.crossSysroot); err != nil {
+		return err
+	}
 	if err := normalizePackagedManPages(in.outputDir, in.buildExec); err != nil {
 		return fmt.Errorf("failed to normalize man pages: %w", err)
 	}
@@ -3235,6 +3239,7 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, opts BuildOptions)
 		isGeneric:     isGeneric,
 		bootstrap:     opts.Bootstrap,
 		updateWebsite: opts.UpdateWebsite,
+		crossSysroot:  crossSystemSysrootFor(cfg, defaults),
 	}); err != nil {
 		return 0, err
 	}
@@ -3967,6 +3972,7 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 		shouldStrip:   shouldStrip,
 		isGeneric:     isGeneric,
 		bootstrap:     false,
+		crossSysroot:  crossSystemSysrootFor(cfg, defaults),
 	}); err != nil {
 		return err
 	}
