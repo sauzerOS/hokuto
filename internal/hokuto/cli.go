@@ -380,14 +380,14 @@ func Main() {
 		}
 
 	case "__place-staging":
-		// Internal helper: hard links a staging tree into the target root.
+		// Internal helper: places a staging tree into the target root.
 		// Split out as a subcommand so the privileged path can reuse the
 		// Executor's sudo/run0 handling instead of re-implementing it.
 		if len(os.Args) != 4 {
 			fmt.Fprintln(os.Stderr, "Usage: hokuto __place-staging <staging-dir> <root-dir>")
 			os.Exit(2)
 		}
-		if err := placeStagingByHardlink(os.Args[2], os.Args[3]); err != nil {
+		if err := placeStagingLocally(os.Args[2], os.Args[3]); err != nil {
 			fmt.Fprintf(os.Stderr, "hokuto: staging placement failed: %v\n", err)
 			os.Exit(1)
 		}

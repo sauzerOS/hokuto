@@ -126,3 +126,14 @@ func stripShellComment(line string) string {
 func unconfiguredCrossBuildAllowed() bool {
 	return os.Getenv(allowUnconfiguredCrossEnv) == "1"
 }
+
+// crossBuildActive records whether the build currently running is a cross
+// build. generateDepends needs it to honour the "nocross" dependency flag, and
+// it runs far from where the cross mode is decided.
+var crossBuildActive bool
+
+// setCrossBuildActive is called once the build mode for this run is known.
+func setCrossBuildActive(v bool) { crossBuildActive = v }
+
+// crossBuildInProgress reports whether a cross build is running.
+func crossBuildInProgress() bool { return crossBuildActive }

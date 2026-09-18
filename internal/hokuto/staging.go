@@ -380,37 +380,25 @@ func placeStaging(stagingDir, rootDir string, execCtx *Executor) error {
 		}
 	}
 
-	// --- Fast path: hard link placement on a shared filesystem ---
-	// The tarball has already been written to staging on this filesystem, so
-	// linking its entries into rootDir costs metadata operations only instead
-	// of copying every byte a second time. This also halves the bytes an
-	// install writes to disk.
-	if canPlaceByHardlink(stagingPath, rootDir) {
-		err := runHardlinkPlacement(stagingPath, rootDir, execCtx)
-		if err == nil {
-			debugf("Placed %s into %s by hard link (no bytes copied)\n", stagingPath, rootDir)
-			return removeStagingDir(stagingDir, execCtx)
+	// Placement runs entirely in one privileged context. Both strategies write
+	// into rootDir, so escalating once here is what lets the tar fallback work
+	// at all: escalating per file-operation instead left it silently writing
+	// nothing when hokuto was invoked as an unprivileged user.
+	if os.Geteuid() == 0 || execCtx == nil || !execCtx.ShouldRunAsRoot {
+		if err := placeStagingLocally(stagingPath, rootDir); err != nil {
+			return err
 		}
-		// A partial placement is harmless: the tar copy below is idempotent and
-		// finishes whatever is left.
-		debugf("Hard link placement failed (%v), falling back to the tar copy\n", err)
+		return removeStagingDir(stagingDir, execCtx)
 	}
 
-	// Placement has exactly two strategies now: hard links when staging shares a
-	// filesystem with the root (the normal case, since staging is deliberately
-	// created inside rootDir), and the internal tar copy for everything else.
-	//
-	// rsync used to sit between them. It is gone because the tar path now matches
-	// what `rsync -aHAX --keep-dirlinks` gave us: it writes through symlinked
-	// directories, relinks files that share an inode, and carries extended
-	// attributes such as security.capability across.
-
-	// --- Fallback: internal tar copy ---
-	// This is resilient to broken system tools during updates
-	debugf("Falling back to the internal Go tar copy\n")
-
-	if err := copyTreeWithTar(stagingPath, rootDir, execCtx); err != nil {
-		return fmt.Errorf("internal tar fallback failed: %v", err)
+	self, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("cannot locate the hokuto binary for privileged placement: %w", err)
+	}
+	cmd := exec.Command(self, "__place-staging", stagingPath, rootDir)
+	cmd.Stderr = os.Stderr
+	if err := execCtx.Run(cmd); err != nil {
+		return fmt.Errorf("staging placement failed: %w", err)
 	}
 
 	return removeStagingDir(stagingDir, execCtx)
@@ -428,6 +416,30 @@ func removeStagingDir(stagingDir string, execCtx *Executor) error {
 	rmCmd := exec.Command("rm", "-rf", stagingDir)
 	if err := execCtx.Run(rmCmd); err != nil {
 		return fmt.Errorf("failed to remove staging dir %s: %v", stagingDir, err)
+	}
+	return nil
+}
+
+// placeStagingLocally moves a staging tree into rootDir in the current process,
+// which must already hold the privileges needed to write there.
+//
+// Hard linking is tried first and costs metadata operations only. It does not
+// apply when staging and the root are on different filesystems, and individual
+// entries can still fail where a package writes below a nested mount, so the
+// internal tar copy finishes whatever is left. That copy is idempotent, which
+// is what makes a partial hard link placement harmless.
+func placeStagingLocally(stagingDir, rootDir string) error {
+	if canPlaceByHardlink(stagingDir, rootDir) {
+		if err := placeStagingByHardlink(stagingDir, rootDir); err == nil {
+			debugf("Placed %s into %s by hard link (no bytes copied)\n", stagingDir, rootDir)
+			return nil
+		} else {
+			debugf("Hard link placement failed (%v), falling back to the tar copy\n", err)
+		}
+	}
+	debugf("Placing %s into %s with the internal tar copy\n", stagingDir, rootDir)
+	if err := copyTreeWithTar(stagingDir, rootDir, &Executor{}); err != nil {
+		return fmt.Errorf("internal tar fallback failed: %w", err)
 	}
 	return nil
 }

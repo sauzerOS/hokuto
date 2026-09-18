@@ -2152,7 +2152,12 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, opts BuildOptions)
 	// installed on the target. This runs after the block above, which clears
 	// the cross flags for plain build dependencies compiled natively during a
 	// cross session, so those are not caught by it.
-	if cfg.Values["HOKUTO_CROSS_ARCH"] != "" || cfg.Values["HOKUTO_CROSS_SYSTEM"] == "1" {
+	isCrossBuild := cfg.Values["HOKUTO_CROSS_ARCH"] != "" || cfg.Values["HOKUTO_CROSS_SYSTEM"] == "1"
+	// Recorded for generateDepends, which honours the "nocross" flag but runs
+	// far from where the build mode is known.
+	setCrossBuildActive(isCrossBuild)
+
+	if isCrossBuild {
 		if supported, reason := packageSupportsCrossBuild(pkgDir, options); !supported {
 			if !unconfiguredCrossBuildAllowed() {
 				return 0, fmt.Errorf(

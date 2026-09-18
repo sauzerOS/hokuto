@@ -370,7 +370,7 @@ func parseDependsData(content []byte) ([]DepSpec, error) {
 			dependencies = append(dependencies, altDeps...)
 		} else {
 			// Regular dependency parsing
-			name, op, ver, optional, rebuild, makeDep, cross, crossNative, runtimeOnly, postInstall, suggest, suggestText := parseDepToken(line)
+			name, op, ver, optional, rebuild, makeDep, cross, crossNative, noCross, runtimeOnly, postInstall, suggest, suggestText := parseDepToken(line)
 			makeOpt := hasDependencyFlag(line, "makeopt")
 			if name != "" {
 				dependencies = append(dependencies, DepSpec{
@@ -383,6 +383,7 @@ func parseDependsData(content []byte) ([]DepSpec, error) {
 					MakeOpt:      makeOpt,
 					Cross:        cross,
 					CrossNative:  crossNative,
+					NoCross:      noCross,
 					RuntimeOnly:  runtimeOnly,
 					PostInstall:  postInstall,
 					Suggest:      suggest,
@@ -403,12 +404,12 @@ func parseAlternativeDeps(line string) ([]DepSpec, error) {
 	parts := strings.Split(line, "|")
 	var alternatives []string
 	var commonOp, commonVer string
-	var commonOptional, commonRebuild, commonMake, commonMakeOpt, commonCross, commonCrossNative, commonRuntimeOnly, commonPostInstall, commonSuggest bool
+	var commonOptional, commonRebuild, commonMake, commonMakeOpt, commonCross, commonCrossNative, commonNoCross, commonRuntimeOnly, commonPostInstall, commonSuggest bool
 	var commonSuggestText string
 
 	for _, part := range parts {
 		part = strings.TrimSpace(part)
-		name, op, ver, optional, rebuild, makeDep, cross, crossNative, runtimeOnly, postInstall, suggest, suggestText := parseDepToken(part)
+		name, op, ver, optional, rebuild, makeDep, cross, crossNative, noCross, runtimeOnly, postInstall, suggest, suggestText := parseDepToken(part)
 		makeOpt := hasDependencyFlag(part, "makeopt")
 		if name != "" {
 			alternatives = append(alternatives, name)
@@ -421,6 +422,7 @@ func parseAlternativeDeps(line string) ([]DepSpec, error) {
 			commonMake = commonMake || makeDep || makeOpt
 			commonMakeOpt = commonMakeOpt || makeOpt
 			commonCross = commonCross || cross
+			commonNoCross = commonNoCross || noCross
 			commonCrossNative = commonCrossNative || crossNative
 			commonRuntimeOnly = commonRuntimeOnly || runtimeOnly
 			commonPostInstall = commonPostInstall || postInstall

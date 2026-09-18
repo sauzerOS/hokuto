@@ -12,9 +12,9 @@ package hokuto
 import (
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"syscall"
@@ -112,21 +112,6 @@ func canPlaceByHardlink(stagingDir, rootDir string) bool {
 	return same
 }
 
-// runHardlinkPlacement performs the placement, escalating privileges the same
-// way the rsync path does when hokuto is not already running as root.
-func runHardlinkPlacement(stagingDir, rootDir string, execCtx *Executor) error {
-	if os.Geteuid() == 0 || execCtx == nil || !execCtx.ShouldRunAsRoot {
-		return placeStagingByHardlink(stagingDir, rootDir)
-	}
-	self, err := os.Executable()
-	if err != nil {
-		return fmt.Errorf("cannot locate the hokuto binary for privileged placement: %w", err)
-	}
-	cmd := exec.Command(self, "__place-staging", stagingDir, rootDir)
-	cmd.Stderr = os.Stderr
-	return execCtx.Run(cmd)
-}
-
 // placeStagingByHardlink populates rootDir from stagingDir using hard links.
 //
 // A hard link shares the inode, so mode, ownership, timestamps, xattrs and ACLs
@@ -210,6 +195,18 @@ func placeStagingByHardlink(stagingDir, rootDir string) error {
 				return os.Link(srcPath, tmp)
 			})
 			if err != nil {
+				// A package can write below a nested mount: linux-rpi4 puts the
+				// kernel and dtbs in /boot, which on a Pi is a separate vfat
+				// partition. link() cannot cross a device, and vfat has no hard
+				// links at all, so fall back to copying just this entry rather
+				// than failing the whole placement.
+				if isCrossDeviceLinkError(err) {
+					debugf("Hard link not possible for %s (%v); copying instead\n", dstPath, err)
+					if cerr := copyFilePreservingMetadata(srcPath, dstPath, info); cerr != nil {
+						return fmt.Errorf("%s: %w", dstPath, cerr)
+					}
+					return nil
+				}
 				return fmt.Errorf("%s: %w", dstPath, err)
 			}
 			return nil
@@ -267,6 +264,58 @@ func ensurePlacementDir(dstPath string, src fs.FileInfo) error {
 		return err
 	}
 	return lchownFromInfo(dstPath, src)
+}
+
+// isCrossDeviceLinkError reports whether a link() failure was caused by the
+// source and destination living on different filesystems, or by a filesystem
+// that has no hard links at all. Both are ordinary situations when a package
+// writes below a nested mount, and neither should abort the placement.
+func isCrossDeviceLinkError(err error) bool {
+	return errors.Is(err, syscall.EXDEV) || errors.Is(err, syscall.EPERM) || errors.Is(err, syscall.EOPNOTSUPP)
+}
+
+// copyFilePreservingMetadata places a single entry by copying its contents,
+// used when the destination cannot be hard linked to.
+func copyFilePreservingMetadata(srcPath, dstPath string, info fs.FileInfo) error {
+	if !info.Mode().IsRegular() {
+		// Devices, fifos and sockets carry no contents to copy, so recreate the
+		// node itself. A filesystem that refused the link often cannot hold one
+		// of these either, so a failure here is reported rather than ignored.
+		st, ok := info.Sys().(*syscall.Stat_t)
+		if !ok {
+			return fmt.Errorf("cannot read device numbers for %s", srcPath)
+		}
+		return replaceAtomically(dstPath, func(tmp string) error {
+			if err := syscall.Mknod(tmp, uint32(st.Mode), int(st.Rdev)); err != nil {
+				return err
+			}
+			return lchownFromInfo(tmp, info)
+		})
+	}
+	return replaceAtomically(dstPath, func(tmp string) error {
+		in, err := os.Open(srcPath)
+		if err != nil {
+			return err
+		}
+		defer in.Close()
+		out, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, info.Mode().Perm())
+		if err != nil {
+			return err
+		}
+		if _, err := io.Copy(out, in); err != nil {
+			out.Close()
+			return err
+		}
+		if err := out.Close(); err != nil {
+			return err
+		}
+		// Ownership and timestamps are best effort: a vfat destination cannot
+		// represent either, and failing there would be worse than losing them.
+		_ = lchownFromInfo(tmp, info)
+		atime, mtime := fileTimes(info)
+		_ = os.Chtimes(tmp, atime, mtime)
+		return nil
+	})
 }
 
 // replaceAtomically builds the new entry beside dstPath and renames it over the

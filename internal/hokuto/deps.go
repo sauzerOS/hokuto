@@ -1374,11 +1374,11 @@ func resolvedBuildDependencyCandidates(dep DepSpec, yes bool, cfg *Config) ([]st
 // "pkg post-install", and "pkg suggest Optional support" and returns name, op,
 // version, flags, and optional suggestion text.
 
-func parseDepToken(token string) (name string, op string, ver string, optional bool, rebuild bool, makeDep bool, cross bool, crossNative bool, runtimeOnly bool, postInstall bool, suggest bool, suggestText string) {
+func parseDepToken(token string) (name string, op string, ver string, optional bool, rebuild bool, makeDep bool, cross bool, crossNative bool, noCross bool, runtimeOnly bool, postInstall bool, suggest bool, suggestText string) {
 	// Split by whitespace to separate package spec from flags
 	parts := strings.Fields(token)
 	if len(parts) == 0 {
-		return "", "", "", false, false, false, false, false, false, false, false, ""
+		return "", "", "", false, false, false, false, false, false, false, false, false, ""
 	}
 
 	pkgSpec := parts[0]
@@ -1395,6 +1395,8 @@ func parseDepToken(token string) (name string, op string, ver string, optional b
 			makeDep = true
 		case "cross":
 			cross = true
+		case "nocross":
+			noCross = true
 		case "crossnative":
 			crossNative = true
 			cross = true // Implies cross because it's only for cross-compilation scenarios
@@ -1421,10 +1423,10 @@ func parseDepToken(token string) (name string, op string, ver string, optional b
 		if idx := strings.Index(pkgSpec, op); idx != -1 {
 			name := pkgSpec[:idx]
 			ver := pkgSpec[idx+len(op):]
-			return strings.TrimSpace(name), op, strings.TrimSpace(ver), optional, rebuild, makeDep, cross, crossNative, runtimeOnly, postInstall, suggest, suggestText
+			return strings.TrimSpace(name), op, strings.TrimSpace(ver), optional, rebuild, makeDep, cross, crossNative, noCross, runtimeOnly, postInstall, suggest, suggestText
 		}
 	}
-	return pkgSpec, "", "", optional, rebuild, makeDep, cross, crossNative, runtimeOnly, postInstall, suggest, suggestText
+	return pkgSpec, "", "", optional, rebuild, makeDep, cross, crossNative, noCross, runtimeOnly, postInstall, suggest, suggestText
 }
 
 func hasDependencyFlag(token, flag string) bool {
@@ -2146,6 +2148,7 @@ type DepSpec struct {
 	Make         bool     // True if dependency is only needed at build time
 	MakeOpt      bool     // True if an available binary may be used as an optional build-time bootstrap
 	Cross        bool     // True if dependency is only for cross-compilation
+	NoCross      bool     // True if dependency does NOT apply to a cross-built package
 	CrossNative  bool     // True if dependency is only for cross-compilation AND NOT cross-system
 	RuntimeOnly  bool     // True if dependency is needed after install but not for the build graph
 	PostInstall  bool     // True if dependency is needed only while running the post-install hook

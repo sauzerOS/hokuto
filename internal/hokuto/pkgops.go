@@ -822,7 +822,7 @@ func generateDepends(pkgName, pkgDir, outputDir, rootDir string, execCtx *Execut
 				}
 
 				// Extract package name to use as key in the map
-				name, op, ver, optional, rebuild, makeDep, cross, crossNative, runtimeOnly, postInstall, suggest, suggestText := parseDepToken(line)
+				name, op, ver, optional, rebuild, makeDep, cross, crossNative, noCross, runtimeOnly, postInstall, suggest, suggestText := parseDepToken(line)
 				if name != "" {
 					cleanName := cleanManualDepName(name)
 					if cleanName == "" {
@@ -844,6 +844,15 @@ func generateDepends(pkgName, pkgDir, outputDir, rootDir string, execCtx *Execut
 					// Skip non-runtime dependency hints. If an optional feature is
 					// actually linked, libdeps above will add the real runtime owner.
 					if makeDep || optional || rebuild {
+						continue
+					}
+
+					// "nocross" marks a dependency of the native build only. A
+					// cross build usually enables a smaller feature set, and
+					// without this the cross-built package would still record
+					// the native list and demand packages the target neither
+					// needs nor has.
+					if noCross && crossBuildInProgress() {
 						continue
 					}
 
