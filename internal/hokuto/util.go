@@ -61,9 +61,15 @@ func fcPrintln(w io.Writer, p any, a ...any) {
 }
 
 // debugf prints debug messages when Debug is true
+// debugf writes to stderr, never stdout. Debug mode is inherited by child
+// processes through HOKUTO_DEBUG, and some of those children write a data
+// stream on stdout -- the __zstd-frames filter tar invokes through
+// --use-compress-program hands tar the package archive that way. A single
+// debug line on stdout there ends up inside the tarball, which then fails to
+// decompress with "magic number mismatch".
 func debugf(format string, args ...any) {
 	if Debug {
-		fmt.Printf(format, args...)
+		fmt.Fprintf(os.Stderr, format, args...)
 	}
 }
 

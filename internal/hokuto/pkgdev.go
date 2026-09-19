@@ -667,7 +667,10 @@ func bumpPackage(pkgName, expectedOldVersion, newVersion, commitMsg string) (str
 	if err := fetchSources(pkgName, pkgDir, false); err != nil {
 		return "", fmt.Errorf("%s: could not download sources: %v", pkgName, err)
 	}
-	if err := verifyOrCreateChecksums(pkgName, pkgDir, false, nil); err != nil {
+	// The version just changed, so the freshly downloaded source is expected to
+	// hash differently from the one recorded for the previous release. Adopt it
+	// instead of prompting -- see checksumAdoptDownloaded.
+	if err := verifyOrCreateChecksumsWithPolicy(pkgName, pkgDir, false, checksumAdoptDownloaded, nil); err != nil {
 		return "", fmt.Errorf("%s: failed to generate checksums: %v", pkgName, err)
 	}
 

@@ -104,9 +104,39 @@ func withSharedDownloadLocks(lockBases []string, fn func() error) error {
 	return fn()
 }
 
+// checksumPolicy selects what to do when a source file's recorded checksum
+// does not match the file on disk.
+type checksumPolicy int
+
+const (
+	// checksumPrompt asks whether to keep the file on disk or fetch it again.
+	checksumPrompt checksumPolicy = iota
+
+	// checksumAdoptDownloaded records the downloaded file's hash without
+	// asking. This is for `hokuto bump`: the version just changed, so the
+	// source is a different tarball and a mismatch is the expected outcome,
+	// not a warning sign.
+	//
+	// It only ever changes anything for a source whose filename carries no
+	// version -- an untagged release served as e.g. "source.tar.gz". When the
+	// URL interpolates ${version} the new name has no recorded checksum at
+	// all, so that case never reaches the prompt in the first place.
+	//
+	// Answering "keep" already adopts the new hash (the checksum is recomputed
+	// from whatever is on disk further down), so this skips a question whose
+	// only useful answer is the default. It is still safe: the source cache is
+	// keyed on hash(url + version), so bumping the version forces a fresh
+	// download rather than reusing the previous release under the same name.
+	checksumAdoptDownloaded
+)
+
 // verifyOrCreateChecksums checks source file integrity, prompting the user for action on mismatch.
 
 func verifyOrCreateChecksums(pkgName, pkgDir string, force bool, logger io.Writer) error {
+	return verifyOrCreateChecksumsWithPolicy(pkgName, pkgDir, force, checksumPrompt, logger)
+}
+
+func verifyOrCreateChecksumsWithPolicy(pkgName, pkgDir string, force bool, policy checksumPolicy, logger io.Writer) error {
 	if logger == nil {
 		logger = os.Stdout
 	}
@@ -266,6 +296,9 @@ func verifyOrCreateChecksums(pkgName, pkgDir string, force bool, logger io.Write
 				WithPrompt(func() {
 					performRedownload(fname, originalURL, substitutedURL, pkgVersion, pkgSrcDir, (logger != os.Stdout), logger)
 				})
+			} else if policy == checksumAdoptDownloaded && !isLocal {
+				// A version bump: this is a different tarball by definition.
+				actionSummary = "Updated (version bump)"
 			} else {
 				WithPrompt(func() {
 					// Try to use /dev/tty for direct user interaction
