@@ -15,9 +15,38 @@ import (
 	"sync"
 )
 
-func stripPackage(outputDir string, stripStaticArchives bool, buildExec *Executor, logger io.Writer) error {
+// stripBinary returns the strip executable a package's output should be run
+// through.
+//
+// A cross build emits target binaries and the host strip cannot read them, so
+// the cross toolchain's strip is used. The exceptions mirror the toolchain
+// selection in pkgBuild's environment setup: cross-simple mode, and
+// "host-tool" packages under cross-system, both produce build-machine binaries
+// and want the plain host strip.
+func stripBinary(cfg *Config, options map[string]bool) string {
+	const hostStrip = "strip"
+	if cfg == nil {
+		return hostStrip
+	}
+	crossArch := cfg.Values["HOKUTO_CROSS_ARCH"]
+	if crossArch == "" || cfg.Values["HOKUTO_CROSS_SIMPLE"] == "1" {
+		return hostStrip
+	}
+	if options["host-tool"] && cfg.Values["HOKUTO_CROSS_SYSTEM"] == "1" {
+		return hostStrip
+	}
+	if crossArch == "arm64" {
+		crossArch = "aarch64"
+	}
+	return crossArch + "-linux-gnu-strip"
+}
+
+func stripPackage(outputDir string, stripStaticArchives bool, stripBin string, buildExec *Executor, logger io.Writer) error {
 	if logger == nil {
 		logger = os.Stdout
+	}
+	if stripBin == "" {
+		stripBin = "strip"
 	}
 	fmt.Fprint(logger, colArrow.Sprint("-> "))
 	if stripStaticArchives {
@@ -154,7 +183,7 @@ func stripPackage(outputDir string, stripStaticArchives bool, buildExec *Executo
 				stripArgs = []string{"--strip-debug", p}
 			}
 			debugf("  -> Stripping %s\n", p)
-			stripCmd := exec.Command("strip", stripArgs...)
+			stripCmd := exec.Command(stripBin, stripArgs...)
 			stripCmd.Stderr = stderrWriter // Use the conditional writer
 			if err := buildExec.Run(stripCmd); err != nil {
 				// Log as warning only. Do not mark the whole package as failed.

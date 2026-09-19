@@ -1844,7 +1844,7 @@ func packageSplitOutputs(parentPkgName, pkgDir, splitRoot, version, revision, ta
 
 		splitShouldStrip := shouldStrip && !splitOptions["nostrip"]
 		if splitShouldStrip {
-			if err := stripPackage(splitOutputDir, splitOptions["staticlibs"], buildExec, opts.LogWriter); err != nil {
+			if err := stripPackage(splitOutputDir, splitOptions["staticlibs"], stripBinary(cfg, splitOptions), buildExec, opts.LogWriter); err != nil {
 				return fmt.Errorf("split package %s failed during stripping phase: %w", outputSplitName, err)
 			}
 		} else {
@@ -1927,6 +1927,7 @@ type builtPackageFinalization struct {
 	started       time.Time
 	elapsed       time.Duration
 	shouldStrip   bool
+	stripBin      string
 	isGeneric     bool
 	bootstrap     bool
 	updateWebsite bool
@@ -2056,7 +2057,7 @@ func finalizeBuiltPackage(in builtPackageFinalization) error {
 	debugf("Depends written to %s\n", filepath.Join(installedDir, "depends"))
 
 	if in.shouldStrip {
-		if err := stripPackage(in.outputDir, in.options["staticlibs"], in.buildExec, in.logger); err != nil {
+		if err := stripPackage(in.outputDir, in.options["staticlibs"], in.stripBin, in.buildExec, in.logger); err != nil {
 			return fmt.Errorf("build failed during stripping phase for %s: %w", in.sourcePkgName, err)
 		}
 	} else {
@@ -2347,10 +2348,9 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, opts BuildOptions)
 
 	// Check if strip should be disabled
 	shouldStrip := cfg.DefaultStrip
-	// Disable stripping for cross-compilation as host 'strip' doesn't support target binaries
-	if cfg.Values["HOKUTO_CROSS_ARCH"] != "" {
-		shouldStrip = false
-	}
+	// Cross builds are stripped too, using the cross toolchain's strip rather
+	// than the host one -- see stripBinary. Leaving them unstripped is not
+	// harmless: an unstripped libxul.so is 2.6GB against 114MB of .text.
 
 	if options["nostrip"] {
 		if shouldStrip { // Only print if it wasn't already disabled
@@ -3236,6 +3236,7 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, opts BuildOptions)
 		started:       startTime,
 		elapsed:       elapsed,
 		shouldStrip:   shouldStrip,
+		stripBin:      stripBinary(cfg, options),
 		isGeneric:     isGeneric,
 		bootstrap:     opts.Bootstrap,
 		updateWebsite: opts.UpdateWebsite,
@@ -3970,6 +3971,7 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 		started:       startTime,
 		elapsed:       elapsed,
 		shouldStrip:   shouldStrip,
+		stripBin:      stripBinary(cfg, options),
 		isGeneric:     isGeneric,
 		bootstrap:     false,
 		crossSysroot:  crossSystemSysrootFor(cfg, defaults),
