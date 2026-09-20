@@ -72,6 +72,7 @@ var (
 	BumpLogFile           = "/var/log/hokuto-bump.log"
 	BumpIgnoreFile        = "/var/db/hokuto/bump-ignore.json"
 	OptionalRebuildFile   = "/var/db/hokuto/optional-rebuilds.json"
+	SaveDir               = "/var/db/hokuto/save"
 	//go:embed assets/MIRROR
 	embeddedMirrorList string
 

@@ -689,21 +689,38 @@ func (r *throughputTimeoutReader) start() {
 		defer ticker.Stop()
 
 		var lastBytes int64
+		var stalledWindows int
+
+		// Require several consecutive slow windows before considering
+		// the download stalled. This tolerates short-lived throughput dips.
+		const maxStalledWindows = 3
+
 		for {
 			select {
 			case <-ticker.C:
 				totalBytes := r.bytes.Load()
 				windowBytes := totalBytes - lastBytes
-				if windowBytes < r.minBytesPerWindow {
-					r.stallErr.Store(fmt.Errorf("download stalled: received %s in the last %s, below minimum %s",
-						humanReadableSize(windowBytes),
-						r.window,
-						humanReadableSize(r.minBytesPerWindow),
-					))
-					r.cancel()
-					return
-				}
 				lastBytes = totalBytes
+
+				if windowBytes < r.minBytesPerWindow {
+					stalledWindows++
+
+					if stalledWindows >= maxStalledWindows {
+						r.stallErr.Store(fmt.Errorf(
+							"download stalled: received %s in the last %s, below minimum %s for %d consecutive windows",
+							humanReadableSize(windowBytes),
+							r.window,
+							humanReadableSize(r.minBytesPerWindow),
+							maxStalledWindows,
+						))
+						r.cancel()
+						return
+					}
+				} else {
+					// Download is healthy again.
+					stalledWindows = 0
+				}
+
 			case <-r.done:
 				return
 			}

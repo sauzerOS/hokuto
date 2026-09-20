@@ -1079,7 +1079,7 @@ func pkgInstallWithRemotePolicy(tarballPath, pkgName string, cfg *Config, execCt
 				if fast {
 					fmt.Println()
 				}
-				cPrintf(colInfo, "File %s modified, %schoose action: [K]eep current, [u]se new, [e]dit, use new for [A]ll: ", file, ownerDisplay)
+				cPrintf(colInfo, "File %s modified, %schoose action: [K]eep current, [u]se new, [b]ackup, [e]dit, use new for [A]ll: ", file, ownerDisplay)
 				// Flush stdout to ensure prompt is visible
 				os.Stdout.Sync()
 				// Use the shared, robust bufio.Reader
@@ -1135,6 +1135,11 @@ func pkgInstallWithRemotePolicy(tarballPath, pkgName string, cfg *Config, execCt
 				}
 			case "u":
 				// keep staging file as-is
+			case "b":
+				// Backup current file and use new file from package (keep staging file as-is)
+				if err := backupModifiedFile(currentFile, file, execCtx, logger); err != nil {
+					return nil, fmt.Errorf("failed to backup modified file %s: %w", currentFile, err)
+				}
 			case "a":
 				// Use new for all remaining files - set flag and use new for this file
 				skipAllPrompts = true
@@ -2153,4 +2158,49 @@ func isRemoteUpdate() bool {
 		}
 	}
 	return hasUpdate && hasRemote
+}
+
+// formatBackupFileName formats a relative file path (e.g. "etc/hokuto/hokuto.conf")
+// into a backup file name (e.g. "etc_hokuto-hokuto.conf").
+func formatBackupFileName(relPath string) string {
+	clean := filepath.Clean(filepath.ToSlash(relPath))
+	clean = strings.TrimPrefix(clean, "/")
+	dir := filepath.Dir(clean)
+	base := filepath.Base(clean)
+	if dir == "." || dir == "" {
+		return base
+	}
+	dirPart := strings.ReplaceAll(dir, "/", "_")
+	return dirPart + "-" + base
+}
+
+// backupModifiedFile saves a backup copy of currentFile to SaveDir (e.g. /var/db/hokuto/save)
+// using the format dir_path-filename.
+func backupModifiedFile(currentFile, relPath string, execCtx *Executor, logger io.Writer) error {
+	backupName := formatBackupFileName(relPath)
+	backupPath := filepath.Join(SaveDir, backupName)
+	backupDir := filepath.Dir(backupPath)
+
+	if os.Geteuid() == 0 {
+		if err := os.MkdirAll(backupDir, 0755); err != nil {
+			return fmt.Errorf("failed to create backup dir %s natively: %w", backupDir, err)
+		}
+		if err := copyFile(currentFile, backupPath); err != nil {
+			return fmt.Errorf("failed to backup file %s to %s natively: %w", currentFile, backupPath, err)
+		}
+	} else {
+		mkdirCmd := exec.Command("mkdir", "-p", backupDir)
+		if err := execCtx.Run(mkdirCmd); err != nil {
+			return fmt.Errorf("failed to create backup dir %s: %w", backupDir, err)
+		}
+		cpCmd := exec.Command("cp", "--remove-destination", "--preserve=mode,ownership,timestamps", currentFile, backupPath)
+		if err := execCtx.Run(cpCmd); err != nil {
+			return fmt.Errorf("failed to backup file %s to %s: %w", currentFile, backupPath, err)
+		}
+	}
+
+	if logger != nil {
+		fmt.Fprintf(logger, "%s", colInfo.Sprintf("Saved backup of %s to %s\n", currentFile, backupPath))
+	}
+	return nil
 }
