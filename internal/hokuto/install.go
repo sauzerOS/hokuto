@@ -1350,14 +1350,19 @@ func pkgInstallWithRemotePolicy(tarballPath, pkgName string, cfg *Config, execCt
 
 	// --- NEW: Dependency Check and Backup (Before deletion) ---
 	debugf("Dependency check")
-	// --- NEW: Dependency Check and Backup (Before deletion) ---
-	debugf("Dependency check")
-	affectedPackages := make(map[string][]string) // Changed to map[string][]string
+	affectedPackages := make(map[string][]string)
 	libFilesToDelete := make(map[string]struct{})
+
+	// Ensure the temporary directory exists.
+	if err := os.MkdirAll(tmpDir, 0755); err != nil {
+		return nil, fmt.Errorf("failed to create temporary directory %s: %v", tmpDir, err)
+	}
+
 	tempLibBackupDir, err := os.MkdirTemp(tmpDir, "hokuto-lib-backup-")
 	if err != nil {
 		return nil, fmt.Errorf("failed to create temporary backup directory: %v", err)
 	}
+
 	// CLEANUP: Ensure the backup directory is removed on exit
 	defer func() {
 		if !Debug {
@@ -1457,7 +1462,6 @@ func pkgInstallWithRemotePolicy(tarballPath, pkgName string, cfg *Config, execCt
 			}
 		}
 	}
-	// 4b. Backup all affected library files
 	// 4b. Backup all affected library files
 	for libPath := range libFilesToDelete {
 		// libPath is the HOKUTO_ROOT-prefixed path (e.g., /tmp/hokuto/usr/lib/libfoo.so)
