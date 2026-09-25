@@ -4462,13 +4462,16 @@ func handleBuildCommand(args []string, cfg *Config) (err error) {
 		if *noCleanup || *bootstrap || *noDevel || !buildWorkStarted {
 			return
 		}
-		// A cross build installs into the target sysroot: the built package and
-		// the cross dependencies pulled in alongside it ARE the deliverable, not
-		// throwaway host build tools, and they must persist for later cross
-		// builds. Nothing installed during a cross session is temporary.
+		// Dependencies a cross build pulls into the host (aarch64-* sysroot
+		// packages, natively built make tools) are temporary exactly like in a
+		// native build. Only the requested targets are the deliverable: a
+		// cross-system build installs them under their arch-prefixed output
+		// name, which is not what the world file records, so keep them
+		// explicitly or the orphan sweep below would remove them.
 		if cfg.Values["HOKUTO_CROSS_ARCH"] != "" {
-			temporaryBuildDeps = nil
-			return
+			for pkgName := range userRequestedMap {
+				retainTemporaryBuildDep(pkgName)
+			}
 		}
 		cleanupAfterFailure := err != nil
 		buildSessionRemovable := func(dep string, seen map[string]bool, removable *[]string, allowPreexisting bool) {
