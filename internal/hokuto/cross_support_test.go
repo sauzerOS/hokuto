@@ -163,3 +163,21 @@ func TestPreInstallUninstallSkippedDuringCrossBuild(t *testing.T) {
 		t.Errorf("the hook touched the installed tree during a cross build")
 	}
 }
+
+func TestCrossBuiltForAnotherRootInstallsCrossSystemDependencies(t *testing.T) {
+	cfg := &Config{
+		Values:              map[string]string{"HOKUTO_CROSS_ARCH": "arm64"},
+		CrossOutputPackages: map[string]bool{"python-libversion": true},
+	}
+	// "aarch64-libversion cross" is a sysroot package the requested target
+	// links against, so it must be installed before that target is built.
+	if crossBuiltForAnotherRoot("aarch64-libversion", cfg) {
+		t.Error("arch-prefixed cross-system dependency should be installed on the build host")
+	}
+	if !crossBuiltForAnotherRoot("python-libversion", cfg) {
+		t.Error("requested cross target should stay out of the build host")
+	}
+	if crossBuiltForAnotherRoot("pkgconf", cfg) {
+		t.Error("plain make dependency built natively should be installed on the build host")
+	}
+}

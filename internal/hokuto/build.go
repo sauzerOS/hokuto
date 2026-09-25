@@ -908,6 +908,19 @@ func builtForAnotherRoot(cfg *Config) bool {
 	return cfg.Values["HOKUTO_CROSS_ARCH"] != "" && cfg.Values["HOKUTO_CROSS_SYSTEM"] != "1"
 }
 
+// crossBuiltForAnotherRoot reports whether pkgName, built in the session
+// described by cfg, is a target-device package that must stay out of the build
+// host. Packages named with the cross arch prefix (e.g. "aarch64-libversion")
+// are cross-system sysroot packages that pkgBuild builds with
+// HOKUTO_CROSS_SYSTEM=1; later builds in the same plan link against them, so
+// they are installed on the host just like the parallel installer does.
+func crossBuiltForAnotherRoot(pkgName string, cfg *Config) bool {
+	if dependencyNameHasCrossPrefix(pkgName, cfg) {
+		return false
+	}
+	return builtForAnotherRoot(packageBuildConfig(pkgName, cfg))
+}
+
 func packageBuildConfig(pkgName string, cfg *Config) *Config {
 	if cfg.Values["HOKUTO_CROSS_ARCH"] == "" || isCrossTargetPackage(pkgName, cfg) {
 		return cfg
@@ -4605,7 +4618,7 @@ func handleBuildCommand(args []string, cfg *Config) (err error) {
 			// "make" dependency pulled in during a cross session), in which
 			// case its real output is the plain name.
 			installCfg := packageBuildConfig(pkgName, cfg)
-			if builtForAnotherRoot(installCfg) {
+			if crossBuiltForAnotherRoot(pkgName, cfg) {
 				// Cross built for the target root; nothing to install here.
 				debugf("Not installing cross built %s on the build host\n", pkgName)
 				continue
@@ -5418,7 +5431,7 @@ func executeBuildPass(plan *BuildPlan, _ string, installAllTargets bool, cfg *Co
 				// plan is about to use. The per-package config is what decides,
 				// so a plain "make" dependency compiled natively during a cross
 				// session is still installed normally.
-				if (installAllTargets || shouldInstallNow) && builtForAnotherRoot(packageBuildConfig(pkgName, cfg)) {
+				if (installAllTargets || shouldInstallNow) && crossBuiltForAnotherRoot(pkgName, cfg) {
 					debugf("Not installing cross built %s on the build host\n", pkgName)
 				} else if installAllTargets || shouldInstallNow {
 					// Install the package immediately. Use the per-package
