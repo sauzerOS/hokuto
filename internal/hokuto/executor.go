@@ -120,6 +120,7 @@ func (e *Executor) ensureSudo() error {
 
 		// Non-interactive check failed — the ticket has likely expired.
 		// We must now re-authenticate interactively using `sudo -v`.
+		prepareDependencyProgressLogOutput()
 		colArrow.Print("-> ")
 		colSuccess.Println("Sudo ticket has expired. Re-authenticating")
 

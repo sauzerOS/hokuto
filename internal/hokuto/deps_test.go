@@ -2872,3 +2872,14 @@ func TestParallelBuildBreaksCycleBetweenInstalledPendingPackages(t *testing.T) {
 		t.Fatalf("expected deadlock for unsatisfiable dependency, got %v", err)
 	}
 }
+
+func TestPrepareDependencyProgressLogOutputFinishesRegisteredProgressLine(t *testing.T) {
+	finished := 0
+	deactivate := activateProgressLineFinisher(func() { finished++ })
+	prepareDependencyProgressLogOutput()
+	deactivate()
+	prepareDependencyProgressLogOutput()
+	if finished != 1 {
+		t.Fatalf("expected registered progress line to be finished once, got %d", finished)
+	}
+}

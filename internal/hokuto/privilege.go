@@ -95,6 +95,12 @@ func authenticateSudo() error {
 	if _, err := exec.LookPath("sudo"); err != nil {
 		return err
 	}
+	// Authentication can be deferred until the first privileged dependency
+	// install. Move an active progress bar off the line only when sudo will
+	// actually prompt, so its password prompt starts on a fresh line.
+	if exec.Command("sudo", "-nv").Run() != nil {
+		prepareDependencyProgressLogOutput()
+	}
 	cmd := exec.Command("sudo", "-v")
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
@@ -103,6 +109,7 @@ func authenticateSudo() error {
 }
 
 func authenticateRun0() error {
+	prepareDependencyProgressLogOutput()
 	cmd := exec.Command("run0", "true")
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout

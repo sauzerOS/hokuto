@@ -54,6 +54,9 @@ var develInstallMu sync.Mutex
 var dependencyInstallProgress = struct {
 	sync.Mutex
 	bars []*progressbar.ProgressBar
+	// lineFinishers terminate other active progress lines (such as the
+	// top-level install bar) that must not be cleared or redescribed.
+	lineFinishers []func()
 }{}
 
 var baseDevelPackages = []string{
@@ -2845,16 +2848,37 @@ func clearDependencyInstallProgress(bar *progressbar.ProgressBar) {
 
 // prepareDependencyProgressLogOutput moves ordinary log output off an active
 // progress-bar line. The bar will be redrawn by the next dependency update.
+// activateProgressLineFinisher registers finish, which ends an active progress
+// line with a newline, so log output started by nested operations begins on a
+// fresh line. The returned function unregisters it.
+func activateProgressLineFinisher(finish func()) func() {
+	dependencyInstallProgress.Lock()
+	dependencyInstallProgress.lineFinishers = append(dependencyInstallProgress.lineFinishers, finish)
+	dependencyInstallProgress.Unlock()
+	return func() {
+		dependencyInstallProgress.Lock()
+		if n := len(dependencyInstallProgress.lineFinishers); n > 0 {
+			dependencyInstallProgress.lineFinishers = dependencyInstallProgress.lineFinishers[:n-1]
+		}
+		dependencyInstallProgress.Unlock()
+	}
+}
+
 func prepareDependencyProgressLogOutput() {
 	dependencyInstallProgress.Lock()
 	var bar *progressbar.ProgressBar
 	if len(dependencyInstallProgress.bars) > 0 {
 		bar = dependencyInstallProgress.bars[len(dependencyInstallProgress.bars)-1]
 	}
+	finishers := append([]func(){}, dependencyInstallProgress.lineFinishers...)
 	dependencyInstallProgress.Unlock()
 	if bar != nil && !bar.IsFinished() {
 		_ = bar.Clear()
 		fmt.Fprintln(os.Stderr)
+		return
+	}
+	for i := len(finishers) - 1; i >= 0; i-- {
+		finishers[i]()
 	}
 }
 

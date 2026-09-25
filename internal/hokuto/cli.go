@@ -889,6 +889,7 @@ func Main() {
 				installProgressLineActive = false
 			}
 		}
+		deactivateInstallProgressLine := activateProgressLineFinisher(finishInstallProgressLine)
 
 		for i, arg := range installPlan {
 			var tarballPath, pkgName, resolvedVersion string
@@ -1303,6 +1304,7 @@ func Main() {
 			}
 			finishInstallProgressLine()
 		}
+		deactivateInstallProgressLine()
 
 		if allSucceeded {
 			metaNames := make([]string, 0, len(requestedMetas))
