@@ -752,6 +752,14 @@ func (pm *ParallelManager) Run() error {
 				}
 				continue // Restart loop to immediately process the newly active pending jobs
 			}
+			// Nothing can start because pending packages wait on each other (for
+			// example zstd and cmake in the same update). Fall back to sequential
+			// semantics: build the first pending package in plan order whose
+			// dependencies are satisfied by already installed versions.
+			if pm.startCycleBreakerLocked() {
+				pm.mu.Unlock()
+				continue
+			}
 			pm.mu.Unlock()
 
 			// If we have failures, assume pending jobs are blocked by them and exit gracefully.
@@ -765,6 +773,21 @@ func (pm *ParallelManager) Run() error {
 		}
 	}
 	return nil
+}
+
+// startCycleBreakerLocked starts one pending package whose build dependencies
+// are satisfied when installed versions of pending packages are accepted. It
+// returns false when no pending package can be started that way.
+func (pm *ParallelManager) startCycleBreakerLocked() bool {
+	for i, pkgName := range pm.Pending {
+		if !pm.canBuildWithPolicy(pkgName, true) {
+			continue
+		}
+		pm.Pending = append(pm.Pending[:i:i], pm.Pending[i+1:]...)
+		pm.startBuild(pkgName, len(pm.Completed)+len(pm.Running)+1, len(pm.BuildPlan.Order))
+		return true
+	}
+	return false
 }
 
 func (pm *ParallelManager) recordRebuildTriggerLocked(rebuildPkg, triggerPkg string) {
@@ -1012,6 +1035,16 @@ func (pm *ParallelManager) readyOptionalRebuildsLocked() []string {
 }
 
 func (pm *ParallelManager) canBuild(pkgName string) bool {
+	return pm.canBuildWithPolicy(pkgName, false)
+}
+
+// canBuildWithPolicy checks whether pkgName's build dependencies are satisfied.
+// Normally an installed dependency that is itself pending in this run is not
+// accepted, so dependents are built against the new version. With
+// acceptInstalledPending set, the installed (previous) version is accepted like
+// the sequential executor does; this is used only to break dependency cycles
+// between pending packages when nothing else can make progress.
+func (pm *ParallelManager) canBuildWithPolicy(pkgName string, acceptInstalledPending bool) bool {
 	// Simplified dependency check reusing logic similar to executeBuildPass
 	if pm.BuildPlan.NoDeps {
 		return true
@@ -1132,7 +1165,7 @@ func (pm *ParallelManager) canBuild(pkgName string) bool {
 			if splitSource != "" && sameSourcePackage(splitSource, pkgName) {
 				selfBootstrap = true
 			}
-			if (!isBuilding || selfBootstrap) && isPackageInstalled(cand) {
+			if (!isBuilding || selfBootstrap || acceptInstalledPending) && isPackageInstalled(cand) {
 				satisfied = true
 				break
 			}

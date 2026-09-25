@@ -2814,3 +2814,61 @@ func writeTestSplitDeclaration(t *testing.T, repo, sourcePkg, splitPkg string) {
 	splitPackageCacheMap = nil
 	splitPackageCacheMu.Unlock()
 }
+
+func TestParallelBuildBreaksCycleBetweenInstalledPendingPackages(t *testing.T) {
+	cfg, repo := withTempDependencyRepo(t)
+	writeTestPackage(t, repo, "zstd", "cmake make\n")
+	writeTestPackage(t, repo, "cmake", "zstd\n")
+	writeTestPackage(t, repo, "fish", "cmake make\n")
+	writeTestPackage(t, repo, "brotli", "missing\n")
+	writeInstalledTestPackage(t, "zstd")
+	writeInstalledTestPackage(t, "cmake")
+
+	plan := &BuildPlan{
+		Order:             []string{"zstd", "cmake", "fish"},
+		SkippedPackages:   make(map[string]string),
+		RebuildPackages:   make(map[string]bool),
+		PostRebuilds:      make(map[string][]string),
+		PostBuildRebuilds: make(map[string][]string),
+	}
+	pm := &ParallelManager{
+		MaxJobs:     2,
+		Config:      cfg,
+		BuildPlan:   plan,
+		Pending:     append([]string(nil), plan.Order...),
+		Running:     make(map[string]time.Time),
+		Completed:   make(map[string]bool),
+		Available:   make(map[string]bool),
+		Failed:      make(map[string]error),
+		LogFiles:    make(map[string]*os.File),
+		resultChan:  make(chan buildResult, 2),
+		promptPause: make(chan bool),
+		promptAck:   make(chan struct{}),
+		AutoYes:     true,
+	}
+	var order []string
+	pm.Builder = func(pkg string, _ *Config, _ *Executor, _ BuildOptions) (time.Duration, error) {
+		return time.Millisecond, nil
+	}
+	pm.Installer = func(pkg string, _ io.Writer) (parallelInstallResult, error) {
+		order = append(order, pkg)
+		return parallelInstallResult{Available: []string{pkg}}, nil
+	}
+
+	if pm.canBuild("zstd") || pm.canBuild("cmake") {
+		t.Fatal("pending packages should normally wait for each other's new versions")
+	}
+	if err := pm.Run(); err != nil {
+		t.Fatalf("parallel build should break the cycle like sequential mode: %v", err)
+	}
+	if strings.Join(order, " ") != "zstd cmake fish" {
+		t.Fatalf("expected cycle to be broken in plan order, got %v", order)
+	}
+
+	// A genuinely unsatisfiable dependency must still be reported.
+	pm.Pending = []string{"brotli"}
+	pm.BuildPlan.Order = []string{"brotli"}
+	if err := pm.Run(); err == nil || !strings.Contains(err.Error(), "deadlock") {
+		t.Fatalf("expected deadlock for unsatisfiable dependency, got %v", err)
+	}
+}
