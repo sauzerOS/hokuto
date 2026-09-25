@@ -4078,7 +4078,9 @@ func handleBuildCommand(args []string, cfg *Config) (err error) {
 	endBuildSession := registerHokutoBuildSession()
 	defer endBuildSession()
 	defer func() {
-		if err == nil {
+		// A cross build produces packages for another system, so optional
+		// runtime dependencies of what it installs here are not useful.
+		if err == nil && cfg.Values["HOKUTO_CROSS_ARCH"] == "" {
 			flushPackageSuggestions(os.Stdout, cfg, *noRemote, true, false)
 			return
 		}

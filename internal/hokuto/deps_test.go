@@ -2883,3 +2883,25 @@ func TestPrepareDependencyProgressLogOutputFinishesRegisteredProgressLine(t *tes
 		t.Fatalf("expected registered progress line to be finished once, got %d", finished)
 	}
 }
+
+func TestCollectPackageSuggestionsSkipsCrossSystemPackages(t *testing.T) {
+	withTempDependencyRepo(t)
+
+	root := t.TempDir()
+	rootDir = root
+	Installed = filepath.Join(root, "var", "db", "hokuto", "installed")
+
+	writeInstalledTestPackage(t, "aarch64-systemd")
+	if err := os.WriteFile(filepath.Join(Installed, "aarch64-systemd", "suggests"), []byte("systemd-ukify suggest Unified Kernel tool\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	packageSuggestions.Lock()
+	packageSuggestions.items = make(map[string]map[string]packageSuggestion)
+	packageSuggestions.Unlock()
+
+	collectPackageSuggestions("aarch64-systemd", rootDir)
+	if hasPackageSuggestions() {
+		t.Fatal("cross-system packages should not suggest optional runtime dependencies")
+	}
+}

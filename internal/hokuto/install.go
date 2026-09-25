@@ -167,6 +167,12 @@ func suggestionAlternativesInstalled(item packageSuggestion) bool {
 }
 
 func collectPackageSuggestions(pkgName, rootDir string) {
+	// Cross-system packages (aarch64-*, x86_64-*) are sysroot copies used for
+	// cross compiling; nothing on the host runs them, so their optional
+	// runtime dependencies are never worth suggesting.
+	if strings.HasPrefix(pkgName, "aarch64-") || strings.HasPrefix(pkgName, "x86_64-") {
+		return
+	}
 	declared := readPackageSuggestionsForCollection(pkgName, rootDir, true)
 	if len(declared) == 0 {
 		return
