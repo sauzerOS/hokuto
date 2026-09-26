@@ -1411,6 +1411,8 @@ func handleAutoBumpRepository(cfg *Config, autoBuild bool, assumeYes bool, repoU
 			pkgName = "fast_float"
 		case "cairo-graphics-library":
 			pkgName = "cairo"
+                case "utf8proc":
+			pkgName = "libutf8proc"
 		}
 
 		var newestVer string
