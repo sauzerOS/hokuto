@@ -19,8 +19,12 @@
 #   /var/cache/hokuto            binary cache (and the sources mount below it)
 #   /var/tmp/hokuto              TMPDIR, on the host's zram disk
 #   /var/tmpdir/hokuto           TMPDIR2, disk-backed, for "noram" builds
-#   /etc/hokuto                  config, signing keys, hokuto.update/.rebuild
-#   /usr/bin/hokuto              the host's hokuto, so both run the same version
+#   /etc/hokuto/hokuto.conf, hokuto.lock, keys/   config, mirror credentials,
+#                                version locks and the signing key
+#   /usr/local/bin/hokuto        the host's hokuto, so both run the same version;
+#                                it comes first in PATH. The container's own
+#                                hokuto package (/usr/bin/hokuto, hokuto.update,
+#                                .rebuild, .pkgset) stays updatable.
 #   ~/.gitconfig, ~/.git-credentials   git identity and push credentials
 #   the sauzerOS.github.io checkout    build status and logs (bump --build)
 #
@@ -188,9 +192,20 @@ nspawn_run() {
         # Explicit, as systemd-nspawn asks for: its future default plus
         # netlink, which ip(8) and some test suites use.
         --restrict-address-families="AF_INET AF_INET6 AF_UNIX AF_NETLINK"
-        --bind-ro=/etc/hokuto
-        --bind-ro=/usr/bin/hokuto
+        --bind-ro=/usr/bin/hokuto:/usr/local/bin/hokuto
     )
+    # Only the host's local hokuto files: the rest of /etc/hokuto belongs to
+    # the container's hokuto package, which must be able to update them.
+    local file
+    for file in hokuto.conf hokuto.lock keys; do
+        [ -e "/etc/hokuto/$file" ] && args+=(--bind-ro="/etc/hokuto/$file")
+    done
+    # Interactive shells reset PATH in /etc/profile, which appends
+    # /usr/local/bin at the end; move it to the front there too.
+    install -d "$ROOTFS/etc/profile.d"
+    printf '%s\n' '# hokuto-builder: prefer the host hokuto mounted at /usr/local/bin' \
+        'case "$PATH" in /usr/local/bin:*) ;; *) PATH="/usr/local/bin:$PATH" ;; esac' \
+        'export PATH' >"$ROOTFS/etc/profile.d/hokuto-builder.sh"
     local dir
     for dir in "${SHARED_DIRS[@]}"; do
         [ -d "$dir" ] || install -d -o "$BUILD_UID" -g "$BUILD_GID" "$dir"
@@ -207,7 +222,6 @@ nspawn_run() {
     else
         info "No website checkout at $website; build status will not be published"
     fi
-    local file
     for file in .gitconfig .git-credentials; do
         [ -f "$BUILD_HOME/$file" ] && args+=(--bind-ro="$BUILD_HOME/$file")
     done
@@ -236,9 +250,9 @@ cmd_destroy() {
 
 case "$1" in
     create) cmd_create ;;
-    bump) shift; nspawn_run "$BUILD_USER" hokuto bump --auto --build "$@" ;;
+    bump) shift; nspawn_run "$BUILD_USER" /usr/local/bin/hokuto bump --auto --build "$@" ;;
     run) shift; [ $# -gt 0 ] || usage 1; nspawn_run "$BUILD_USER" "$@" ;;
     shell) nspawn_run "$BUILD_USER" /bin/bash -l ;;
-    update) nspawn_run "$BUILD_USER" hokuto update -y ;;
+    update) nspawn_run "$BUILD_USER" /usr/local/bin/hokuto update -y ;;
     destroy) cmd_destroy ;;
 esac
