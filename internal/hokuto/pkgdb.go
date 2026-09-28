@@ -260,6 +260,9 @@ func findPackageMetadataDir(pkgName string) (string, error) {
 	}
 
 	searchNames := []string{pkgName}
+	if base, _, ok := splitKmodInstance(pkgName); ok {
+		searchNames = []string{base}
+	}
 	prefixes := []string{"aarch64-", "x86_64-"}
 	for _, pref := range prefixes {
 		if strings.HasPrefix(pkgName, pref) {
@@ -311,6 +314,12 @@ func findPackageDir(pkgName string) (string, error) {
 	}
 
 	searchNames := []string{pkgName}
+
+	// Kernel module instances (nvidia-open~linux) are built from the recipe
+	// named before the "~"; see kmod.go.
+	if base, _, ok := splitKmodInstance(pkgName); ok {
+		searchNames = []string{base}
+	}
 
 	// For cross-compilation system packages (aarch64-pkg), fallback to the base package (pkg)
 	// if the prefixed directory doesn't exist.

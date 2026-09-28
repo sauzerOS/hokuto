@@ -73,6 +73,16 @@ func getRebuildTriggers(triggerPkg string, rootDir string) []string {
 		if fields[0] == triggerPkg {
 			// Check if each package is installed before adding to rebuild list
 			for _, pkg := range fields[1:] {
+				// A kernel module package is rebuilt as the instance for
+				// the kernel that triggered it (nvidia-open~linux-cachyos).
+				if isKmodRecipe(pkg) {
+					if instance := kmodInstanceName(pkg, triggerPkg); isPackageInstalled(instance) {
+						packagesToRebuild = append(packagesToRebuild, instance)
+					} else {
+						debugf("Skipping rebuild trigger for %s (not installed)\n", instance)
+					}
+					continue
+				}
 				if isPackageInstalled(pkg) {
 					packagesToRebuild = append(packagesToRebuild, pkg)
 				} else {
@@ -764,6 +774,16 @@ func pkgInstallWithRemotePolicy(tarballPath, pkgName string, cfg *Config, execCt
 	}
 	if err := VerifyPackageSignature(stagingDir, archivePkgName, cfg, execCtx, sigLogger); err != nil {
 		return nil, err
+	}
+	// Kernel modules must match the release their kernel has installed now.
+	if _, _, isKmod := splitKmodInstance(archivePkgName); isKmod {
+		info, err := readFileAsRoot(filepath.Join(stagingDir, "var", "db", "hokuto", "installed", archivePkgName, "pkginfo"))
+		if err != nil {
+			return nil, fmt.Errorf("%s: failed to read pkginfo: %w", archivePkgName, err)
+		}
+		if err := checkKmodStagedRelease(archivePkgName, ParsePkgInfo(info)); err != nil {
+			return nil, err
+		}
 	}
 	if archivePkgName != pkgName {
 		from := filepath.Join(stagingDir, "var", "db", "hokuto", "installed", archivePkgName)
@@ -1870,6 +1890,7 @@ func checkStagingConflicts(pkgName, stagingDir, rootDir, stagingManifest string,
 	}
 	conflictsByPkg := make(map[string][]conflictInfo)
 	unmanagedConflicts := []conflictInfo{}
+	var siblingConflicts []conflictInfo
 
 	// First pass: collect all conflicts
 	scanner := bufio.NewScanner(strings.NewReader(string(stagingData)))
@@ -1912,7 +1933,15 @@ func checkStagingConflicts(pkgName, stagingDir, rootDir, stagingManifest string,
 			ownerPkg = ownershipSnapshot.ownerOtherThan(filePathCleanNoSlash, pkgName)
 		}
 
-		if ownerPkg != "" && ownerPkg != pkgName {
+		if ownerPkg != "" && kmodSiblings(ownerPkg, pkgName) {
+			// The same kernel module package for another kernel ships the
+			// same config file (/etc/modprobe.d/...). Share it silently.
+			siblingConflicts = append(siblingConflicts, conflictInfo{
+				filePath:    filePath,
+				stagingFile: stagingFile,
+				conflictPkg: ownerPkg,
+			})
+		} else if ownerPkg != "" && ownerPkg != pkgName {
 			// File is owned by another package - this is a conflict
 			conflictsByPkg[ownerPkg] = append(conflictsByPkg[ownerPkg], conflictInfo{
 				filePath:    filePath,
@@ -1938,6 +1967,20 @@ func checkStagingConflicts(pkgName, stagingDir, rootDir, stagingManifest string,
 	// package.
 	var batchRequests []AlternativeRequest
 	var stagingFilesToRemove []string
+
+	// Files shared with a sibling kernel module instance: the new file is
+	// used and both instances own it, so uninstalling one keeps it.
+	for _, c := range siblingConflicts {
+		batchRequests = append(batchRequests, AlternativeRequest{
+			FilePath:     c.filePath,
+			IncomingPkg:  pkgName,
+			CurrentPkg:   c.conflictPkg,
+			IncomingFile: c.stagingFile,
+		})
+		if filesHandledInConflict != nil {
+			filesHandledInConflict[c.filePath] = true
+		}
+	}
 
 	// Second pass: prompt once per conflicting package, in a stable order
 	conflictPkgs := make([]string, 0, len(conflictsByPkg))

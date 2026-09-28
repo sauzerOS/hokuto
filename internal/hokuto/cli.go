@@ -1,6 +1,7 @@
 package hokuto
 
 import (
+	"bufio"
 	"context"
 	"encoding/hex"
 	"errors"
@@ -734,6 +735,32 @@ func Main() {
 			fmt.Println("Usage: hokuto install [options] <tarball|pkgname>")
 			installCmd.PrintDefaults()
 			os.Exit(1)
+		}
+
+		// Kernel module packages are installed per kernel (nvidia-open~linux).
+		stdinReader := bufio.NewReader(os.Stdin)
+		packagesToInstall, legacyKmods, err := expandKmodRequests(packagesToInstall, kmodPromptAssumesYes(effectiveYes), stdinReader, os.Stdout)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+		for _, legacy := range legacyKmods {
+			colWarn.Printf("%s was installed before kernel modules were tracked per kernel; it is replaced by the per-kernel package(s).\n", legacy)
+			if !effectiveYes {
+				fmt.Printf("Uninstall %s now? [Y/n]: ", legacy)
+				answer, _ := stdinReader.ReadString('\n')
+				if a := strings.ToLower(strings.TrimSpace(answer)); a != "" && a != "y" && a != "yes" {
+					fmt.Fprintf(os.Stderr, "Aborted: %s must be removed before its per-kernel packages can be installed.\n", legacy)
+					os.Exit(1)
+				}
+			}
+			if err := pkgUninstall(legacy, cfg, RootExec, true, true, nil); err != nil {
+				fmt.Fprintf(os.Stderr, "Error: failed to uninstall %s: %v\n", legacy, err)
+				os.Exit(1)
+			}
+			if err := removeFromWorld(legacy); err != nil {
+				debugf("Warning: failed to remove %s from world: %v\n", legacy, err)
+			}
 		}
 
 		// Ensure 'sauzeros-base' is installed first if missing

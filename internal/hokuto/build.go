@@ -1945,6 +1945,7 @@ type builtPackageFinalization struct {
 	bootstrap     bool
 	updateWebsite bool
 	crossSysroot  string
+	kmod          *kmodTarget // set for kernel module package instances
 }
 
 func removePathFromOutput(outputDir, relPath string, execCtx *Executor) {
@@ -2049,6 +2050,12 @@ func finalizeBuiltPackage(in builtPackageFinalization) error {
 		in.logger = os.Stdout
 	}
 
+	if in.kmod != nil {
+		if err := in.kmod.verifyOutput(in.outputDir); err != nil {
+			return err
+		}
+	}
+
 	installedDir := filepath.Join(in.outputDir, "var", "db", "hokuto", "installed", in.outputPkgName)
 	debugf("Creating metadata directory: %s\n", installedDir)
 	if err := in.buildExec.Run(exec.Command("mkdir", "-p", installedDir)); err != nil {
@@ -2138,6 +2145,11 @@ func finalizeBuiltPackage(in builtPackageFinalization) error {
 	if err := WritePackageInfo(in.outputDir, in.outputPkgName, in.version, in.revision, in.targetArch, in.cflagsVal, in.isGeneric, isMultilib, pkginfoExec); err != nil {
 		return fmt.Errorf("failed to write pkginfo: %w", err)
 	}
+	if in.kmod != nil {
+		if err := in.kmod.recordInPkgInfo(in.outputDir, in.outputPkgName, pkginfoExec); err != nil {
+			return fmt.Errorf("failed to record kernel in pkginfo: %w", err)
+		}
+	}
 
 	if err := generateManifest(in.outputDir, installedDir, in.buildExec); err != nil {
 		return fmt.Errorf("failed to generate manifest: %w", err)
@@ -2201,6 +2213,19 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, opts BuildOptions)
 
 	// NEW: Load build options (consolidated from 'options' file or individual files)
 	options := loadBuildOptions(pkgDir)
+
+	// Kernel module packages build for one kernel, named by the instance.
+	kmod, err := kmodBuildTarget(pkgName)
+	if err != nil {
+		return 0, err
+	}
+	if kmod != nil {
+		headers, err := kmod.ensureHeaders(cfg)
+		if err != nil {
+			return 0, err
+		}
+		defer uninstallBuildDependencies(headers, cfg)
+	}
 
 	// Save current cross settings to restore them later (prevent pollution across packages in the same run)
 	origCrossSystem := cfg.Values["HOKUTO_CROSS_SYSTEM"]
@@ -2725,6 +2750,11 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, opts BuildOptions)
 			defaults["HOKUTO_LTO"] = "1"
 		} else {
 			defaults["HOKUTO_LTO"] = "0"
+		}
+		if kmod != nil {
+			for k, v := range kmod.env() {
+				defaults[k] = v
+			}
 		}
 
 		if !isGeneric {
@@ -3256,6 +3286,7 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, opts BuildOptions)
 		bootstrap:     opts.Bootstrap,
 		updateWebsite: opts.UpdateWebsite,
 		crossSysroot:  crossSystemSysrootFor(cfg, defaults),
+		kmod:          kmod,
 	}); err != nil {
 		return 0, err
 	}
@@ -3330,6 +3361,19 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 
 	// NEW: Load build options (consolidated from 'options' file or individual files)
 	options := loadBuildOptions(pkgDir)
+
+	// Kernel module packages build for one kernel, named by the instance.
+	kmod, err := kmodBuildTarget(pkgName)
+	if err != nil {
+		return err
+	}
+	if kmod != nil {
+		headers, err := kmod.ensureHeaders(cfg)
+		if err != nil {
+			return err
+		}
+		defer uninstallBuildDependencies(headers, cfg)
+	}
 
 	// 1. Initialize a LOCAL temporary directory variable with the global default.
 	currentTmpDir := tmpDir
@@ -3528,6 +3572,11 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 		defaults["HOKUTO_LTO"] = "1"
 	} else {
 		defaults["HOKUTO_LTO"] = "0"
+	}
+	if kmod != nil {
+		for k, v := range kmod.env() {
+			defaults[k] = v
+		}
 	}
 
 	multilibVal := "0"
@@ -3990,6 +4039,7 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 		isGeneric:     isGeneric,
 		bootstrap:     false,
 		crossSysroot:  crossSystemSysrootFor(cfg, defaults),
+		kmod:          kmod,
 	}); err != nil {
 		return err
 	}
@@ -4345,6 +4395,11 @@ func handleBuildCommand(args []string, cfg *Config) (err error) {
 	if len(requestedPackages) == 0 {
 		buildCmd.Usage()
 		return fmt.Errorf("no packages specified")
+	}
+	// Kernel module packages are built per kernel (nvidia-open~linux).
+	requestedPackages, _, err = expandKmodRequests(requestedPackages, kmodPromptAssumesYes(false), bufio.NewReader(os.Stdin), os.Stdout)
+	if err != nil {
+		return err
 	}
 
 	// Record the literal CLI targets as the packages -cross=<arch> is meant
