@@ -220,7 +220,7 @@ func installKmodHeaders(name string, cfg *Config) (bool, error) {
 	if kmodInstallHeaders != nil {
 		return kmodInstallHeaders(name, cfg)
 	}
-	return installAvailableBuildDependencyBinaryWithOptions(name, cfg, false, false, true)
+	return installAvailableBuildDependencyBinaryWithOptions(name, cfg, false, true, true)
 }
 
 func removeKmodHeaders(name string, cfg *Config) {
@@ -228,7 +228,20 @@ func removeKmodHeaders(name string, cfg *Config) {
 		kmodRemoveHeaders(name, cfg)
 		return
 	}
-	uninstallBuildDependencies([]string{name}, cfg)
+	if uninstallBuildDependenciesWithOptions([]string{name}, cfg, true) > 0 {
+		kmodNotify("Removed %s, no module build needs it any more", name)
+	}
+}
+
+// kmodNotify prints one status line. Module builds usually run in parallel
+// under a redrawn progress line; WithPrompt pauses and clears it so the
+// message gets a line of its own. Only the print happens inside, so the
+// interactive lock is held just for that.
+func kmodNotify(format string, a ...any) {
+	WithPrompt(func() {
+		colArrow.Print("-> ")
+		colSuccess.Printf(format+"\n", a...)
+	})
 }
 
 func (t *kmodTarget) headersPackage() string {
@@ -249,8 +262,7 @@ func (t *kmodTarget) acquireHeaders(cfg *Config) (release func(), err error) {
 	defer kmodHeaders.Unlock()
 
 	if !t.buildTreePresent() {
-		colArrow.Print("-> ")
-		colSuccess.Printf("Installing %s for %s\n", headers, t.Instance)
+		kmodNotify("Installing %s for %s", headers, t.Instance)
 		installed, err := installKmodHeaders(headers, cfg)
 		if err != nil {
 			return nil, fmt.Errorf("failed to install %s: %w", headers, err)

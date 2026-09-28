@@ -485,3 +485,32 @@ func TestAcquireHeadersKeepsHeadersInstalledByTheUser(t *testing.T) {
 	}
 	release()
 }
+
+// Module builds run under the parallel progress line; header messages must
+// pause it (the prompt hooks) instead of being appended to it.
+func TestKmodHeaderMessagesPauseTheProgressLine(t *testing.T) {
+	buildDir := filepath.Join(t.TempDir(), "build")
+	oldInstall, oldRemove := kmodInstallHeaders, kmodRemoveHeaders
+	kmodInstallHeaders = func(string, *Config) (bool, error) {
+		if err := os.MkdirAll(buildDir, 0o755); err != nil {
+			return false, err
+		}
+		return true, os.WriteFile(filepath.Join(buildDir, "Makefile"), nil, 0o644)
+	}
+	kmodRemoveHeaders = func(string, *Config) {}
+	t.Cleanup(func() { kmodInstallHeaders, kmodRemoveHeaders = oldInstall, oldRemove })
+
+	paused, resumed := 0, 0
+	SetPromptHooks(func() { paused++ }, func() { resumed++ })
+	t.Cleanup(func() { SetPromptHooks(nil, nil) })
+
+	target := &kmodTarget{Instance: "xpadneo~linux", KernelPackage: "linux", Release: "7.2.8-sauzerOS", BuildDir: buildDir}
+	release, err := target.acquireHeaders(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	release()
+	if paused != 1 || resumed != 1 {
+		t.Errorf("installing message: progress line paused %d / resumed %d times, want 1 / 1", paused, resumed)
+	}
+}
