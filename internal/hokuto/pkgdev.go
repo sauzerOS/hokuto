@@ -1136,6 +1136,7 @@ func saveBumpIgnoreList(ignores map[string]bumpIgnoreEntry) error {
 type autoBumpSelection struct {
 	Selected  []int
 	Blacklist []int
+	NoBuild   []int // selected, but bumped without building (=numbers)
 	Skip      bool
 }
 
@@ -1155,11 +1156,26 @@ func parseAutoBumpSelection(input string, count int) (autoBumpSelection, error) 
 
 	selected := make(map[int]bool)
 	blacklisted := make(map[int]bool)
+	noBuild := make(map[int]bool)
 	var selectionParts []string
 
 	for _, part := range strings.Split(input, ",") {
 		part = strings.TrimSpace(part)
 		if part == "" {
+			continue
+		}
+
+		// "=N": bump N but do not build it, in an --auto --build run.
+		if rest, ok := strings.CutPrefix(part, "="); ok {
+			rest = strings.TrimSpace(rest)
+			idx, err := strconv.Atoi(rest)
+			if err != nil {
+				return result, fmt.Errorf("invalid bump-only number: =%s", rest)
+			}
+			if idx <= 0 || idx > count {
+				return result, fmt.Errorf("number out of range (1-%d): %d", count, idx)
+			}
+			noBuild[idx-1] = true
 			continue
 		}
 
@@ -1194,17 +1210,26 @@ func parseAutoBumpSelection(input string, count int) (autoBumpSelection, error) 
 		for _, idx := range indices {
 			selected[idx] = true
 		}
-	} else if len(blacklisted) > 0 {
+	} else if len(blacklisted) > 0 || len(noBuild) > 0 {
+		// Only markers were given: they modify "all".
 		for i := 0; i < count; i++ {
 			if !blacklisted[i] {
 				selected[i] = true
 			}
 		}
 	}
+	// A bump-only number is always bumped, even next to an exclusion list.
+	for idx := range noBuild {
+		selected[idx] = true
+	}
 
 	for idx := range blacklisted {
 		delete(selected, idx)
+		delete(noBuild, idx)
 		result.Blacklist = append(result.Blacklist, idx)
+	}
+	for idx := range noBuild {
+		result.NoBuild = append(result.NoBuild, idx)
 	}
 
 	for idx := range selected {
@@ -1212,6 +1237,7 @@ func parseAutoBumpSelection(input string, count int) (autoBumpSelection, error) 
 	}
 	sort.Ints(result.Selected)
 	sort.Ints(result.Blacklist)
+	sort.Ints(result.NoBuild)
 	return result, nil
 }
 
@@ -1592,6 +1618,7 @@ func handleAutoBumpRepository(cfg *Config, autoBuild bool, assumeYes bool, repoU
 	}
 
 	var indices []int
+	skipBuild := make(map[int]bool)
 	var ok bool
 	if assumeYes {
 		for i := range candidates {
@@ -1600,12 +1627,19 @@ func handleAutoBumpRepository(cfg *Config, autoBuild bool, assumeYes bool, repoU
 		ok = true
 	} else {
 		var selection autoBumpSelection
-		selection, ok = askForAutoBumpSelection("Bump (a)ll, (s)kip repo, (q)uit, pick packages (numbers or -numbers), or blacklist versions (!numbers):", len(candidates))
+		prompt := "Bump (a)ll, (s)kip repo, (q)uit, pick packages (numbers or -numbers), or blacklist versions (!numbers):"
+		if autoBuild {
+			prompt = "Bump (a)ll, (s)kip repo, (q)uit, pick packages (numbers or -numbers), bump without building (=numbers), or blacklist versions (!numbers):"
+		}
+		selection, ok = askForAutoBumpSelection(prompt, len(candidates))
 		if selection.Skip {
 			colNote.Println("Skipping repository.")
 			return nil
 		}
 		indices = selection.Selected
+		for _, idx := range selection.NoBuild {
+			skipBuild[idx] = true
+		}
 		if ok && len(selection.Blacklist) > 0 {
 			now := time.Now()
 			for _, idx := range selection.Blacklist {
@@ -1667,7 +1701,9 @@ func handleAutoBumpRepository(cfg *Config, autoBuild bool, assumeYes bool, repoU
 			successfullyBumped = append(successfullyBumped, pkgName)
 			logMsg("BUMP_SUCCESS: %s: %s -> %s\n", pkgName, curVer, newVer)
 
-			if autoBuild {
+			if autoBuild && skipBuild[idx] {
+				colNote.Printf(">> [SKIP BUILD] %s bumped only, as selected.\n", pkgName)
+			} else if autoBuild {
 				var buildErrs []error
 				if isPkgSet {
 					for _, p := range sets[pkgName] {

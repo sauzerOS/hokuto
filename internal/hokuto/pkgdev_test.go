@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -632,5 +633,41 @@ func TestBumpPackageRestoresRecipeWhenSourcesCannotBeFetched(t *testing.T) {
 	}
 	if status := strings.TrimSpace(runGit("status", "--porcelain")); status != "" {
 		t.Errorf("failed bump must leave the recipe unchanged, git status:\n%s", status)
+	}
+}
+
+func TestParseAutoBumpSelectionBumpOnly(t *testing.T) {
+	cases := []struct {
+		input     string
+		selected  []int
+		noBuild   []int
+		blacklist []int
+	}{
+		// Plain numbers pick packages; =N adds N as bump-only.
+		{"1,=3", []int{0, 2}, []int{2}, nil},
+		// Only markers: they modify "all".
+		{"=3", []int{0, 1, 2, 3}, []int{2}, nil},
+		{"=2, =4", []int{0, 1, 2, 3}, []int{1, 3}, nil},
+		// Exclusions and a bump-only number together.
+		{"-2,=3", []int{0, 2, 3}, []int{2}, nil},
+		// A blacklisted package is never bumped, even if also marked =.
+		{"=3,!3", []int{0, 1, 3}, nil, []int{2}},
+		// No marker: nothing changes for existing selections.
+		{"1,2", []int{0, 1}, nil, nil},
+	}
+	for _, tc := range cases {
+		got, err := parseAutoBumpSelection(tc.input, 4)
+		if err != nil {
+			t.Fatalf("%q: %v", tc.input, err)
+		}
+		if !slices.Equal(got.Selected, tc.selected) || !slices.Equal(got.NoBuild, tc.noBuild) || !slices.Equal(got.Blacklist, tc.blacklist) {
+			t.Errorf("%q: selected %v noBuild %v blacklist %v; want %v %v %v",
+				tc.input, got.Selected, got.NoBuild, got.Blacklist, tc.selected, tc.noBuild, tc.blacklist)
+		}
+	}
+	for _, bad := range []string{"=", "=x", "=5", "=0"} {
+		if _, err := parseAutoBumpSelection(bad, 4); err == nil {
+			t.Errorf("%q must be rejected", bad)
+		}
 	}
 }

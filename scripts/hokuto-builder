@@ -1,0 +1,197 @@
+#!/bin/bash
+#
+# hokuto-builder: run hokuto in a systemd-nspawn container instead of on the
+# host, typically for `hokuto bump --auto --build`. Build dependencies and
+# base-devel get installed into the container, not the host system.
+#
+#   hokuto-builder create          create the container (once)
+#   hokuto-builder bump [-y]       hokuto bump --auto --build, interactive;
+#                                  -y bumps and builds everything unattended
+#   hokuto-builder run <cmd...>    run any command in the container
+#   hokuto-builder shell           interactive shell in the container
+#   hokuto-builder update          update the container's own packages
+#   hokuto-builder destroy         delete the container
+#
+# Commands run as the invoking user (same name and uid as on the host), with
+# passwordless sudo inside the container. Shared with the host:
+#
+#   /repo                        recipes; bump commits and pushes from here
+#   /var/cache/hokuto            binary cache (and the sources mount below it)
+#   /var/tmp/hokuto              TMPDIR, on the host's zram disk
+#   /var/tmpdir/hokuto           TMPDIR2, disk-backed, for "noram" builds
+#   /etc/hokuto                  config, signing keys, hokuto.update/.rebuild
+#   /usr/bin/hokuto              the host's hokuto, so both run the same version
+#   ~/.gitconfig, ~/.git-credentials   git identity and push credentials
+#
+# The container location is asked for by 'create' and saved in
+# /etc/hokuto-builder.conf for the other commands.
+#
+# Settings (environment):
+#   HOKUTO_BUILDER_ROOT   container root, overrides the saved location
+#   HOKUTO_BUILDER_NAME   machine name     (default hokuto-builder)
+
+set -euo pipefail
+
+CONFIG_FILE=/etc/hokuto-builder.conf
+DEFAULT_ROOTFS=/var/lib/hokuto-builder
+MACHINE=${HOKUTO_BUILDER_NAME:-hokuto-builder}
+
+# sauzeros and base-devel are metapackages (/repo/sauzeros/.hokuto).
+BASE_PACKAGES=(sauzeros base-devel git git-lfs sudo ca-certificates curl wget rsync less)
+
+# Directories shared read-write with the host.
+SHARED_DIRS=(/repo /var/cache/hokuto /var/tmp/hokuto /var/tmpdir/hokuto)
+SOURCES_MOUNT=/var/cache/hokuto/sources
+SOURCES_UNIT=var-cache-hokuto-sources.mount
+# The auto-bump blacklist is state, not configuration: keep one copy.
+BUMP_IGNORE=/var/db/hokuto/bump-ignore.json
+
+die() { printf '\033[0;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
+info() { printf '\033[0;36m->\033[0m %s\n' "$*"; }
+
+usage() {
+    sed -n '3,13p' "$(readlink -f "$0")" | sed 's/^# \{0,1\}//'
+    exit "${1:-0}"
+}
+
+case "${1:-}" in
+    create | bump | run | shell | update | destroy) ;;
+    -h | --help | help) usage ;;
+    *) usage 1 ;;
+esac
+
+if [ "$EUID" -ne 0 ]; then
+    exec sudo --preserve-env=HOKUTO_BUILDER_ROOT,HOKUTO_BUILDER_NAME "$(readlink -f "$0")" "$@"
+fi
+
+BUILD_USER=${SUDO_USER:-}
+if [ -z "$BUILD_USER" ] || [ "$BUILD_USER" = root ]; then
+    die "run hokuto-builder as your normal user; it uses sudo itself"
+fi
+BUILD_UID=$(id -u "$BUILD_USER")
+BUILD_GID=$(id -g "$BUILD_USER")
+BUILD_GROUP=$(id -gn "$BUILD_USER")
+BUILD_HOME=$(getent passwd "$BUILD_USER" | cut -d: -f6)
+
+# Container location: environment, then the location saved by 'create'.
+saved_rootfs() {
+    [ -f "$CONFIG_FILE" ] && sed -n 's/^ROOTFS=//p' "$CONFIG_FILE" | tail -n 1
+}
+ROOTFS=${HOKUTO_BUILDER_ROOT:-$(saved_rootfs)}
+ROOTFS=${ROOTFS:-$DEFAULT_ROOTFS}
+
+container_exists() {
+    [ -d "$ROOTFS/var/db/hokuto/installed" ]
+}
+
+# Refuse to start while the sources cache is not mounted: downloads would
+# silently fill the directory underneath it on the root filesystem.
+check_sources_mount() {
+    if systemctl cat "$SOURCES_UNIT" >/dev/null 2>&1 && ! mountpoint -q "$SOURCES_MOUNT"; then
+        die "$SOURCES_MOUNT is not mounted ($SOURCES_UNIT); unlock and mount GiGA first"
+    fi
+}
+
+cmd_create() {
+    command -v systemd-nspawn >/dev/null || die "systemd-nspawn not found"
+    local answer
+    read -r -p "Container location [$ROOTFS]: " answer
+    ROOTFS=$(realpath -m -- "${answer:-$ROOTFS}")
+    [ "$ROOTFS" != / ] || die "refusing to use / as the container location"
+    container_exists && die "$ROOTFS already exists; use 'update', or 'destroy' and create it again"
+    # Never install a system on top of existing data.
+    if [ -e "$ROOTFS" ] && [ -n "$(ls -A -- "$ROOTFS" 2>/dev/null)" ]; then
+        die "$ROOTFS exists and is not empty"
+    fi
+    mkdir -p "$ROOTFS"
+    printf 'ROOTFS=%s\n' "$ROOTFS" >"$CONFIG_FILE"
+    info "Saved the location in $CONFIG_FILE"
+
+    info "Installing ${BASE_PACKAGES[*]} into $ROOTFS"
+    # --remote installs binaries from the mirror, so nothing is compiled on
+    # the host to create the container.
+    HOKUTO_ROOT="$ROOTFS" hokuto install -y --remote "${BASE_PACKAGES[@]}"
+
+    info "Creating user $BUILD_USER ($BUILD_UID:$BUILD_GID)"
+    if [ -x "$ROOTFS/usr/bin/pwconv" ] || [ -x "$ROOTFS/usr/sbin/pwconv" ]; then
+        chroot "$ROOTFS" pwconv
+    fi
+    chroot "$ROOTFS" getent group "$BUILD_GROUP" >/dev/null ||
+        chroot "$ROOTFS" groupadd -g "$BUILD_GID" "$BUILD_GROUP"
+    chroot "$ROOTFS" getent passwd "$BUILD_USER" >/dev/null ||
+        chroot "$ROOTFS" useradd -M -u "$BUILD_UID" -g "$BUILD_GID" -d "$BUILD_HOME" -s /bin/bash "$BUILD_USER"
+    install -d -m 0755 -o "$BUILD_UID" -g "$BUILD_GID" "$ROOTFS$BUILD_HOME"
+
+    # hokuto authenticates through sudo; nobody can log into the container.
+    local sudoers="$ROOTFS/etc/sudoers"
+    [ -f "$sudoers" ] || die "sudo did not install $sudoers"
+    grep -qE '^[@#]includedir[[:space:]]+/etc/sudoers.d' "$sudoers" ||
+        printf '\n@includedir /etc/sudoers.d\n' >>"$sudoers"
+    install -d -m 0750 "$ROOTFS/etc/sudoers.d"
+    printf '%s ALL=(ALL:ALL) NOPASSWD: ALL\n' "$BUILD_USER" >"$ROOTFS/etc/sudoers.d/hokuto-builder"
+    chmod 0440 "$ROOTFS/etc/sudoers.d/hokuto-builder"
+
+    echo "$MACHINE" >"$ROOTFS/etc/hostname"
+    info "Container ready: $ROOTFS"
+}
+
+# nspawn_run <user> <command...>
+nspawn_run() {
+    local user=$1
+    shift
+    container_exists || die "no container at $ROOTFS; run 'hokuto-builder create' first"
+    check_sources_mount
+
+    local args=(
+        --quiet
+        --directory="$ROOTFS"
+        --machine="$MACHINE"
+        --register=no
+        --resolv-conf=copy-host
+        --timezone=copy
+        --bind-ro=/etc/hokuto
+        --bind-ro=/usr/bin/hokuto
+    )
+    local dir
+    for dir in "${SHARED_DIRS[@]}"; do
+        [ -d "$dir" ] || install -d -o "$BUILD_UID" -g "$BUILD_GID" "$dir"
+        args+=(--bind="$dir")
+    done
+    # A separate mount below /var/cache/hokuto; bind it explicitly.
+    mountpoint -q "$SOURCES_MOUNT" && args+=(--bind="$SOURCES_MOUNT")
+    [ -f "$BUMP_IGNORE" ] && args+=(--bind="$BUMP_IGNORE")
+    local file
+    for file in .gitconfig .git-credentials; do
+        [ -f "$BUILD_HOME/$file" ] && args+=(--bind-ro="$BUILD_HOME/$file")
+    done
+
+    if [ "$user" = root ]; then
+        systemd-nspawn "${args[@]}" -- "$@"
+    else
+        systemd-nspawn "${args[@]}" --user="$user" --chdir="$BUILD_HOME" \
+            --setenv=HOME="$BUILD_HOME" -- "$@"
+    fi
+}
+
+cmd_destroy() {
+    [ "$ROOTFS" != / ] || die "refusing to delete /"
+    container_exists || [ -d "$ROOTFS" ] || die "no container at $ROOTFS"
+    if pgrep -f "systemd-nspawn.*--directory=$ROOTFS" >/dev/null; then
+        die "the container is running"
+    fi
+    read -r -p "Delete $ROOTFS? [y/N] " answer
+    [[ "$answer" =~ ^[Yy]$ ]] || exit 1
+    # Bind mounts only exist inside a running container, and
+    # --one-file-system stops at anything else mounted below the root.
+    rm -rf --one-file-system -- "$ROOTFS"
+    info "Deleted $ROOTFS"
+}
+
+case "$1" in
+    create) cmd_create ;;
+    bump) shift; nspawn_run "$BUILD_USER" hokuto bump --auto --build "$@" ;;
+    run) shift; [ $# -gt 0 ] || usage 1; nspawn_run "$BUILD_USER" "$@" ;;
+    shell) nspawn_run "$BUILD_USER" /bin/bash -l ;;
+    update) nspawn_run "$BUILD_USER" hokuto update -y ;;
+    destroy) cmd_destroy ;;
+esac
