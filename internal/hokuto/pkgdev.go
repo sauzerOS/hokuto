@@ -1413,6 +1413,8 @@ func handleAutoBumpRepository(cfg *Config, autoBuild bool, assumeYes bool, repoU
 			pkgName = "cairo"
                 case "utf8proc":
 			pkgName = "libutf8proc"
+		case "python-dbus-python":
+			pkgName = "dbus-python"
 		}
 
 		var newestVer string
