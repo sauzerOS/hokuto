@@ -22,6 +22,7 @@
 #   /etc/hokuto                  config, signing keys, hokuto.update/.rebuild
 #   /usr/bin/hokuto              the host's hokuto, so both run the same version
 #   ~/.gitconfig, ~/.git-credentials   git identity and push credentials
+#   the sauzerOS.github.io checkout    build status and logs (bump --build)
 #
 # The container location is asked for by 'create' and saved in
 # /etc/hokuto-builder.conf for the other commands.
@@ -45,6 +46,9 @@ SOURCES_MOUNT=/var/cache/hokuto/sources
 SOURCES_UNIT=var-cache-hokuto-sources.mount
 # The auto-bump blacklist is state, not configuration: keep one copy.
 BUMP_IGNORE=/var/db/hokuto/bump-ignore.json
+# hokuto publishes build status and logs to this checkout (HOKUTO_WEBSITE_REPO
+# in hokuto.conf, same default as hokuto).
+DEFAULT_WEBSITE_REPO=/home/dbz/Documents/sauzerOS.github.io
 
 die() { printf '\033[0;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 info() { printf '\033[0;36m->\033[0m %s\n' "$*"; }
@@ -195,6 +199,14 @@ nspawn_run() {
     # A separate mount below /var/cache/hokuto; bind it explicitly.
     mountpoint -q "$SOURCES_MOUNT" && args+=(--bind="$SOURCES_MOUNT")
     [ -f "$BUMP_IGNORE" ] && args+=(--bind="$BUMP_IGNORE")
+    local website
+    website=$(sed -n 's/^HOKUTO_WEBSITE_REPO=//p' /etc/hokuto/hokuto.conf 2>/dev/null | tail -n 1 | tr -d '"' || true)
+    website=${website:-$DEFAULT_WEBSITE_REPO}
+    if [ -d "$website/.git" ]; then
+        args+=(--bind="$website")
+    else
+        info "No website checkout at $website; build status will not be published"
+    fi
     local file
     for file in .gitconfig .git-credentials; do
         [ -f "$BUILD_HOME/$file" ] && args+=(--bind-ro="$BUILD_HOME/$file")

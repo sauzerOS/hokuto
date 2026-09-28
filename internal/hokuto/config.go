@@ -109,6 +109,11 @@ func initConfig(cfg *Config) {
 		CacheDir = "/var/cache/hokuto"
 	}
 
+	WebsiteRepo = cfg.Values["HOKUTO_WEBSITE_REPO"]
+	if WebsiteRepo == "" {
+		WebsiteRepo = defaultWebsiteRepo
+	}
+
 	repoPaths = cfg.Values["HOKUTO_PATH"]
 	if repoPaths == "" {
 		log.Printf("Warning: HOKUTO_PATH is not set")
