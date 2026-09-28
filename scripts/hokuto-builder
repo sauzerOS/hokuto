@@ -200,6 +200,12 @@ nspawn_run() {
     for file in hokuto.conf hokuto.lock keys; do
         [ -e "/etc/hokuto/$file" ] && args+=(--bind-ro="/etc/hokuto/$file")
     done
+    # hokuto stages installs on the root's own filesystem so it can hard link
+    # them into place; /var/cache/hokuto is the host's here, so it uses this
+    # one, which the build user must own (hokuto creates entries as that user).
+    install -d -o "$BUILD_UID" -g "$BUILD_GID" "$ROOTFS/var/lib/hokuto"
+    install -d -o "$BUILD_UID" -g "$BUILD_GID" "$ROOTFS/var/lib/hokuto/staging"
+    chown "$BUILD_UID:$BUILD_GID" "$ROOTFS/var/lib/hokuto" "$ROOTFS/var/lib/hokuto/staging"
     # Interactive shells reset PATH in /etc/profile, which appends
     # /usr/local/bin at the end; move it to the front there too.
     install -d "$ROOTFS/etc/profile.d"

@@ -70,3 +70,26 @@ func TestCopyTreeWithTarWritesThroughDirSymlink(t *testing.T) {
 		t.Fatalf("file was not written through the symlink: %v", err)
 	}
 }
+
+// A candidate that exists but is not writable, e.g. left behind root-owned by
+// an install run as root, must be skipped rather than chosen and then fail
+// with "failed to create staging dir".
+func TestInstallStagingBaseSkipsUnwritableCandidate(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("run as an unprivileged user")
+	}
+	root := t.TempDir()
+	first := filepath.Join(root, "var/cache/hokuto/staging")
+	if err := os.MkdirAll(first, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(first, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(first, 0o755) })
+
+	got := installStagingBase(root, t.TempDir(), nil)
+	if want := filepath.Join(root, "var/lib/hokuto/staging"); got != want {
+		t.Fatalf("unwritable candidate not skipped\n got  %q\n want %q", got, want)
+	}
+}

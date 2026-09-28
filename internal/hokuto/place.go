@@ -64,10 +64,15 @@ func sameFilesystem(a, b string) (bool, error) {
 // The candidates are tried in order and the first one that lands on rootDir's
 // filesystem wins. If none does, the caller's fallback (historically TMPDIR) is
 // returned and placement degrades to a copy, exactly as before.
+// stagingWritable reports whether the current user can create entries in dir.
+func stagingWritable(dir string) bool {
+	return unix.Access(dir, unix.W_OK|unix.X_OK) == nil
+}
+
 func installStagingBase(rootDir, fallback string, cfg *Config) string {
 	if cfg != nil {
 		if v := strings.TrimSpace(cfg.Values["STAGINGDIR"]); v != "" {
-			if err := os.MkdirAll(v, 0o755); err == nil {
+			if err := os.MkdirAll(v, 0o755); err == nil && stagingWritable(v) {
 				return v
 			}
 			debugf("STAGINGDIR %s is unusable, falling back to autodetection\n", v)
@@ -81,6 +86,13 @@ func installStagingBase(rootDir, fallback string, cfg *Config) string {
 	} {
 		if err := os.MkdirAll(candidate, 0o755); err != nil {
 			debugf("Staging candidate %s not creatable: %v\n", candidate, err)
+			continue
+		}
+		// It may already exist owned by someone else, e.g. created by an
+		// earlier install run as root; the package directory is made below it
+		// as the invoking user.
+		if !stagingWritable(candidate) {
+			debugf("Staging candidate %s is not writable\n", candidate)
 			continue
 		}
 		same, err := sameFilesystem(candidate, rootDir)
