@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 
 	"golang.org/x/term"
 )
@@ -198,27 +199,85 @@ func (t *kmodTarget) env() map[string]string {
 	}
 }
 
-// ensureHeaders makes the target kernel's build tree available, installing
-// its headers package (<kernel>-headers) from a binary when needed. It
-// returns what it installed so the caller can remove it after the build.
-func (t *kmodTarget) ensureHeaders(cfg *Config) ([]string, error) {
-	if fi, err := os.Stat(filepath.Join(t.BuildDir, "Makefile")); err == nil && !fi.IsDir() {
-		return nil, nil
+// Kernel headers are shared by every module build for the same kernel, and
+// module packages usually build in parallel. kmodHeaders serializes their
+// installation and counts the builds using them, so they are installed once
+// and removed only after the last of those builds, and only if a module
+// build installed them.
+var kmodHeaders = struct {
+	sync.Mutex
+	users     map[string]int
+	installed map[string]bool
+}{users: map[string]int{}, installed: map[string]bool{}}
+
+// Test hooks; nil means the real install and removal.
+var (
+	kmodInstallHeaders func(name string, cfg *Config) (bool, error)
+	kmodRemoveHeaders  func(name string, cfg *Config)
+)
+
+func installKmodHeaders(name string, cfg *Config) (bool, error) {
+	if kmodInstallHeaders != nil {
+		return kmodInstallHeaders(name, cfg)
 	}
-	headers := t.KernelPackage + kmodHeadersSufix
-	colArrow.Print("-> ")
-	colSuccess.Printf("Installing %s for %s\n", headers, t.Instance)
-	installed, err := installAvailableBuildDependencyBinaryWithOptions(headers, cfg, false, false, true)
-	if err != nil {
-		return nil, fmt.Errorf("failed to install %s: %w", headers, err)
+	return installAvailableBuildDependencyBinaryWithOptions(name, cfg, false, false, true)
+}
+
+func removeKmodHeaders(name string, cfg *Config) {
+	if kmodRemoveHeaders != nil {
+		kmodRemoveHeaders(name, cfg)
+		return
 	}
-	if fi, err := os.Stat(filepath.Join(t.BuildDir, "Makefile")); err != nil || fi.IsDir() {
-		return nil, fmt.Errorf("%s: no kernel build tree at %s; build and install %s for kernel %s first", t.Instance, t.BuildDir, headers, t.Release)
+	uninstallBuildDependencies([]string{name}, cfg)
+}
+
+func (t *kmodTarget) headersPackage() string {
+	return t.KernelPackage + kmodHeadersSufix
+}
+
+func (t *kmodTarget) buildTreePresent() bool {
+	fi, err := os.Stat(filepath.Join(t.BuildDir, "Makefile"))
+	return err == nil && !fi.IsDir()
+}
+
+// acquireHeaders makes the target kernel's build tree available for one
+// build, installing its headers package (<kernel>-headers) from a binary when
+// it is missing. The returned release must be called when the build is done.
+func (t *kmodTarget) acquireHeaders(cfg *Config) (release func(), err error) {
+	headers := t.headersPackage()
+	kmodHeaders.Lock()
+	defer kmodHeaders.Unlock()
+
+	if !t.buildTreePresent() {
+		colArrow.Print("-> ")
+		colSuccess.Printf("Installing %s for %s\n", headers, t.Instance)
+		installed, err := installKmodHeaders(headers, cfg)
+		if err != nil {
+			return nil, fmt.Errorf("failed to install %s: %w", headers, err)
+		}
+		if installed {
+			kmodHeaders.installed[headers] = true
+		}
+		if !t.buildTreePresent() {
+			return nil, fmt.Errorf("%s: no kernel build tree at %s; build and install %s for kernel %s first", t.Instance, t.BuildDir, headers, t.Release)
+		}
 	}
-	if installed {
-		return []string{headers}, nil
-	}
-	return nil, nil
+	kmodHeaders.users[headers]++
+
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			kmodHeaders.Lock()
+			defer kmodHeaders.Unlock()
+			kmodHeaders.users[headers]--
+			if kmodHeaders.users[headers] > 0 || !kmodHeaders.installed[headers] {
+				return
+			}
+			delete(kmodHeaders.users, headers)
+			delete(kmodHeaders.installed, headers)
+			removeKmodHeaders(headers, cfg)
+		})
+	}, nil
 }
 
 // verifyOutput checks that the package only ships modules for the target

@@ -2220,11 +2220,11 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, opts BuildOptions)
 		return 0, err
 	}
 	if kmod != nil {
-		headers, err := kmod.ensureHeaders(cfg)
+		releaseHeaders, err := kmod.acquireHeaders(cfg)
 		if err != nil {
 			return 0, err
 		}
-		defer uninstallBuildDependencies(headers, cfg)
+		defer releaseHeaders()
 	}
 
 	// Save current cross settings to restore them later (prevent pollution across packages in the same run)
@@ -3368,11 +3368,11 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 		return err
 	}
 	if kmod != nil {
-		headers, err := kmod.ensureHeaders(cfg)
+		releaseHeaders, err := kmod.acquireHeaders(cfg)
 		if err != nil {
 			return err
 		}
-		defer uninstallBuildDependencies(headers, cfg)
+		defer releaseHeaders()
 	}
 
 	// 1. Initialize a LOCAL temporary directory variable with the global default.

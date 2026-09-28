@@ -8,7 +8,9 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 // withKmodFixture creates a repository with a kmod recipe (nvidia-open), a
@@ -398,4 +400,88 @@ func TestLegacyKmodKernelFallback(t *testing.T) {
 	if !slices.Equal(got, []string{"vhba-module"}) || len(replaced) != 0 {
 		t.Errorf("ambiguous package must be left alone: %v %v", got, replaced)
 	}
+}
+
+func TestAcquireHeadersSharedAcrossParallelBuilds(t *testing.T) {
+	buildDir := filepath.Join(t.TempDir(), "build")
+	var mu sync.Mutex
+	installs, removals := 0, 0
+	oldInstall, oldRemove := kmodInstallHeaders, kmodRemoveHeaders
+	kmodInstallHeaders = func(name string, cfg *Config) (bool, error) {
+		mu.Lock()
+		installs++
+		mu.Unlock()
+		// Slow on purpose: concurrent installs used to overlap here.
+		time.Sleep(20 * time.Millisecond)
+		if err := os.MkdirAll(buildDir, 0o755); err != nil {
+			return false, err
+		}
+		return true, os.WriteFile(filepath.Join(buildDir, "Makefile"), nil, 0o644)
+	}
+	kmodRemoveHeaders = func(name string, cfg *Config) {
+		mu.Lock()
+		removals++
+		mu.Unlock()
+		os.RemoveAll(buildDir)
+	}
+	t.Cleanup(func() { kmodInstallHeaders, kmodRemoveHeaders = oldInstall, oldRemove })
+
+	targets := []string{"nvidia-open~linux", "vhba-module~linux", "vmware-modules~linux", "xpadneo~linux"}
+	releases := make([]func(), len(targets))
+	var wg sync.WaitGroup
+	errs := make([]error, len(targets))
+	for i, name := range targets {
+		wg.Add(1)
+		go func(i int, name string) {
+			defer wg.Done()
+			target := &kmodTarget{Instance: name, KernelPackage: "linux", Release: "7.2.8-sauzerOS", BuildDir: buildDir}
+			releases[i], errs[i] = target.acquireHeaders(nil)
+		}(i, name)
+	}
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("%s: %v", targets[i], err)
+		}
+	}
+	if installs != 1 {
+		t.Fatalf("headers installed %d times, want once", installs)
+	}
+
+	// The first build to finish must not pull the headers from the others.
+	for i := 0; i < len(releases)-1; i++ {
+		releases[i]()
+		releases[i]() // releasing twice is harmless
+		if removals != 0 {
+			t.Fatalf("headers removed while %d build(s) still use them", len(releases)-1-i)
+		}
+		if _, err := os.Stat(filepath.Join(buildDir, "Makefile")); err != nil {
+			t.Fatalf("build tree gone early: %v", err)
+		}
+	}
+	releases[len(releases)-1]()
+	if removals != 1 {
+		t.Fatalf("headers removed %d times after the last build, want once", removals)
+	}
+}
+
+func TestAcquireHeadersKeepsHeadersInstalledByTheUser(t *testing.T) {
+	buildDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(buildDir, "Makefile"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	oldInstall, oldRemove := kmodInstallHeaders, kmodRemoveHeaders
+	kmodInstallHeaders = func(string, *Config) (bool, error) {
+		t.Error("present headers must not be installed again")
+		return false, nil
+	}
+	kmodRemoveHeaders = func(string, *Config) { t.Error("headers the user installed must not be removed") }
+	t.Cleanup(func() { kmodInstallHeaders, kmodRemoveHeaders = oldInstall, oldRemove })
+
+	target := &kmodTarget{Instance: "xpadneo~linux", KernelPackage: "linux", Release: "7.2.8-sauzerOS", BuildDir: buildDir}
+	release, err := target.acquireHeaders(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	release()
 }
