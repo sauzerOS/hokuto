@@ -7,6 +7,9 @@
 #   hokuto-builder create          create the container (once)
 #   hokuto-builder bump [-y]       hokuto bump --auto --build, interactive;
 #                                  -y bumps and builds everything unattended
+#   hokuto-builder build <pkg...>  build as bump --build does, then upload --sync;
+#                                  --no-upload skips the upload, other options
+#                                  go to hokuto build
 #   hokuto-builder run <cmd...>    run any command in the container
 #   hokuto-builder shell           interactive shell in the container
 #   hokuto-builder update          update the container's own packages
@@ -58,12 +61,12 @@ die() { printf '\033[0;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 info() { printf '\033[0;36m->\033[0m %s\n' "$*"; }
 
 usage() {
-    sed -n '3,13p' "$(readlink -f "$0")" | sed 's/^# \{0,1\}//'
+    sed -n '3,16p' "$(readlink -f "$0")" | sed 's/^# \{0,1\}//'
     exit "${1:-0}"
 }
 
 case "${1:-}" in
-    create | bump | run | shell | update | destroy) ;;
+    create | bump | build | run | shell | update | destroy) ;;
     -h | --help | help) usage ;;
     *) usage 1 ;;
 esac
@@ -240,6 +243,33 @@ nspawn_run() {
     fi
 }
 
+# The build step of `hokuto bump --build` for packages that are already
+# bumped (e.g. after a failed build): idle, not installed, status and log
+# published to the website, then the mirror synced if the build succeeded.
+cmd_build() {
+    local upload=1 arg
+    local args=()
+    for arg in "$@"; do
+        if [ "$arg" = --no-upload ]; then
+            upload=0
+        else
+            args+=("$arg")
+        fi
+    done
+    [ ${#args[@]} -gt 0 ] || die "usage: hokuto-builder build <pkg>... [--no-upload]"
+    # One container session; the arguments reach hokuto as "$@", unquoted
+    # nowhere.
+    # shellcheck disable=SC2016
+    nspawn_run "$BUILD_USER" /bin/sh -c '
+        upload=$1
+        shift
+        /usr/local/bin/hokuto build -i --no-install --index "$@" || exit
+        if [ "$upload" = 1 ]; then
+            /usr/local/bin/hokuto upload --sync
+        fi
+    ' hokuto-builder-build "$upload" "${args[@]}"
+}
+
 cmd_destroy() {
     [ "$ROOTFS" != / ] || die "refusing to delete /"
     container_exists || [ -d "$ROOTFS" ] || die "no container at $ROOTFS"
@@ -257,6 +287,7 @@ cmd_destroy() {
 case "$1" in
     create) cmd_create ;;
     bump) shift; nspawn_run "$BUILD_USER" /usr/local/bin/hokuto bump --auto --build "$@" ;;
+    build) shift; cmd_build "$@" ;;
     run) shift; [ $# -gt 0 ] || usage 1; nspawn_run "$BUILD_USER" "$@" ;;
     shell) nspawn_run "$BUILD_USER" /bin/bash -l ;;
     update) nspawn_run "$BUILD_USER" /usr/local/bin/hokuto update -y ;;
