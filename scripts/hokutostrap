@@ -47,15 +47,21 @@ SIG="hokuto.tar.xz.sig"
 # 3. Download
 log_info "Downloading latest Hokuto release"
 
-if command -v curl >/dev/null 2>&1; then
-    curl -s -L -f -o "$TMP_DIR/$TARBALL" "$BASE_URL/$TARBALL?arch=$ARCH"
-    curl -s -L -f -o "$TMP_DIR/$SIG" "$BASE_URL/$SIG?arch=$ARCH"
-elif command -v wget >/dev/null 2>&1; then
-    wget -q -O "$TMP_DIR/$TARBALL" "$BASE_URL/$TARBALL?arch=$ARCH"
-    wget -q -O "$TMP_DIR/$SIG" "$BASE_URL/$SIG?arch=$ARCH"
-else
-    log_warn "Neither curl nor wget found. Trying to proceed if files exist"
-fi
+# The download service answers with an occasional HTTP 500 (it looks up the
+# latest release through the GitHub API), so retry, and say what failed
+# instead of letting `set -e` end the script silently.
+download() {
+    if command -v curl >/dev/null 2>&1; then
+        curl -sS -L -f --retry 8 --retry-delay 5 -o "$2" "$1"
+    elif command -v wget >/dev/null 2>&1; then
+        wget -q --tries=8 --waitretry=5 --retry-on-http-error=500,502,503,504 -O "$2" "$1"
+    else
+        log_error "Neither curl nor wget found."
+    fi
+}
+
+download "$BASE_URL/$TARBALL?arch=$ARCH" "$TMP_DIR/$TARBALL" || log_error "Failed to download $TARBALL from $BASE_URL"
+download "$BASE_URL/$SIG?arch=$ARCH" "$TMP_DIR/$SIG" || log_error "Failed to download $SIG from $BASE_URL"
 
 if [ ! -f "$TMP_DIR/$TARBALL" ]; then
     log_warn "Download appeared to fail (file missing). Will attempt to check anyway."
