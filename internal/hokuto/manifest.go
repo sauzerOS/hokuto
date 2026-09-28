@@ -110,7 +110,9 @@ func generateManifest(outputDir, installedDir string, execCtx *Executor) error {
 		switch e.FileType {
 		case "d":
 			dirs = append(dirs, e.Path)
-		case "l":
+		case "l", "o":
+			// Symlinks and special files (FIFOs, sockets, devices) have no
+			// content to hash; opening a FIFO would block forever.
 			symlinks = append(symlinks, e.Path)
 			symlinkMap[e.Path] = true
 		default:
@@ -122,6 +124,9 @@ func generateManifest(outputDir, installedDir string, execCtx *Executor) error {
 	if err != nil {
 		return fmt.Errorf("failed to open temporary manifest file: %v", err)
 	}
+	// One write per entry would be one syscall per line; big packages have
+	// tens of thousands of entries.
+	w := bufio.NewWriter(f)
 
 	// Write directory entries
 	for _, entry := range dirs {
@@ -130,7 +135,7 @@ func generateManifest(outputDir, installedDir string, execCtx *Executor) error {
 		if !strings.HasSuffix(cleaned, "/") {
 			cleaned += "/"
 		}
-		if _, err := fmt.Fprintln(f, cleaned); err != nil {
+		if _, err := fmt.Fprintln(w, cleaned); err != nil {
 			f.Close()
 			return fmt.Errorf("failed to write manifest entry: %v", err)
 		}
@@ -138,7 +143,7 @@ func generateManifest(outputDir, installedDir string, execCtx *Executor) error {
 
 	// Write symlink entries (000000 checksum)
 	for _, entry := range symlinks {
-		if _, err := fmt.Fprintf(f, "%s 000000\n", entry); err != nil {
+		if _, err := fmt.Fprintf(w, "%s 000000\n", entry); err != nil {
 			f.Close()
 			return fmt.Errorf("failed to write symlink entry: %v", err)
 		}
@@ -163,13 +168,19 @@ func generateManifest(outputDir, installedDir string, execCtx *Executor) error {
 			f.Close()
 			return fmt.Errorf("missing checksum for %s", absPath)
 		}
-		if _, err := fmt.Fprintf(f, "%s  %s\n", entry, checksum); err != nil {
+		if _, err := fmt.Fprintf(w, "%s  %s\n", entry, checksum); err != nil {
 			f.Close()
 			return fmt.Errorf("failed to write manifest entry: %v", err)
 		}
 	}
 
-	f.Close()
+	if err := w.Flush(); err != nil {
+		f.Close()
+		return fmt.Errorf("failed to write manifest entries: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("failed to close temporary manifest file: %v", err)
+	}
 
 	// Append the manifest's own checksum
 	tempChecksum, err := ComputeChecksum(tmpManifest, execCtx)

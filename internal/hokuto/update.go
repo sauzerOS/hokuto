@@ -1801,52 +1801,9 @@ func applyUpdateOrder(pkgNames []string) ([]string, map[string][]string) {
 		return pkgNames, nil
 	}
 
-	// Map to store the priority of packages.
-	// We use the order of appearance in the file to determine priority.
-	priority := make(map[string]int)
-	scanner := bufio.NewScanner(strings.NewReader(string(data)))
-	rank := 0
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-
-		// Each line can contain one or more packages separated by spaces
-		pkgs := strings.Fields(line)
-		for _, p := range pkgs {
-			// Only assign priority if not already assigned (first occurrence wins)
-			if _, exists := priority[p]; !exists {
-				priority[p] = rank
-				rank++
-			}
-		}
-	}
-
-	if len(priority) == 0 {
-		return pkgNames, nil
-	}
-
-	// Create a copy to avoid modifying the input slice
-	result := make([]string, len(pkgNames))
-	copy(result, pkgNames)
-
-	// Sort the packages. We use a stable sort to maintain the relative order
-	// provided by the dependency resolver for packages not mentioned in the update file
-	// or for which no relative order is specified.
-	sort.SliceStable(result, func(i, j int) bool {
-		p1, ok1 := priority[result[i]]
-		p2, ok2 := priority[result[j]]
-
-		// If both packages are in the update order file, use their relative order.
-		if ok1 && ok2 {
-			return p1 < p2
-		}
-
-		// If only one is in the file or neither is, we preserve their original
-		// relative order from the topological sort to avoid breaking dependencies.
-		return false
-	})
+	// Reorder by the chains in the file without ever moving a package ahead
+	// of one of its dependencies; see orderUpdatePlan.
+	result := orderUpdatePlan(pkgNames, loadUpdateOrderChains())
 
 	// Generate manual prerequisites for parallel builds
 	manualPrereqs := make(map[string][]string)
@@ -1858,7 +1815,7 @@ func applyUpdateOrder(pkgNames []string) ([]string, map[string][]string) {
 	}
 
 	// Re-scan to generate prerequisites based on per-line ordering
-	scanner = bufio.NewScanner(strings.NewReader(string(data)))
+	scanner := bufio.NewScanner(strings.NewReader(string(data)))
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" || strings.HasPrefix(line, "#") {

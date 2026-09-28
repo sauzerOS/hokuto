@@ -74,13 +74,13 @@ func selectableEntryColors(entry selectableEntry) (tcell.Color, tcell.Color) {
 	}
 }
 
-func normalizeTrackedPath(root, path string) (string, bool) {
+func normalizeTrackedPath(root, path string, dirCache map[string]string) (string, bool) {
 	path = strings.TrimSpace(path)
 	if path == "" || strings.HasSuffix(path, "/") {
 		return "", false
 	}
 
-	clean := filepath.ToSlash(filepath.Clean(canonicalizePath(root, path)))
+	clean := filepath.ToSlash(filepath.Clean(canonicalizePathCached(root, path, dirCache)))
 	if clean == "/etc" || clean == "/usr" || strings.HasPrefix(clean, "/etc/") || strings.HasPrefix(clean, "/usr/") {
 		return clean, true
 	}
@@ -129,12 +129,14 @@ func loadOwnedSystemFiles(root string) (map[string]struct{}, error) {
 		go func() {
 			defer wg.Done()
 			local := make(map[string]struct{})
+			// Per worker: the cache is not safe for concurrent use.
+			dirCache := make(map[string]string)
 			for entry := range jobs {
 				if !entry.IsDir() {
 					continue
 				}
 				manifestPath := filepath.Join(Installed, entry.Name(), "manifest")
-				if err := collectOwnedManifestPaths(root, manifestPath, local); err != nil {
+				if err := collectOwnedManifestPaths(root, manifestPath, local, dirCache); err != nil {
 					errOnce.Do(func() { firstErr = err })
 				}
 			}
@@ -159,7 +161,7 @@ func loadOwnedSystemFiles(root string) (map[string]struct{}, error) {
 	return owned, nil
 }
 
-func collectOwnedManifestPaths(root, manifestPath string, owned map[string]struct{}) error {
+func collectOwnedManifestPaths(root, manifestPath string, owned map[string]struct{}, dirCache map[string]string) error {
 	file, err := os.Open(manifestPath)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -174,7 +176,7 @@ func collectOwnedManifestPaths(root, manifestPath string, owned map[string]struc
 	scanner.Buffer(buf, 1024*1024)
 	for scanner.Scan() {
 		path := parseManifestFilePath(scanner.Text())
-		if normalized, ok := normalizeTrackedPath(root, path); ok {
+		if normalized, ok := normalizeTrackedPath(root, path, dirCache); ok {
 			owned[normalized] = struct{}{}
 		}
 	}
@@ -186,6 +188,7 @@ func collectOwnedManifestPaths(root, manifestPath string, owned map[string]struc
 
 func scanUnmanagedSystemFiles(root string, owned map[string]struct{}) ([]unmanagedEntry, error) {
 	var unmanaged []unmanagedEntry
+	dirCache := make(map[string]string)
 	for _, scanRoot := range []string{"etc", "usr"} {
 		absRoot := filepath.Join(root, scanRoot)
 		if _, err := os.Lstat(absRoot); err != nil {
@@ -212,7 +215,7 @@ func scanUnmanagedSystemFiles(root string, owned map[string]struct{}) ([]unmanag
 				return nil
 			}
 			trackedPath := "/" + filepath.ToSlash(rel)
-			canonicalPath := filepath.ToSlash(filepath.Clean(canonicalizePath(root, trackedPath)))
+			canonicalPath := filepath.ToSlash(filepath.Clean(canonicalizePathCached(root, trackedPath, dirCache)))
 			if _, ok := owned[canonicalPath]; !ok {
 				size := int64(0)
 				if info, err := entry.Info(); err == nil {
@@ -240,7 +243,16 @@ func scanModifiedManifestFiles(root string) ([]unmanagedEntry, error) {
 		return nil, fmt.Errorf("failed to read installed package db: %w", err)
 	}
 
-	var modified []unmanagedEntry
+	// Collect every tracked file first and hash them in one parallel pass;
+	// hashing file by file made this a single-threaded read of all of /usr.
+	type checksumCandidate struct {
+		normalized, expected, owner, diskPath string
+		size                                  int64
+	}
+	var candidates []checksumCandidate
+	var diskPaths []string
+	queued := make(map[string]bool)
+	dirCache := make(map[string]string)
 	for _, entry := range entries {
 		if !entry.IsDir() {
 			continue
@@ -264,7 +276,7 @@ func scanModifiedManifestFiles(root string) ([]unmanagedEntry, error) {
 			if manifestPath == "" || expected == "" || expected == "000000" {
 				continue
 			}
-			normalized, ok := normalizeTrackedPath(root, manifestPath)
+			normalized, ok := normalizeTrackedPath(root, manifestPath, dirCache)
 			if !ok {
 				continue
 			}
@@ -273,13 +285,10 @@ func scanModifiedManifestFiles(root string) ([]unmanagedEntry, error) {
 			if err != nil || info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
 				continue
 			}
-			got, err := ComputeChecksum(diskPath, UserExec)
-			if err != nil {
-				debugf("Skipping checksum comparison for %s: %v\n", normalized, err)
-				continue
-			}
-			if got != expected {
-				modified = append(modified, unmanagedEntry{Path: normalized, Reason: "modified:" + entry.Name(), Size: info.Size()})
+			candidates = append(candidates, checksumCandidate{normalized, expected, entry.Name(), diskPath, info.Size()})
+			if !queued[diskPath] {
+				queued[diskPath] = true
+				diskPaths = append(diskPaths, diskPath)
 			}
 		}
 		if err := scanner.Err(); err != nil {
@@ -287,6 +296,23 @@ func scanModifiedManifestFiles(root string) ([]unmanagedEntry, error) {
 			return nil, fmt.Errorf("failed to scan manifest %s: %w", manifestPath, err)
 		}
 		file.Close()
+	}
+
+	sums, err := ComputeChecksums(diskPaths, UserExec)
+	if err != nil {
+		// Unreadable files are simply left out, as before.
+		debugf("Some files could not be hashed: %v\n", err)
+	}
+	var modified []unmanagedEntry
+	for _, c := range candidates {
+		got, ok := sums[c.diskPath]
+		if !ok {
+			debugf("Skipping checksum comparison for %s\n", c.normalized)
+			continue
+		}
+		if got != c.expected {
+			modified = append(modified, unmanagedEntry{Path: c.normalized, Reason: "modified:" + c.owner, Size: c.size})
+		}
 	}
 
 	sortUnmanagedEntries(modified)

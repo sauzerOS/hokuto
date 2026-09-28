@@ -940,6 +940,7 @@ func findPackagesByManifestString(query string) error {
 	}
 
 	foundAny := false
+	dirCache := make(map[string]string)
 	for _, e := range entries {
 		if !e.IsDir() {
 			continue
@@ -977,7 +978,7 @@ func findPackagesByManifestString(query string) error {
 				continue
 			}
 
-			canonicalPath := filepath.ToSlash(filepath.Clean(canonicalizePath(root, path)))
+			canonicalPath := filepath.ToSlash(filepath.Clean(canonicalizePathCached(root, path, dirCache)))
 			if strings.Contains(path, query) || strings.Contains(canonicalPath, canonicalQuery) {
 				match = true
 				break

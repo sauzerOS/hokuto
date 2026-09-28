@@ -555,3 +555,82 @@ func TestBumpPackageCustomCommitMessage(t *testing.T) {
 		t.Fatalf("expected version file to contain '1.0.0 2', got %q", string(verData))
 	}
 }
+
+func TestTweakVersionImageMagickTagScheme(t *testing.T) {
+	for in, want := range map[string]string{
+		"7.1.2-27": "7.1.2-27", // already upstream's tag scheme
+		"7.1.2.27": "7.1.2-27", // older Repology form
+		"7.1.2_32": "7.1.2-32", // current Repology form
+		"7.1.2":    "7.1.2",    // no patch level: left alone
+		"7.1.2-rc": "7.1.2-rc", // unknown shape: left alone
+	} {
+		if got := tweakVersion("imagemagick", in); got != want {
+			t.Errorf("tweakVersion(imagemagick, %q) = %q, want %q", in, got, want)
+		}
+	}
+	if got := tweakVersion("other", "7.1.2_32"); got != "7.1.2_32" {
+		t.Errorf("other packages must be untouched, got %q", got)
+	}
+}
+
+func TestBumpPackageRestoresRecipeWhenSourcesCannotBeFetched(t *testing.T) {
+	repoDir := t.TempDir()
+	oldRepoPaths, oldSourcesDir, oldCacheStore := repoPaths, SourcesDir, CacheStore
+	repoPaths = repoDir
+	SourcesDir = filepath.Join(t.TempDir(), "sources")
+	CacheStore = filepath.Join(SourcesDir, "_cache")
+	t.Cleanup(func() {
+		repoPaths, SourcesDir, CacheStore = oldRepoPaths, oldSourcesDir, oldCacheStore
+	})
+
+	runGit := func(args ...string) string {
+		t.Helper()
+		out, err := exec.Command("git", append([]string{"-C", repoDir}, args...)...).CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v failed: %v: %s", args, err, out)
+		}
+		return string(out)
+	}
+	runGit("init")
+	runGit("config", "user.name", "Hokuto Test")
+	runGit("config", "user.email", "test@sauzeros.invalid")
+
+	// Only the current release's source exists, like an upstream tag that
+	// does not exist under the new version's spelling.
+	pkgDir := filepath.Join(repoDir, "testpkg")
+	files := map[string]string{
+		"files/dummy-1.0.0.txt": "hello",
+		"version":               "1.0.0 1\n",
+		".sources":              "files/dummy-${version}.txt\n",
+		"sources":               "files/dummy-1.0.0.txt\n",
+		"checksums":             "previous-checksum  dummy-1.0.0.txt\n",
+	}
+	for name, data := range files {
+		path := filepath.Join(pkgDir, name)
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(data), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	runGit("add", ".")
+	runGit("commit", "-q", "-m", "initial commit")
+
+	if _, err := bumpPackage("testpkg", "", "1.1.0", ""); err == nil {
+		t.Fatal("bump must fail when the new sources cannot be fetched")
+	}
+
+	for _, name := range []string{"version", "sources", "checksums"} {
+		data, err := os.ReadFile(filepath.Join(pkgDir, name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(data) != files[name] {
+			t.Errorf("%s left half-bumped: %q, want %q", name, data, files[name])
+		}
+	}
+	if status := strings.TrimSpace(runGit("status", "--porcelain")); status != "" {
+		t.Errorf("failed bump must leave the recipe unchanged, git status:\n%s", status)
+	}
+}

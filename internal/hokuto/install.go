@@ -1827,6 +1827,9 @@ func checkStagingConflicts(pkgName, stagingDir, rootDir, stagingManifest string,
 	ownershipSnapshot := getFileOwnershipSnapshot(rootDir)
 	// Also build a set of files owned by the current package (for upgrade scenarios)
 	currentPkgFiles := make(map[string]bool)
+	// Parent-directory symlinks don't change during this pass, so resolve
+	// each directory once instead of once per manifest line.
+	dirCache := make(map[string]string)
 
 	// First, check if current package is installed and build its file set
 	installedManifestPath := filepath.Join(Installed, pkgName, "manifest")
@@ -1838,7 +1841,7 @@ func checkStagingConflicts(pkgName, stagingDir, rootDir, stagingManifest string,
 				continue
 			}
 			manifestFilePath := entry.Path
-			cleanPath := canonicalizePath(rootDir, manifestFilePath)
+			cleanPath := canonicalizePathCached(rootDir, manifestFilePath, dirCache)
 			cleanPathNoSlash := strings.TrimPrefix(cleanPath, "/")
 			currentPkgFiles[cleanPath] = true
 			currentPkgFiles[cleanPathNoSlash] = true
@@ -1881,7 +1884,7 @@ func checkStagingConflicts(pkgName, stagingDir, rootDir, stagingManifest string,
 
 		filePath := entry.Path // Path from manifest (may have leading slash)
 		// Normalize path: remove leading slash for comparison
-		filePathClean := canonicalizePath(rootDir, filePath)
+		filePathClean := canonicalizePathCached(rootDir, filePath, dirCache)
 		filePathCleanNoSlash := strings.TrimPrefix(filePathClean, "/")
 
 		// Ignore internal metadata files
@@ -1930,8 +1933,20 @@ func checkStagingConflicts(pkgName, stagingDir, rootDir, stagingManifest string,
 		return fmt.Errorf("error reading staging manifest: %v", err)
 	}
 
-	// Second pass: prompt once per conflicting package
-	for conflictPkg, conflicts := range conflictsByPkg {
+	// All registrations go into one batch so the alternatives DB is loaded,
+	// updated and saved once per install rather than once per conflicting
+	// package.
+	var batchRequests []AlternativeRequest
+	var stagingFilesToRemove []string
+
+	// Second pass: prompt once per conflicting package, in a stable order
+	conflictPkgs := make([]string, 0, len(conflictsByPkg))
+	for conflictPkg := range conflictsByPkg {
+		conflictPkgs = append(conflictPkgs, conflictPkg)
+	}
+	sort.Strings(conflictPkgs)
+	for _, conflictPkg := range conflictPkgs {
+		conflicts := conflictsByPkg[conflictPkg]
 		var input string
 		// Check batch flags first - if already set, skip prompt
 		if keepAllConflicts {
@@ -1972,12 +1987,6 @@ func checkStagingConflicts(pkgName, stagingDir, rootDir, stagingManifest string,
 		}
 
 		// Apply choice to all files in this conflict group
-		// Batch process alternatives for performance
-		var batchRequests []AlternativeRequest
-		// Keep track of which staging files to remove (Keep Original case)
-		stagingFilesToRemove := make(map[string]bool)
-
-		// 1. Gather requests
 		for _, c := range conflicts {
 			switch input {
 			case "k", "o":
@@ -1990,7 +1999,7 @@ func checkStagingConflicts(pkgName, stagingDir, rootDir, stagingManifest string,
 					KeepOriginal: true,
 				}
 				batchRequests = append(batchRequests, req)
-				stagingFilesToRemove[c.filePath] = true
+				stagingFilesToRemove = append(stagingFilesToRemove, c.stagingFile)
 				// Do NOT add to manifestEntriesToRemove. We want the package to "own" the file
 				// even if we are using the existing one on disk. This ensures uninstall works.
 
@@ -2014,24 +2023,6 @@ func checkStagingConflicts(pkgName, stagingDir, rootDir, stagingManifest string,
 			}
 		}
 
-		// 2. Execute Batch
-		if len(batchRequests) > 0 {
-			debugf("Processing %d alternative registrations concurrently...\n", len(batchRequests))
-			if err := BatchRegisterAlternatives(rootDir, batchRequests, execCtx); err != nil {
-				return fmt.Errorf("failed to register package alternatives: %w", err)
-			}
-		}
-
-		// 3. Post-processing (Cleanup staging files for "Keep" case)
-		for _, c := range conflicts {
-			if stagingFilesToRemove[c.filePath] {
-				rmCmd := exec.Command("rm", "-f", c.stagingFile)
-				if err := execCtx.Run(rmCmd); err != nil {
-					return fmt.Errorf("failed to remove file from staging %s: %v", c.stagingFile, err)
-				}
-				// filesRemovedFromStaging[c.filePath] = true <--- CHANGED: Keep in manifest for alternatives
-			}
-		}
 	}
 
 	// Handle unmanaged file conflicts
@@ -2071,10 +2062,6 @@ func checkStagingConflicts(pkgName, stagingDir, rootDir, stagingManifest string,
 			useNewForAll = true
 		}
 
-		var unmanagedBatchRequests []AlternativeRequest
-		unmanagedStagingToRemove := make(map[string]bool)
-		// unmanagedManifestToRemove := make(map[string]bool) // Not used currently as we keep manifest entries for alternatives
-
 		for _, c := range unmanagedConflicts {
 			switch input {
 			case "k", "o":
@@ -2086,8 +2073,8 @@ func checkStagingConflicts(pkgName, stagingDir, rootDir, stagingManifest string,
 					IncomingFile: c.stagingFile,
 					KeepOriginal: true,
 				}
-				unmanagedBatchRequests = append(unmanagedBatchRequests, req)
-				unmanagedStagingToRemove[c.filePath] = true
+				batchRequests = append(batchRequests, req)
+				stagingFilesToRemove = append(stagingFilesToRemove, c.stagingFile)
 				debugf("Kept existing unmanaged file, queueing new file as alternative: %s\n", c.filePath)
 
 			case "n":
@@ -2099,26 +2086,27 @@ func checkStagingConflicts(pkgName, stagingDir, rootDir, stagingManifest string,
 					IncomingFile: c.stagingFile,
 					KeepOriginal: false,
 				}
-				unmanagedBatchRequests = append(unmanagedBatchRequests, req)
+				batchRequests = append(batchRequests, req)
 				debugf("Using new file, queueing existing file as alternative: %s\n", c.filePath)
 			}
 		}
+	}
 
-		if len(unmanagedBatchRequests) > 0 {
-			debugf("Processing %d unmanaged alternatives concurrently...\n", len(unmanagedBatchRequests))
-			if err := BatchRegisterAlternatives(rootDir, unmanagedBatchRequests, execCtx); err != nil {
-				return fmt.Errorf("failed to register unmanaged alternatives: %w", err)
-			}
+	if len(batchRequests) > 0 {
+		debugf("Processing %d alternative registrations concurrently...\n", len(batchRequests))
+		if err := BatchRegisterAlternatives(rootDir, batchRequests, execCtx); err != nil {
+			return fmt.Errorf("failed to register package alternatives: %w", err)
 		}
+	}
 
-		for _, c := range unmanagedConflicts {
-			if unmanagedStagingToRemove[c.filePath] {
-				rmCmd := exec.Command("rm", "-f", c.stagingFile)
-				if err := execCtx.Run(rmCmd); err != nil {
-					return fmt.Errorf("failed to remove file from staging %s: %v", c.stagingFile, err)
-				}
-				// filesRemovedFromStaging[c.filePath] = true
-			}
+	// "Keep original": the incoming file is now stashed, so drop it from the
+	// staging tree. Its manifest entry stays so the package still owns the
+	// path for uninstall.
+	for start := 0; start < len(stagingFilesToRemove); start += 500 {
+		end := min(start+500, len(stagingFilesToRemove))
+		args := append([]string{"-f", "--"}, stagingFilesToRemove[start:end]...)
+		if err := execCtx.Run(exec.Command("rm", args...)); err != nil {
+			return fmt.Errorf("failed to remove kept-original files from staging: %v", err)
 		}
 	}
 

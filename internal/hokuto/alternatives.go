@@ -1,7 +1,6 @@
 package hokuto
 
 import (
-	"bufio"
 	"bytes"
 	"encoding/json"
 	"fmt"
@@ -14,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 )
 
 // AlternativeRequest represents a request to register an alternative (used for batch processing)
@@ -36,7 +36,9 @@ type alternativeFileInfo struct {
 
 type alternativeBatchContext struct {
 	incomingFiles map[string]alternativeFileInfo
-	ownerByPath   map[string]string
+	// ownership is only loaded when some request has no known current
+	// owner, i.e. for unmanaged-file conflicts.
+	ownership *fileOwnershipSnapshot
 }
 
 var alternativeStoreLocks sync.Map
@@ -221,12 +223,95 @@ func saveAlternativesDB(hRoot string, db *GlobalAlternativesDB, execCtx *Executo
 	if err := renameAlternativeAsRoot(tempPath, dbPath, execCtx); err != nil {
 		return fmt.Errorf("failed to atomically replace alternatives DB: %w", err)
 	}
+	// The DB is committed; a failed prune only leaves garbage for the next save.
+	if removed, err := pruneAlternativeStore(hRoot, db, execCtx); err != nil {
+		debugf("Warning: failed to prune alternatives store: %v\n", err)
+	} else if removed > 0 {
+		debugf("Pruned %d unreferenced file(s) from the alternatives store\n", removed)
+	}
 	return nil
 }
 
 // getStashedFilePath returns the path to a stashed file in the store
 func getStashedFilePath(hRoot, b3sum string) string {
 	return filepath.Join(hRoot, GlobalAlternativesStoreDir, b3sum)
+}
+
+// alternativeStoreGracePeriod protects store files that were just written.
+// Another hokuto process may have stored a file for an alternative whose DB
+// entry it has not saved yet. ctime is used because the store copy is made
+// with cp -a, which preserves the source's mtime but not its ctime.
+const alternativeStoreGracePeriod = time.Hour
+
+// unreferencedAlternativeStoreFiles lists store files that no alternative in
+// db points at and that are older than the grace period. Only regular files
+// named like a digest are considered, so nothing else in the directory is
+// ever touched.
+func unreferencedAlternativeStoreFiles(hRoot string, db *GlobalAlternativesDB, now time.Time) ([]string, error) {
+	storeDir := filepath.Join(hRoot, GlobalAlternativesStoreDir)
+	entries, err := os.ReadDir(storeDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+
+	referenced := make(map[string]bool)
+	for _, entry := range db.Files {
+		for _, alt := range entry.Alternatives {
+			referenced[alt.B3Sum] = true
+		}
+	}
+
+	var unreferenced []string
+	for _, e := range entries {
+		name := e.Name()
+		if referenced[name] || !validAlternativeDigest(name) || !e.Type().IsRegular() {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		if st, ok := info.Sys().(*syscall.Stat_t); ok {
+			if now.Sub(time.Unix(st.Ctim.Unix())) < alternativeStoreGracePeriod {
+				continue
+			}
+		}
+		unreferenced = append(unreferenced, filepath.Join(storeDir, name))
+	}
+	return unreferenced, nil
+}
+
+// pruneAlternativeStore deletes the store files that db no longer references
+// and returns how many were removed.
+func pruneAlternativeStore(hRoot string, db *GlobalAlternativesDB, execCtx *Executor) (int, error) {
+	return pruneAlternativeStoreAt(hRoot, db, execCtx, time.Now())
+}
+
+func pruneAlternativeStoreAt(hRoot string, db *GlobalAlternativesDB, execCtx *Executor, now time.Time) (int, error) {
+	paths, err := unreferencedAlternativeStoreFiles(hRoot, db, now)
+	if err != nil || len(paths) == 0 {
+		return 0, err
+	}
+	if os.Geteuid() == 0 || execCtx == nil {
+		for _, path := range paths {
+			if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+				return 0, err
+			}
+		}
+		return len(paths), nil
+	}
+	const chunk = 500
+	for start := 0; start < len(paths); start += chunk {
+		end := min(start+chunk, len(paths))
+		args := append([]string{"-f", "--"}, paths[start:end]...)
+		if err := execCtx.Run(exec.Command("rm", args...)); err != nil {
+			return 0, err
+		}
+	}
+	return len(paths), nil
 }
 
 // ensureStoreDir creates the store directory if it doesn't exist
@@ -718,56 +803,6 @@ func parseManifestFilePath(line string) string {
 	return entry.Path
 }
 
-func buildAlternativeOwnerCache(hRoot string) map[string]string {
-	ownerByPath := make(map[string]string)
-	installedRoot := filepath.Join(hRoot, "var", "db", "hokuto", "installed")
-	entries, err := os.ReadDir(installedRoot)
-	if err != nil {
-		return ownerByPath
-	}
-
-	for _, e := range entries {
-		if !e.IsDir() {
-			continue
-		}
-		pkgName := e.Name()
-		manifestPath := filepath.Join(installedRoot, pkgName, "manifest")
-		f, err := os.Open(manifestPath)
-		if err != nil {
-			continue
-		}
-
-		scanner := bufio.NewScanner(f)
-		for scanner.Scan() {
-			manifestPath := parseManifestFilePath(scanner.Text())
-			if manifestPath == "" || strings.HasSuffix(manifestPath, "/") {
-				continue
-			}
-			canonicalPath := canonicalizePath(hRoot, manifestPath)
-			canonicalNoSlash := strings.TrimPrefix(canonicalPath, "/")
-			if _, exists := ownerByPath[canonicalPath]; !exists {
-				ownerByPath[canonicalPath] = pkgName
-			}
-			if _, exists := ownerByPath[canonicalNoSlash]; !exists {
-				ownerByPath[canonicalNoSlash] = pkgName
-			}
-		}
-		_ = f.Close()
-	}
-	return ownerByPath
-}
-
-func alternativeOwnerFromCache(ctx *alternativeBatchContext, hRoot, targetAbsPath string) string {
-	if ctx == nil || len(ctx.ownerByPath) == 0 {
-		return findPackageOwningFile(hRoot, targetAbsPath)
-	}
-	canonicalTarget := canonicalizePath(hRoot, targetAbsPath)
-	if owner := ctx.ownerByPath[canonicalTarget]; owner != "" {
-		return owner
-	}
-	return ctx.ownerByPath[strings.TrimPrefix(canonicalTarget, "/")]
-}
-
 // registerAlternative registers regular files and symlinks without ever
 // following symlinks or admitting directories into the alternatives store.
 func registerAlternative(hRoot, filePath string, req AlternativeRequest, execCtx *Executor, db *GlobalAlternativesDB, dbMu *sync.Mutex, batchCtx *alternativeBatchContext) error {
@@ -784,6 +819,36 @@ func registerAlternative(hRoot, filePath string, req AlternativeRequest, execCtx
 		}
 	}
 
+	// Hashing the file on disk and copying into the store are the slow parts
+	// and touch no shared state, so only the DB update holds dbMu. Store
+	// writes are serialized per digest by ensureAlternativeStored itself.
+	targetAbsPath := filepath.Join(hRoot, filePath)
+	currentInfo, err := alternativeFileMetadata(targetAbsPath, execCtx)
+	if err != nil {
+		return fmt.Errorf("failed to inspect existing alternative: %w", err)
+	}
+	currentOwner := req.CurrentPkg
+	if currentOwner == "" {
+		if batchCtx != nil {
+			currentOwner = batchCtx.ownership.ownerOtherThan(filePath, req.IncomingPkg)
+		}
+		if currentOwner == "" {
+			currentOwner = "unmanaged"
+		}
+	}
+
+	storeSource, storeInfo, needsStore, err := updateAlternativeEntry(db, dbMu, filePath, req, targetAbsPath, currentOwner, currentInfo, incomingInfo)
+	if err != nil || !needsStore {
+		return err
+	}
+	return ensureAlternativeStored(hRoot, storeSource, storeInfo, execCtx)
+}
+
+// updateAlternativeEntry records the current and incoming alternatives for
+// filePath under dbMu and reports which file, if any, must be copied into the
+// store: the incoming one when the original stays active, the original one
+// otherwise.
+func updateAlternativeEntry(db *GlobalAlternativesDB, dbMu *sync.Mutex, filePath string, req AlternativeRequest, targetAbsPath, currentOwner string, currentInfo, incomingInfo alternativeFileInfo) (string, alternativeFileInfo, bool, error) {
 	dbMu.Lock()
 	defer dbMu.Unlock()
 	if db.Files == nil {
@@ -801,49 +866,27 @@ func registerAlternative(hRoot, filePath string, req AlternativeRequest, execCtx
 			continue
 		}
 		if activeAlt != nil {
-			return fmt.Errorf("alternatives database has multiple active entries for %s", filePath)
+			return "", alternativeFileInfo{}, false, fmt.Errorf("alternatives database has multiple active entries for %s", filePath)
 		}
 		activeAlt = alt
 	}
-
-	targetAbsPath := filepath.Join(hRoot, filePath)
-	currentInfo, err := alternativeFileMetadata(targetAbsPath, execCtx)
-	if err != nil {
-		return fmt.Errorf("failed to inspect existing alternative: %w", err)
-	}
 	if activeAlt != nil && !alternativeMatchesInfo(activeAlt, currentInfo) {
-		return fmt.Errorf("active alternative for %s does not match the file on disk", filePath)
+		return "", alternativeFileInfo{}, false, fmt.Errorf("active alternative for %s does not match the file on disk", filePath)
 	}
 
 	currentAlt := getOrCreateAlternative(entry, currentInfo)
-	currentOwner := req.CurrentPkg
-	if currentOwner == "" {
-		currentOwner = alternativeOwnerFromCache(batchCtx, hRoot, targetAbsPath)
-		if currentOwner == "" {
-			currentOwner = "unmanaged"
-		}
-	}
 	addAlternativeOwner(currentAlt, currentOwner)
 
 	incomingAlt := getOrCreateAlternative(entry, incomingInfo)
 	addAlternativeOwner(incomingAlt, req.IncomingPkg)
 
+	needsStore := incomingAlt != currentAlt
 	if req.KeepOriginal {
-		if incomingAlt != currentAlt {
-			if err := ensureAlternativeStored(hRoot, req.IncomingFile, incomingInfo, execCtx); err != nil {
-				return err
-			}
-		}
 		setActiveAlternative(entry, currentAlt)
-	} else {
-		if incomingAlt != currentAlt {
-			if err := ensureAlternativeStored(hRoot, targetAbsPath, currentInfo, execCtx); err != nil {
-				return err
-			}
-		}
-		setActiveAlternative(entry, incomingAlt)
+		return req.IncomingFile, incomingInfo, needsStore, nil
 	}
-	return nil
+	setActiveAlternative(entry, incomingAlt)
+	return targetAbsPath, currentInfo, needsStore, nil
 }
 
 // BatchRegisterAlternatives processes a list of alternative requests concurrently.
@@ -902,9 +945,12 @@ func BatchRegisterAlternatives(hRoot string, requests []AlternativeRequest, exec
 		return err
 	}
 
-	batchCtx := &alternativeBatchContext{
-		incomingFiles: incomingInfo,
-		ownerByPath:   buildAlternativeOwnerCache(hRoot),
+	batchCtx := &alternativeBatchContext{incomingFiles: incomingInfo}
+	for _, req := range requests {
+		if req.CurrentPkg == "" {
+			batchCtx.ownership = getFileOwnershipSnapshot(hRoot)
+			break
+		}
 	}
 
 	var dbMu sync.Mutex
@@ -941,62 +987,6 @@ func BatchRegisterAlternatives(hRoot string, requests []AlternativeRequest, exec
 
 	// Save DB once
 	return saveAlternativesDB(hRoot, db, execCtx)
-}
-
-// findPackageOwningFile searches installed packages to find which one owns the given file path.
-// It returns the package name, or empty string if not found.
-func findPackageOwningFile(hRoot, targetAbsPath string) string {
-	// The targetAbsPath is absolute (e.g. /usr/bin/foo).
-	// Manifests store paths relative to root or absolute (handled in uninstall.go).
-	// We need to iterate all installed packages: var/db/hokuto/installed/*/manifest
-
-	installedRoot := filepath.Join(hRoot, "var", "db", "hokuto", "installed")
-	entries, err := os.ReadDir(installedRoot)
-	if err != nil {
-		return ""
-	}
-
-	canonicalTarget := canonicalizePath(hRoot, targetAbsPath)
-	canonicalTargetNoSlash := strings.TrimPrefix(canonicalTarget, "/")
-
-	for _, e := range entries {
-		if !e.IsDir() {
-			continue
-		}
-		pkgName := e.Name()
-		manifestPath := filepath.Join(installedRoot, pkgName, "manifest")
-
-		// We'll use a simple scanner - optimized for speed?
-		// Since this only runs on conflict, it's acceptable.
-		f, err := os.Open(manifestPath)
-		if err != nil {
-			continue
-		}
-
-		scanner := bufio.NewScanner(f)
-		found := false
-		for scanner.Scan() {
-			mPath := parseManifestFilePath(scanner.Text())
-			if mPath == "" {
-				continue
-			}
-
-			// Normalize manifest path using canonicalizePath
-			canonicalMPath := canonicalizePath(hRoot, mPath)
-			canonicalMPathNoSlash := strings.TrimPrefix(canonicalMPath, "/")
-			if canonicalMPathNoSlash == canonicalTargetNoSlash {
-				found = true
-				break
-			}
-		}
-		f.Close()
-
-		if found {
-			return pkgName
-		}
-	}
-
-	return ""
 }
 
 func restoreAlternativesOnUninstall(pkgName, hRoot string, execCtx *Executor) (map[string]bool, error) {
@@ -1178,6 +1168,17 @@ func handleAlternativesCommand(args []string) error {
 		return err
 	}
 
+	// An empty DB can still leave files behind in the store.
+	if len(args) > 0 && args[0] == "prune" {
+		removed, err := pruneAlternativeStore(hRoot, db, RootExec)
+		if err != nil {
+			return fmt.Errorf("failed to prune alternatives store: %w", err)
+		}
+		colArrow.Print("-> ")
+		colSuccess.Printf("Removed %d unreferenced file(s) from the alternatives store\n", removed)
+		return nil
+	}
+
 	if len(db.Files) == 0 {
 		colInfo.Println("No alternatives recorded.")
 		return nil
@@ -1215,6 +1216,7 @@ func printAlternativesHelp() {
 	fmt.Println("  (no args)             List all alternatives grouped by conflict set")
 	fmt.Println("  <package>             Interactively switch alternatives for a package")
 	fmt.Println("  discard-unmanaged     Cleanup unmanaged alternatives (requires root)")
+	fmt.Println("  prune                 Delete stored files no alternative references anymore")
 	fmt.Println("  -ls, --list <owner>   List files provided by a specific owner (e.g. 'unmanaged')")
 	fmt.Println()
 }

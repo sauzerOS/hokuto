@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 
 	"golang.org/x/sys/unix"
 	"lukechampine.com/blake3"
@@ -526,10 +527,17 @@ func ComputeChecksum(path string, execCtx *Executor) (string, error) {
 }
 
 func computeSingleGoHash(path string, execCtx *Executor, buf []byte) (string, error) {
-	// 1. Try to read directly.
-	f, err := os.Open(path)
+	// 1. Try to read directly. O_NONBLOCK keeps the open from hanging on a
+	// FIFO; it has no effect on regular files, and anything that is not a
+	// regular file (FIFO, socket, device, directory) has no content to hash.
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
 	if err == nil {
 		defer f.Close()
+		if info, statErr := f.Stat(); statErr != nil {
+			return "", statErr
+		} else if !info.Mode().IsRegular() {
+			return "", fmt.Errorf("cannot checksum %s: not a regular file (%s)", path, info.Mode().Type())
+		}
 		h := blake3.New(32, nil)
 		if _, copyErr := io.CopyBuffer(h, f, buf); copyErr == nil {
 			return fmt.Sprintf("%x", h.Sum(nil)), nil

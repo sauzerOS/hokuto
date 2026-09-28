@@ -42,8 +42,10 @@ func TestApplySourceForgeDirect(t *testing.T) {
 // who is asking. SourceForge serves an HTML interstitial to non-browser agents
 // and 403s browser ones; ftp.gnu.org rejects a request with no User-Agent.
 func TestNativeDownloadHandlesBotChecks(t *testing.T) {
-	if testing.Short() {
-		t.Skip("network test")
+	// Downloads from real mirrors, so it only runs on request:
+	// HOKUTO_NETWORK_TESTS=1 go test -run TestNativeDownloadHandlesBotChecks ./...
+	if os.Getenv("HOKUTO_NETWORK_TESTS") != "1" {
+		t.Skip("network test; set HOKUTO_NETWORK_TESTS=1 to run it")
 	}
 	cases := []struct{ name, url string }{
 		{"sourceforge", "https://sourceforge.net/projects/libpng/files/libpng16/1.6.58/libpng-1.6.58.tar.xz"},

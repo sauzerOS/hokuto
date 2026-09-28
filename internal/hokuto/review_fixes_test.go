@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -102,19 +103,50 @@ func TestFindOwnerPackageSupportsSpaces(t *testing.T) {
 	}
 }
 
-func TestFindPackageOwningDirectorySupportsSpaces(t *testing.T) {
+func TestBatchRegisterAlternativesResolvesOwnerFromSnapshot(t *testing.T) {
 	root := t.TempDir()
-	installed := filepath.Join(root, "var", "db", "hokuto", "installed", "demo")
-	if err := os.MkdirAll(installed, 0o755); err != nil {
+	oldInstalled := Installed
+	Installed = filepath.Join(root, "var", "db", "hokuto", "installed")
+	t.Cleanup(func() { Installed = oldInstalled })
+
+	const filePath = "/usr/share/Program Files/demo.txt"
+	if err := os.MkdirAll(filepath.Join(Installed, "demo"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	const manifestPath = "/usr/share/Program Files/Common Files/"
-	if err := os.WriteFile(filepath.Join(installed, "manifest"), []byte(manifestPath+"\n"), 0o644); err != nil {
+	manifest := "/usr/share/Program Files/\n" + filePath + "  " + strings.Repeat("0", 64) + "\n"
+	if err := os.WriteFile(filepath.Join(Installed, "demo", "manifest"), []byte(manifest), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(root, filePath)
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target, []byte("demo\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	incoming := filepath.Join(t.TempDir(), "demo.txt")
+	if err := os.WriteFile(incoming, []byte("other\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
-	if owner := findPackageOwningFile(root, manifestPath); owner != "demo" {
-		t.Fatalf("unexpected owner %q", owner)
+	// No CurrentPkg: the owner must come from the installed manifests.
+	if err := BatchRegisterAlternatives(root, []AlternativeRequest{{
+		FilePath: filePath, IncomingPkg: "other", IncomingFile: incoming,
+	}}, &Executor{Context: context.Background()}); err != nil {
+		t.Fatal(err)
+	}
+	db, err := loadAlternativesDB(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry := db.Files[filePath]
+	if entry == nil || len(entry.Alternatives) != 2 {
+		t.Fatalf("expected two alternatives for %s, got %#v", filePath, entry)
+	}
+	for _, alt := range entry.Alternatives {
+		if alt.State == StateStashed && !slices.Equal(alt.Owners, []string{"demo"}) {
+			t.Fatalf("stashed original owned by %v, want [demo]", alt.Owners)
+		}
 	}
 }
 

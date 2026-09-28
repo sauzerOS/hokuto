@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -59,14 +60,16 @@ func lstatViaExecutor(path string, execCtx *Executor) (string, error) {
 
 type FileListEntry struct {
 	Path     string
-	FileType string // "f" for file, "d" for directory, "l" for symlink
+	FileType string // "f" for file, "d" for directory, "l" for symlink, "o" for anything else (FIFO, socket, device)
 }
 
 func listOutputFilesWithTypes(outputDir string, execCtx *Executor) ([]FileListEntry, error) {
 	// Optimization: If we have root (or don't need it), use native Go
 	if os.Geteuid() == 0 || !execCtx.ShouldRunAsRoot {
 		var entries []FileListEntry
-		err := filepath.Walk(outputDir, func(path string, info os.FileInfo, err error) error {
+		// WalkDir takes file types from the directory entries instead of
+		// an lstat per file; like Walk it never follows symlinks.
+		err := filepath.WalkDir(outputDir, func(path string, d fs.DirEntry, err error) error {
 			if err != nil {
 				return err
 			}
@@ -84,15 +87,18 @@ func listOutputFilesWithTypes(outputDir string, execCtx *Executor) ([]FileListEn
 			}
 
 			entry := FileListEntry{}
-			if info.IsDir() {
+			if d.IsDir() {
 				entry.Path = "/" + rel + "/"
 				entry.FileType = "d"
-			} else if info.Mode()&os.ModeSymlink != 0 {
+			} else if d.Type()&fs.ModeSymlink != 0 {
 				entry.Path = "/" + rel
 				entry.FileType = "l"
-			} else {
+			} else if d.Type().IsRegular() {
 				entry.Path = "/" + rel
 				entry.FileType = "f"
+			} else {
+				entry.Path = "/" + rel
+				entry.FileType = "o"
 			}
 			entries = append(entries, entry)
 			return nil
@@ -133,8 +139,12 @@ func listOutputFilesWithTypes(outputDir string, execCtx *Executor) ([]FileListEn
 		}
 
 		// Parse "type path"
-		// First char is type (f, d, l)
+		// First char is type (f, d, l); find also reports p, s, b and c
+		// for FIFOs, sockets and devices, which have no content to hash.
 		ftype := string(line[0])
+		if ftype != "f" && ftype != "d" && ftype != "l" {
+			ftype = "o"
+		}
 		path := strings.TrimSpace(line[2:])
 
 		rel, err := filepath.Rel(outputDir, path)

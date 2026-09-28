@@ -632,6 +632,23 @@ func bumpPackage(pkgName, expectedOldVersion, newVersion, commitMsg string) (str
 		return "", fmt.Errorf("%s: wrong version (found %s, expected %s)", pkgName, currentVer, expectedOldVersion)
 	}
 
+	// The version and sources files are rewritten before the new sources are
+	// downloaded. If anything fails before the commit, put the recipe back:
+	// a half-bumped recipe already carries the new version, so the next
+	// auto-bump would take it for up to date.
+	snapshot := snapshotRecipeFiles(pkgDir, "version", "sources", "checksums")
+	recipeUpdated := false
+	defer func() {
+		if recipeUpdated {
+			return
+		}
+		if err := snapshot.restore(); err != nil {
+			colWarn.Printf("%s: failed to restore recipe files after a failed bump: %v\n", pkgName, err)
+			return
+		}
+		debugf("%s: restored version, sources and checksums after a failed bump\n", pkgName)
+	}()
+
 	// 3) Amend version to newVersion
 	// Logic: If version changed, reset revision to 1
 	//        If version same, increment revision
@@ -674,6 +691,9 @@ func bumpPackage(pkgName, expectedOldVersion, newVersion, commitMsg string) (str
 		return "", fmt.Errorf("%s: failed to generate checksums: %v", pkgName, err)
 	}
 
+	// The recipe is consistent from here on; a failed commit keeps it.
+	recipeUpdated = true
+
 	// 6) git add . (within pkgDir)
 	gitAdd := exec.Command("git", "-C", pkgDir, "add", ".")
 	if out, err := gitAdd.CombinedOutput(); err != nil {
@@ -692,6 +712,46 @@ func bumpPackage(pkgName, expectedOldVersion, newVersion, commitMsg string) (str
 	}
 
 	return pkgDir, nil
+}
+
+type recipeFileSnapshot struct {
+	path    string
+	data    []byte
+	mode    os.FileMode
+	existed bool
+}
+
+type recipeSnapshot []recipeFileSnapshot
+
+// snapshotRecipeFiles records the named files of a recipe, including which
+// ones do not exist yet, so restore can return the recipe to this state.
+func snapshotRecipeFiles(pkgDir string, names ...string) recipeSnapshot {
+	snap := make(recipeSnapshot, 0, len(names))
+	for _, name := range names {
+		path := filepath.Join(pkgDir, name)
+		entry := recipeFileSnapshot{path: path, mode: 0o644}
+		if info, err := os.Stat(path); err == nil {
+			if data, err := os.ReadFile(path); err == nil {
+				entry.data, entry.mode, entry.existed = data, info.Mode().Perm(), true
+			}
+		}
+		snap = append(snap, entry)
+	}
+	return snap
+}
+
+func (snap recipeSnapshot) restore() error {
+	var errs []error
+	for _, entry := range snap {
+		if entry.existed {
+			if err := os.WriteFile(entry.path, entry.data, entry.mode); err != nil {
+				errs = append(errs, err)
+			}
+		} else if err := os.Remove(entry.path); err != nil && !os.IsNotExist(err) {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
 }
 
 // buildBumpedPackage builds a bumped package through the regular build command
@@ -1515,6 +1575,11 @@ func handleAutoBumpRepository(cfg *Config, autoBuild bool, assumeYes bool, repoU
 	sort.SliceStable(candidates, func(i, j int) bool {
 		return candidates[i].PkgName < candidates[j].PkgName
 	})
+	// Then honour /etc/hokuto/hokuto.update, as `hokuto update` does, so
+	// chains like "vulkan-headers vulkan-loader vulkan-tools" are bumped and
+	// built in that order. Done before the list is shown so the numbers the
+	// user picks match the order they are processed in.
+	candidates = orderAutoBumpCandidates(candidates, sets, loadUpdateOrderChains())
 
 	fmt.Println()
 	colSuccess.Printf("--- %d Package(s) to Bump ---\n", len(candidates))
@@ -1677,15 +1742,13 @@ func tweakVersion(pkgName, ver string) string {
 		// while the actual version used by openssh and our repo is 10.3p1.
 		return strings.ReplaceAll(ver, "_p", "p")
 	case "imagemagick":
-		// Keep upstream's GitHub tag scheme when Repology already reports it:
-		// 7.1.2-27 -> 7.1.2-27. Older Repology variants used 7.1.2.27.
-		if strings.Contains(ver, "-") {
-			return ver
-		}
-		if regexp.MustCompile(`^\d+\.\d+\.\d+\.\d+$`).MatchString(ver) {
-			lastDot := strings.LastIndex(ver, ".")
-			return ver[:lastDot] + "-" + ver[lastDot+1:]
+		// Upstream tags releases as 7.1.2-27. Repology has reported the
+		// patch level as 7.1.2-27, 7.1.2.27 and 7.1.2_32 over time.
+		if m := imagemagickVersionRe.FindStringSubmatch(ver); m != nil {
+			return m[1] + "-" + m[2]
 		}
 	}
 	return ver
 }
+
+var imagemagickVersionRe = regexp.MustCompile(`^(\d+\.\d+\.\d+)[-._](\d+)$`)

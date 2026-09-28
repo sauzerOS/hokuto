@@ -239,6 +239,7 @@ func removeObsoleteFiles(pkgName, stagingDir, rootDir string) ([]string, error) 
 
 	// Build set of paths present in staging manifest
 	stagingSet := make(map[string]struct{})
+	dirCache := make(map[string]string)
 	if len(stagingData) > 0 {
 		sc := bufio.NewScanner(strings.NewReader(string(stagingData)))
 		for sc.Scan() {
@@ -250,7 +251,7 @@ func removeObsoleteFiles(pkgName, stagingDir, rootDir string) ([]string, error) 
 				continue
 			}
 			path := entry.Path
-			canonical := canonicalizePath(rootDir, path)
+			canonical := canonicalizePathCached(rootDir, path, dirCache)
 			stagingSet[canonical] = struct{}{}
 			stagingSet[strings.TrimPrefix(canonical, "/")] = struct{}{}
 			stagingSet[path] = struct{}{}
@@ -285,7 +286,7 @@ func removeObsoleteFiles(pkgName, stagingDir, rootDir string) ([]string, error) 
 		}
 
 		// Check if canonical path matches
-		canonicalPath := canonicalizePath(rootDir, path)
+		canonicalPath := canonicalizePathCached(rootDir, path, dirCache)
 		canonicalPathNoSlash := strings.TrimPrefix(canonicalPath, "/")
 		if _, ok := stagingSet[canonicalPath]; ok {
 			continue
