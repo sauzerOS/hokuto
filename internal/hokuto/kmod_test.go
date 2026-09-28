@@ -340,3 +340,62 @@ func TestInstalledKernelsFindsOwningPackages(t *testing.T) {
 		t.Errorf("kernelReleaseForPackage = %q, %v", rel, err)
 	}
 }
+
+func TestLegacyKmodMigration(t *testing.T) {
+	_, installed := withKmodFixture(t, kernelLinux, kernelCachyOS)
+	sum := strings.Repeat("0", 64)
+	for pkg, manifest := range map[string]string{
+		// Built for linux-cachyos, listed under the /lib alias.
+		"nvidia-open": "/lib/modules/7.2.8-sauzerOS_C/kernel/drivers/video/nvidia.ko.zst  " + sum + "\n",
+		"zlib":        "/usr/lib/libz.so.1  " + sum + "\n",
+	} {
+		if err := os.MkdirAll(filepath.Join(installed, pkg), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(installed, pkg, "manifest"), []byte(manifest), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if kernel, err := legacyKmodKernel("nvidia-open"); err != nil || kernel != "linux-cachyos" {
+		t.Errorf("legacyKmodKernel = %q, %v", kernel, err)
+	}
+
+	got, replaced := migrateLegacyKmodTargets([]string{"imagemagick", "nvidia-open", "nvidia-open~linux"})
+	if !slices.Equal(got, []string{"imagemagick", "nvidia-open~linux-cachyos", "nvidia-open~linux"}) {
+		t.Errorf("targets %v", got)
+	}
+	if len(replaced) != 1 || replaced["nvidia-open~linux-cachyos"] != "nvidia-open" {
+		t.Errorf("replaced %v", replaced)
+	}
+
+	// The instance was not installed (its build failed): keep the plain package.
+	finishLegacyKmodMigration(replaced, &Config{Values: map[string]string{}})
+	if _, err := os.Stat(filepath.Join(installed, "nvidia-open")); err != nil {
+		t.Errorf("legacy package must stay when its instance is missing: %v", err)
+	}
+}
+
+func TestLegacyKmodKernelFallback(t *testing.T) {
+	_, installed := withKmodFixture(t, kernelLinux)
+	if err := os.MkdirAll(filepath.Join(installed, "vhba-module"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Modules for a kernel that is gone: with one kernel left, use it.
+	manifest := "/lib/modules/7.2.7-sauzerOS/extra/vhba.ko  " + strings.Repeat("0", 64) + "\n"
+	if err := os.WriteFile(filepath.Join(installed, "vhba-module", "manifest"), []byte(manifest), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if kernel, err := legacyKmodKernel("vhba-module"); err != nil || kernel != "linux" {
+		t.Errorf("legacyKmodKernel = %q, %v", kernel, err)
+	}
+	// With two kernels and no match the choice is ambiguous.
+	kernelLister = func() []installedKernel { return []installedKernel{kernelLinux, kernelCachyOS} }
+	if _, err := legacyKmodKernel("vhba-module"); err == nil {
+		t.Error("ambiguous kernel must be reported")
+	}
+	got, replaced := migrateLegacyKmodTargets([]string{"vhba-module"})
+	if !slices.Equal(got, []string{"vhba-module"}) || len(replaced) != 0 {
+		t.Errorf("ambiguous package must be left alone: %v %v", got, replaced)
+	}
+}

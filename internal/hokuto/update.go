@@ -1234,6 +1234,12 @@ func checkForUpgrades(ctx context.Context, cfg *Config, maxJobs int, yes bool) e
 		pkgNames = append(pkgNames, filteredUpgradeList[idx].Name)
 	}
 
+	// Kernel module packages installed under their plain name before kernel
+	// tracking are updated as the instance for their kernel; the plain
+	// package is removed once that instance is installed.
+	pkgNames, legacyKmods := migrateLegacyKmodTargets(pkgNames)
+	defer finishLegacyKmodMigration(legacyKmods, cfg)
+
 	// 5. Build order and dependency resolution for the updates
 	userRequestedMap := make(map[string]bool)
 	hokutoInUpdates := false

@@ -361,3 +361,91 @@ func promptKernelChoice(pkg string, kernels []installedKernel, in *bufio.Reader,
 func kmodPromptAssumesYes(yes bool) bool {
 	return yes || isExplicitYes() || !term.IsTerminal(int(os.Stdin.Fd()))
 }
+
+// legacyKmodKernel picks the kernel package a module package installed under
+// its plain name (from before kernel tracking) belongs to: the kernel whose
+// release its manifest ships modules for, or the only installed kernel.
+func legacyKmodKernel(name string) (string, error) {
+	kernels := kernelLister()
+	byRelease := make(map[string]string, len(kernels))
+	for _, k := range kernels {
+		byRelease[k.Release] = k.Package
+	}
+	if data, err := readFileAsRoot(filepath.Join(Installed, name, "manifest")); err == nil {
+		for _, line := range strings.Split(string(data), "\n") {
+			entry, ok, err := parseManifestLine(line)
+			if err != nil || !ok {
+				continue
+			}
+			path := strings.TrimPrefix(entry.Path, "/usr")
+			if rest, found := strings.CutPrefix(path, "/lib/modules/"); found {
+				release, _, _ := strings.Cut(rest, "/")
+				if pkg := byRelease[release]; pkg != "" {
+					return pkg, nil
+				}
+			}
+		}
+	}
+	if len(kernels) == 1 {
+		return kernels[0].Package, nil
+	}
+	return "", fmt.Errorf("cannot tell which kernel %s was built for (installed kernels: %s); install it with hokuto install %s", name, describeInstalledKernels(), name)
+}
+
+// migrateLegacyKmodTargets replaces plain kernel module package names in an
+// update list with the instance for their kernel. It returns the new list
+// and, per instance, the plain package it replaces.
+func migrateLegacyKmodTargets(pkgNames []string) ([]string, map[string]string) {
+	replaced := make(map[string]string)
+	out := make([]string, 0, len(pkgNames))
+	for _, name := range pkgNames {
+		if _, _, isInstance := splitKmodInstance(name); isInstance || !isKmodRecipe(name) {
+			out = append(out, name)
+			continue
+		}
+		kernel, err := legacyKmodKernel(name)
+		if err != nil {
+			colWarn.Printf("%v\n", err)
+			out = append(out, name)
+			continue
+		}
+		instance := kmodInstanceName(name, kernel)
+		colArrow.Print("-> ")
+		colSuccess.Printf("%s is now tracked per kernel; updating it as %s\n", name, instance)
+		replaced[instance] = name
+		out = append(out, instance)
+	}
+	return out, replaced
+}
+
+// finishLegacyKmodMigration removes each plain package whose instance is now
+// installed. Their shared files are registered as alternatives of both, so
+// the uninstall only drops what the instance does not ship. Instances that
+// failed to build leave the plain package in place.
+func finishLegacyKmodMigration(replaced map[string]string, cfg *Config) {
+	instances := make([]string, 0, len(replaced))
+	for instance := range replaced {
+		instances = append(instances, instance)
+	}
+	sort.Strings(instances)
+	for _, instance := range instances {
+		legacy := replaced[instance]
+		if !isPackageInstalled(instance) || !isPackageInstalled(legacy) {
+			continue
+		}
+		if err := pkgUninstall(legacy, cfg, RootExec, true, true, nil); err != nil {
+			colWarn.Printf("Warning: failed to remove %s after installing %s: %v\n", legacy, instance, err)
+			continue
+		}
+		if err := removeFromWorld(legacy); err != nil {
+			debugf("Warning: failed to remove %s from world: %v\n", legacy, err)
+		}
+		// Nothing depends on module packages, so outside the world file the
+		// instance would count as an orphan.
+		if err := addToWorld(instance); err != nil {
+			debugf("Warning: failed to add %s to world: %v\n", instance, err)
+		}
+		colArrow.Print("-> ")
+		colSuccess.Printf("Replaced %s with %s\n", legacy, instance)
+	}
+}
