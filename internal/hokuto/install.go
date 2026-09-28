@@ -321,7 +321,13 @@ func flushPackageSuggestions(logger io.Writer, cfg *Config, noRemote bool, promp
 			if item.Text != "" {
 				prompt = fmt.Sprintf("%s (%s)", prompt, item.Text)
 			}
-			if !autoYes && !askForConfirmationDefaultNo(colInfo, "%s%s", colArrow.Sprint("-> "), prompt) {
+			// Suggestions are optional and default to No, so -y (and the
+			// auto-bump's global yes) takes that default: they are listed
+			// above but never installed without an explicit answer.
+			if autoYes || GlobalAssumeYes {
+				continue
+			}
+			if !askForConfirmationDefaultNo(colInfo, "%s%s", colArrow.Sprint("-> "), prompt) {
 				continue
 			}
 

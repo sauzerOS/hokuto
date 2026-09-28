@@ -2905,3 +2905,40 @@ func TestCollectPackageSuggestionsSkipsCrossSystemPackages(t *testing.T) {
 		t.Fatal("cross-system packages should not suggest optional runtime dependencies")
 	}
 }
+
+// -y and the auto-bump's global yes take a suggestion's default answer (No):
+// a missing suggested dependency is listed but never installed.
+func TestFlushPackageSuggestionsAssumeYesDoesNotInstall(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		autoYes   bool
+		globalYes bool
+	}{
+		{"-y", true, false},
+		{"global yes", false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, _ := withTempDependencyRepo(t)
+			root := t.TempDir()
+			rootDir = root
+			Installed = filepath.Join(root, "var", "db", "hokuto", "installed")
+			writeInstalledTestPackage(t, "media-player")
+			if err := os.WriteFile(filepath.Join(Installed, "media-player", "suggests"), []byte("linux suggest mainline kernel\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			discardPackageSuggestions()
+			collectPackageSuggestions("media-player", rootDir)
+			GlobalAssumeYes = tc.globalYes
+			defer func() { GlobalAssumeYes = false }()
+
+			var out bytes.Buffer
+			flushPackageSuggestions(&out, cfg, true, true, tc.autoYes)
+			if !strings.Contains(out.String(), "linux") || !strings.Contains(out.String(), "mainline kernel") {
+				t.Errorf("the suggestion must still be listed, got %q", out.String())
+			}
+			if strings.Contains(out.String(), "Installing suggested dependency") {
+				t.Errorf("suggestion installed without an explicit answer: %q", out.String())
+			}
+		})
+	}
+}

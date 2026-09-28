@@ -75,7 +75,11 @@ BUILD_HOME=$(getent passwd "$BUILD_USER" | cut -d: -f6)
 
 # Container location: environment, then the location saved by 'create'.
 saved_rootfs() {
-    [ -f "$CONFIG_FILE" ] && sed -n 's/^ROOTFS=//p' "$CONFIG_FILE" | tail -n 1
+    # Must succeed without a config file: this runs in an assignment under
+    # set -e, where a failing status ends the script silently.
+    if [ -f "$CONFIG_FILE" ]; then
+        sed -n 's/^ROOTFS=//p' "$CONFIG_FILE" | tail -n 1
+    fi
 }
 ROOTFS=${HOKUTO_BUILDER_ROOT:-$(saved_rootfs)}
 ROOTFS=${ROOTFS:-$DEFAULT_ROOTFS}
@@ -92,6 +96,26 @@ check_sources_mount() {
     fi
 }
 
+# The container needs a persistent filesystem that allows setuid (sudo).
+# /run and /tmp are RAM-backed tmpfs mounted nosuid, so a typo such as
+# /run/media/Intel for /run/media/$USER/Intel ends up there.
+check_location() {
+    local dir=$1 fstype options
+    while [ ! -e "$dir" ]; do dir=$(dirname -- "$dir"); done
+    fstype=$(findmnt -n -o FSTYPE -T "$dir")
+    options=$(findmnt -n -o OPTIONS -T "$dir")
+    case "$fstype" in
+        tmpfs | ramfs)
+            die "$1 would be on $fstype ($(findmnt -n -o TARGET -T "$dir")): it lives in RAM and is lost on reboot"
+            ;;
+    esac
+    case ",$options," in
+        *,nosuid,*)
+            die "$1 is on a filesystem mounted nosuid ($(findmnt -n -o TARGET -T "$dir")); sudo cannot work in the container. Remount it with 'suid' or pick another location"
+            ;;
+    esac
+}
+
 cmd_create() {
     command -v systemd-nspawn >/dev/null || die "systemd-nspawn not found"
     local answer
@@ -103,6 +127,7 @@ cmd_create() {
     if [ -e "$ROOTFS" ] && [ -n "$(ls -A -- "$ROOTFS" 2>/dev/null)" ]; then
         die "$ROOTFS exists and is not empty"
     fi
+    check_location "$ROOTFS"
     mkdir -p "$ROOTFS"
     printf 'ROOTFS=%s\n' "$ROOTFS" >"$CONFIG_FILE"
     info "Saved the location in $CONFIG_FILE"
@@ -131,6 +156,11 @@ cmd_create() {
     printf '%s ALL=(ALL:ALL) NOPASSWD: ALL\n' "$BUILD_USER" >"$ROOTFS/etc/sudoers.d/hokuto-builder"
     chmod 0440 "$ROOTFS/etc/sudoers.d/hokuto-builder"
 
+    if [ -x "$ROOTFS/usr/bin/locale-gen" ]; then
+        info "Generating locales from /etc/locale.gen"
+        chroot "$ROOTFS" /usr/bin/locale-gen
+    fi
+
     echo "$MACHINE" >"$ROOTFS/etc/hostname"
     info "Container ready: $ROOTFS"
 }
@@ -140,6 +170,8 @@ nspawn_run() {
     local user=$1
     shift
     container_exists || die "no container at $ROOTFS; run 'hokuto-builder create' first"
+    # Removable drives are remounted nosuid by udisks after a replug.
+    check_location "$ROOTFS"
     check_sources_mount
 
     local args=(
@@ -149,6 +181,9 @@ nspawn_run() {
         --register=no
         --resolv-conf=copy-host
         --timezone=copy
+        # Explicit, as systemd-nspawn asks for: its future default plus
+        # netlink, which ip(8) and some test suites use.
+        --restrict-address-families="AF_INET AF_INET6 AF_UNIX AF_NETLINK"
         --bind-ro=/etc/hokuto
         --bind-ro=/usr/bin/hokuto
     )
@@ -168,7 +203,7 @@ nspawn_run() {
     if [ "$user" = root ]; then
         systemd-nspawn "${args[@]}" -- "$@"
     else
-        systemd-nspawn "${args[@]}" --user="$user" --chdir="$BUILD_HOME" \
+        systemd-nspawn "${args[@]}" --uid="$user" --chdir="$BUILD_HOME" \
             --setenv=HOME="$BUILD_HOME" -- "$@"
     fi
 }
