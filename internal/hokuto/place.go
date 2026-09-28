@@ -19,6 +19,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 // noHardlinkPlacementEnv disables the hard link fast path and forces placement
@@ -312,8 +314,14 @@ func copyFilePreservingMetadata(srcPath, dstPath string, info fs.FileInfo) error
 		// Ownership and timestamps are best effort: a vfat destination cannot
 		// represent either, and failing there would be worse than losing them.
 		_ = lchownFromInfo(tmp, info)
+		// chown clears setuid/setgid and O_CREAT applied the umask, so set the
+		// full mode afterwards; xattrs (file capabilities) come last.
+		_ = os.Chmod(tmp, placementMode(info))
 		atime, mtime := fileTimes(info)
 		_ = os.Chtimes(tmp, atime, mtime)
+		for name, value := range readXattrs(srcPath) {
+			_ = unix.Lsetxattr(tmp, name, []byte(value), 0)
+		}
 		return nil
 	})
 }

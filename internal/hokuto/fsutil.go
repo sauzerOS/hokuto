@@ -481,100 +481,51 @@ func copyTreeWithTar(src, dst string, execCtx *Executor) error {
 			os.Chtimes(target, hdr.AccessTime, hdr.ModTime) // best effort
 
 		case tar.TypeReg:
-			// Write file content
-			if os.Geteuid() == 0 {
-				outFile, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, os.FileMode(hdr.Mode))
-				if err != nil {
-					return fmt.Errorf("failed to create file %s natively: %w", target, err)
-				}
-				if _, err := io.Copy(outFile, tr); err != nil {
-					outFile.Close()
-					return fmt.Errorf("failed to write file %s natively: %w", target, err)
-				}
-				outFile.Close()
-				_ = os.Chown(target, hdr.Uid, hdr.Gid)
-			} else {
-				outFile, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, os.FileMode(hdr.Mode))
-				if err != nil {
-					if execCtx.ShouldRunAsRoot {
-						// Create file via shell redirection
-						var content bytes.Buffer
-						if _, err := io.Copy(&content, tr); err != nil {
-							return fmt.Errorf("failed to read file content: %w", err)
-						}
-
-						// Write via dd for privilege escalation
-						ddCmd := exec.Command("dd", "of="+target, "status=none")
-						ddCmd.Stdin = &content
-						if err := execCtx.Run(ddCmd); err != nil {
-							return fmt.Errorf("failed to write file %s with privileges: %w", target, err)
-						}
-
-						chmodCmd := exec.Command("chmod", fmt.Sprintf("%o", hdr.Mode), target)
-						execCtx.Run(chmodCmd) // best effort
-					} else {
-						return fmt.Errorf("failed to create file %s: %w", target, err)
-					}
-				} else {
-					if _, err := io.Copy(outFile, tr); err != nil {
-						outFile.Close()
-						return fmt.Errorf("failed to write file %s: %w", target, err)
-					}
-					outFile.Close()
-				}
+			if err := placeTarRegularFile(tr, hdr, target, execCtx); err != nil {
+				return err
 			}
-
-			// Set ownership and times
-			if os.Geteuid() == 0 {
-				_ = os.Chown(target, hdr.Uid, hdr.Gid)
-			} else if execCtx.ShouldRunAsRoot {
-				chownCmd := exec.Command("chown", fmt.Sprintf("%d:%d", hdr.Uid, hdr.Gid), target)
-				execCtx.Run(chownCmd) // best effort
-			}
-			os.Chtimes(target, hdr.AccessTime, hdr.ModTime) // best effort
+			// Ownership, mode and xattrs were set before the rename.
+			continue
 
 		case tar.TypeSymlink:
-			// Remove existing file/link if present
-			os.Remove(target)
-
-			if err := os.Symlink(hdr.Linkname, target); err != nil {
-				if os.Geteuid() == 0 {
-					return fmt.Errorf("failed to create symlink %s natively: %w", target, err)
+			err := replaceAtomically(target, func(tmp string) error {
+				if err := os.Symlink(hdr.Linkname, tmp); err != nil {
+					return err
 				}
-				if execCtx.ShouldRunAsRoot {
-					lnCmd := exec.Command("ln", "-sf", hdr.Linkname, target)
-					if err := execCtx.Run(lnCmd); err != nil {
-						return fmt.Errorf("failed to create symlink %s: %w", target, err)
-					}
-				} else {
+				_ = unix.Lchown(tmp, hdr.Uid, hdr.Gid) // best effort when unprivileged
+				return nil
+			})
+			if err != nil {
+				if os.Geteuid() == 0 || !execCtx.ShouldRunAsRoot {
 					return fmt.Errorf("failed to create symlink %s: %w", target, err)
 				}
-			}
-
-			// Set ownership on the symlink itself
-			if os.Geteuid() == 0 {
-				_ = unix.Lchown(target, hdr.Uid, hdr.Gid)
-			} else if execCtx.ShouldRunAsRoot {
-				chownCmd := exec.Command("chown", "-h", fmt.Sprintf("%d:%d", hdr.Uid, hdr.Gid), target)
-				execCtx.Run(chownCmd) // best effort
+				tmp := target + placementTmpSuffix
+				if err := execCtx.Run(exec.Command("ln", "-sfn", "--", hdr.Linkname, tmp)); err != nil {
+					return fmt.Errorf("failed to create symlink %s: %w", target, err)
+				}
+				execCtx.Run(exec.Command("chown", "-h", fmt.Sprintf("%d:%d", hdr.Uid, hdr.Gid), tmp)) // best effort
+				if err := execCtx.Run(exec.Command("mv", "-Tf", "--", tmp, target)); err != nil {
+					return fmt.Errorf("failed to place symlink %s: %w", target, err)
+				}
 			}
 
 		case tar.TypeLink:
-			// Hard link
+			// Hard link to a file placed earlier in this archive.
 			linkTarget := filepath.Join(dst, hdr.Linkname)
-			os.Remove(target)
-
-			if err := os.Link(linkTarget, target); err != nil {
-				if os.Geteuid() == 0 {
-					return fmt.Errorf("failed to create hard link %s natively: %w", target, err)
-				}
-				if execCtx.ShouldRunAsRoot {
-					lnCmd := exec.Command("ln", linkTarget, target)
-					if err := execCtx.Run(lnCmd); err != nil {
-						return fmt.Errorf("failed to create hard link %s: %w", target, err)
-					}
-				} else {
+			err := replaceAtomically(target, func(tmp string) error {
+				return os.Link(linkTarget, tmp)
+			})
+			if err != nil {
+				if os.Geteuid() == 0 || !execCtx.ShouldRunAsRoot {
 					return fmt.Errorf("failed to create hard link %s: %w", target, err)
+				}
+				tmp := target + placementTmpSuffix
+				execCtx.Run(exec.Command("rm", "-f", "--", tmp)) // leftover from an interrupted install
+				if err := execCtx.Run(exec.Command("ln", "--", linkTarget, tmp)); err != nil {
+					return fmt.Errorf("failed to create hard link %s: %w", target, err)
+				}
+				if err := execCtx.Run(exec.Command("mv", "-Tf", "--", tmp, target)); err != nil {
+					return fmt.Errorf("failed to place hard link %s: %w", target, err)
 				}
 			}
 
@@ -589,6 +540,67 @@ func copyTreeWithTar(src, dst string, execCtx *Executor) error {
 		}
 	}
 
+	return nil
+}
+
+// placeTarRegularFile writes one regular file from the tar stream beside target
+// under a temporary name and renames it into place. Writing into the existing
+// file instead would change it underneath every process that has it mapped,
+// and a program started mid-write would load a half-written library: this is
+// how a sudo waiting for a placement segfaulted in the build container.
+// Ownership, then the full mode (setuid and setgid included, which chown
+// clears), timestamps and xattrs are applied before the rename, so the new
+// file is never visible without them.
+func placeTarRegularFile(r io.Reader, hdr *tar.Header, target string, execCtx *Executor) error {
+	mode := placementMode(hdr.FileInfo())
+	mtime := hdr.ModTime
+	atime := hdr.AccessTime
+	if atime.IsZero() {
+		atime = mtime
+	}
+	started := false
+	err := replaceAtomically(target, func(tmp string) error {
+		out, err := os.OpenFile(tmp, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+		if err != nil {
+			return err
+		}
+		started = true
+		if _, err := io.Copy(out, r); err != nil {
+			out.Close()
+			return err
+		}
+		if err := out.Close(); err != nil {
+			return err
+		}
+		_ = os.Lchown(tmp, hdr.Uid, hdr.Gid) // best effort when unprivileged
+		if err := os.Chmod(tmp, mode); err != nil {
+			return err
+		}
+		_ = os.Chtimes(tmp, atime, mtime)
+		applyXattrs(tmp, hdr)
+		return nil
+	})
+	if err == nil {
+		return nil
+	}
+	// Without write access to the directory, escalate; only possible while
+	// nothing of the stream has been consumed yet.
+	if started || os.Geteuid() == 0 || execCtx == nil || !execCtx.ShouldRunAsRoot || !errors.Is(err, fs.ErrPermission) {
+		return fmt.Errorf("failed to write file %s: %w", target, err)
+	}
+	tmp := target + placementTmpSuffix
+	dd := exec.Command("dd", "of="+tmp, "status=none")
+	dd.Stdin = r
+	if err := execCtx.Run(dd); err != nil {
+		return fmt.Errorf("failed to write file %s with privileges: %w", target, err)
+	}
+	execCtx.Run(exec.Command("chown", fmt.Sprintf("%d:%d", hdr.Uid, hdr.Gid), tmp)) // best effort
+	if err := execCtx.Run(exec.Command("chmod", fmt.Sprintf("%o", hdr.Mode&0o7777), tmp)); err != nil {
+		return fmt.Errorf("failed to set mode of %s: %w", target, err)
+	}
+	if err := execCtx.Run(exec.Command("mv", "-f", "--", tmp, target)); err != nil {
+		return fmt.Errorf("failed to place file %s: %w", target, err)
+	}
 	return nil
 }
 
