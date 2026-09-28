@@ -369,7 +369,8 @@ func PromptForMasterPrivateKey() (ed25519.PrivateKey, error) {
 		keyPath = filepath.Join(root, "etc", "hokuto", "keys", "hokuto.key")
 	}
 
-	if data, err := os.ReadFile(keyPath); err == nil {
+	// The key is root-only (0600); read it through sudo like getPrivateKey.
+	if data, err := readFileAsRoot(keyPath); err == nil {
 		debugf("Using master private key from %s\n", keyPath)
 		trimmedKey := strings.TrimSpace(string(data))
 		if len(trimmedKey) == 128 {
