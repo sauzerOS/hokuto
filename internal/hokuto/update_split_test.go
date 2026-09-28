@@ -206,56 +206,6 @@ func TestBinaryUpdatePlanDoesNotTraverseSourceBuildDependencies(t *testing.T) {
 	}
 }
 
-func TestAutomaticPerlRebuildDiscoversAndOrdersInstalledModules(t *testing.T) {
-	_, installedRoot := withSplitUpdateFixture(t)
-	for name, depends := range map[string]string{
-		"perl-base-module": "perl\n",
-		"perl-app-module":  "perl\nperl-base-module\n",
-		"perl-5":           "\n",
-		"unrelated":        "perl\n",
-	} {
-		if err := os.MkdirAll(filepath.Join(installedRoot, name), 0o755); err != nil {
-			t.Fatal(err)
-		}
-		pkgDir := filepath.Join(repoPaths, name)
-		if err := os.MkdirAll(pkgDir, 0o755); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(filepath.Join(pkgDir, "build"), []byte("#!/bin/sh\n"), 0o755); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(filepath.Join(pkgDir, "version"), []byte("1.0 1\n"), 0o644); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(filepath.Join(pkgDir, "depends"), []byte(depends), 0o644); err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	got := automaticRebuildTriggers("perl", true)
-	want := []string{"perl-base-module", "perl-app-module"}
-	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
-		t.Fatalf("unexpected Perl rebuild order: got %v want %v", got, want)
-	}
-	if got := automaticRebuildTriggers("perl", false); len(got) != 0 {
-		t.Fatalf("fresh Perl install must not rebuild modules, got %v", got)
-	}
-
-	nonInstalledDir := filepath.Join(repoPaths, "perl-repository-only")
-	if err := os.MkdirAll(nonInstalledDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	for file, data := range map[string]string{"build": "#!/bin/sh\n", "version": "1.0 1\n", "depends": "perl\n"} {
-		if err := os.WriteFile(filepath.Join(nonInstalledDir, file), []byte(data), 0o644); err != nil {
-			t.Fatal(err)
-		}
-	}
-	repoModules := repositoryPerlModulePackages()
-	if len(repoModules) != 3 || repoModules[0] != "perl-base-module" || repoModules[1] != "perl-app-module" || repoModules[2] != "perl-repository-only" {
-		t.Fatalf("repository scan must include uninstalled Perl modules in dependency order, got %v", repoModules)
-	}
-}
-
 func TestPrioritizeHokutoUpdateDropsUnrelatedSplits(t *testing.T) {
 	// Reproduces the reported bug: picking "all" queues split outputs alongside
 	// hokuto, and they were installed from their own loop before the package

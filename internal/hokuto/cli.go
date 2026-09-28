@@ -71,7 +71,7 @@ func printHelp() {
 			{"chroot", "<dir> [cmd]", "Enter chroot and run command (default: /bin/bash)"},
 			{"cross-sync", "[-native] [-jN] [-i]", "Identify and build missing native cross (or aarch64 native) packages"},
 			{"init-repos", "", "Initialize repositories"},
-			{"perl-rebuild", "", "Rebuild all installed Perl modules"},
+			{"perl-rebuild", "", "Bump the revision of Perl modules and packages that depend on perl"},
 			{"python-rebuild", "", "Rebuild all python packages"},
 			{"settings", "", "Manage hokuto configuration interactively"},
 			{"version, --version", "", "Version information"},

@@ -1,99 +1,86 @@
 package hokuto
 
 import (
+	"debug/elf"
 	"fmt"
+	"io"
+	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 )
 
-func isPerlModulePackageName(name string) bool {
-	if !strings.HasPrefix(name, "perl-") {
-		return false
-	}
-	// perl-N is a parallel interpreter identity, not a CPAN module.
-	if base, _, versioned := splitVersionedPackageName(name); versioned && base == "perl" {
-		return false
-	}
-	return true
+// A Perl upgrade that changes the API version (5.42 -> 5.44) breaks every
+// compiled extension built against the old one. Instead of rebuilding them on
+// each machine when perl is installed, the recipes marked perlxs get a
+// revision bump in the repository, so they are rebuilt and published once and
+// every machine picks them up as ordinary updates.
+
+// perlXSOption marks a recipe that installs compiled code built against the
+// Perl API: XS modules (perl-xml-parser, texinfo's makeinfo) or an embedded
+// interpreter (vim). Pure-Perl modules and packages that merely run perl
+// scripts survive an API change and don't carry it.
+const perlXSOption = "perlxs"
+
+// isPerlXSSymbol matches the symbols an XS object imports from the
+// interpreter: Perl_* functions and PL_* globals.
+func isPerlXSSymbol(name string) bool {
+	return strings.HasPrefix(name, "Perl_") || strings.HasPrefix(name, "PL_")
 }
 
-func perlModuleSourceAvailable(name string) bool {
-	pkgDir, err := findPackageDir(name)
-	if err != nil {
-		return false
-	}
-	info, err := os.Stat(filepath.Join(pkgDir, "build"))
-	return err == nil && !info.IsDir()
-}
-
-func orderPerlModulePackages(candidates map[string]bool) []string {
-	// Topologically order modules so providers are rebuilt before
-	// modules that depend on them. Cycles retain deterministic lexical order.
-	names := make([]string, 0, len(candidates))
-	for name := range candidates {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-	state := make(map[string]uint8, len(names))
-	ordered := make([]string, 0, len(names))
-	var visit func(string)
-	visit = func(name string) {
-		if state[name] == 2 {
-			return
+// findPerlXSObjects returns the shared objects under root, relative to it,
+// that import Perl API symbols.
+func findPerlXSObjects(root string) []string {
+	var found []string
+	_ = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || !d.Type().IsRegular() || !strings.Contains(d.Name(), ".so") {
+			return nil
 		}
-		if state[name] == 1 {
-			return
+		f, err := elf.Open(path)
+		if err != nil {
+			return nil
 		}
-		state[name] = 1
-		if pkgDir, err := findPackageDir(name); err == nil {
-			if deps, err := parseDependsFile(pkgDir); err == nil {
-				var moduleDeps []string
-				for _, dep := range deps {
-					if dep.PostInstall {
-						continue
-					}
-					if candidates[dep.Name] {
-						moduleDeps = append(moduleDeps, dep.Name)
-					}
+		defer f.Close()
+		syms, err := f.ImportedSymbols()
+		if err != nil {
+			return nil
+		}
+		for _, sym := range syms {
+			if isPerlXSSymbol(sym.Name) {
+				if rel, err := filepath.Rel(root, path); err == nil {
+					found = append(found, "/"+rel)
 				}
-				sort.Strings(moduleDeps)
-				for _, dep := range moduleDeps {
-					visit(dep)
-				}
+				break
 			}
 		}
-		state[name] = 2
-		ordered = append(ordered, name)
-	}
-	for _, name := range names {
-		visit(name)
-	}
-	return ordered
-}
-
-func installedPerlModulePackages() []string {
-	entries, err := os.ReadDir(Installed)
-	if err != nil {
 		return nil
-	}
-	candidates := make(map[string]bool)
-	for _, entry := range entries {
-		if !entry.IsDir() || !isPerlModulePackageName(entry.Name()) {
-			continue
-		}
-		if !perlModuleSourceAvailable(entry.Name()) {
-			debugf("Skipping Perl module rebuild for %s: source recipe not found\n", entry.Name())
-			continue
-		}
-		candidates[entry.Name()] = true
-	}
-	return orderPerlModulePackages(candidates)
+	})
+	return found
 }
 
-func repositoryPerlModulePackages() []string {
-	candidates := make(map[string]bool)
+// warnMissingPerlXSOption points at recipes that install XS objects without
+// perlxs, since a Perl API bump would otherwise leave them broken.
+func warnMissingPerlXSOption(pkgName, outputDir string, options map[string]bool, logger io.Writer) {
+	if options[perlXSOption] {
+		return
+	}
+	objects := findPerlXSObjects(outputDir)
+	if len(objects) == 0 {
+		return
+	}
+	fmt.Fprintln(logger, colWarn.Sprintf("Warning: %s installs compiled Perl modules (%s) but its options file lacks %q; a Perl API upgrade won't bump it.",
+		pkgName, objects[0], perlXSOption))
+}
+
+// perlDependentRecipes returns the recipe directories marked perlxs, keyed
+// by package name. When a name exists in more than one repository, the first
+// one in HOKUTO_PATH wins, as it does for builds.
+func perlDependentRecipes() map[string]string {
+	recipes := make(map[string]string)
+	seen := make(map[string]bool)
 	for _, repoPath := range filepath.SplitList(repoPaths) {
 		repoPath = strings.TrimSpace(repoPath)
 		if repoPath == "" {
@@ -104,45 +91,127 @@ func repositoryPerlModulePackages() []string {
 			continue
 		}
 		for _, entry := range entries {
-			if !entry.IsDir() || !isPerlModulePackageName(entry.Name()) {
+			name := entry.Name()
+			if !entry.IsDir() || seen[name] {
 				continue
 			}
-			pkgDir := filepath.Join(repoPath, entry.Name())
-			buildInfo, buildErr := os.Stat(filepath.Join(pkgDir, "build"))
-			versionInfo, versionErr := os.Stat(filepath.Join(pkgDir, "version"))
-			if buildErr != nil || versionErr != nil || buildInfo.IsDir() || versionInfo.IsDir() {
+			pkgDir := filepath.Join(repoPath, name)
+			if info, err := os.Stat(filepath.Join(pkgDir, "version")); err != nil || info.IsDir() {
 				continue
 			}
-			candidates[entry.Name()] = true
+			seen[name] = true
+			if loadBuildOptions(pkgDir)[perlXSOption] {
+				recipes[name] = pkgDir
+			}
 		}
 	}
-	return orderPerlModulePackages(candidates)
+	return recipes
 }
 
-func automaticRebuildTriggers(triggerPkg string, wasInstalled bool) []string {
-	if triggerPkg != "perl" || !wasInstalled {
+// bumpRecipeRevision rewrites pkgDir/version from "ver N" to "ver N+1" and
+// returns the new contents without the trailing newline.
+func bumpRecipeRevision(pkgDir string) (string, error) {
+	versionPath := filepath.Join(pkgDir, "version")
+	data, err := os.ReadFile(versionPath)
+	if err != nil {
+		return "", err
+	}
+	fields := strings.Fields(string(data))
+	if len(fields) == 0 {
+		return "", fmt.Errorf("version file empty")
+	}
+	rev := 1
+	if len(fields) > 1 {
+		if rev, err = strconv.Atoi(fields[1]); err != nil {
+			return "", fmt.Errorf("invalid revision %q", fields[1])
+		}
+	}
+	bumped := fmt.Sprintf("%s %d", fields[0], rev+1)
+	if err := os.WriteFile(versionPath, []byte(bumped+"\n"), 0o644); err != nil {
+		return "", err
+	}
+	return bumped, nil
+}
+
+// perlAPIVersion reduces a perl release to the part its XS ABI follows:
+// 5.44.0 -> 5.44. Maintenance releases (5.42.1 -> 5.42.2) keep the ABI.
+func perlAPIVersion(version string) string {
+	parts := strings.SplitN(version, ".", 3)
+	if len(parts) < 2 {
+		return version
+	}
+	return parts[0] + "." + parts[1]
+}
+
+// currentRecipeVersion returns the first field of a recipe's version file.
+func currentRecipeVersion(pkgName string) (string, error) {
+	pkgDir, err := findPackageDir(pkgName)
+	if err != nil {
+		return "", fmt.Errorf("%s: package not found", pkgName)
+	}
+	data, err := os.ReadFile(filepath.Join(pkgDir, "version"))
+	if err != nil {
+		return "", fmt.Errorf("%s: could not read version file", pkgName)
+	}
+	fields := strings.Fields(string(data))
+	if len(fields) == 0 {
+		return "", fmt.Errorf("%s: version file empty", pkgName)
+	}
+	return fields[0], nil
+}
+
+// bumpPerlDependents bumps the revision of every perlxs recipe, then commits the version files, one
+// commit per git repository. Nothing is pushed.
+func bumpPerlDependents(perlVersion string) error {
+	recipes := perlDependentRecipes()
+	if len(recipes) == 0 {
+		colArrow.Print("-> ")
+		colSuccess.Printf("No recipes are marked %s.\n", perlXSOption)
 		return nil
 	}
-	return installedPerlModulePackages()
+	names := make([]string, 0, len(recipes))
+	for name := range recipes {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	colArrow.Print("-> ")
+	colSuccess.Printf("Bumping %d recipe(s) for perl %s\n", len(names), perlVersion)
+	byRepo := make(map[string][]string)
+	var repoOrder []string
+	for _, name := range names {
+		pkgDir := recipes[name]
+		bumped, err := bumpRecipeRevision(pkgDir)
+		if err != nil {
+			return fmt.Errorf("%s: %w", name, err)
+		}
+		colArrow.Print("-> ")
+		colSuccess.Printf("%s: %s\n", name, bumped)
+		root, err := getGitRepoRoot(pkgDir)
+		if err != nil {
+			return fmt.Errorf("%s: failed to determine git repo root: %w", name, err)
+		}
+		if _, ok := byRepo[root]; !ok {
+			repoOrder = append(repoOrder, root)
+		}
+		byRepo[root] = append(byRepo[root], filepath.Join(pkgDir, "version"))
+	}
+
+	msg := fmt.Sprintf("perl %s: bump revision of dependent packages", perlVersion)
+	for _, root := range repoOrder {
+		// Commit only these paths so unrelated staged changes stay out.
+		args := append([]string{"-C", root, "commit", "-m", msg, "--"}, byRepo[root]...)
+		if out, err := exec.Command("git", args...).CombinedOutput(); err != nil {
+			return fmt.Errorf("git commit in %s failed: %v: %s", root, err, strings.TrimSpace(string(out)))
+		}
+	}
+	return nil
 }
 
 func handlePerlRebuildCommand(cfg *Config) error {
-	colArrow.Print("-> ")
-	colSuccess.Println("Scanning repositories for Perl modules to rebuild")
-	modules := repositoryPerlModulePackages()
-	if len(modules) == 0 {
-		colArrow.Print("-> ")
-		colSuccess.Println("No Perl module recipes found in HOKUTO_PATH.")
-		return nil
+	perlVersion, err := currentRecipeVersion("perl")
+	if err != nil {
+		return err
 	}
-	colArrow.Print("-> ")
-	colSuccess.Printf("Rebuilding %d Perl module(s): %s\n", len(modules), strings.Join(modules, ", "))
-	// This is a repository-wide package rebuild. Do not install modules that
-	// were absent before the command; the automatic Perl-upgrade trigger handles
-	// rebuilding and reinstalling the installed subset.
-	args := append([]string{"--no-install"}, modules...)
-	if err := handleBuildCommand(args, cfg); err != nil {
-		return fmt.Errorf("failed to rebuild Perl modules: %w", err)
-	}
-	return nil
+	return bumpPerlDependents(perlVersion)
 }

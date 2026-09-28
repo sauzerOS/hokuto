@@ -2069,6 +2069,8 @@ func finalizeBuiltPackage(in builtPackageFinalization) error {
 	}
 	debugf("Depends written to %s\n", filepath.Join(installedDir, "depends"))
 
+	warnMissingPerlXSOption(in.outputPkgName, in.outputDir, in.options, in.logger)
+
 	if in.shouldStrip {
 		if err := stripPackage(in.outputDir, in.options["staticlibs"], in.stripBin, in.buildExec, in.logger); err != nil {
 			return fmt.Errorf("build failed during stripping phase for %s: %w", in.sourcePkgName, err)

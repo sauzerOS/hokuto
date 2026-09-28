@@ -744,9 +744,24 @@ func handleSingleBumpCommand(pkgName, newVersion, commitMsg string, build bool, 
 		newVersion = fields[0]
 	}
 
+	var oldPerlVersion string
+	if bumpPkgName == "perl" {
+		if v, err := currentRecipeVersion("perl"); err == nil {
+			oldPerlVersion = v
+		}
+	}
+
 	pkgDir, err := bumpPackage(bumpPkgName, "", newVersion, commitMsg)
 	if err != nil {
 		return err
+	}
+
+	// A new Perl API version breaks the XS modules built against the old one,
+	// so their recipes are bumped in the same push.
+	if oldPerlVersion != "" && perlAPIVersion(oldPerlVersion) != perlAPIVersion(newVersion) {
+		if err := bumpPerlDependents(newVersion); err != nil {
+			return fmt.Errorf("perl bumped, but bumping its dependents failed: %w", err)
+		}
 	}
 
 	// Push changes
