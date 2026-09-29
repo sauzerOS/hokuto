@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -2940,5 +2941,39 @@ func TestFlushPackageSuggestionsAssumeYesDoesNotInstall(t *testing.T) {
 				t.Errorf("suggestion installed without an explicit answer: %q", out.String())
 			}
 		})
+	}
+}
+
+func TestResolveMissingDepsAddsDependenciesRecordedInBinary(t *testing.T) {
+	cfg, repo := withTempDependencyRepo(t)
+	cfg.Values["HOKUTO_ARCH"] = "x86_64"
+	tarballDependencyCache = sync.Map{}
+	t.Cleanup(func() { tarballDependencyCache = sync.Map{} })
+
+	// The recipe omits libssh2; the package made from it records it.
+	writeTestPackage(t, repo, "rust", "glibc\n")
+	writeTestPackage(t, repo, "glibc", "")
+	writeTestPackage(t, repo, "libssh2", "")
+	variant := GetSystemVariantForPackage(cfg, "rust")
+	path := filepath.Join(BinDir, StandardizeRemoteName("rust", "1.0", "1", "x86_64", variant))
+	writeTestBinaryTarballWithDepends(t, path, "rust", "1.0", "1", "glibc\nlibssh2\n")
+	writeCachedTestBinary(t, cfg, "glibc")
+	writeCachedTestBinary(t, cfg, "libssh2")
+
+	var missing []string
+	if err := resolveMissingDeps("rust", map[string]bool{}, &missing, map[string]bool{}, cfg, true); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := strings.Join(missing, ","), "glibc,libssh2,rust"; got != want {
+		t.Fatalf("binary rust dependency: got %s want %s", got, want)
+	}
+
+	// Built from source, the recipe alone decides.
+	missing = nil
+	if err := resolveMissingDeps("rust", map[string]bool{}, &missing, map[string]bool{"rust": true}, cfg, true); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := strings.Join(missing, ","), "glibc,rust"; got != want {
+		t.Fatalf("source rust build: got %s want %s", got, want)
 	}
 }

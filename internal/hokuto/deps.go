@@ -708,6 +708,58 @@ func dependencyBinaryAvailable(pkgName string, cfg *Config, noRemote bool) bool 
 	return err == nil
 }
 
+// tarballDependencyCache memoizes scanTarballDependencySpecs per archive path:
+// depends sits near the end of a package, so each scan decompresses nearly
+// the whole archive.
+var tarballDependencyCache sync.Map // path -> []DepSpec
+
+// recordedBinaryDependencySpecs returns the dependencies recorded in the binary
+// package that will be installed for pkgName. They include the libraries found
+// when the package was made, which its recipe may not list (rust's cargo links
+// libssh2), so a dependency installed from a binary needs them in addition to
+// the recipe's. Unknown or unreadable packages contribute nothing.
+func recordedBinaryDependencySpecs(pkgName string, cfg *Config, noRemote bool) []DepSpec {
+	if strings.Contains(pkgName, "@") {
+		return nil
+	}
+	version, revision, err := getRepoVersion2(pkgName)
+	if err != nil {
+		return nil
+	}
+	outputName := getOutputPackageName(pkgName, cfg)
+	if tarballPath := findCachedBinaryTarballVersion(outputName, version, revision, cfg); tarballPath != "" {
+		if cached, ok := tarballDependencyCache.Load(tarballPath); ok {
+			return cached.([]DepSpec)
+		}
+		deps, err := scanTarballDependencySpecs(tarballPath)
+		if err != nil {
+			debugf("Ignoring recorded dependencies of %s: %v\n", filepath.Base(tarballPath), err)
+			return nil
+		}
+		tarballDependencyCache.Store(tarballPath, deps)
+		return deps
+	}
+	if noRemote || BinaryMirror == "" {
+		return nil
+	}
+	index, err := GetCachedRemoteIndex(cfg)
+	if err != nil {
+		return nil
+	}
+	// The exact recipe version first; otherwise the entry that made
+	// dependencyBinaryAvailable report a binary.
+	entry, err := GetRemotePackageEntry(outputName+"@"+version+"-"+revision, cfg, index)
+	if err != nil {
+		if entry, err = GetRemotePackageEntry(pkgName, cfg, index); err != nil {
+			return nil
+		}
+	}
+	if !repoEntryHasDependencyMetadata(*entry) {
+		return nil
+	}
+	return depSpecsFromNames(entry.Depends)
+}
+
 func resolveDependencyList(parentPkg string, deps []DepSpec, visited map[string]bool, plan *[]string, force bool, yes bool, cfg *Config, remoteIndex []RepoEntry, allowRemote bool) error {
 	for _, dep := range deps {
 		if dep.Make || dep.Optional || dep.Rebuild || dep.PostInstall || dep.Suggest {
@@ -935,6 +987,9 @@ func resolveMissingDeps(pkgName string, processed map[string]bool, missing *[]st
 		dependencies, err = parseDependsFile(pkgDir)
 		if err != nil {
 			return fmt.Errorf("failed to parse dependencies for %s: %w", pkgName, err)
+		}
+		if binaryAvailableForPkg && !isPackageInstalled(pkgName) {
+			dependencies = append(dependencies, recordedBinaryDependencySpecs(pkgName, cfg, noRemote)...)
 		}
 	}
 
