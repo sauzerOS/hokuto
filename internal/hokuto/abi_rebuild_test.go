@@ -105,7 +105,7 @@ func TestRemovedSharedLibraries(t *testing.T) {
 
 func TestAbiConsumers(t *testing.T) {
 	_, repo := withTempDependencyRepo(t)
-	for _, name := range []string{"libfoo", "app", "tool", "old-user", "prebuilt", "lib32-user-src", "cross-user"} {
+	for _, name := range []string{"libfoo", "app", "tool", "old-user", "prebuilt", "lib32-user-src", "cross-user", "variant-mix", "both-variants"} {
 		writeTestPackage(t, repo, name, "")
 	}
 	if err := os.WriteFile(filepath.Join(repo, "prebuilt", "options"), []byte("binary\n"), 0o644); err != nil {
@@ -122,6 +122,13 @@ func TestAbiConsumers(t *testing.T) {
 		{Name: "old-user", Version: "1.0", Revision: "1", Arch: "x86_64", Variant: "optimized", MetadataVersion: v2, Libdeps: []string{"elf64:libfoo.so.3"}},
 		{Name: "old-user", Version: "1.1", Revision: "1", Arch: "x86_64", Variant: "optimized", MetadataVersion: v2, Libdeps: []string{"elf64:libc.so.6"}},
 		{Name: "prebuilt", Version: "1.0", Revision: "1", Arch: "x86_64", Variant: "generic", MetadataVersion: v2, Libdeps: []string{"elf64:libfoo.so.3"}},
+		// An older build of another variant is not current either: only
+		// variant-mix 1.2 (generic) is checked, not 1.1 (optimized).
+		{Name: "variant-mix", Version: "1.1", Revision: "1", Arch: "x86_64", Variant: "optimized", MetadataVersion: v2, Libdeps: []string{"elf64:libfoo.so.3"}},
+		{Name: "variant-mix", Version: "1.2", Revision: "1", Arch: "x86_64", Variant: "generic", MetadataVersion: v2, Libdeps: []string{"elf64:libc.so.6"}},
+		// Both variants of the newest version count.
+		{Name: "both-variants", Version: "2.0", Revision: "1", Arch: "x86_64", Variant: "generic", MetadataVersion: v2, Libdeps: []string{"elf64:libc.so.6"}},
+		{Name: "both-variants", Version: "2.0", Revision: "1", Arch: "x86_64", Variant: "optimized", MetadataVersion: v2, Libdeps: []string{"elf64:libfoo.so.3"}},
 		{Name: "libfoo-utils", Version: "3.0", Revision: "1", Arch: "x86_64", Variant: "optimized", MetadataVersion: v2, Libdeps: []string{"elf64:libfoo.so.3"}}, // no recipe
 		{Name: "libfoo", Version: "3.0", Revision: "1", Arch: "x86_64", Variant: "optimized", MetadataVersion: v2, Libdeps: []string{"elf64:libfoo.so.3"}},
 		{Name: "lib32-user", Version: "1.0", Revision: "1", Arch: "x86_64", Variant: "multi-optimized", MetadataVersion: v2, Libdeps: []string{"elf32:libfoo.so.3"}}, // 32-bit library kept
@@ -130,7 +137,7 @@ func TestAbiConsumers(t *testing.T) {
 	}
 	brk := abiBreak{Library: "libfoo", Removed: []libDepRef{{ABI: "elf64", Name: "libfoo.so.3"}}}
 	got, unknown := abiConsumers(index, "x86_64", brk)
-	want := map[string][]string{"app": {"libfoo.so.3"}, "tool": {"libfoo.so.3"}}
+	want := map[string][]string{"app": {"libfoo.so.3"}, "tool": {"libfoo.so.3"}, "both-variants": {"libfoo.so.3"}}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("consumers: got %v want %v", got, want)
 	}

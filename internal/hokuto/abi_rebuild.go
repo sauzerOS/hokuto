@@ -131,28 +131,31 @@ func libDepMatches(entry string, lib libDepRef) bool {
 	return ref.ABI == "" || ref.ABI == lib.ABI
 }
 
-// latestIndexEntries keeps the newest entry per package name, arch and
-// variant.
+// latestIndexEntries keeps, per package name and arch, only the entries of
+// its newest version-revision: one per variant built at that version. Older
+// packages still on the mirror, including an older build of another variant
+// (1.1 optimized next to 1.2 generic), are left out.
 func latestIndexEntries(index []RepoEntry) []RepoEntry {
-	type key struct{ name, arch, variant string }
-	latest := make(map[key]RepoEntry)
-	var order []key
+	type key struct{ name, arch string }
+	newest := make(map[key]RepoEntry)
 	for _, e := range index {
 		if e.Type == "meta" {
 			continue
 		}
-		k := key{e.Name, e.Arch, e.Variant}
-		old, ok := latest[k]
-		if !ok {
-			order = append(order, k)
-		}
-		if !ok || isNewer(e, old) {
-			latest[k] = e
+		k := key{e.Name, e.Arch}
+		if old, ok := newest[k]; !ok || isNewer(e, old) {
+			newest[k] = e
 		}
 	}
-	entries := make([]RepoEntry, 0, len(order))
-	for _, k := range order {
-		entries = append(entries, latest[k])
+	var entries []RepoEntry
+	for _, e := range index {
+		if e.Type == "meta" {
+			continue
+		}
+		n := newest[key{e.Name, e.Arch}]
+		if e.Version == n.Version && e.Revision == n.Revision {
+			entries = append(entries, e)
+		}
 	}
 	return entries
 }
