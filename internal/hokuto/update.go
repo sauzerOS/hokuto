@@ -572,8 +572,37 @@ func buildMissingRepositoryBinaries(cfg *Config, buildArgs []string, yes bool) e
 		return nil
 	}
 
-	buildArgs = append(buildArgs, selected...)
-	return handleBuildCommand(buildArgs, cfg)
+	targets, skipped := missingBinaryBuildTargets(selected)
+	if len(targets) == 0 {
+		return fmt.Errorf("none of the selected packages can be built here (skipped: %s)", strings.Join(skipped, ", "))
+	}
+
+	buildArgs = append(buildArgs, targets...)
+	buildErr := handleBuildCommand(buildArgs, cfg)
+	if len(skipped) > 0 {
+		colArrow.Print("-> ")
+		colWarn.Printf("Skipped: %s\n", strings.Join(skipped, ", "))
+	}
+	return buildErr
+}
+
+// missingBinaryBuildTargets turns the selected packages into build requests.
+// One package that cannot even be requested here (a kernel module with no
+// kernel installed) must not stop the others, so each is resolved on its own
+// and the failures are skipped with a warning. Kernel modules are built for
+// every installed kernel, as the mirror needs them all.
+func missingBinaryBuildTargets(selected []string) (targets, skipped []string) {
+	for _, pkgName := range selected {
+		expanded, _, err := expandKmodRequests([]string{pkgName}, true, bufio.NewReader(os.Stdin), os.Stdout)
+		if err != nil {
+			colArrow.Print("-> ")
+			colWarn.Printf("Skipping %s: %v\n", pkgName, err)
+			skipped = append(skipped, pkgName)
+			continue
+		}
+		targets = append(targets, expanded...)
+	}
+	return targets, skipped
 }
 
 // getBaseRepoPath finds the Git worktree containing a HOKUTO_PATH entry.

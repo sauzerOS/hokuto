@@ -285,10 +285,14 @@ cmd_build() {
     nspawn_run "$BUILD_USER" /bin/sh -c '
         upload=$1
         shift
-        /usr/local/bin/hokuto build -i --no-install --index "$@" || exit
+        status=0
+        /usr/local/bin/hokuto build -i --no-install --index "$@" || status=$?
+        # A failed package must not keep the others off the mirror: upload
+        # whatever was built, then report the build status.
         if [ "$upload" = 1 ]; then
-            /usr/local/bin/hokuto upload --sync
+            /usr/local/bin/hokuto upload --sync || { rc=$?; [ "$status" != 0 ] || status=$rc; }
         fi
+        exit "$status"
     ' hokuto-builder-build "$upload" "${args[@]}"
 }
 
@@ -313,10 +317,14 @@ cmd_rebuild() {
         upload=$1
         shift
         /usr/local/bin/hokuto update --remote -y || exit
-        /usr/local/bin/hokuto update --build-missing-binaries -i "$@" || exit
+        status=0
+        /usr/local/bin/hokuto update --build-missing-binaries -i "$@" || status=$?
+        # A failed package must not keep the others off the mirror: upload
+        # whatever was built, then report the build status.
         if [ "$upload" = 1 ]; then
-            /usr/local/bin/hokuto upload --sync
+            /usr/local/bin/hokuto upload --sync || { rc=$?; [ "$status" != 0 ] || status=$rc; }
         fi
+        exit "$status"
     ' hokuto-builder-rebuild "$upload" "${args[@]}"
 }
 
@@ -340,10 +348,14 @@ cmd_cross_sync() {
     nspawn_run "$BUILD_USER" /bin/sh -c '
         upload=$1
         shift
-        /usr/local/bin/hokuto cross-sync "$@" || exit
+        status=0
+        /usr/local/bin/hokuto cross-sync "$@" || status=$?
+        # A failed package must not keep the others off the mirror: upload
+        # whatever was built, then report the build status.
         if [ "$upload" = 1 ]; then
-            /usr/local/bin/hokuto upload --sync
+            /usr/local/bin/hokuto upload --sync || { rc=$?; [ "$status" != 0 ] || status=$rc; }
         fi
+        exit "$status"
     ' hokuto-builder-cross-sync "$upload" "${args[@]}"
 }
 

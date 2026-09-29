@@ -153,3 +153,19 @@ func TestMissingBinarySelector(t *testing.T) {
 		t.Fatalf("escape: build %v blacklist %v", build, blacklist)
 	}
 }
+
+func TestMissingBinaryBuildTargetsSkipsUnbuildable(t *testing.T) {
+	// No kernel installed: the kernel module is skipped, the rest is built.
+	withKmodFixture(t)
+	targets, skipped := missingBinaryBuildTargets([]string{"zlib", "nvidia-open", "linux"})
+	if !reflect.DeepEqual(targets, []string{"zlib", "linux"}) || !reflect.DeepEqual(skipped, []string{"nvidia-open"}) {
+		t.Fatalf("targets %v skipped %v", targets, skipped)
+	}
+
+	// With kernels, a module is built for each of them, without asking.
+	withKmodFixture(t, kernelLinux, kernelCachyOS)
+	targets, skipped = missingBinaryBuildTargets([]string{"nvidia-open", "zlib"})
+	if !reflect.DeepEqual(targets, []string{"nvidia-open~linux", "nvidia-open~linux-cachyos", "zlib"}) || len(skipped) != 0 {
+		t.Fatalf("targets %v skipped %v", targets, skipped)
+	}
+}
