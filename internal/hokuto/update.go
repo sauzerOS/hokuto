@@ -18,6 +18,7 @@ import (
 	gogit "github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing/object"
 	"github.com/gookit/color"
+	"golang.org/x/term"
 )
 
 // getRepoVersion reads pkgname/version from repoPaths and returns the version string.
@@ -484,43 +485,79 @@ func buildMissingRepositoryBinaries(cfg *Config, buildArgs []string, yes bool) e
 		}
 	}
 
+	ignores, err := loadBuildIgnoreList()
+	if err != nil {
+		colWarn.Printf("Warning: failed to read build blacklist %s: %v\n", BuildIgnoreFile, err)
+		ignores = make(map[string]buildIgnoreEntry)
+	}
+
 	packages := make([]string, 0, len(statuses))
+	hidden := 0
 	for pkgName, status := range statuses {
 		if !includeNeverBuilt && status.PreviousVersion == "" {
+			continue
+		}
+		if buildIgnored(ignores, pkgName) {
+			hidden++
 			continue
 		}
 		packages = append(packages, pkgName)
 	}
 	sort.Strings(packages)
+	if hidden > 0 {
+		colArrow.Print("-> ")
+		colNote.Printf("%d blacklisted package(s) hidden until their version or revision changes (%s)\n", hidden, BuildIgnoreFile)
+	}
 	if len(packages) == 0 {
 		colArrow.Print("-> ")
 		colSuccess.Println("All packages with existing binaries are current.")
 		return nil
 	}
-	colArrow.Print("-> ")
-	colWarn.Printf("Found %d source package(s) with missing binaries:\n", len(packages))
+
+	entries := make([]missingBinaryEntry, len(packages))
 	for i, pkgName := range packages {
 		status := statuses[pkgName]
 		sort.Strings(status.Missing)
-		colArrow.Print("-> ")
-		fmt.Printf("%2d) ", i+1)
-		color.Bold.Printf("%s", pkgName)
-		fmt.Print(": ")
+		info := strings.Join(status.Missing, ", ")
 		currentVersion, currentRevision, _ := getRepoVersion2(pkgName)
 		if transition := binaryVersionTransition(status, currentVersion, currentRevision); transition != "" {
-			colNote.Printf("%s", transition)
-			fmt.Print(" (")
-			colNote.Printf("%s", strings.Join(status.Missing, ", "))
-			fmt.Println(")")
-		} else {
-			colNote.Printf("%s\n", strings.Join(status.Missing, ", "))
+			info = transition + " (" + info + ")"
 		}
+		entries[i] = missingBinaryEntry{Name: pkgName, Info: info}
 	}
 
 	var selected []string
-	if yes {
+	switch {
+	case yes:
 		selected = packages
-	} else {
+	case term.IsTerminal(int(os.Stdout.Fd())) && term.IsTerminal(int(os.Stdin.Fd())):
+		build, blacklist, err := selectMissingBinaryPackages(entries)
+		if err != nil {
+			return err
+		}
+		pruned := pruneBuildIgnores(ignores)
+		for _, pkgName := range blacklist {
+			ignores[pkgName] = buildIgnoreEntry{Package: pkgName, Version: recipeRelease(pkgName), AddedAt: time.Now()}
+		}
+		if len(blacklist) > 0 || pruned {
+			if err := saveBuildIgnoreList(ignores); err != nil {
+				colWarn.Printf("Warning: failed to save build blacklist %s: %v\n", BuildIgnoreFile, err)
+			} else if len(blacklist) > 0 {
+				colArrow.Print("-> ")
+				colNote.Printf("Blacklisted until their next version or revision: %s\n", strings.Join(blacklist, ", "))
+			}
+		}
+		selected = build
+	default:
+		colArrow.Print("-> ")
+		colWarn.Printf("Found %d source package(s) with missing binaries:\n", len(entries))
+		for i, entry := range entries {
+			colArrow.Print("-> ")
+			fmt.Printf("%2d) ", i+1)
+			color.Bold.Printf("%s", entry.Name)
+			fmt.Print(": ")
+			colNote.Printf("%s\n", entry.Info)
+		}
 		indices, ok := AskForSelection("Build (a)ll, (q)uit, or select missing binary packages (numbers or -numbers):", len(packages))
 		if !ok {
 			colNote.Println("Missing binary build canceled by user.")

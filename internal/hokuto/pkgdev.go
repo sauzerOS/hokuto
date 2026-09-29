@@ -1102,15 +1102,22 @@ func saveBumpIgnoreList(ignores map[string]bumpIgnoreEntry) error {
 		return err
 	}
 	data = append(data, '\n')
+	return writeStateFile(BumpIgnoreFile, data)
+}
 
+// writeStateFile writes one of hokuto's root-owned state files (mode 644),
+// through sudo when not running as root. It overwrites the file in place
+// (cp, not rename), so a file bind-mounted into the build container stays the
+// host's copy.
+func writeStateFile(path string, data []byte) error {
 	if os.Geteuid() == 0 {
-		if err := os.MkdirAll(filepath.Dir(BumpIgnoreFile), 0o755); err != nil {
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 			return err
 		}
-		return os.WriteFile(BumpIgnoreFile, data, 0o644)
+		return os.WriteFile(path, data, 0o644)
 	}
 
-	tmp, err := os.CreateTemp("", "hokuto-bump-ignore-*.json")
+	tmp, err := os.CreateTemp("", "hokuto-state-*.json")
 	if err != nil {
 		return err
 	}
@@ -1124,13 +1131,13 @@ func saveBumpIgnoreList(ignores map[string]bumpIgnoreEntry) error {
 		return err
 	}
 
-	if err := RootExec.Run(exec.Command("mkdir", "-p", filepath.Dir(BumpIgnoreFile))); err != nil {
+	if err := RootExec.Run(exec.Command("mkdir", "-p", filepath.Dir(path))); err != nil {
 		return err
 	}
-	if err := RootExec.Run(exec.Command("cp", tmpPath, BumpIgnoreFile)); err != nil {
+	if err := RootExec.Run(exec.Command("cp", tmpPath, path)); err != nil {
 		return err
 	}
-	return RootExec.Run(exec.Command("chmod", "644", BumpIgnoreFile))
+	return RootExec.Run(exec.Command("chmod", "644", path))
 }
 
 type autoBumpSelection struct {

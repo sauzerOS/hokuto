@@ -37,6 +37,8 @@
 #                                hokuto package (/usr/bin/hokuto, hokuto.update,
 #                                .rebuild, .pkgset) stays updatable.
 #   ~/.gitconfig, ~/.git-credentials   git identity and push credentials
+#   /var/db/hokuto/bump-ignore.json, build-ignore.json   the bump and rebuild
+#                                blacklists
 #   the sauzerOS.github.io checkout    build status and logs (bump --build)
 #
 # The container location is asked for by 'create' and saved in
@@ -61,6 +63,8 @@ SOURCES_MOUNT=/var/cache/hokuto/sources
 SOURCES_UNIT=var-cache-hokuto-sources.mount
 # The auto-bump blacklist is state, not configuration: keep one copy.
 BUMP_IGNORE=/var/db/hokuto/bump-ignore.json
+# Likewise the blacklist of update --build-missing-binaries (rebuild).
+BUILD_IGNORE=/var/db/hokuto/build-ignore.json
 # hokuto publishes build status and logs to this checkout (HOKUTO_WEBSITE_REPO
 # in hokuto.conf, same default as hokuto).
 DEFAULT_WEBSITE_REPO=/home/dbz/Documents/sauzerOS.github.io
@@ -233,6 +237,14 @@ nspawn_run() {
     # A separate mount below /var/cache/hokuto; bind it explicitly.
     mountpoint -q "$SOURCES_MOUNT" && args+=(--bind="$SOURCES_MOUNT")
     [ -f "$BUMP_IGNORE" ] && args+=(--bind="$BUMP_IGNORE")
+    # Created on the host when missing, so it can be bound; hokuto overwrites
+    # it in place, and a blacklist made in the container lands on the host.
+    if [ ! -e "$BUILD_IGNORE" ]; then
+        install -d /var/db/hokuto
+        printf '[]\n' >"$BUILD_IGNORE"
+        chmod 644 "$BUILD_IGNORE"
+    fi
+    args+=(--bind="$BUILD_IGNORE")
     local website
     website=$(sed -n 's/^HOKUTO_WEBSITE_REPO=//p' /etc/hokuto/hokuto.conf 2>/dev/null | tail -n 1 | tr -d '"' || true)
     website=${website:-$DEFAULT_WEBSITE_REPO}

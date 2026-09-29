@@ -71,6 +71,7 @@ var (
 	PkgDBPath             = "/var/db/hokuto/pkg-db.json.zst"
 	BumpLogFile           = "/var/log/hokuto-bump.log"
 	BumpIgnoreFile        = "/var/db/hokuto/bump-ignore.json"
+	BuildIgnoreFile       = "/var/db/hokuto/build-ignore.json"
 	OptionalRebuildFile   = "/var/db/hokuto/optional-rebuilds.json"
 	SaveDir               = "/var/db/hokuto/save"
 	//go:embed assets/MIRROR
