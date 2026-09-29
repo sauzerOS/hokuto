@@ -3053,3 +3053,37 @@ func TestEnsureDevelPackagesSkipsCrossToolchainBeingBuilt(t *testing.T) {
 		t.Fatalf("expected missing aarch64-gcc to be required, got %v", err)
 	}
 }
+
+func TestDevelPackagesInstallAsHostPackagesDuringCrossBuilds(t *testing.T) {
+	cfg, repo := withTempDependencyRepo(t)
+	cfg.Values["HOKUTO_ARCH"] = "x86_64"
+	writeTestPackage(t, repo, "qemu-user-static-binfmt", "")
+	path := filepath.Join(BinDir, StandardizeRemoteName("qemu-user-static-binfmt", "1.0", "1", "x86_64", "generic"))
+	writeTestBinaryTarball(t, path, "qemu-user-static-binfmt", "1.0", "1")
+	cfg.Values["HOKUTO_CROSS_ARCH"] = "arm64"
+
+	// Under the cross settings the name is looked up as an aarch64 package.
+	if _, _, ok, _ := availableBuildDependencyBinaryTarball("qemu-user-static-binfmt", cfg, true); ok {
+		t.Fatal("fixture: cross config unexpectedly found the x86_64 package")
+	}
+	installCfg := develInstallConfig("qemu-user-static-binfmt", cfg)
+	if _, got, ok, err := availableBuildDependencyBinaryTarball("qemu-user-static-binfmt", installCfg, true); err != nil || !ok || got != path {
+		t.Fatalf("host devel package not found under its install config: %q %v %v", got, ok, err)
+	}
+	if cfg.Values["HOKUTO_CROSS_ARCH"] != "arm64" {
+		t.Fatal("develInstallConfig modified the build config")
+	}
+	if develInstallConfig("aarch64-gcc", cfg) != cfg {
+		t.Fatal("a cross toolchain package must keep the cross config")
+	}
+
+	// A plain cross build of gcc makes a target gcc; only cross-system output
+	// can stand in for a toolchain requirement.
+	if built := crossToolchainBeingBuilt(cfg, []string{"gcc"}); len(built) != 0 {
+		t.Fatalf("plain cross build treated as providing %v", built)
+	}
+	cfg.Values["HOKUTO_CROSS_SYSTEM"] = "1"
+	if built := crossToolchainBeingBuilt(cfg, []string{"gcc"}); !built["aarch64-gcc"] || built["gcc"] {
+		t.Fatalf("cross-system build of gcc should provide aarch64-gcc only: %v", built)
+	}
+}

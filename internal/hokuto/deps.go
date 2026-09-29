@@ -3361,19 +3361,42 @@ func ensureDevelPackagesInstalledWithOptions(cfg *Config, includeMultilib bool, 
 	return ensureDevelPackagesInstalledForBuild(cfg, nil, includeMultilib, noRemote, quiet)
 }
 
+// crossToolchainBeingBuilt returns the cross-system packages (aarch64-*) that
+// building produces. They are the only devel packages a build set can
+// provide itself: a plain cross build of gcc makes a target gcc, not the
+// host's.
+func crossToolchainBeingBuilt(cfg *Config, building []string) map[string]bool {
+	built := make(map[string]bool)
+	for _, pkgName := range building {
+		for _, name := range []string{pkgName, getOutputPackageName(pkgName, cfg)} {
+			if dependencyNameHasCrossPrefix(name, cfg) {
+				built[name] = true
+			}
+		}
+	}
+	return built
+}
+
+// develInstallConfig is the configuration a devel package is installed
+// with. Devel packages run on the build host, so one without the cross prefix
+// (base-devel, qemu-user-static-binfmt) is the native package even during a
+// cross build; under cfg it would be looked up as an aarch64 package.
+func develInstallConfig(pkgName string, cfg *Config) *Config {
+	if cfg == nil || cfg.Values["HOKUTO_CROSS_ARCH"] == "" || dependencyNameHasCrossPrefix(pkgName, cfg) {
+		return cfg
+	}
+	return nativeConfig(cfg)
+}
+
 // ensureDevelPackagesInstalledForBuild is ensureDevelPackagesInstalledWithOptions
-// for a known build set. A devel package the set itself builds is not
+// for a known build set. A toolchain package the set itself builds is not
 // installed first, so the cross toolchain (aarch64-gcc, ...) can be built
 // before any package of it exists.
 func ensureDevelPackagesInstalledForBuild(cfg *Config, building []string, includeMultilib bool, noRemote bool, quiet bool) ([]string, error) {
 	develInstallMu.Lock()
 	defer develInstallMu.Unlock()
 
-	built := make(map[string]bool)
-	for _, pkgName := range building {
-		built[pkgName] = true
-		built[getOutputPackageName(pkgName, cfg)] = true
-	}
+	built := crossToolchainBeingBuilt(cfg, building)
 	var missing []string
 	for _, pkgName := range requiredDevelPackages(cfg, includeMultilib) {
 		if built[pkgName] || isPackageInstalled(pkgName) {
@@ -3395,7 +3418,8 @@ func ensureDevelPackagesInstalledForBuild(cfg *Config, building []string, includ
 	defer deactivateProgress()
 	for _, pkgName := range missing {
 		describeDependencyInstallProgress(bar, pkgName)
-		installed, err := installAvailableBuildDependencyBinaryWithOptions(pkgName, cfg, noRemote, quiet, true)
+		installCfg := develInstallConfig(pkgName, cfg)
+		installed, err := installAvailableBuildDependencyBinaryWithOptions(pkgName, installCfg, noRemote, quiet, true)
 		if err != nil {
 			return newlyInstalled, err
 		}
@@ -3404,7 +3428,7 @@ func ensureDevelPackagesInstalledForBuild(cfg *Config, building []string, includ
 		}
 		advanceDependencyInstallProgress(bar)
 		if installed {
-			outputName := getOutputPackageName(pkgName, cfg)
+			outputName := getOutputPackageName(pkgName, installCfg)
 			newlyInstalled = append(newlyInstalled, outputName)
 		}
 	}

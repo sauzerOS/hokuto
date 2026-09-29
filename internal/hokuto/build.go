@@ -129,13 +129,9 @@ func missingDevelPackagesForBuildSet(cfg *Config, pkgNames []string) []string {
 	if !packageSetNeedsDevelPackages(pkgNames) {
 		return nil
 	}
-	// As ensureDevelPackagesInstalledForBuild: what the set builds is not a
-	// prerequisite of it.
-	built := make(map[string]bool)
-	for _, pkgName := range pkgNames {
-		built[pkgName] = true
-		built[getOutputPackageName(pkgName, cfg)] = true
-	}
+	// As ensureDevelPackagesInstalledForBuild: a toolchain package the set
+	// builds is not a prerequisite of it.
+	built := crossToolchainBeingBuilt(cfg, pkgNames)
 	var missing []string
 	for _, pkgName := range missingDevelPackagesForBuild(cfg, packageSetHasBuildOption(pkgNames, "multilib")) {
 		if !built[pkgName] {
@@ -158,7 +154,7 @@ func missingDevelPackagesForBuild(cfg *Config, includeMultilib bool) []string {
 	var missing []string
 	for _, pkgName := range requiredDevelPackages(cfg, includeMultilib) {
 		if !isPackageInstalled(pkgName) {
-			missing = append(missing, getOutputPackageName(pkgName, cfg))
+			missing = append(missing, getOutputPackageName(pkgName, develInstallConfig(pkgName, cfg)))
 		}
 	}
 	sort.Strings(missing)
@@ -938,6 +934,11 @@ func packageBuildConfig(pkgName string, cfg *Config) *Config {
 	if cfg.Values["HOKUTO_CROSS_ARCH"] == "" || isCrossTargetPackage(pkgName, cfg) {
 		return cfg
 	}
+	return nativeConfig(cfg)
+}
+
+// nativeConfig returns a copy of cfg with the cross settings cleared.
+func nativeConfig(cfg *Config) *Config {
 	clone := &Config{
 		Values:              make(map[string]string, len(cfg.Values)),
 		DefaultStrip:        cfg.DefaultStrip,
