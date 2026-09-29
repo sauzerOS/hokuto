@@ -2427,7 +2427,7 @@ func installRebuildDependenciesWithOptions(pkgNames []string, cfg *Config, noRem
 
 	if packageSetNeedsDevelPackages(pkgNames) {
 		includeMultilib := packageSetHasBuildOption(pkgNames, "multilib")
-		installed, err := ensureDevelPackagesInstalledWithOptions(cfg, includeMultilib, noRemote, quiet)
+		installed, err := ensureDevelPackagesInstalledForBuild(cfg, pkgNames, includeMultilib, noRemote, quiet)
 		for _, pkgName := range installed {
 			addInstalled(pkgName)
 		}
@@ -3293,7 +3293,37 @@ func requiredDevelPackages(cfg *Config, includeMultilib bool) []string {
 	if includeMultilib && multilibEnabled(cfg) {
 		required = append(required, multilibDevelPackages...)
 	}
-	return required
+	return append(required, crossDevelPackages(cfg)...)
+}
+
+// crossDevelMetaPackage is to cross builds what base-devel is to native ones:
+// the cross toolchain, installed before the build when missing.
+const crossDevelMetaPackage = "aarch64-base-devel"
+
+// crossDevelPackages lists the members of crossDevelMetaPackage for a cross
+// or cross-system arm64 build, and nothing otherwise.
+func crossDevelPackages(cfg *Config) []string {
+	if cfg == nil {
+		return nil
+	}
+	switch cfg.Values["HOKUTO_CROSS_ARCH"] {
+	case "arm64", "aarch64":
+	default:
+		return nil
+	}
+	meta, ok := findMetaPackage(crossDevelMetaPackage)
+	if !ok {
+		debugf("Meta package %s not found; not installing a cross toolchain\n", crossDevelMetaPackage)
+		return nil
+	}
+	var names []string
+	for _, dep := range meta.Depends {
+		if dep.Make || dep.Optional || dep.Rebuild || dep.PostInstall || dep.Suggest {
+			continue
+		}
+		names = append(names, dep.Name)
+	}
+	return names
 }
 
 func isRequiredDevelPackage(pkgName string, cfg *Config) bool {
@@ -3328,12 +3358,25 @@ func ensureDevelPackagesInstalled(cfg *Config, includeMultilib bool, noRemote bo
 }
 
 func ensureDevelPackagesInstalledWithOptions(cfg *Config, includeMultilib bool, noRemote bool, quiet bool) ([]string, error) {
+	return ensureDevelPackagesInstalledForBuild(cfg, nil, includeMultilib, noRemote, quiet)
+}
+
+// ensureDevelPackagesInstalledForBuild is ensureDevelPackagesInstalledWithOptions
+// for a known build set. A devel package the set itself builds is not
+// installed first, so the cross toolchain (aarch64-gcc, ...) can be built
+// before any package of it exists.
+func ensureDevelPackagesInstalledForBuild(cfg *Config, building []string, includeMultilib bool, noRemote bool, quiet bool) ([]string, error) {
 	develInstallMu.Lock()
 	defer develInstallMu.Unlock()
 
+	built := make(map[string]bool)
+	for _, pkgName := range building {
+		built[pkgName] = true
+		built[getOutputPackageName(pkgName, cfg)] = true
+	}
 	var missing []string
 	for _, pkgName := range requiredDevelPackages(cfg, includeMultilib) {
-		if isPackageInstalled(pkgName) {
+		if built[pkgName] || isPackageInstalled(pkgName) {
 			continue
 		}
 		missing = append(missing, pkgName)

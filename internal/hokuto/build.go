@@ -129,7 +129,20 @@ func missingDevelPackagesForBuildSet(cfg *Config, pkgNames []string) []string {
 	if !packageSetNeedsDevelPackages(pkgNames) {
 		return nil
 	}
-	return missingDevelPackagesForBuild(cfg, packageSetHasBuildOption(pkgNames, "multilib"))
+	// As ensureDevelPackagesInstalledForBuild: what the set builds is not a
+	// prerequisite of it.
+	built := make(map[string]bool)
+	for _, pkgName := range pkgNames {
+		built[pkgName] = true
+		built[getOutputPackageName(pkgName, cfg)] = true
+	}
+	var missing []string
+	for _, pkgName := range missingDevelPackagesForBuild(cfg, packageSetHasBuildOption(pkgNames, "multilib")) {
+		if !built[pkgName] {
+			missing = append(missing, pkgName)
+		}
+	}
+	return missing
 }
 
 func buildPackageNames(packageSet map[string]bool) []string {
@@ -4079,7 +4092,7 @@ func handleBuildCommand(args []string, cfg *Config) (err error) {
 	var genericBuild = buildCmd.Bool("generic", false, "Use _GEN flags and store packages in generic subfolder")
 	var crossArch = buildCmd.String("cross", "", "Enable cross-compilation for target architecture (e.g., arm64)")
 	var noDeps = buildCmd.Bool("no-deps", false, "Skip dependency checking and build only the specified package(s)")
-	var noDevel = buildCmd.Bool("no-devel", false, "Skip automatic base-devel dependency installation")
+	var noDevel = buildCmd.Bool("no-devel", false, "Skip automatic base-devel (and, for cross builds, aarch64-base-devel) installation")
 	var noCleanup = buildCmd.Bool("no-cleanup", false, "Keep temporary build dependencies installed after the build")
 	var noInstall = buildCmd.Bool("no-install", false, "Build packages without installing final user targets")
 	var noRemote = buildCmd.Bool("no-remote", false, "Do not use the remote binary mirror for build dependency resolution or installs")
@@ -4593,7 +4606,7 @@ func handleBuildCommand(args []string, cfg *Config) (err error) {
 			return nil
 		}
 		includeMultilib := packageSetHasBuildOption(pkgNames, "multilib")
-		installedDevelDeps, err := ensureDevelPackagesInstalledWithOptions(cfg, includeMultilib, *noRemote, quietDependencyInstalls)
+		installedDevelDeps, err := ensureDevelPackagesInstalledForBuild(cfg, pkgNames, includeMultilib, *noRemote, quietDependencyInstalls)
 		if err != nil {
 			return fmt.Errorf("failed to prepare devel packages: %w", err)
 		}

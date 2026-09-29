@@ -2977,3 +2977,79 @@ func TestResolveMissingDepsAddsDependenciesRecordedInBinary(t *testing.T) {
 		t.Fatalf("source rust build: got %s want %s", got, want)
 	}
 }
+
+func writeCrossDevelMetaPackage(t *testing.T, repo string) {
+	t.Helper()
+	metaDir := filepath.Join(filepath.Dir(repo), ".hokuto")
+	if err := os.MkdirAll(metaDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(metaDir, "metapackages.toml"), []byte(`
+[aarch64-base-devel]
+description = "aarch64 cross toolchain"
+depends = [
+"aarch64-binutils",
+"aarch64-gcc",
+]
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRequiredDevelPackagesAddCrossToolchainForCrossBuilds(t *testing.T) {
+	cfg, repo := withTempDependencyRepo(t)
+	oldRepoPaths := repoPaths
+	repoPaths = repo
+	t.Cleanup(func() { repoPaths = oldRepoPaths })
+	writeCrossDevelMetaPackage(t, repo)
+
+	has := func(list []string, name string) bool {
+		for _, n := range list {
+			if n == name {
+				return true
+			}
+		}
+		return false
+	}
+	if native := requiredDevelPackages(cfg, false); has(native, "aarch64-gcc") {
+		t.Fatalf("native build requires the cross toolchain: %v", native)
+	}
+	for _, mode := range []string{"", "system"} {
+		cfg.Values["HOKUTO_CROSS_ARCH"] = "arm64"
+		cfg.Values["HOKUTO_CROSS_SYSTEM"] = map[string]string{"": "", "system": "1"}[mode]
+		cross := requiredDevelPackages(cfg, false)
+		if !has(cross, "gcc") || !has(cross, "aarch64-binutils") || !has(cross, "aarch64-gcc") {
+			t.Fatalf("cross %q build must require base-devel and aarch64-base-devel: %v", mode, cross)
+		}
+	}
+}
+
+func TestEnsureDevelPackagesSkipsCrossToolchainBeingBuilt(t *testing.T) {
+	cfg, repo := withTempDependencyRepo(t)
+	oldRepoPaths := repoPaths
+	repoPaths = repo
+	t.Cleanup(func() { repoPaths = oldRepoPaths })
+	writeCrossDevelMetaPackage(t, repo)
+	cfg.Values["HOKUTO_CROSS_ARCH"] = "arm64"
+	cfg.Values["HOKUTO_CROSS_SYSTEM"] = "1"
+
+	for _, pkgName := range baseDevelPackages {
+		writeInstalledTestPackage(t, pkgName)
+	}
+	writeInstalledTestPackage(t, "aarch64-binutils")
+
+	// Building aarch64-gcc (gcc under -cross=arm64,system) must not first
+	// require a package of it.
+	if _, err := ensureDevelPackagesInstalledForBuild(cfg, []string{"gcc"}, false, true, true); err != nil {
+		t.Fatalf("toolchain self-build asked for itself: %v", err)
+	}
+	if missing := missingDevelPackagesForBuildSet(cfg, []string{"gcc"}); len(missing) != 0 {
+		t.Fatalf("--ask plan lists the package being built: %v", missing)
+	}
+
+	// Anything else needs it, and fails clearly without a package of it.
+	_, err := ensureDevelPackagesInstalledForBuild(cfg, []string{"zlib"}, false, true, true)
+	if err == nil || !strings.Contains(err.Error(), "aarch64-gcc") {
+		t.Fatalf("expected missing aarch64-gcc to be required, got %v", err)
+	}
+}
