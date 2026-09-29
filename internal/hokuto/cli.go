@@ -70,7 +70,7 @@ func printHelp() {
 		{
 			{"bootstrap", "<dir>", "Build a bootstrap rootfs in target directory"},
 			{"chroot", "<dir> [cmd]", "Enter chroot and run command (default: /bin/bash)"},
-			{"cross-sync", "[-native] [-jN] [-i]", "Identify and build missing native cross (or aarch64 native) packages"},
+			{"cross-sync", "[-system] [-jN] [-i]", "Build missing native aarch64 packages (or, with -system, outdated aarch64-* cross-system packages)"},
 			{"init-repos", "", "Initialize repositories"},
 			{"perl-rebuild", "", "Bump the revision of Perl modules and packages that depend on perl"},
 			{"python-rebuild", "", "Rebuild all python packages"},

@@ -10,6 +10,9 @@
 #   hokuto-builder build <pkg...>  build as bump --build does, then upload --sync;
 #                                  --no-upload skips the upload, other options
 #                                  go to hokuto build
+#   hokuto-builder cross-sync [-system] [-jN]
+#                                  hokuto cross-sync, then upload --sync;
+#                                  --no-upload skips the upload
 #   hokuto-builder run <cmd...>    run any command in the container
 #   hokuto-builder shell           interactive shell in the container
 #   hokuto-builder update          update the container's own packages
@@ -61,12 +64,12 @@ die() { printf '\033[0;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 info() { printf '\033[0;36m->\033[0m %s\n' "$*"; }
 
 usage() {
-    sed -n '3,16p' "$(readlink -f "$0")" | sed 's/^# \{0,1\}//'
+    sed -n '3,19p' "$(readlink -f "$0")" | sed 's/^# \{0,1\}//'
     exit "${1:-0}"
 }
 
 case "${1:-}" in
-    create | bump | build | run | shell | update | destroy) ;;
+    create | bump | build | cross-sync | run | shell | update | destroy) ;;
     -h | --help | help) usage ;;
     *) usage 1 ;;
 esac
@@ -270,6 +273,32 @@ cmd_build() {
     ' hokuto-builder-build "$upload" "${args[@]}"
 }
 
+# hokuto cross-sync: build the native aarch64 packages, or with -system the
+# aarch64-* cross-system packages, that the mirror lacks at their recipe
+# version. Both are found from the mirror index and the recipes, so nothing
+# needs to be installed first. Idle, like the other builds, and the mirror
+# synced afterwards.
+cmd_cross_sync() {
+    local upload=1 arg
+    local args=(-i)
+    for arg in "$@"; do
+        if [ "$arg" = --no-upload ]; then
+            upload=0
+        else
+            args+=("$arg")
+        fi
+    done
+    # shellcheck disable=SC2016
+    nspawn_run "$BUILD_USER" /bin/sh -c '
+        upload=$1
+        shift
+        /usr/local/bin/hokuto cross-sync "$@" || exit
+        if [ "$upload" = 1 ]; then
+            /usr/local/bin/hokuto upload --sync
+        fi
+    ' hokuto-builder-cross-sync "$upload" "${args[@]}"
+}
+
 cmd_destroy() {
     [ "$ROOTFS" != / ] || die "refusing to delete /"
     container_exists || [ -d "$ROOTFS" ] || die "no container at $ROOTFS"
@@ -288,6 +317,7 @@ case "$1" in
     create) cmd_create ;;
     bump) shift; nspawn_run "$BUILD_USER" /usr/local/bin/hokuto bump --auto --build "$@" ;;
     build) shift; cmd_build "$@" ;;
+    cross-sync) shift; cmd_cross_sync "$@" ;;
     run) shift; [ $# -gt 0 ] || usage 1; nspawn_run "$BUILD_USER" "$@" ;;
     shell) nspawn_run "$BUILD_USER" /bin/bash -l ;;
     update) nspawn_run "$BUILD_USER" /usr/local/bin/hokuto update -y ;;
