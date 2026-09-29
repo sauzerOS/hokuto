@@ -122,21 +122,38 @@ func GetSystemVariantForPackage(cfg *Config, pkgName string) string {
 
 // repoEntryMetadataVersion identifies entries whose archive metadata has been
 // fully scanned. Increment it whenever ReadPackageMetadata gains a field that
-// requires existing remote archives to be scanned again.
-const repoEntryMetadataVersion = 1
+// requires existing remote archives to be scanned again; `hokuto upload
+// --reindex` then rescans the older entries.
+//
+//	1: depends
+//	2: libdeps
+const repoEntryMetadataVersion = 2
+
+// repoEntryDependsMetadataVersion is the first metadata version with a
+// scanned depends list. Clients check this one, not repoEntryMetadataVersion,
+// so an index that has not been reindexed yet does not make them download
+// packages just to read their dependencies.
+const repoEntryDependsMetadataVersion = 1
+
+// repoEntryLibdepsMetadataVersion is the first metadata version with a
+// scanned libdeps list; older entries' Libdeps are unknown, not empty.
+const repoEntryLibdepsMetadataVersion = 2
 
 // RepoEntry represents a single package in the repository index.
 type RepoEntry struct {
-	Name            string   `json:"name"`
-	Type            string   `json:"type,omitempty"`
-	Version         string   `json:"version"`
-	Revision        string   `json:"revision"`
-	Arch            string   `json:"arch"`
-	Variant         string   `json:"variant"` // generic or optimized
-	Filename        string   `json:"filename"`
-	Size            int64    `json:"size"`
-	B3Sum           string   `json:"b3sum"`
-	Depends         []string `json:"depends,omitempty"`
+	Name     string   `json:"name"`
+	Type     string   `json:"type,omitempty"`
+	Version  string   `json:"version"`
+	Revision string   `json:"revision"`
+	Arch     string   `json:"arch"`
+	Variant  string   `json:"variant"` // generic or optimized
+	Filename string   `json:"filename"`
+	Size     int64    `json:"size"`
+	B3Sum    string   `json:"b3sum"`
+	Depends  []string `json:"depends,omitempty"`
+	// Libdeps are the shared libraries the package links against, as in its
+	// libdeps file (elf64:libfoo.so.3). Known from metadata version 2 on.
+	Libdeps         []string `json:"libdeps,omitempty"`
 	Suggests        []string `json:"suggests,omitempty"`
 	Description     string   `json:"description,omitempty"`
 	MetadataVersion int      `json:"metadata_version,omitempty"`
@@ -162,8 +179,8 @@ func ReadPackageMetadata(tarballPath string) (RepoEntry, error) {
 	}
 	entry.B3Sum = sum
 
-	// 2. Scan tarball once for all metadata (pkginfo and depends)
-	metadata, deps, err := scanTarballMetadata(tarballPath)
+	// 2. Scan tarball once for all metadata (pkginfo, depends and libdeps)
+	metadata, deps, libdeps, err := scanTarballMetadataWithLibdeps(tarballPath)
 	if err != nil {
 		return entry, fmt.Errorf("failed to scan tarball metadata: %w", err)
 	}
@@ -179,25 +196,35 @@ func ReadPackageMetadata(tarballPath string) (RepoEntry, error) {
 
 	// 5. Populate Dependencies
 	entry.Depends = deps
+	entry.Libdeps = libdeps
 
 	return entry, nil
 }
 
 // scanTarballMetadata reads pkginfo and depends files from a .tar.zst archive in one pass.
 func scanTarballMetadata(tarballPath string) (map[string]string, []string, error) {
+	metadata, deps, _, err := scanTarballMetadataWithLibdeps(tarballPath)
+	return metadata, deps, err
+}
+
+// scanTarballMetadataWithLibdeps is scanTarballMetadata that also returns the
+// package's libdeps entries. Only hokuto's own metadata directory counts, not
+// a payload file that happens to be called libdeps.
+func scanTarballMetadataWithLibdeps(tarballPath string) (map[string]string, []string, []string, error) {
 	f, err := os.Open(tarballPath)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	defer f.Close()
 
 	zsr, err := zstd.NewReader(f)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	defer zsr.Close()
 
 	var metadata map[string]string
+	libdeps := []string{}
 	var dependencies []string
 
 	tr := tar.NewReader(zsr)
@@ -207,14 +234,27 @@ func scanTarballMetadata(tarballPath string) (map[string]string, []string, error
 			break
 		}
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
+		}
+
+		if strings.HasSuffix(header.Name, "/libdeps") && strings.Contains(header.Name, "var/db/hokuto/installed/") {
+			data, err := io.ReadAll(tr)
+			if err != nil {
+				return nil, nil, nil, fmt.Errorf("failed to read libdeps from %s: %w", tarballPath, err)
+			}
+			for _, line := range strings.Split(string(data), "\n") {
+				if dep, ok := parseLibDepRef(line); ok {
+					libdeps = append(libdeps, dep.String())
+				}
+			}
+			continue
 		}
 
 		// 1. Look for pkginfo
 		if strings.HasSuffix(header.Name, "/pkginfo") {
 			data, err := io.ReadAll(tr)
 			if err != nil {
-				return nil, nil, fmt.Errorf("failed to read pkginfo from %s: %w", tarballPath, err)
+				return nil, nil, nil, fmt.Errorf("failed to read pkginfo from %s: %w", tarballPath, err)
 			}
 			metadata = ParsePkgInfo(data)
 			continue
@@ -224,7 +264,7 @@ func scanTarballMetadata(tarballPath string) (map[string]string, []string, error
 		if strings.HasSuffix(header.Name, "/depends") {
 			data, err := io.ReadAll(tr)
 			if err != nil {
-				return nil, nil, fmt.Errorf("failed to read depends from %s: %w", tarballPath, err)
+				return nil, nil, nil, fmt.Errorf("failed to read depends from %s: %w", tarballPath, err)
 			}
 			depSpecs, err := parseDependsData(data)
 			if err != nil {
@@ -245,10 +285,10 @@ func scanTarballMetadata(tarballPath string) (map[string]string, []string, error
 	}
 
 	if metadata == nil {
-		return nil, nil, fmt.Errorf("pkginfo not found in %s", tarballPath)
+		return nil, nil, nil, fmt.Errorf("pkginfo not found in %s", tarballPath)
 	}
 
-	return metadata, dependencies, nil
+	return metadata, dependencies, libdeps, nil
 }
 
 func scanTarballDependencySpecs(tarballPath string) ([]DepSpec, error) {

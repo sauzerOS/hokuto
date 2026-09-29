@@ -1,0 +1,263 @@
+package hokuto
+
+import (
+	"archive/tar"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"reflect"
+	"strings"
+	"testing"
+
+	"github.com/klauspost/compress/zstd"
+)
+
+// writeTestArchive writes a .tar.zst with the given regular files (path ->
+// content) and symlinks (path -> target).
+func writeTestArchive(t *testing.T, path string, files, symlinks map[string]string) {
+	t.Helper()
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	zw, err := zstd.NewWriter(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer zw.Close()
+	tw := tar.NewWriter(zw)
+	defer tw.Close()
+	for name, content := range files {
+		if err := tw.WriteHeader(&tar.Header{Name: name, Mode: 0o644, Size: int64(len(content)), Typeflag: tar.TypeReg}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tw.Write([]byte(content)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for name, target := range symlinks {
+		if err := tw.WriteHeader(&tar.Header{Name: name, Linkname: target, Mode: 0o777, Typeflag: tar.TypeSymlink}); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestTarballSharedLibraryPaths(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "libfoo.tar.zst")
+	writeTestArchive(t, path, map[string]string{
+		"./usr/lib/libfoo.so.3.1.0":                  "elf",
+		"usr/lib32/libfoo.so.3.1.0":                  "elf",
+		"usr/include/foo.h":                          "h",
+		"var/db/hokuto/installed/libfoo/libdeps":     "elf64:libc.so.6\n",
+		"var/db/hokuto/installed/libfoo/libx.so.1":   "not a payload file",
+		"usr/share/doc/libfoo/libfoo.so.3.1.0.notes": "txt",
+	}, map[string]string{
+		"usr/lib/libfoo.so.3": "libfoo.so.3.1.0",
+		"usr/lib/libfoo.so":   "libfoo.so.3",
+	})
+	got, err := tarballSharedLibraryPaths(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]bool{
+		"/usr/lib/libfoo.so.3.1.0": true, "/usr/lib32/libfoo.so.3.1.0": true,
+		"/usr/lib/libfoo.so.3": true, "/usr/lib/libfoo.so": true,
+	}
+	if len(got) != len(want) {
+		t.Fatalf("got %v", got)
+	}
+	for _, p := range got {
+		if !want[p] {
+			t.Fatalf("unexpected library path %s in %v", p, got)
+		}
+	}
+}
+
+func TestRemovedSharedLibraries(t *testing.T) {
+	old := []string{
+		"/usr/lib/libfoo.so", "/usr/lib/libfoo.so.3", "/usr/lib/libfoo.so.3.1.0",
+		"/usr/lib32/libfoo.so.3", // still shipped for 32-bit
+		"/usr/lib/foo/libbar.so.1",
+		"/usr/lib/libgone.so.2",
+	}
+	updated := []string{
+		"/usr/lib/libfoo.so", "/usr/lib/libfoo.so.4", "/usr/lib/libfoo.so.4.0.0",
+		"/usr/lib32/libfoo.so.3",
+		"/usr/lib/libbar.so.1", // moved directory, same library
+	}
+	got := removedSharedLibraries(old, updated)
+	want := []libDepRef{
+		{ABI: "elf64", Name: "libfoo.so.3"},
+		{ABI: "elf64", Name: "libfoo.so.3.1.0"},
+		{ABI: "elf64", Name: "libgone.so.2"},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("removed: got %v want %v", got, want)
+	}
+	// A minor update that keeps the soname removes only the versioned file,
+	// which nothing links against.
+	if got := removedSharedLibraries([]string{"/usr/lib/libfoo.so.3", "/usr/lib/libfoo.so.3.1.0"},
+		[]string{"/usr/lib/libfoo.so.3", "/usr/lib/libfoo.so.3.2.0"}); len(got) != 1 || got[0].Name != "libfoo.so.3.1.0" {
+		t.Fatalf("soname-preserving update: %v", got)
+	}
+}
+
+func TestAbiConsumers(t *testing.T) {
+	_, repo := withTempDependencyRepo(t)
+	for _, name := range []string{"libfoo", "app", "tool", "old-user", "prebuilt", "lib32-user-src", "cross-user"} {
+		writeTestPackage(t, repo, name, "")
+	}
+	if err := os.WriteFile(filepath.Join(repo, "prebuilt", "options"), []byte("binary\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "lib32-user-src", "depends.lib32-user"), []byte(""), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	v2 := repoEntryLibdepsMetadataVersion
+	index := []RepoEntry{
+		{Name: "app", Version: "1.0", Revision: "1", Arch: "x86_64", Variant: "optimized", MetadataVersion: v2, Libdeps: []string{"elf64:libc.so.6", "elf64:libfoo.so.3"}},
+		{Name: "tool", Version: "2.0", Revision: "1", Arch: "x86_64", Variant: "optimized", MetadataVersion: v2, Libdeps: []string{"/usr/lib/libfoo.so.3"}}, // old absolute format
+		// Only the newest entry counts: old-user dropped the dependency.
+		{Name: "old-user", Version: "1.0", Revision: "1", Arch: "x86_64", Variant: "optimized", MetadataVersion: v2, Libdeps: []string{"elf64:libfoo.so.3"}},
+		{Name: "old-user", Version: "1.1", Revision: "1", Arch: "x86_64", Variant: "optimized", MetadataVersion: v2, Libdeps: []string{"elf64:libc.so.6"}},
+		{Name: "prebuilt", Version: "1.0", Revision: "1", Arch: "x86_64", Variant: "generic", MetadataVersion: v2, Libdeps: []string{"elf64:libfoo.so.3"}},
+		{Name: "libfoo-utils", Version: "3.0", Revision: "1", Arch: "x86_64", Variant: "optimized", MetadataVersion: v2, Libdeps: []string{"elf64:libfoo.so.3"}}, // no recipe
+		{Name: "libfoo", Version: "3.0", Revision: "1", Arch: "x86_64", Variant: "optimized", MetadataVersion: v2, Libdeps: []string{"elf64:libfoo.so.3"}},
+		{Name: "lib32-user", Version: "1.0", Revision: "1", Arch: "x86_64", Variant: "multi-optimized", MetadataVersion: v2, Libdeps: []string{"elf32:libfoo.so.3"}}, // 32-bit library kept
+		{Name: "cross-user", Version: "1.0", Revision: "1", Arch: "aarch64", Variant: "optimized", MetadataVersion: v2, Libdeps: []string{"elf64:libfoo.so.3"}},
+		{Name: "unscanned", Version: "1.0", Revision: "1", Arch: "x86_64", Variant: "optimized", MetadataVersion: 1},
+	}
+	brk := abiBreak{Library: "libfoo", Removed: []libDepRef{{ABI: "elf64", Name: "libfoo.so.3"}}}
+	got, unknown := abiConsumers(index, "x86_64", brk)
+	want := map[string][]string{"app": {"libfoo.so.3"}, "tool": {"libfoo.so.3"}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("consumers: got %v want %v", got, want)
+	}
+	if unknown != 1 {
+		t.Fatalf("expected 1 unscanned package, got %d", unknown)
+	}
+
+	// A split package maps to its recipe.
+	brk32 := abiBreak{Library: "libfoo", Removed: []libDepRef{{ABI: "elf32", Name: "libfoo.so.3"}}}
+	if got, _ := abiConsumers(index, "x86_64", brk32); !reflect.DeepEqual(got, map[string][]string{"lib32-user-src": {"libfoo.so.3"}}) {
+		t.Fatalf("split consumer: %v", got)
+	}
+}
+
+func TestReadPackageMetadataRecordsLibdeps(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "app-1.0-1-x86_64-optimized.tar.zst")
+	writeTestArchive(t, path, map[string]string{
+		"var/db/hokuto/installed/app/pkginfo": "name=app\nversion=1.0\nrevision=1\narch=x86_64\ngeneric=0\nmultilib=0\n",
+		"var/db/hokuto/installed/app/depends": "glibc\n",
+		"var/db/hokuto/installed/app/libdeps": "elf64:libc.so.6\nelf64:libfoo.so.3\n",
+		"usr/share/app/libdeps":               "not metadata\n",
+	}, nil)
+	entry, err := ReadPackageMetadata(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if entry.MetadataVersion != repoEntryLibdepsMetadataVersion || !reflect.DeepEqual(entry.Libdeps, []string{"elf64:libc.so.6", "elf64:libfoo.so.3"}) {
+		t.Fatalf("entry: version %d libdeps %v", entry.MetadataVersion, entry.Libdeps)
+	}
+	// Older index entries still count as having dependency metadata, so
+	// clients do not download packages before the index is reindexed.
+	if !repoEntryHasDependencyMetadata(RepoEntry{MetadataVersion: 1}) {
+		t.Fatal("metadata version 1 entries lost their dependency metadata")
+	}
+}
+
+func TestBumpABIConsumersCommitsAndPushes(t *testing.T) {
+	_, repo := withTempDependencyRepo(t)
+	remote := filepath.Join(t.TempDir(), "remote.git")
+	if out, err := exec.Command("git", "init", "--bare", "-q", "-b", "master", remote).CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v\n%s", err, out)
+	}
+	gitIn(t, repo, "init", "-q", "-b", "master")
+	gitIn(t, repo, "config", "user.name", "Hokuto Test")
+	gitIn(t, repo, "config", "user.email", "test@sauzeros.invalid")
+	gitIn(t, repo, "remote", "add", "origin", remote)
+	for _, name := range []string{"app", "tool", "edited"} {
+		writeTestPackage(t, repo, name, "")
+	}
+	gitIn(t, repo, "add", ".")
+	gitIn(t, repo, "commit", "-q", "-m", "initial")
+	gitIn(t, repo, "push", "-q", "-u", "origin", "master")
+
+	// Your own uncommitted version change must not be swept into the commit.
+	if err := os.WriteFile(filepath.Join(repo, "edited", "version"), []byte("2.0 1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Nor unrelated staged work.
+	if err := os.WriteFile(filepath.Join(repo, "app", "build"), []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, repo, "add", "app/build")
+
+	consumers := map[string][]string{"app": {"libfoo.so.3"}, "tool": {"libfoo.so.3"}, "edited": {"libfoo.so.3"}}
+	result, err := bumpABIConsumers(consumers, map[string][]string{"libfoo": {"libfoo.so.3"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(result.Bumped, []string{"app", "tool"}) || len(result.Skipped) != 1 || !strings.HasPrefix(result.Skipped[0], "edited:") {
+		t.Fatalf("result: %+v", result)
+	}
+	for _, name := range []string{"app", "tool"} {
+		if got := gitIn(t, repo, "show", "origin/master:"+name+"/version"); got != "1.0 2" {
+			t.Fatalf("%s pushed version %q", name, got)
+		}
+	}
+	if msg := gitIn(t, remote, "log", "-1", "--format=%s"); msg != "rebuild for libfoo (libfoo.so.3) ABI change" {
+		t.Fatalf("commit message %q", msg)
+	}
+	if files := gitIn(t, remote, "show", "--name-only", "--format=", "HEAD"); files != "app/version\ntool/version" {
+		t.Fatalf("commit contains %q", files)
+	}
+	if got, _ := os.ReadFile(filepath.Join(repo, "edited", "version")); string(got) != "2.0 1\n" {
+		t.Fatalf("edited version file changed: %q", got)
+	}
+	if staged := gitIn(t, repo, "diff", "--cached", "--name-only"); staged != "app/build" {
+		t.Fatalf("staged work lost or committed: %q", staged)
+	}
+}
+
+func TestDetectABIBreak(t *testing.T) {
+	cfg, repo := withTempDependencyRepo(t)
+	cfg.Values["HOKUTO_ARCH"] = "x86_64"
+	writeTestPackage(t, repo, "libfoo", "")
+	if err := os.WriteFile(filepath.Join(repo, "libfoo", "version"), []byte("4.0 1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "libfoo", "depends.lib32-libfoo"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	variant := GetSystemVariantForPackage(cfg, "libfoo")
+	archive := func(name, version, variant string, libs ...string) string {
+		path := filepath.Join(BinDir, StandardizeRemoteName(name, version, "1", "x86_64", variant))
+		files := map[string]string{}
+		for _, lib := range libs {
+			files[lib] = "elf"
+		}
+		writeTestArchive(t, path, files, nil)
+		return path
+	}
+	archive("libfoo", "4.0", variant, "usr/lib/libfoo.so.4")
+	archive("libfoo", "3.0", "optimized", "usr/lib/libfoo.so.3")
+	lib32Variant := GetSystemVariantForPackage(cfg, "lib32-libfoo")
+	archive("lib32-libfoo", "4.0", lib32Variant, "usr/lib32/libfoo.so.4")
+	archive("lib32-libfoo", "3.0", "multi-optimized", "usr/lib32/libfoo.so.3")
+
+	index := []RepoEntry{
+		{Name: "libfoo", Version: "3.0", Revision: "1", Arch: "x86_64", Variant: "optimized"},
+		{Name: "libfoo", Version: "5.0", Revision: "1", Arch: "x86_64", Variant: "optimized"}, // newer than the build: ignored
+		{Name: "lib32-libfoo", Version: "3.0", Revision: "1", Arch: "x86_64", Variant: "multi-optimized"},
+	}
+	brk, err := detectABIBreak("libfoo", cfg, index)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []libDepRef{{ABI: "elf64", Name: "libfoo.so.3"}, {ABI: "elf32", Name: "libfoo.so.3"}}
+	if brk.Version != "4.0" || !reflect.DeepEqual(brk.Removed, want) {
+		t.Fatalf("break: %+v", brk)
+	}
+}

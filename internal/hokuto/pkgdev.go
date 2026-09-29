@@ -1736,6 +1736,13 @@ func handleAutoBumpRepository(cfg *Config, autoBuild bool, assumeYes bool, repoU
 		fmt.Println("------------------------------------------------")
 	}
 
+	// Published packages linked against a library these builds dropped get a
+	// revision bump, to be rebuilt by `hokuto update --build-missing-binaries`.
+	var abiLibs []string
+	if autoBuild {
+		abiLibs = handleABIRebuilds(successfullyBuilt, cfg, logMsg)
+	}
+
 	// If build was requested and some packages were built, run upload --sync
 	if autoBuild && len(successfullyBuilt) > 0 {
 		// upload --sync must see the new database immediately, so this one
@@ -1766,6 +1773,7 @@ func handleAutoBumpRepository(cfg *Config, autoBuild bool, assumeYes bool, repoU
 	logMsg("================================\n")
 
 	colSuccess.Println("=== Work Complete ===")
+	printABIRebuildHint(abiLibs)
 	return nil
 }
 

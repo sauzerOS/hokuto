@@ -10,6 +10,11 @@
 #   hokuto-builder build <pkg...>  build as bump --build does, then upload --sync;
 #                                  --no-upload skips the upload, other options
 #                                  go to hokuto build
+#   hokuto-builder rebuild [-jN]   build and upload recipes whose version or
+#                                  revision is ahead of the mirror (after an
+#                                  ABI change bump bumped them); the container
+#                                  is first updated from the mirror so they
+#                                  link against the new libraries
 #   hokuto-builder cross-sync [-system] [-jN]
 #                                  hokuto cross-sync, then upload --sync;
 #                                  --no-upload skips the upload
@@ -64,12 +69,12 @@ die() { printf '\033[0;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 info() { printf '\033[0;36m->\033[0m %s\n' "$*"; }
 
 usage() {
-    sed -n '3,19p' "$(readlink -f "$0")" | sed 's/^# \{0,1\}//'
+    sed -n '3,24p' "$(readlink -f "$0")" | sed 's/^# \{0,1\}//'
     exit "${1:-0}"
 }
 
 case "${1:-}" in
-    create | bump | build | cross-sync | run | shell | update | destroy) ;;
+    create | bump | build | rebuild | cross-sync | run | shell | update | destroy) ;;
     -h | --help | help) usage ;;
     *) usage 1 ;;
 esac
@@ -195,6 +200,8 @@ nspawn_run() {
         --register=no
         --resolv-conf=copy-host
         --timezone=copy
+        # Lets hokuto name hokuto-builder commands in its hints.
+        --setenv=HOKUTO_BUILDER=1
         # Explicit, as systemd-nspawn asks for: its future default plus
         # netlink, which ip(8) and some test suites use.
         --restrict-address-families="AF_INET AF_INET6 AF_UNIX AF_NETLINK"
@@ -273,6 +280,34 @@ cmd_build() {
     ' hokuto-builder-build "$upload" "${args[@]}"
 }
 
+# A library whose new version drops a soname makes bump raise the revision of
+# the published packages linked against it. Build those: first update the
+# container from the mirror (binary packages only), so they link against the
+# library bump just uploaded, then build every recipe whose current version
+# has no package yet, as hokuto update --build-missing-binaries lists them,
+# and upload.
+cmd_rebuild() {
+    local upload=1 arg
+    local args=()
+    for arg in "$@"; do
+        if [ "$arg" = --no-upload ]; then
+            upload=0
+        else
+            args+=("$arg")
+        fi
+    done
+    # shellcheck disable=SC2016
+    nspawn_run "$BUILD_USER" /bin/sh -c '
+        upload=$1
+        shift
+        /usr/local/bin/hokuto update --remote -y || exit
+        /usr/local/bin/hokuto update --build-missing-binaries -i "$@" || exit
+        if [ "$upload" = 1 ]; then
+            /usr/local/bin/hokuto upload --sync
+        fi
+    ' hokuto-builder-rebuild "$upload" "${args[@]}"
+}
+
 # hokuto cross-sync: build the native aarch64 packages, or with -system the
 # aarch64-* cross-system packages, that the mirror lacks at their recipe
 # version. Both are found from the mirror index and the recipes, so nothing
@@ -318,6 +353,7 @@ case "$1" in
     create) cmd_create ;;
     bump) shift; nspawn_run "$BUILD_USER" /usr/local/bin/hokuto bump --auto --build "$@" ;;
     build) shift; cmd_build "$@" ;;
+    rebuild) shift; cmd_rebuild "$@" ;;
     cross-sync) shift; cmd_cross_sync "$@" ;;
     run) shift; [ $# -gt 0 ] || usage 1; nspawn_run "$BUILD_USER" "$@" ;;
     shell) nspawn_run "$BUILD_USER" /bin/bash -l ;;

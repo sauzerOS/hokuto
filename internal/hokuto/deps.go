@@ -451,7 +451,7 @@ func depSpecsFromNames(names []string) []DepSpec {
 // an older index entry that was never scanned. Keep accepting populated legacy
 // entries, while current entries may legitimately contain an empty Depends list.
 func repoEntryHasDependencyMetadata(entry RepoEntry) bool {
-	return entry.MetadataVersion >= repoEntryMetadataVersion || len(entry.Depends) > 0
+	return entry.MetadataVersion >= repoEntryDependsMetadataVersion || len(entry.Depends) > 0
 }
 
 func resolveBinaryDependenciesFromArchive(pkgName string, cfg *Config, remoteIndex []RepoEntry, allowRemote bool) ([]DepSpec, bool, error) {
