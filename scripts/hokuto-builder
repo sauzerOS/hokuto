@@ -277,10 +277,11 @@ cmd_build() {
 # aarch64-* cross-system packages, that the mirror lacks at their recipe
 # version. Both are found from the mirror index and the recipes, so nothing
 # needs to be installed first. Idle, like the other builds, and the mirror
-# synced afterwards.
+# synced afterwards. Like build, it never installs what it builds: the
+# packages are for the mirror, not this container.
 cmd_cross_sync() {
     local upload=1 arg
-    local args=(-i)
+    local args=(-i -no-install)
     for arg in "$@"; do
         if [ "$arg" = --no-upload ]; then
             upload=0

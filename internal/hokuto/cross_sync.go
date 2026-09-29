@@ -30,6 +30,7 @@ func handleCrossSyncCommand(args []string, cfg *Config) error {
 	syncCmd := flag.NewFlagSet("cross-sync", flag.ContinueOnError)
 	systemModeFlag := syncCmd.Bool("system", false, "Sync the cross-system packages (aarch64-*) on the mirror instead of native aarch64 packages")
 	idleFlag := syncCmd.Bool("i", false, "Use idle build priority")
+	noInstallFlag := syncCmd.Bool("no-install", false, "Do not offer to install the built -system packages on this host")
 	parallelFlag := syncCmd.Int("j", 1, "Number of parallel build jobs")
 
 	if err := syncCmd.Parse(args); err != nil {
@@ -113,6 +114,9 @@ func handleCrossSyncCommand(args []string, cfg *Config) error {
 	}
 	if *idleFlag {
 		buildArgs = append(buildArgs, "-i")
+	}
+	if *noInstallFlag {
+		buildArgs = append(buildArgs, "--no-install")
 	}
 	if *parallelFlag > 1 {
 		buildArgs = append(buildArgs, "-j"+strconv.Itoa(*parallelFlag))
