@@ -3087,3 +3087,77 @@ func TestDevelPackagesInstallAsHostPackagesDuringCrossBuilds(t *testing.T) {
 		t.Fatalf("cross-system build of gcc should provide aarch64-gcc only: %v", built)
 	}
 }
+
+func TestResolveMissingDepsNotesHostToolRequestedAsCrossTarget(t *testing.T) {
+	cfg, repo := withTempDependencyRepo(t)
+	writeTestPackage(t, repo, "meson", "")
+	writeTestPackage(t, repo, "ninja", "")
+	writeTestPackage(t, repo, "zlib", "")
+	writeTestPackage(t, repo, "harfbuzz", "meson cross make\nninja cross make\naarch64-zlib cross\n")
+
+	resolve := func() {
+		t.Helper()
+		cfg.CrossHostTools = nil
+		var missing []string
+		forceBuild := map[string]bool{}
+		processed := map[string]bool{}
+		for pkgName := range cfg.CrossOutputPackages {
+			forceBuild[pkgName] = true
+		}
+		for _, pkgName := range []string{"harfbuzz", "meson", "zlib"} {
+			if cfg.CrossOutputPackages[pkgName] {
+				if err := resolveMissingDeps(pkgName, processed, &missing, forceBuild, cfg, true); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
+	}
+
+	// Native session: nothing to note.
+	cfg.CrossOutputPackages = map[string]bool{"harfbuzz": true, "meson": true}
+	resolve()
+	if len(cfg.CrossHostTools) != 0 {
+		t.Fatalf("native build noted host tools: %v", cfg.CrossHostTools)
+	}
+
+	// meson is both harfbuzz's host tool and a requested -system target;
+	// ninja is only a host tool and resolves normally; aarch64-zlib is a
+	// target dependency, not a host tool, even with zlib requested too.
+	cfg.Values["HOKUTO_CROSS_ARCH"] = "arm64"
+	cfg.Values["HOKUTO_CROSS_SYSTEM"] = "1"
+	cfg.CrossOutputPackages = map[string]bool{"harfbuzz": true, "meson": true, "zlib": true}
+	resolve()
+	if len(cfg.CrossHostTools) != 1 || !cfg.CrossHostTools["meson"] {
+		t.Fatalf("expected only meson as a colliding host tool, got %v", cfg.CrossHostTools)
+	}
+
+	// Without meson requested there is no collision.
+	cfg.CrossOutputPackages = map[string]bool{"harfbuzz": true}
+	resolve()
+	if len(cfg.CrossHostTools) != 0 {
+		t.Fatalf("noted a host tool that is not a cross target: %v", cfg.CrossHostTools)
+	}
+}
+
+func TestInstallCrossHostTools(t *testing.T) {
+	cfg, repo := withTempDependencyRepo(t)
+	writeTestPackage(t, repo, "meson", "")
+	cfg.Values["HOKUTO_CROSS_ARCH"] = "arm64"
+	cfg.Values["HOKUTO_CROSS_SYSTEM"] = "1"
+
+	if installed, err := installCrossHostTools(cfg, true, true); err != nil || len(installed) != 0 {
+		t.Fatalf("nothing noted: %v %v", installed, err)
+	}
+
+	cfg.CrossHostTools = map[string]bool{"meson": true}
+	_, err := installCrossHostTools(cfg, true, true)
+	if err == nil || !strings.Contains(err.Error(), "no native binary package") {
+		t.Fatalf("expected a clear error without a native meson binary, got %v", err)
+	}
+
+	// Already installed natively: nothing to do, whatever the cross state.
+	writeInstalledTestPackage(t, "meson")
+	if installed, err := installCrossHostTools(cfg, true, true); err != nil || len(installed) != 0 {
+		t.Fatalf("installed native meson not recognized: %v %v", installed, err)
+	}
+}

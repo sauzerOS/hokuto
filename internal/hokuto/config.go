@@ -26,6 +26,13 @@ type Config struct {
 	// cross target apart from an ordinary build-time tool that happens to be
 	// needed too, even though both are bare names with no arch prefix.
 	CrossOutputPackages map[string]bool
+
+	// CrossHostTools collects, during dependency resolution, the bare names
+	// that some package needs as a host tool ("meson cross make") while the
+	// same name is also a cross target in CrossOutputPackages. The plan keys
+	// packages by name, so it would take the cross build of the target for
+	// the host tool; installCrossHostTools installs the native package first.
+	CrossHostTools map[string]bool
 }
 
 // Load /etc/hokuto/hokuto.conf and apply defaults

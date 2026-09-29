@@ -1065,6 +1065,8 @@ func resolveMissingDeps(pkgName string, processed map[string]bool, missing *[]st
 			continue
 		}
 
+		noteCrossHostTool(depName, cfg)
+
 		// CHECK VERSION CONSTRAINTS & FETCH IF NEEDED
 		if dep.Op != "" && dep.Version != "" {
 			// 1. Check if any satisfying package is ALREADY INSTALLED (including renamed ones)
@@ -2365,6 +2367,11 @@ func installBuildDependenciesWithOptions(pkgName string, cfg *Config, noRemote b
 	if err := resolveMissingDeps(pkgName, masterProcessed, &missing, userRequested, cfg, noRemote); err != nil {
 		return newlyInstalled, fmt.Errorf("failed to resolve dependencies for %s: %v", pkgName, err)
 	}
+	hostTools, err := installCrossHostTools(cfg, noRemote, quiet)
+	newlyInstalled = append(newlyInstalled, hostTools...)
+	if err != nil {
+		return newlyInstalled, err
+	}
 
 	// makeopt dependencies never enter the source dependency graph. Install an
 	// exact or older available binary now, and silently leave the feature
@@ -3375,6 +3382,62 @@ func crossToolchainBeingBuilt(cfg *Config, building []string) map[string]bool {
 		}
 	}
 	return built
+}
+
+// noteCrossHostTool records depName in cfg.CrossHostTools when a dependency
+// edge names, without the target prefix, a package that is also requested as
+// a cross target: a bare cross dependency is a host tool (see hokuto.html),
+// not the target being built in the same session.
+func noteCrossHostTool(depName string, cfg *Config) {
+	if cfg == nil || cfg.Values["HOKUTO_CROSS_ARCH"] == "" || !cfg.CrossOutputPackages[depName] || dependencyNameHasCrossPrefix(depName, cfg) {
+		return
+	}
+	if cfg.CrossHostTools == nil {
+		cfg.CrossHostTools = make(map[string]bool)
+	}
+	cfg.CrossHostTools[depName] = true
+}
+
+// installCrossHostTools installs the native package of each name noted by
+// noteCrossHostTool that is not installed yet, before the cross build starts,
+// and returns what it installed. This is the state a build host normally
+// already has (native meson installed while aarch64-meson is cross built).
+// A host tool without a native binary cannot be built in this session, since
+// the plan would build its cross target instead, so that is an error.
+func installCrossHostTools(cfg *Config, noRemote bool, quiet bool) ([]string, error) {
+	if cfg == nil || len(cfg.CrossHostTools) == 0 {
+		return nil, nil
+	}
+	names := make([]string, 0, len(cfg.CrossHostTools))
+	for name := range cfg.CrossHostTools {
+		if !isPackageInstalled(name) {
+			names = append(names, name)
+		}
+	}
+	if len(names) == 0 {
+		return nil, nil
+	}
+	sort.Strings(names)
+
+	prepareDependencyProgressLogOutput()
+	colArrow.Print("-> ")
+	colSuccess.Printf("Installing native host tools also requested as cross targets: %s\n", strings.Join(names, ", "))
+
+	hostCfg := nativeConfig(cfg)
+	var installed []string
+	for _, name := range names {
+		ok, err := installAvailableBuildDependencyBinaryWithOptions(name, hostCfg, noRemote, quiet, true)
+		if err != nil {
+			return installed, fmt.Errorf("failed to install native %s: %w", name, err)
+		}
+		if !ok && !isPackageInstalled(name) {
+			return installed, fmt.Errorf("%s is needed natively as a build tool and requested as a cross target, but has no native binary package; install it first (hokuto install %s) or cross build %s in a separate run", name, name, name)
+		}
+		if ok {
+			installed = append(installed, name)
+		}
+	}
+	return installed, nil
 }
 
 // develInstallConfig is the configuration a devel package is installed

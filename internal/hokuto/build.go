@@ -4802,6 +4802,13 @@ func handleBuildCommand(args []string, cfg *Config) (err error) {
 			}
 
 			buildWorkStarted = true
+			hostTools, err := installCrossHostTools(cfg, *noRemote, quietDependencyInstalls)
+			for _, tool := range hostTools {
+				addTemporaryBuildDep(tool)
+			}
+			if err != nil {
+				return err
+			}
 			packagesThatMustBeBuilt = make(map[string]bool)
 			for pkg := range forceBuildMap {
 				packagesThatMustBeBuilt[pkg] = true
