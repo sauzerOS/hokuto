@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 type PackageStatus struct {
@@ -19,6 +20,9 @@ type PackageStatus struct {
 	Log     string `json:"log,omitempty"`
 	// Logs lists the kept logs, newest first; Log is Logs[0].
 	Logs []string `json:"logs,omitempty"`
+	// Built is when this status was recorded (RFC 3339, UTC); packages.html
+	// lists the most recent first.
+	Built string `json:"built,omitempty"`
 }
 
 // websiteLogsKept is how many build logs per package stay on the site. Older
@@ -150,6 +154,7 @@ func UpdateWebsiteStatus(pkgName, version, status, logPath string) error {
 	}
 	packages[index].Version = version
 	packages[index].Status = status
+	packages[index].Built = time.Now().UTC().Format(time.RFC3339)
 	if logRelPath != "" {
 		for _, old := range recordWebsiteLog(&packages[index], logRelPath) {
 			if err := os.Remove(filepath.Join(websiteRepo, old)); err != nil && !errors.Is(err, os.ErrNotExist) {

@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func gunzipFile(t *testing.T, path string) string {
@@ -92,6 +93,9 @@ func TestUpdateWebsiteStatusRebasesOntoIndexCommits(t *testing.T) {
 	}
 	if len(status) != 1 || status[0].Log != "logs/imagemagick-7.1.2-32-1.txt.gz" {
 		t.Fatalf("unexpected published status %+v", status)
+	}
+	if built, err := time.Parse(time.RFC3339, status[0].Built); err != nil || time.Since(built) > time.Minute {
+		t.Fatalf("status has no current build time: %q (%v)", status[0].Built, err)
 	}
 	if got := gunzipFile(t, filepath.Join(local, "logs", "imagemagick-7.1.2-32-1.txt.gz")); got != "build output\n" {
 		t.Fatalf("published log %q", got)
