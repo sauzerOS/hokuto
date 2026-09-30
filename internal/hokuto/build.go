@@ -1632,6 +1632,15 @@ for arg in "$@" .; do
     fi
 done
 
+# hokuto exports the target sysroot's PKG_CONFIG_* variables to the whole
+# build, which meson's build-machine pkg-config inherits. Build-time tools it
+# resolves that way (glib-compile-resources, glib-mkenums, wayland-scanner, ...)
+# would then come from the sysroot and fail with "Exec format error". The
+# native file points build-machine lookups back at the host's pkg-config.
+if [ "${HOKUTO_CROSS:-0}" = "1" ] && [ -n "${HOKUTO_NATIVE_FILE:-}" ]; then
+    set -- --native-file "$HOKUTO_NATIVE_FILE" "$@"
+fi
+
 set -x
 exec meson setup \
     --prefix "$PREFIX" \

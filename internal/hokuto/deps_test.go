@@ -2613,7 +2613,7 @@ printf '%s\n' "$@" > "$MESON_ARGS_FILE"
 		t.Fatal(err)
 	}
 
-	runHelper := func(t *testing.T, helper string, want []string) {
+	runHelper := func(t *testing.T, helper string, want []string, env ...string) {
 		t.Helper()
 		argsFile := filepath.Join(tmp, helper+"-args")
 		cmd := exec.Command(filepath.Join(helperDir, helper), "build", sourceDir, "-Dfoo=bar")
@@ -2621,7 +2621,9 @@ printf '%s\n' "$@" > "$MESON_ARGS_FILE"
 		cmd.Env = append(os.Environ(),
 			"PATH="+fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"),
 			"MESON_ARGS_FILE="+argsFile,
+			"HOKUTO_CROSS=",
 		)
+		cmd.Env = append(cmd.Env, env...)
 		if out, err := cmd.CombinedOutput(); err != nil {
 			t.Fatalf("%s failed: %v\n%s", helper, err, out)
 		}
@@ -2670,6 +2672,13 @@ printf '%s\n' "$@" > "$MESON_ARGS_FILE"
 	wantMeson := append(append(append([]string{}, commonPrefix...), "lib"), commonSuffix...)
 	wantMeson = append(wantMeson, commonFinal...)
 	runHelper(t, "hokuto-meson", wantMeson)
+
+	// A cross build points build-machine pkg-config lookups at the host so
+	// build-time tools are not taken from the target sysroot.
+	wantMesonCross := append(append(append([]string{}, commonPrefix...), "lib"), commonSuffix...)
+	wantMesonCross = append(wantMesonCross, "-D", "b_pie=true", "-D", "b_ndebug=true", "-D", "python.bytecompile=1",
+		"--cross-file", "aarch64", "--native-file", "/tmp/native.ini", "build", sourceDir, "-Dfoo=bar")
+	runHelper(t, "hokuto-meson", wantMesonCross, "HOKUTO_CROSS=1", "HOKUTO_ARCH=aarch64", "HOKUTO_NATIVE_FILE=/tmp/native.ini")
 
 	wantMeson32 := append(append(append([]string{}, commonPrefix...), "lib32"), commonSuffix...)
 	wantMeson32 = append(wantMeson32, "--cross-file", "lib32")
