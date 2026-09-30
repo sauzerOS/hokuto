@@ -369,3 +369,71 @@ func writeLibDeps(libdepsFile string, libs []string, execCtx *Executor) error {
 	}
 	return nil
 }
+
+// libDepMachineUse records whether a libdeps entry is needed by ELF files
+// built for the cross target, by files built for any other machine (the build
+// host), or both.
+type libDepMachineUse struct {
+	target bool
+	host   bool
+}
+
+// elfMachineForArchPrefix maps a cross-system package prefix to the ELF
+// machine of the target files such a package ships.
+func elfMachineForArchPrefix(prefix string) (elf.Machine, bool) {
+	switch prefix {
+	case "aarch64-":
+		return elf.EM_AARCH64, true
+	case "x86_64-":
+		return elf.EM_X86_64, true
+	}
+	return elf.EM_NONE, false
+}
+
+// libDepsByMachine classifies the DT_NEEDED entries of the executable ELF
+// files in outputDir by the machine they were built for, keyed like libdeps
+// entries ("elf64:libfoo.so.1"). A cross-system package (aarch64-foo) holds
+// target libraries, whose dependencies live in the sysroot, and may also hold
+// host tools (aarch64-gcc's compiler), whose dependencies live on the host;
+// the libdeps file alone cannot tell the two apart. Files the native reader
+// cannot parse are skipped, leaving their libraries to the host-only default.
+var libDepsByMachine = func(outputDir string, target elf.Machine) (map[string]libDepMachineUse, error) {
+	uses := make(map[string]libDepMachineUse)
+	err := filepath.WalkDir(outputDir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if !d.Type().IsRegular() {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil || info.Mode().Perm()&0o111 == 0 {
+			return err
+		}
+		f, err := elf.Open(path)
+		if err != nil {
+			return nil
+		}
+		defer f.Close()
+		abi := "elf64"
+		if f.Class == elf.ELFCLASS32 {
+			abi = "elf32"
+		}
+		needed, err := f.ImportedLibraries()
+		if err != nil {
+			return nil
+		}
+		for _, lib := range needed {
+			key := abi + ":" + lib
+			use := uses[key]
+			if f.Machine == target {
+				use.target = true
+			} else {
+				use.host = true
+			}
+			uses[key] = use
+		}
+		return nil
+	})
+	return uses, err
+}

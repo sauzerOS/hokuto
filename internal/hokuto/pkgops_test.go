@@ -3,8 +3,10 @@ package hokuto
 import (
 	"archive/tar"
 	"context"
+	"debug/elf"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -559,5 +561,75 @@ func TestGenerateDependsUsesVersionedRuntimePackageForConstraint(t *testing.T) {
 	}
 	if got, want := string(data), "webrtc-audio-processing-1\n"; got != want {
 		t.Fatalf("unexpected generated dependencies: got %q want %q", got, want)
+	}
+}
+
+func generateDependsForCrossOwners(t *testing.T, pkgName string, uses map[string]libDepMachineUse) []string {
+	t.Helper()
+	tmp := t.TempDir()
+	pkgDir := filepath.Join(tmp, "repo", strings.TrimPrefix(pkgName, "aarch64-"))
+	outputDir := filepath.Join(tmp, "out")
+	dbRoot := filepath.Join(outputDir, "var", "db", "hokuto", "installed")
+	targetDir := filepath.Join(dbRoot, pkgName)
+	if err := os.MkdirAll(pkgDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	owners := map[string]string{
+		"harfbuzz":         "/usr/lib/libharfbuzz.so.0",
+		"aarch64-harfbuzz": "/usr/aarch64-linux-gnu/lib/libharfbuzz.so.0",
+		"zlib-ng":          "/usr/lib/libz.so.1",
+		"aarch64-zlib-ng":  "/usr/aarch64-linux-gnu/lib/libz.so.1",
+	}
+	for owner, path := range owners {
+		if err := os.MkdirAll(filepath.Join(dbRoot, owner), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dbRoot, owner, "manifest"), []byte(path+" -\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.MkdirAll(targetDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(targetDir, "libdeps"), []byte("elf64:libharfbuzz.so.0\nelf64:libz.so.1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	oldScan := libDepsByMachine
+	libDepsByMachine = func(string, elf.Machine) (map[string]libDepMachineUse, error) { return uses, nil }
+	t.Cleanup(func() { libDepsByMachine = oldScan })
+
+	execCtx := &Executor{Context: context.Background()}
+	if err := generateDepends(pkgName, pkgDir, outputDir, outputDir, execCtx, false); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(targetDir, "depends"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := strings.Fields(string(data))
+	sort.Strings(got)
+	return got
+}
+
+func TestGenerateDependsCrossSystemPackageRecordsSysrootOwners(t *testing.T) {
+	// aarch64-freetype's target library needs libharfbuzz.so.0 from the
+	// sysroot, and a host tool it ships needs the host's libz alongside the
+	// target library's sysroot libz.
+	got := generateDependsForCrossOwners(t, "aarch64-freetype", map[string]libDepMachineUse{
+		"elf64:libharfbuzz.so.0": {target: true},
+		"elf64:libz.so.1":        {target: true, host: true},
+	})
+	want := []string{"aarch64-harfbuzz", "aarch64-zlib-ng", "zlib-ng"}
+	if strings.Join(got, " ") != strings.Join(want, " ") {
+		t.Fatalf("depends = %v, want %v", got, want)
+	}
+}
+
+func TestGenerateDependsNativePackageIgnoresSysrootOwners(t *testing.T) {
+	got := generateDependsForCrossOwners(t, "freetype", nil)
+	want := []string{"harfbuzz", "zlib-ng"}
+	if strings.Join(got, " ") != strings.Join(want, " ") {
+		t.Fatalf("depends = %v, want %v", got, want)
 	}
 }

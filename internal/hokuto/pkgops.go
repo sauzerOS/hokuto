@@ -457,6 +457,17 @@ func libraryPathMatchesDep(path string, dep libDepRef) bool {
 // isArchPrefixedPackageName reports whether name is a cross-system package
 // name (aarch64-foo, x86_64-foo), i.e. one installed into /usr/<triplet> on
 // the machine performing cross builds rather than onto a target system.
+// archPrefixOf returns the cross-system prefix ("aarch64-", "x86_64-") of a
+// package name, or "" for a native package.
+func archPrefixOf(name string) string {
+	for _, prefix := range []string{"aarch64-", "x86_64-"} {
+		if strings.HasPrefix(name, prefix) {
+			return prefix
+		}
+	}
+	return ""
+}
+
 func isArchPrefixedPackageName(name string) bool {
 	for _, prefix := range []string{"aarch64-", "x86_64-"} {
 		if strings.HasPrefix(name, prefix) {
@@ -565,6 +576,42 @@ func generateDepends(pkgName, pkgDir, outputDir, rootDir string, execCtx *Execut
 				libdeps = append(libdeps, dep)
 			}
 		}
+		// A cross-system package (aarch64-foo) links its target files against
+		// the sysroot copies of its libraries, owned by aarch64-* packages, and
+		// any host tools it ships against the host's. Both kinds of owner match
+		// a library by name, so pick the one built for the same machine as the
+		// files that need it. Without this, aarch64-freetype recorded the host
+		// "harfbuzz" for libharfbuzz.so.0, which the build host always has, and
+		// installing it never pulled in aarch64-harfbuzz.
+		targetPrefix := archPrefixOf(pkgName)
+		var machineUses map[string]libDepMachineUse
+		if machine, ok := elfMachineForArchPrefix(targetPrefix); ok && len(libdeps) > 0 {
+			uses, err := libDepsByMachine(outputDir, machine)
+			if err != nil {
+				debugf("Could not classify library dependencies of %s by machine: %v\n", pkgName, err)
+			} else {
+				machineUses = uses
+			}
+		}
+		ownerServesLib := func(owner string, lib libDepRef) bool {
+			if targetPrefix == "" {
+				return true
+			}
+			key := lib.Name
+			if lib.ABI != "" {
+				key = lib.ABI + ":" + lib.Name
+			}
+			use, ok := machineUses[key]
+			if !ok {
+				// Unclassified: keep the host owner, as before.
+				use = libDepMachineUse{host: true}
+			}
+			if strings.HasPrefix(owner, targetPrefix) {
+				return use.target
+			}
+			return use.host
+		}
+
 		if len(libdeps) > 0 {
 			// Scan all installed packages for matching libs
 			dbRoot := runtimeDBRoot
@@ -601,6 +648,9 @@ func generateDepends(pkgName, pkgDir, outputDir, rootDir string, execCtx *Execut
 				lines := strings.Split(string(data), "\n")
 
 				for _, lib := range libdeps {
+					if !ownerServesLib(otherPkg, lib) {
+						continue
+					}
 					for _, line := range lines {
 						entry, ok, parseErr := parseManifestLine(line)
 						if parseErr != nil || !ok || strings.HasSuffix(entry.Path, "/") {
@@ -732,10 +782,16 @@ func generateDepends(pkgName, pkgDir, outputDir, rootDir string, execCtx *Execut
 
 	// Then, add library-only dependencies (just package names)
 	for dep, line := range libDepSet {
-		// Ignore aarch64- and bootstrap-only packages in auto-detected dependencies (Part 1/libdeps)
-		// unless they were explicitly listed in the repo depends file (Part 2).
-		// repoDepLines packages have already been removed from libDepSet at this point.
-		if strings.HasPrefix(dep, "aarch64-") || isBootstrapOnlyPackageName(dep) {
+		// Ignore sysroot (aarch64-*) and bootstrap-only packages in
+		// auto-detected dependencies (Part 1/libdeps) unless they were
+		// explicitly listed in the repo depends file (Part 2). A sysroot
+		// package keeps sysroot owners of its own architecture: those are its
+		// real runtime dependencies. repoDepLines packages have already been
+		// removed from libDepSet at this point.
+		if prefix := archPrefixOf(dep); prefix != "" && prefix != archPrefixOf(pkgName) {
+			continue
+		}
+		if isBootstrapOnlyPackageName(dep) {
 			continue
 		}
 		deps = append(deps, line)
