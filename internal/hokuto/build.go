@@ -1641,6 +1641,26 @@ if [ "${HOKUTO_CROSS:-0}" = "1" ] && [ -n "${HOKUTO_NATIVE_FILE:-}" ]; then
     set -- --native-file "$HOKUTO_NATIVE_FILE" "$@"
 fi
 
+# hokuto appends the target sysroot's bin directory to PATH for cross builds.
+# meson needs none of it -- the cross file names the prefixed cross tools in
+# /usr/bin -- and with it a native find_program() whose host package is missing
+# silently picks the target binary instead of failing at configure time.
+if [ "${HOKUTO_CROSS:-0}" = "1" ] && [ -n "${HOKUTO_ARCH:-}" ]; then
+    sysroot_bin="/usr/${HOKUTO_ARCH}-linux-gnu/bin"
+    new_path=""
+    old_ifs=$IFS
+    IFS=:
+    set -f
+    for dir in $PATH; do
+        [ "$dir" = "$sysroot_bin" ] && continue
+        new_path="${new_path:+$new_path:}$dir"
+    done
+    set +f
+    IFS=$old_ifs
+    PATH=$new_path
+    export PATH
+fi
+
 set -x
 exec meson setup \
     --prefix "$PREFIX" \

@@ -2608,6 +2608,7 @@ func TestHokutoMesonHelpersRunMesonSetupWithDefaults(t *testing.T) {
 	fakeMeson := filepath.Join(fakeBin, "meson")
 	fakeMesonScript := `#!/bin/sh
 printf '%s\n' "$@" > "$MESON_ARGS_FILE"
+printf '%s\n' "$PATH" > "$MESON_ARGS_FILE.path"
 `
 	if err := os.WriteFile(fakeMeson, []byte(fakeMesonScript), 0o755); err != nil {
 		t.Fatal(err)
@@ -2678,7 +2679,18 @@ printf '%s\n' "$@" > "$MESON_ARGS_FILE"
 	wantMesonCross := append(append(append([]string{}, commonPrefix...), "lib"), commonSuffix...)
 	wantMesonCross = append(wantMesonCross, "-D", "b_pie=true", "-D", "b_ndebug=true", "-D", "python.bytecompile=1",
 		"--cross-file", "aarch64", "--native-file", "/tmp/native.ini", "build", sourceDir, "-Dfoo=bar")
-	runHelper(t, "hokuto-meson", wantMesonCross, "HOKUTO_CROSS=1", "HOKUTO_ARCH=aarch64", "HOKUTO_NATIVE_FILE=/tmp/native.ini")
+	runHelper(t, "hokuto-meson", wantMesonCross, "HOKUTO_CROSS=1", "HOKUTO_ARCH=aarch64", "HOKUTO_NATIVE_FILE=/tmp/native.ini",
+		"PATH="+fakeBin+string(os.PathListSeparator)+os.Getenv("PATH")+string(os.PathListSeparator)+"/usr/aarch64-linux-gnu/bin")
+	crossPath, err := os.ReadFile(filepath.Join(tmp, "hokuto-meson-args.path"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(crossPath), "/usr/aarch64-linux-gnu/bin") {
+		t.Fatalf("meson setup should not see the target sysroot bin in PATH: %s", crossPath)
+	}
+	if !strings.Contains(string(crossPath), fakeBin) {
+		t.Fatalf("meson setup lost the rest of PATH: %s", crossPath)
+	}
 
 	wantMeson32 := append(append(append([]string{}, commonPrefix...), "lib32"), commonSuffix...)
 	wantMeson32 = append(wantMeson32, "--cross-file", "lib32")

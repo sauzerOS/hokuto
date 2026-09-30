@@ -188,6 +188,47 @@ cmd_create() {
     info "Container ready: $ROOTFS"
 }
 
+# Cross builds run target binaries (meson build tools, spa-json-dump, test
+# helpers) through qemu-user-static via binfmt_misc. That registration is host
+# kernel state: in the container systemd-binfmt cannot run and
+# /proc/sys/fs/binfmt_misc is read only, so the post-install of the
+# container's qemu-user-static-binfmt registers nothing and aarch64 binaries
+# fail with "Exec format error". Register it from the host instead. The F flag
+# makes the kernel open the interpreter at registration, so it works inside the
+# container even when the path only exists in the container's root.
+ensure_qemu_binfmt() {
+    local name=qemu-aarch64 binfmt=/proc/sys/fs/binfmt_misc
+    local conf=/usr/lib/binfmt.d/qemu-aarch64-static.conf
+    local interp=/usr/bin/qemu-aarch64-static root="" rule
+    [ -e "$binfmt/$name" ] && return 0
+    if ! mountpoint -q "$binfmt"; then
+        mount -t binfmt_misc binfmt_misc "$binfmt" 2>/dev/null || {
+            info "binfmt_misc is unavailable; cross builds cannot run aarch64 binaries"
+            return 0
+        }
+        [ -e "$binfmt/$name" ] && return 0
+    fi
+    if [ ! -f "$conf" ] || [ ! -x "$interp" ]; then
+        root=$ROOTFS
+        if [ ! -f "$root$conf" ] || [ ! -x "$root$interp" ]; then
+            info "Installing qemu-user-static-binfmt into the container for cross builds"
+            HOKUTO_ROOT="$ROOTFS" hokuto install -y --remote qemu-user-static-binfmt || {
+                info "Could not install qemu-user-static-binfmt; cross builds cannot run aarch64 binaries"
+                return 0
+            }
+        fi
+    fi
+    rule=$(grep -m1 "^:$name:" "$root$conf") || return 0
+    # Fields: :name:type:offset:magic:mask:interpreter:flags
+    rule=$(printf '%s\n' "$rule" | awk -F: -v OFS=: -v interp="$root$interp" '
+        { $7 = interp; if ($8 !~ /F/) $8 = $8 "F"; print }')
+    if printf '%s' "$rule" >"$binfmt/register" 2>/dev/null; then
+        info "Registered $name with binfmt_misc for cross builds"
+    else
+        info "Could not register $name with binfmt_misc; cross builds cannot run aarch64 binaries"
+    fi
+}
+
 # nspawn_run <user> <command...>
 nspawn_run() {
     local user=$1
@@ -196,6 +237,7 @@ nspawn_run() {
     # Removable drives are remounted nosuid by udisks after a replug.
     check_location "$ROOTFS"
     check_sources_mount
+    ensure_qemu_binfmt
 
     local args=(
         --quiet
