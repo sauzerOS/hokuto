@@ -170,12 +170,29 @@ func crossSystemSysrootFor(cfg *Config, defaults map[string]string) string {
 // after the prefixed package and so never collides with a native one.
 var crossContainmentExemptPrefixes = []string{"/var/db/hokuto/"}
 
+// pathNamesCrossTarget reports whether a path outside the sysroot is named
+// after the target triplet, like the cross toolchain's own host programs and
+// support files: /usr/bin/aarch64-linux-gnu-gcc,
+// /usr/lib/gcc/aarch64-linux-gnu/16.2.0/cc1. Such a path cannot collide with a
+// native host file, so it is where a cross compiler (aarch64-gcc,
+// aarch64-binutils) legitimately installs outside the sysroot.
+func pathNamesCrossTarget(abs, triplet string) bool {
+	for _, part := range strings.Split(abs, "/") {
+		if part == triplet || strings.HasPrefix(part, triplet+"-") {
+			return true
+		}
+	}
+	return false
+}
+
 // verifyCrossSystemContainment refuses to package a cross,system build that
-// staged files outside its sysroot.
+// staged files outside its sysroot, other than ones named after the target
+// triplet (see pathNamesCrossTarget).
 func verifyCrossSystemContainment(outputDir, sysroot string) error {
 	if sysroot == "" {
 		return nil
 	}
+	triplet := filepath.Base(sysroot)
 	var stray []string
 	total := 0
 	walkErr := filepath.WalkDir(outputDir, func(path string, entry os.DirEntry, err error) error {
@@ -187,7 +204,7 @@ func verifyCrossSystemContainment(outputDir, sysroot string) error {
 			return nil
 		}
 		abs := "/" + filepath.ToSlash(rel)
-		if strings.HasPrefix(abs, sysroot+"/") {
+		if strings.HasPrefix(abs, sysroot+"/") || pathNamesCrossTarget(abs, triplet) {
 			return nil
 		}
 		for _, exempt := range crossContainmentExemptPrefixes {
