@@ -51,6 +51,7 @@ func printHelp() {
 			{"alt", "<pkg>", "List packages with alternatives or show/switch alternatives for a package"},
 			{"cleanup", "[options]", "Cleanup caches"},
 			{"depends", "[--reverse] <pkg>", "Show package dependencies or reverse dependencies"},
+			{"fetch", "[-f] <pkg[@ver]>...", "Download binary packages into the binary cache and keep them"},
 			{"find, f", "<query>", "Find which package matches query string"},
 			{"info", "", "View notices and additional information for installed packages"},
 			{"manifest, m", "<pkg>", "Show the file list for an installed package"},
@@ -192,6 +193,9 @@ func Main() {
 	// Create the main application context and the function to cancel it.
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	// Packages downloaded for this command are not kept; exitHokuto covers the
+	// paths that leave through os.Exit.
+	defer removeFetchedBinaries()
 
 	// 2. SIGNAL CHANNEL SETUP
 	sigs := make(chan os.Signal, 1)
@@ -213,7 +217,7 @@ func Main() {
 					case <-sigs:
 						colArrow.Print("\n-> ")
 						colError.Printf("Forced immediate exit.")
-						os.Exit(130) // Common exit code for SIGINT
+						exitHokuto(130) // Common exit code for SIGINT
 					case <-time.After(5 * time.Second):
 						// If no second signal, continue waiting for the loop to repeat
 						continue
@@ -235,12 +239,12 @@ func Main() {
 					case <-sigs:
 						colArrow.Print("\n-> ")
 						color.Danger.Printf("Second interrupt received. Forcing immediate exit.")
-						os.Exit(130)
+						exitHokuto(130)
 					case <-time.After(2 * time.Second):
 						// Give more time for graceful shutdown (increased from 500ms to 2s)
 						colArrow.Print("\n-> ")
 						color.Danger.Printf("Graceful shutdown timeout. Exiting.")
-						os.Exit(130)
+						exitHokuto(130)
 					}
 				}
 
@@ -269,7 +273,7 @@ func Main() {
 	cfg, err := loadConfig(configPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to load configuration: %v\n", err)
-		os.Exit(1)
+		exitHokuto(1)
 	}
 	mergeEnvOverrides(cfg)
 	initConfig(cfg)
@@ -285,7 +289,7 @@ func Main() {
 	if requiresRoot {
 		if err := authenticateOnce(false); err != nil {
 			fmt.Fprintf(os.Stderr, "Authentication failed: %v\n", err)
-			os.Exit(1)
+			exitHokuto(1)
 		}
 	}
 
@@ -326,7 +330,7 @@ func Main() {
 					} else {
 						// Only fail if it's not a direct tarball path (already checked above, but to be safe)
 						fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-						os.Exit(1)
+						exitHokuto(1)
 					}
 				}
 			}
@@ -339,7 +343,7 @@ func Main() {
 		if err := ensureHokutoOwnership(cfg, requiresRoot); err != nil {
 			if requiresRoot {
 				fmt.Fprintf(os.Stderr, "Error: failed to prepare Hokuto directories: %v\n", err)
-				os.Exit(1)
+				exitHokuto(1)
 			}
 			fmt.Fprintf(os.Stderr, "Warning: Ownership check failed: %v\n", err)
 		}
@@ -377,7 +381,7 @@ func Main() {
 		// parallel, and unpacks with -d.
 		if err := runZstdFramesFilter(os.Args[2:]); err != nil {
 			fmt.Fprintf(os.Stderr, "hokuto: zstd filter failed: %v\n", err)
-			os.Exit(1)
+			exitHokuto(1)
 		}
 
 	case "__place-staging":
@@ -386,11 +390,11 @@ func Main() {
 		// Executor's sudo/run0 handling instead of re-implementing it.
 		if len(os.Args) != 4 {
 			fmt.Fprintln(os.Stderr, "Usage: hokuto __place-staging <staging-dir> <root-dir>")
-			os.Exit(2)
+			exitHokuto(2)
 		}
 		if err := placeStagingLocally(os.Args[2], os.Args[3]); err != nil {
 			fmt.Fprintf(os.Stderr, "hokuto: staging placement failed: %v\n", err)
-			os.Exit(1)
+			exitHokuto(1)
 		}
 
 	case "__complete":
@@ -428,25 +432,25 @@ func Main() {
 		// Pass 'cfg' to the function
 		if err := handleCleanupCommand(os.Args[2:], cfg); err != nil {
 			fmt.Fprintf(os.Stderr, "Cleanup failed: %v\n", err)
-			os.Exit(1)
+			exitHokuto(1)
 		}
 
 	case "python-rebuild":
 		if err := handlePythonRebuildCommand(cfg); err != nil {
 			fmt.Fprintf(os.Stderr, "Python rebuild failed: %v\n", err)
-			os.Exit(1)
+			exitHokuto(1)
 		}
 
 	case "perl-rebuild":
 		if err := handlePerlRebuildCommand(cfg); err != nil {
 			fmt.Fprintf(os.Stderr, "Perl rebuild failed: %v\n", err)
-			os.Exit(1)
+			exitHokuto(1)
 		}
 
 	case "alt":
 		if err := handleAlternativesCommand(os.Args[2:]); err != nil {
 			fmt.Fprintf(os.Stderr, "Alternatives command failed: %v\n", err)
-			os.Exit(1)
+			exitHokuto(1)
 		}
 
 	case "info":
@@ -458,47 +462,53 @@ func Main() {
 	case "settings":
 		if err := handleSettingsCommand(cfg); err != nil {
 			fmt.Fprintf(os.Stderr, "Settings command failed: %v\n", err)
-			os.Exit(1)
+			exitHokuto(1)
 		}
 
 	case "init-repos":
 		if err := handleInitReposCommand(cfg); err != nil {
 			fmt.Fprintf(os.Stderr, "Repository initialization failed: %v\n", err)
-			os.Exit(1)
+			exitHokuto(1)
 		}
 
 	case "upload":
 		if err := handleUploadCommand(os.Args[2:], cfg); err != nil {
 			fmt.Fprintf(os.Stderr, "Upload failed: %v\n", err)
-			os.Exit(1)
+			exitHokuto(1)
 		}
 
 	case "keys":
 		if err := handleKeysCommand(os.Args[2:], cfg); err != nil {
 			fmt.Fprintf(os.Stderr, "Keys command failed: %v\n", err)
-			os.Exit(1)
+			exitHokuto(1)
 		}
 
 	case "sign-file":
 		if len(os.Args) < 3 {
 			fmt.Println("Usage: hokuto sign-file <path>")
-			os.Exit(1)
+			exitHokuto(1)
 		}
 		if err := handleSignFileCommand(os.Args[2:]); err != nil {
 			fmt.Fprintf(os.Stderr, "Sign-file failed: %v\n", err)
-			os.Exit(1)
+			exitHokuto(1)
 		}
 
 	case "depends":
 		if err := handleDependsCommand(os.Args[2:], cfg); err != nil {
 			fmt.Fprintf(os.Stderr, "Depends command failed: %v\n", err)
-			os.Exit(1)
+			exitHokuto(1)
+		}
+
+	case "fetch":
+		if err := handleFetchCommand(os.Args[2:], cfg); err != nil {
+			fmt.Fprintf(os.Stderr, "Fetch failed: %v\n", err)
+			exitHokuto(1)
 		}
 
 	case "cross-sync":
 		if err := handleCrossSyncCommand(os.Args[2:], cfg); err != nil {
 			fmt.Fprintf(os.Stderr, "Cross-sync failed: %v\n", err)
-			os.Exit(1)
+			exitHokuto(1)
 		}
 
 	case "version", "--version":
@@ -531,7 +541,7 @@ func Main() {
 		var checkIntegrity = lsCmd.Bool("check-integrity", false, "Check installed manifests for missing or modified files and offer to reinstall affected packages.")
 		if err := lsCmd.Parse(os.Args[2:]); err != nil {
 			fmt.Fprintf(os.Stderr, "Error parsing ls flags: %v\n", err)
-			os.Exit(1)
+			exitHokuto(1)
 		}
 
 		pkg := ""
@@ -567,17 +577,17 @@ func Main() {
 	case "check":
 		if len(os.Args) < 3 {
 			fmt.Println("Usage: hokuto check <pkgname>")
-			os.Exit(1)
+			exitHokuto(1)
 		}
 		pkgName := os.Args[2]
 
 		// Perform exact match check
 		if checkPackageExactMatch(pkgName) {
 			// Package found - silent success, exit 0
-			os.Exit(0)
+			exitHokuto(0)
 		} else {
 			// Package not found - silent failure, exit 1
-			os.Exit(1)
+			exitHokuto(1)
 		}
 
 	case "checksum", "c":
@@ -624,13 +634,13 @@ func Main() {
 		}
 
 		if overallErr != nil {
-			os.Exit(1)
+			exitHokuto(1)
 		}
 
 	case "build", "b":
 		if err := handleBuildCommand(os.Args[2:], cfg); err != nil {
 			fmt.Fprintf(os.Stderr, "Build failed: %v\n", err)
-			os.Exit(1)
+			exitHokuto(1)
 		}
 
 	case "bootstrap":
@@ -638,7 +648,7 @@ func Main() {
 		if len(os.Args) < 3 {
 			fmt.Fprintln(os.Stderr, "Usage: hokuto bootstrap <bootstrap-dir>")
 			fmt.Fprintln(os.Stderr, "Error: Missing required argument: <bootstrap-dir>")
-			os.Exit(1)
+			exitHokuto(1)
 		}
 		bootstrapDirArg := os.Args[2]
 
@@ -657,7 +667,7 @@ func Main() {
 		// 3. Call the generic build handler with the constructed arguments.
 		if err := handleBuildCommand(buildArgs, cfg); err != nil {
 			fmt.Fprintf(os.Stderr, "Bootstrap failed: %v\n", err)
-			os.Exit(1)
+			exitHokuto(1)
 		}
 
 	case "install", "i":
@@ -678,7 +688,7 @@ func Main() {
 
 		if err := installCmd.Parse(os.Args[2:]); err != nil {
 			fmt.Fprintf(os.Stderr, "Error parsing install flags: %v\n", err)
-			os.Exit(1)
+			exitHokuto(1)
 		}
 		if *debug {
 			enableRuntimeDebug(cfg)
@@ -702,7 +712,7 @@ func Main() {
 
 		if *remote && *noRemote {
 			fmt.Fprintln(os.Stderr, "Error: --remote and --no-remote cannot be used together.")
-			os.Exit(1)
+			exitHokuto(1)
 		}
 		if *noDeps {
 			defer suppressRuntimeDependencyAutoInstallScope()()
@@ -716,7 +726,7 @@ func Main() {
 			remoteIndex, err = fetchRemoteIndex(cfg, effectiveFast)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Error fetching remote index: %v\n", err)
-				os.Exit(1)
+				exitHokuto(1)
 			}
 		} else if !*noRemote && BinaryMirror != "" {
 			// A normal install may still obtain packages from the binary mirror. Use
@@ -734,7 +744,7 @@ func Main() {
 		if len(packagesToInstall) == 0 {
 			fmt.Println("Usage: hokuto install [options] <tarball|pkgname>")
 			installCmd.PrintDefaults()
-			os.Exit(1)
+			exitHokuto(1)
 		}
 
 		// Kernel module packages are installed per kernel (nvidia-open~linux).
@@ -742,7 +752,7 @@ func Main() {
 		packagesToInstall, legacyKmods, err := expandKmodRequests(packagesToInstall, kmodPromptAssumesYes(effectiveYes), stdinReader, os.Stdout)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(1)
+			exitHokuto(1)
 		}
 		for _, legacy := range legacyKmods {
 			colWarn.Printf("%s was installed before kernel modules were tracked per kernel; it is replaced by the per-kernel package(s).\n", legacy)
@@ -751,12 +761,12 @@ func Main() {
 				answer, _ := stdinReader.ReadString('\n')
 				if a := strings.ToLower(strings.TrimSpace(answer)); a != "" && a != "y" && a != "yes" {
 					fmt.Fprintf(os.Stderr, "Aborted: %s must be removed before its per-kernel packages can be installed.\n", legacy)
-					os.Exit(1)
+					exitHokuto(1)
 				}
 			}
 			if err := pkgUninstall(legacy, cfg, RootExec, true, true, nil); err != nil {
 				fmt.Fprintf(os.Stderr, "Error: failed to uninstall %s: %v\n", legacy, err)
-				os.Exit(1)
+				exitHokuto(1)
 			}
 			if err := removeFromWorld(legacy); err != nil {
 				debugf("Warning: failed to remove %s from world: %v\n", legacy, err)
@@ -831,7 +841,7 @@ func Main() {
 				// Recursively find missing dependencies (always check if deps are installed, force doesn't apply to deps)
 				if err := resolveBinaryDependencies(pkgName, visited, &installPlan, false, effectiveYes, cfg, remoteIndex, !*noRemote); err != nil {
 					fmt.Fprintf(os.Stderr, "Error resolving dependencies for %s: %v\n", pkgName, err)
-					os.Exit(1)
+					exitHokuto(1)
 				}
 			}
 
@@ -860,7 +870,7 @@ func Main() {
 		if len(installPlan) == 0 && len(requestedMetas) == 0 && !*force {
 			colArrow.Print("-> ")
 			colSuccess.Println("All packages and dependencies are already installed.")
-			os.Exit(0)
+			exitHokuto(0)
 		}
 
 		// Notify user if extra dependencies were pulled in
@@ -888,7 +898,7 @@ func Main() {
 		if len(installPlan) == 0 && len(requestedMetas) == 0 && *force {
 			colArrow.Print("-> ")
 			colSuccess.Println("All packages and dependencies are already installed.")
-			os.Exit(0)
+			exitHokuto(0)
 		}
 
 		if *ask && !confirmInstallPlanWithAsk(installPlan, requestedMetas) {
@@ -1366,7 +1376,7 @@ func Main() {
 		flushPackageSuggestions(os.Stdout, cfg, *noRemote, true, effectiveYes)
 
 		if !allSucceeded {
-			os.Exit(1)
+			exitHokuto(1)
 		}
 
 	case "uninstall", "remove", "r":
@@ -1381,7 +1391,7 @@ func Main() {
 
 		if err := uninstallCmd.Parse(os.Args[2:]); err != nil {
 			fmt.Fprintf(os.Stderr, "Error parsing uninstall flags: %v\n", err)
-			os.Exit(1)
+			exitHokuto(1)
 		}
 
 		packagesToUninstall := uninstallCmd.Args()
@@ -1390,16 +1400,16 @@ func Main() {
 		if *list {
 			if len(packagesToUninstall) > 0 {
 				fmt.Fprintln(os.Stderr, "Error: --list cannot be combined with package arguments.")
-				os.Exit(1)
+				exitHokuto(1)
 			}
 			entries, err := installedUninstallListEntries()
 			if err != nil {
 				fmt.Fprintln(os.Stderr, "Error listing installed packages:", err)
-				os.Exit(1)
+				exitHokuto(1)
 			}
 			if err := selectPackagesToUninstall(entries, cfg, effectiveForce); err != nil {
 				fmt.Fprintln(os.Stderr, "Error selecting packages:", err)
-				os.Exit(1)
+				exitHokuto(1)
 			}
 			break
 		}
@@ -1408,7 +1418,7 @@ func Main() {
 			fmt.Println("Usage: hokuto uninstall [options] <pkgname> [pkgname...]")
 			fmt.Println("Options:")
 			uninstallCmd.PrintDefaults()
-			os.Exit(1)
+			exitHokuto(1)
 		}
 
 		// critical section for the entire operation
@@ -1464,7 +1474,7 @@ func Main() {
 		}
 
 		if !allSucceeded {
-			os.Exit(1)
+			exitHokuto(1)
 		}
 		if removedMetaPackage {
 			handleOrphanCleanup(cfg, "")
@@ -1495,7 +1505,7 @@ func Main() {
 
 		if err := updateCmd.Parse(args); err != nil {
 			fmt.Fprintf(os.Stderr, "Error parsing update flags: %v\n", err)
-			os.Exit(1)
+			exitHokuto(1)
 		}
 
 		// Set the global variables that pkgBuild() reads
@@ -1510,15 +1520,15 @@ func Main() {
 
 		if *remote && *buildMissingBinaries {
 			fmt.Fprintln(os.Stderr, "Error: --remote and --build-missing-binaries cannot be used together.")
-			os.Exit(1)
+			exitHokuto(1)
 		}
 		if *remote {
 			if err := checkForRemoteUpgrades(ctx, cfg); err != nil {
 				fmt.Fprintf(os.Stderr, "Remote upgrade process failed: %v\n", err)
-				os.Exit(1)
+				exitHokuto(1)
 			}
 			refreshPkgDBInBackground()
-			os.Exit(0) // Exit after remote update
+			exitHokuto(0) // Exit after remote update
 		}
 
 		updateRepos()
@@ -1546,37 +1556,37 @@ func Main() {
 			}
 			if err := buildMissingRepositoryBinaries(cfg, buildArgs, effectiveYes); err != nil {
 				fmt.Fprintf(os.Stderr, "Missing binary build failed: %v\n", err)
-				os.Exit(1)
+				exitHokuto(1)
 			}
 			refreshPkgDBInBackground()
 			break
 		}
 		if err := checkForUpgrades(ctx, cfg, maxJobs, effectiveYes); err != nil {
 			fmt.Fprintf(os.Stderr, "Upgrade process failed: %v\n", err)
-			os.Exit(1)
+			exitHokuto(1)
 		}
 		refreshPkgDBInBackground()
 
 	case "manifest", "m":
 		if len(os.Args) < 3 {
 			fmt.Println("Usage: hokuto manifest <pkgname>")
-			os.Exit(1)
+			exitHokuto(1)
 		}
 		pkg := os.Args[2]
 		if err := showManifest(pkg); err != nil {
 			fmt.Fprintln(os.Stderr, "Error:", err)
-			os.Exit(1)
+			exitHokuto(1)
 		}
 
 	case "size":
 		if len(os.Args) < 3 {
 			fmt.Println("Usage: hokuto size <pkgname>")
-			os.Exit(1)
+			exitHokuto(1)
 		}
 		pkg := os.Args[2]
 		if err := showInstalledPackageSize(pkg); err != nil {
 			fmt.Fprintln(os.Stderr, "Error:", err)
-			os.Exit(1)
+			exitHokuto(1)
 		}
 
 	case "unmanaged":
@@ -1588,7 +1598,7 @@ func Main() {
 		unmanagedCmd.Var(&extraPaths, "add", "Add a file or directory to the backup selection. Can be repeated.")
 		if err := unmanagedCmd.Parse(os.Args[2:]); err != nil {
 			fmt.Fprintln(os.Stderr, "Error:", err)
-			os.Exit(1)
+			exitHokuto(1)
 		}
 		opts := unmanagedOptions{
 			CheckChecksums: *checkChecksums,
@@ -1598,18 +1608,18 @@ func Main() {
 		}
 		if err := handleUnmanagedCommand(cfg, opts); err != nil {
 			fmt.Fprintln(os.Stderr, "Error:", err)
-			os.Exit(1)
+			exitHokuto(1)
 		}
 
 	case "find", "f":
 		if len(os.Args) < 3 {
 			fmt.Println("Usage: hokuto find <string>")
-			os.Exit(1)
+			exitHokuto(1)
 		}
 		query := os.Args[2]
 		if err := findPackagesByManifestString(query); err != nil {
 			fmt.Fprintln(os.Stderr, "Error:", err)
-			os.Exit(1)
+			exitHokuto(1)
 		}
 
 	case "new", "n":
@@ -1619,12 +1629,12 @@ func Main() {
 		var fromAUR = newCmd.Bool("from-aur", false, "Import package from AUR")
 		if err := newCmd.Parse(os.Args[2:]); err != nil {
 			fmt.Fprintf(os.Stderr, "Error parsing new flags: %v\n", err)
-			os.Exit(1)
+			exitHokuto(1)
 		}
 		args := newCmd.Args()
 		if len(args) < 1 {
 			fmt.Println("Usage: hokuto new [-here] [--from-arch | --from-aur] <pkgname>")
-			os.Exit(1)
+			exitHokuto(1)
 		}
 		pkg := args[0]
 		var targetDir string
@@ -1633,7 +1643,7 @@ func Main() {
 			cwd, err := os.Getwd()
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Error getting current directory: %v\n", err)
-				os.Exit(1)
+				exitHokuto(1)
 			}
 			targetDir = cwd
 		} else {
@@ -1652,7 +1662,7 @@ func Main() {
 			if err := generatePackageFromArch(pkg, source, targetDir); err != nil {
 				if !isImportPackageNotFound(err) {
 					fmt.Fprintln(os.Stderr, "Error:", err)
-					os.Exit(1)
+					exitHokuto(1)
 				}
 				// If exact match fails, try fuzzy search
 				colWarn.Printf("Exact match failed: %v\n", err)
@@ -1662,7 +1672,7 @@ func Main() {
 				candidates, searchErr := searchMetadata(pkg)
 				if searchErr != nil || len(candidates) == 0 {
 					fmt.Fprintf(os.Stderr, "Error: No packages found matching '%s'\n", pkg)
-					os.Exit(1)
+					exitHokuto(1)
 				}
 
 				// Filter candidates by source if specified
@@ -1675,39 +1685,39 @@ func Main() {
 
 				if len(filtered) == 0 {
 					fmt.Fprintf(os.Stderr, "Error: No packages found in %s matching '%s'\n", source, pkg)
-					os.Exit(1)
+					exitHokuto(1)
 				}
 
 				selected := promptSelection(filtered)
 				if selected == nil {
 					fmt.Println("Package creation cancelled.")
-					os.Exit(0)
+					exitHokuto(0)
 				}
 
 				// Try again with selected package
 				if err := generatePackageFromArch(selected.Name, selected.Source, targetDir); err != nil {
 					fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-					os.Exit(1)
+					exitHokuto(1)
 				}
 			}
 		} else {
 			// Original behavior - create empty skeleton
 			if err := newPackage(pkg, targetDir); err != nil {
 				fmt.Fprintln(os.Stderr, "Error:", err)
-				os.Exit(1)
+				exitHokuto(1)
 			}
 		}
 
 	case "cd":
 		if len(os.Args) < 3 {
 			fmt.Println("Usage: hokuto cd <pkgname>")
-			os.Exit(1)
+			exitHokuto(1)
 		}
 		pkgName := os.Args[2]
 		pkgDir, err := findPackageDir(pkgName)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error: Package '%s' not found in any repository: %v\n", pkgName, err)
-			os.Exit(1)
+			exitHokuto(1)
 		}
 		// Spawn a shell in the package directory
 		shell := os.Getenv("SHELL")
@@ -1721,21 +1731,21 @@ func Main() {
 		cmd.Stderr = os.Stderr
 		if err := cmd.Run(); err != nil {
 			fmt.Fprintf(os.Stderr, "Error running shell: %v\n", err)
-			os.Exit(1)
+			exitHokuto(1)
 		}
-		os.Exit(0)
+		exitHokuto(0)
 
 	case "edit", "e":
 		if len(os.Args) != 3 {
 			fmt.Println("Usage: hokuto edit <pkgname>")
-			os.Exit(1)
+			exitHokuto(1)
 		}
 
 		pkg := os.Args[2]
 
 		if err := editPackage(pkg); err != nil {
 			fmt.Fprintln(os.Stderr, "Error:", err)
-			os.Exit(1)
+			exitHokuto(1)
 		}
 		refreshPkgDBInBackground()
 
@@ -1750,17 +1760,17 @@ func Main() {
 		var msgLong = bumpCmd.String("message", "", "Commit message")
 		if err := bumpCmd.Parse(os.Args[2:]); err != nil {
 			fmt.Fprintf(os.Stderr, "Error parsing bump flags: %v\n", err)
-			os.Exit(1)
+			exitHokuto(1)
 		}
 
 		if *auto {
 			effectiveYes := *yes || *yesLong
 			if err := HandleAutoBumpCommand(cfg, *build, effectiveYes); err != nil {
 				fmt.Fprintf(os.Stderr, "Auto bump failed: %v\n", err)
-				os.Exit(1)
+				exitHokuto(1)
 			}
 			refreshPkgDBInBackground()
-			os.Exit(0)
+			exitHokuto(0)
 		}
 
 		args := bumpCmd.Args()
@@ -1774,11 +1784,11 @@ func Main() {
 			pkgsetName, oldVersion, newVersion, commitMsg, err := parseSetBumpArgs(args, flagMsg)
 			if err != nil {
 				fmt.Println("Usage: hokuto bump -set <pkgset> <oldversion> <newversion> [message]")
-				os.Exit(1)
+				exitHokuto(1)
 			}
 			if err := handleSetBumpCommand(pkgsetName, oldVersion, newVersion, commitMsg, *build, cfg); err != nil {
 				fmt.Fprintf(os.Stderr, "Bump failed: %v\n", err)
-				os.Exit(1)
+				exitHokuto(1)
 			}
 		} else {
 			// Mode: Single Bump (hokuto bump <pkg> [newversion] [message] or hokuto bump <pkg> [message])
@@ -1787,12 +1797,12 @@ func Main() {
 				fmt.Println("Usage: hokuto bump <pkgname> [newversion] [message]")
 				fmt.Println("       hokuto bump <pkgname> [message]")
 				fmt.Println("       hokuto bump --auto")
-				os.Exit(1)
+				exitHokuto(1)
 			}
 
 			if err := handleSingleBumpCommand(pkgName, newVersion, commitMsg, *build, cfg); err != nil {
 				fmt.Fprintf(os.Stderr, "Bump failed: %v\n", err)
-				os.Exit(1)
+				exitHokuto(1)
 			}
 		}
 		refreshPkgDBInBackground()
@@ -1800,19 +1810,19 @@ func Main() {
 	case "meta":
 		if err := HandleMetaCommand(os.Args[2:], cfg); err != nil {
 			fmt.Fprintf(os.Stderr, "Meta command failed: %v\n", err)
-			os.Exit(1)
+			exitHokuto(1)
 		}
 
 	case "sync":
 		if err := SyncPkgDB(cfg); err != nil {
 			fmt.Fprintf(os.Stderr, "Sync failed: %v\n", err)
-			os.Exit(1)
+			exitHokuto(1)
 		}
 
 	case "search", "s":
 		if err := SearchPkgDB(os.Args[2:], cfg); err != nil {
 			fmt.Fprintf(os.Stderr, "Search failed: %v\n", err)
-			os.Exit(1)
+			exitHokuto(1)
 		}
 
 	default:
@@ -1820,7 +1830,7 @@ func Main() {
 		exitCode = 1
 	}
 	printPackageInfoReminderIfNeeded()
-	os.Exit(exitCode)
+	exitHokuto(exitCode)
 }
 
 // findNewestTarball finds the newest tarball matching the package name and variant pattern

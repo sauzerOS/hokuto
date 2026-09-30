@@ -185,20 +185,89 @@ func ReadPackageMetadata(tarballPath string) (RepoEntry, error) {
 		return entry, fmt.Errorf("failed to scan tarball metadata: %w", err)
 	}
 
-	// 3. Populate RepoEntry
+	fillRepoEntryMetadata(&entry, metadata, deps, libdeps)
+	return entry, nil
+}
+
+// fillRepoEntryMetadata sets the fields of entry that come from a package's
+// pkginfo, depends and libdeps files.
+func fillRepoEntryMetadata(entry *RepoEntry, metadata map[string]string, deps, libdeps []string) {
 	entry.Name = metadata["name"]
 	entry.Version = metadata["version"]
 	entry.Revision = metadata["revision"]
 	entry.Arch = metadata["arch"]
-
-	// 4. Identify variant
 	entry.Variant = IdentifyVariant(entry.Name, metadata["generic"] == "1", metadata["multilib"] == "1")
-
-	// 5. Populate Dependencies
 	entry.Depends = deps
 	entry.Libdeps = libdeps
+}
 
+// repoEntryFromPackageOutput is ReadPackageMetadata for a tarball hokuto has
+// just created from outputDir: the metadata is read from the files the archive
+// was made of instead of decompressing the archive to find them again.
+func repoEntryFromPackageOutput(tarballPath, outputDir, pkgName string) (RepoEntry, error) {
+	entry := RepoEntry{
+		Filename:        filepath.Base(tarballPath),
+		MetadataVersion: repoEntryMetadataVersion,
+	}
+	info, err := os.Stat(tarballPath)
+	if err != nil {
+		return entry, err
+	}
+	entry.Size = info.Size()
+	if entry.B3Sum, err = ComputeChecksum(tarballPath, nil); err != nil {
+		return entry, fmt.Errorf("failed to compute checksum: %w", err)
+	}
+
+	metaDir := filepath.Join(outputDir, "var", "db", "hokuto", "installed", pkgName)
+	pkginfo, err := os.ReadFile(filepath.Join(metaDir, "pkginfo"))
+	if err != nil {
+		return entry, err
+	}
+	var deps []string
+	if data, err := os.ReadFile(filepath.Join(metaDir, "depends")); err == nil {
+		deps = runtimeDependsForIndex(data, tarballPath)
+	}
+	libdeps := []string{}
+	if data, err := os.ReadFile(filepath.Join(metaDir, "libdeps")); err == nil {
+		libdeps = append(libdeps, libdepsForIndex(data)...)
+	}
+	fillRepoEntryMetadata(&entry, ParsePkgInfo(pkginfo), deps, libdeps)
+	if entry.Name == "" || entry.Version == "" {
+		return entry, fmt.Errorf("pkginfo in %s has no name or version", metaDir)
+	}
 	return entry, nil
+}
+
+// libdepsForIndex returns a libdeps file's entries as the index stores them.
+func libdepsForIndex(data []byte) []string {
+	var libdeps []string
+	for _, line := range strings.Split(string(data), "\n") {
+		if dep, ok := parseLibDepRef(line); ok {
+			libdeps = append(libdeps, dep.String())
+		}
+	}
+	return libdeps
+}
+
+// runtimeDependsForIndex returns the hard runtime dependencies of a depends
+// file as the index stores them. source only labels a parse warning.
+func runtimeDependsForIndex(data []byte, source string) []string {
+	depSpecs, err := parseDependsData(data)
+	if err != nil {
+		debugf("Warning: failed to parse depends data for %s: %v\n", source, err)
+		return nil
+	}
+	var dependencies []string
+	for _, d := range depSpecs {
+		if !d.Make && !d.Optional && !d.Rebuild && !d.PostInstall && !d.Suggest { // Only store hard runtime dependencies
+			name := d.Name
+			if len(d.Alternatives) > 1 {
+				name = strings.Join(d.Alternatives, " | ")
+			}
+			dependencies = append(dependencies, name+d.Op+d.Version)
+		}
+	}
+	return dependencies
 }
 
 // scanTarballMetadata reads pkginfo and depends files from a .tar.zst archive in one pass.
@@ -242,11 +311,7 @@ func scanTarballMetadataWithLibdeps(tarballPath string) (map[string]string, []st
 			if err != nil {
 				return nil, nil, nil, fmt.Errorf("failed to read libdeps from %s: %w", tarballPath, err)
 			}
-			for _, line := range strings.Split(string(data), "\n") {
-				if dep, ok := parseLibDepRef(line); ok {
-					libdeps = append(libdeps, dep.String())
-				}
-			}
+			libdeps = append(libdeps, libdepsForIndex(data)...)
 			continue
 		}
 
@@ -266,20 +331,7 @@ func scanTarballMetadataWithLibdeps(tarballPath string) (map[string]string, []st
 			if err != nil {
 				return nil, nil, nil, fmt.Errorf("failed to read depends from %s: %w", tarballPath, err)
 			}
-			depSpecs, err := parseDependsData(data)
-			if err != nil {
-				debugf("Warning: failed to parse depends data for %s: %v\n", tarballPath, err)
-				continue
-			}
-			for _, d := range depSpecs {
-				if !d.Make && !d.Optional && !d.Rebuild && !d.PostInstall && !d.Suggest { // Only store hard runtime dependencies
-					name := d.Name
-					if len(d.Alternatives) > 1 {
-						name = strings.Join(d.Alternatives, " | ")
-					}
-					dependencies = append(dependencies, name+d.Op+d.Version)
-				}
-			}
+			dependencies = append(dependencies, runtimeDependsForIndex(data, tarballPath)...)
 			continue
 		}
 	}

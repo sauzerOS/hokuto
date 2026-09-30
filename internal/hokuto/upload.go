@@ -11,7 +11,10 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 type uploadCacheEntry struct {
@@ -83,7 +86,82 @@ func saveUploadCache(path string, cache map[string]uploadCacheEntry) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0644)
+	// Replace atomically: a reader must never see a half-written file.
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".upload-cache-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmp.Name())
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Chmod(tmp.Name(), 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp.Name(), path)
+}
+
+// uploadCachePath is where upload remembers the metadata of local binaries,
+// keyed by file name, so it does not have to decompress every archive.
+func uploadCachePath() string {
+	return filepath.Join(CacheDir, "upload-scanning-cache.json")
+}
+
+var uploadCacheMu sync.Mutex
+
+// updateUploadCache applies set and remove to the scanning cache on disk.
+// Builds, binary fetches and upload all write it, possibly from several
+// hokuto processes at once, so the read-modify-write happens under a lock and
+// each writer only touches its own entries.
+func updateUploadCache(set map[string]uploadCacheEntry, remove []string) error {
+	if len(set) == 0 && len(remove) == 0 {
+		return nil
+	}
+	uploadCacheMu.Lock()
+	defer uploadCacheMu.Unlock()
+
+	path := uploadCachePath()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	// Read-only is enough for flock, and still works when a hokuto running as
+	// root (run0) created the lock file and the next run is the plain user.
+	lock, err := os.OpenFile(path+".lock", os.O_CREATE|os.O_RDONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	defer lock.Close()
+	if err := unix.Flock(int(lock.Fd()), unix.LOCK_EX); err != nil {
+		return err
+	}
+	defer unix.Flock(int(lock.Fd()), unix.LOCK_UN)
+
+	cache := loadUploadCache(path)
+	for _, filename := range remove {
+		delete(cache, filename)
+	}
+	maps.Copy(cache, set)
+	return saveUploadCache(path, cache)
+}
+
+// recordUploadCacheEntry remembers entry for the local binary at path, which
+// hokuto just created or fetched, so upload finds its metadata without
+// reading the archive. It is best effort: on failure upload scans the file.
+func recordUploadCacheEntry(path string, entry RepoEntry) {
+	info, err := os.Stat(path)
+	if err != nil || info.Size() != entry.Size {
+		return
+	}
+	err = updateUploadCache(map[string]uploadCacheEntry{
+		filepath.Base(path): {Size: info.Size(), Mtime: info.ModTime(), Entry: entry},
+	}, nil)
+	if err != nil {
+		debugf("Warning: failed to record %s in the upload scanning cache: %v\n", filepath.Base(path), err)
+	}
 }
 
 func repoEntriesByFilename(entries []RepoEntry) map[string]RepoEntry {
@@ -130,6 +208,7 @@ func handleUploadCommand(args []string, cfg *Config) error {
 	var deletePkg optionalStringFlag
 	uploadCmd.Var(&deletePkg, "delete", "Delete remote files with selector; optionally pass package name. Use --delete=all to delete everything immediately")
 	var migrate = uploadCmd.Bool("copy-from-r2", false, "Copy all files from Cloudflare R2 to current mirror")
+	var keepLocal = uploadCmd.Bool("keep-local", false, "Keep local binary packages that are already on the remote after --sync/--prompt")
 
 	// Set output to stderr to avoid polluting stdout if captured
 	uploadCmd.SetOutput(os.Stderr)
@@ -275,43 +354,22 @@ func handleUploadCommand(args []string, cfg *Config) error {
 		return err
 	}
 
-	cachePath := filepath.Join(CacheDir, "upload-scanning-cache.json")
-	cache := loadUploadCache(cachePath)
-	cacheUpdated := false
+	cache := loadUploadCache(uploadCachePath())
+	cacheSet := make(map[string]uploadCacheEntry)
 
+	scanned := scanLocalBinaries(localFiles, cache)
 	latestLocals := make(map[string]RepoEntry) // key: Name-Arch-Variant
-	for _, file := range localFiles {
-		filename := filepath.Base(file)
-
-		info, err := os.Stat(file)
-		if err != nil {
-			debugf("Warning: skipping %s: %v\n", file, err)
+	for _, result := range scanned {
+		if !result.ok {
 			continue
 		}
-
-		var entry RepoEntry
-		if cached, ok := cache[filename]; ok &&
-			cached.Size == info.Size() &&
-			cached.Mtime.Equal(info.ModTime()) &&
-			cached.Entry.MetadataVersion >= repoEntryMetadataVersion {
-			entry = cached.Entry
-		} else {
-			entry, err = ReadPackageMetadata(file)
-			if err != nil {
-				debugf("Warning: skipping %s: %v\n", file, err)
-				continue
-			}
-			// --- NEW: Sanity Check ---
-			if entry.Name == "" || entry.Version == "" {
-				debugf("Warning: skipping %s: missing metadata Name or Version (corruption?)\n", filename)
-				continue
-			}
-			cache[filename] = uploadCacheEntry{
-				Size:  info.Size(),
-				Mtime: info.ModTime(),
+		entry := result.entry
+		if result.fresh {
+			cacheSet[filepath.Base(result.file)] = uploadCacheEntry{
+				Size:  result.size,
+				Mtime: result.mtime,
 				Entry: entry,
 			}
-			cacheUpdated = true
 		}
 
 		key := fmt.Sprintf("%s-%s-%s-%s-%s", entry.Name, entry.Version, entry.Revision, entry.Arch, entry.Variant)
@@ -326,10 +384,18 @@ func handleUploadCommand(args []string, cfg *Config) error {
 		}
 	}
 
-	if cacheUpdated {
-		if err := saveUploadCache(cachePath, cache); err != nil {
-			debugf("Warning: failed to save upload scanning cache: %v\n", err)
+	// Forget files that are gone, so the cache does not grow with every
+	// package that was ever built or fetched. Check the disk rather than the
+	// listing above: a concurrent build may have added one since.
+	var cacheRemove []string
+	for filename := range cache {
+		if _, err := os.Stat(filepath.Join(BinDir, filename)); os.IsNotExist(err) {
+			cacheRemove = append(cacheRemove, filename)
 		}
+	}
+
+	if err := updateUploadCache(cacheSet, cacheRemove); err != nil {
+		debugf("Warning: failed to save upload scanning cache: %v\n", err)
 	}
 
 	// 5. Compare with Remote and Upload
@@ -818,7 +884,139 @@ func handleUploadCommand(args []string, cfg *Config) error {
 		}
 	}
 
+	if (*sync || *prompt) && !*keepLocal {
+		removeUploadedLocalBinaries(latestLocals, newIndexMap)
+	}
+
 	return nil
+}
+
+type localBinaryScan struct {
+	file  string
+	entry RepoEntry
+	size  int64
+	mtime time.Time
+	ok    bool
+	fresh bool // read from the archive rather than the scanning cache
+}
+
+// localBinaryScanWorkers bounds how many archives are read at once. Each one
+// holds a zstd decoder and hashes the whole file, so the limit trades memory
+// and disk contention against the per-file latency it hides.
+const localBinaryScanWorkers = 4
+
+// scanLocalBinaries returns the metadata of each file, in input order. Files
+// whose size and mtime match the scanning cache are served from it; only new
+// or changed files are opened, and those are read in parallel, since each
+// needs a full BLAKE3 pass and a full decompression of the archive.
+func scanLocalBinaries(files []string, cache map[string]uploadCacheEntry) []localBinaryScan {
+	results := make([]localBinaryScan, len(files))
+	var pending []int
+	for i, file := range files {
+		results[i].file = file
+		info, err := os.Stat(file)
+		if err != nil {
+			debugf("Warning: skipping %s: %v\n", file, err)
+			continue
+		}
+		results[i].size = info.Size()
+		results[i].mtime = info.ModTime()
+		if cached, ok := cache[filepath.Base(file)]; ok &&
+			cached.Size == info.Size() &&
+			cached.Mtime.Equal(info.ModTime()) &&
+			cached.Entry.MetadataVersion >= repoEntryMetadataVersion {
+			results[i].entry = cached.Entry
+			results[i].ok = true
+			continue
+		}
+		pending = append(pending, i)
+	}
+	if len(pending) > 0 {
+		debugf("Reading metadata of %d new local binaries (%d cached)\n", len(pending), len(files)-len(pending))
+	}
+
+	jobs := make(chan int)
+	var wg sync.WaitGroup
+	for w := 0; w < min(localBinaryScanWorkers, len(pending)); w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range jobs {
+				file := results[i].file
+				entry, err := ReadPackageMetadata(file)
+				if err != nil {
+					debugf("Warning: skipping %s: %v\n", file, err)
+					continue
+				}
+				if entry.Name == "" || entry.Version == "" {
+					debugf("Warning: skipping %s: missing metadata Name or Version (corruption?)\n", filepath.Base(file))
+					continue
+				}
+				results[i].entry = entry
+				results[i].ok = true
+				results[i].fresh = true
+			}
+		}()
+	}
+	for _, i := range pending {
+		jobs <- i
+	}
+	close(jobs)
+	wg.Wait()
+	return results
+}
+
+// removeUploadedLocalBinaries deletes local packages from BinDir once the
+// remote index serves the identical file (same name and checksum): builds
+// uploaded by this run and dependencies fetched from the mirror. Anything the
+// remote does not have -- a build declined at the prompt, packages --sync
+// skips, local-only builds -- is kept. Nothing is removed while another hokuto
+// build runs, since it may be about to install a package it just built.
+func removeUploadedLocalBinaries(locals, remote map[string]RepoEntry) {
+	if activeSessions := otherActiveHokutoBuildSessions(); len(activeSessions) > 0 {
+		colArrow.Print("-> ")
+		colWarn.Printf("Keeping local binary packages; another Hokuto build is active (pid %s)\n", joinPIDs(activeSessions))
+		return
+	}
+
+	removed, kept := 0, 0
+	var freed int64
+	var removedFiles []string
+	for key, local := range locals {
+		if local.Filename == "" {
+			continue
+		}
+		served, ok := remote[key]
+		if !ok || served.Filename != local.Filename || served.B3Sum == "" || served.B3Sum != local.B3Sum {
+			kept++
+			continue
+		}
+		path := filepath.Join(BinDir, local.Filename)
+		info, err := os.Stat(path)
+		if err != nil {
+			continue
+		}
+		if err := os.Remove(path); err != nil {
+			debugf("Warning: failed to remove uploaded package %s: %v\n", path, err)
+			kept++
+			continue
+		}
+		removedFiles = append(removedFiles, local.Filename)
+		freed += info.Size()
+		removed++
+	}
+	if removed == 0 {
+		return
+	}
+	if err := updateUploadCache(nil, removedFiles); err != nil {
+		debugf("Warning: failed to save upload scanning cache: %v\n", err)
+	}
+	colArrow.Print("-> ")
+	colSuccess.Printf("Removed %d local binary package(s) already on the remote (%s freed", removed, humanReadableSize(freed))
+	if kept > 0 {
+		colSuccess.Printf(", kept %d not on the remote", kept)
+	}
+	colSuccess.Println(")")
 }
 
 func uploadPkgDB(ctx context.Context, r2 *R2Client) error {

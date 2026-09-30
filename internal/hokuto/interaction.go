@@ -95,7 +95,7 @@ func AskForSelection(prompt string, count int) ([]int, bool) {
 			return nil, false
 		}
 		if lower == "q" || lower == "quit" {
-			os.Exit(0)
+			exitHokuto(0)
 		}
 
 		// Selection

@@ -451,7 +451,22 @@ func unpackTarballFallback(tarballPath, dest string) error {
 
 // createPackageTarball creates a .tar.zst archive of outputDir into BinDir.
 // It uses system tar if available, otherwise falls back to pure-Go tar+zstd.
+// createPackageTarball packs outputDir into BinDir and records the new
+// archive's metadata for upload, which then need not decompress it again.
 func createPackageTarball(pkgName, pkgVer, pkgRev, arch, variant, outputDir string, execCtx *Executor, logger io.Writer) error {
+	if err := writePackageTarball(pkgName, pkgVer, pkgRev, arch, variant, outputDir, execCtx, logger); err != nil {
+		return err
+	}
+	tarballPath := filepath.Join(BinDir, StandardizeRemoteName(pkgName, pkgVer, pkgRev, arch, variant))
+	if entry, err := repoEntryFromPackageOutput(tarballPath, outputDir, pkgName); err == nil {
+		recordUploadCacheEntry(tarballPath, entry)
+	} else {
+		debugf("Not caching upload metadata of %s: %v\n", filepath.Base(tarballPath), err)
+	}
+	return nil
+}
+
+func writePackageTarball(pkgName, pkgVer, pkgRev, arch, variant, outputDir string, execCtx *Executor, logger io.Writer) error {
 	if logger == nil {
 		logger = os.Stdout
 	}

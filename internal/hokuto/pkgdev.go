@@ -1274,7 +1274,7 @@ func askForAutoBumpSelection(prompt string, count int) (autoBumpSelection, bool)
 			return autoBumpSelection{}, false
 		}
 		if lower == "q" || lower == "quit" {
-			os.Exit(0)
+			exitHokuto(0)
 		}
 
 		selection, err := parseAutoBumpSelection(input, count)

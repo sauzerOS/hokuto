@@ -1150,12 +1150,19 @@ func fetchSpecificBinaryPackage(pkgName, version, revision, variant string, cfg 
 	filename := StandardizeRemoteName(lookupName, version, revision, arch, variant)
 	url := fmt.Sprintf("%s/%s", BinaryMirror, filename)
 	destPath := filepath.Join(BinDir, filename)
+	_, statErr := os.Stat(destPath)
+	downloading := force || statErr != nil
 
 	// Use downloadFileWithOptions to show progress if not quiet
 	if err := downloadFileWithOptions(url, url, destPath, downloadOptions{Quiet: quiet, Force: force}); err != nil {
 		// Clean up partial file on failure to prevent corrupt cache
 		os.Remove(destPath)
 		return err
+	}
+	// A package this run downloaded is removed again when hokuto exits; one
+	// that was already in BinDir is left alone.
+	if downloading {
+		trackFetchedBinary(destPath)
 	}
 
 	// Check checksum if provided
@@ -1173,9 +1180,31 @@ func fetchSpecificBinaryPackage(pkgName, version, revision, variant string, cfg 
 			colArrow.Print("-> ")
 			colSuccess.Printf("Checksum verified: %s\n", expectedSum)
 		}
+		recordFetchedUploadCacheEntry(destPath, expectedSum)
 	}
 
 	return nil
+}
+
+// recordFetchedUploadCacheEntry hands upload the metadata of a package just
+// fetched from the mirror: the remote index entry it was verified against
+// describes exactly this file, so upload need not decompress it. Only an
+// index this process already loaded is consulted.
+func recordFetchedUploadCacheEntry(path, sum string) {
+	GlobalRemoteIndexMu.Lock()
+	index := GlobalRemoteIndex
+	loaded := GlobalRemoteIndexLoaded
+	GlobalRemoteIndexMu.Unlock()
+	if !loaded {
+		return
+	}
+	filename := filepath.Base(path)
+	for _, entry := range index {
+		if entry.Filename == filename && entry.B3Sum == sum && entry.MetadataVersion >= repoEntryMetadataVersion {
+			recordUploadCacheEntry(path, entry)
+			return
+		}
+	}
 }
 
 // fetchBinaryPackage attempts to download a binary package from the configured mirror.
