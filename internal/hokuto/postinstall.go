@@ -45,6 +45,9 @@ func PostInstallTasks(execCtx *Executor, logger io.Writer) error {
 		{"/usr/bin/gio-querymodules", []string{"/usr/lib/gio/modules"}},
 		{"/usr/bin/gio-querymodules-32", []string{"/usr/lib32/gio/modules"}},
 		{"gdk-pixbuf-query-loaders", []string{"--update-cache"}},
+		// VLC's plugins come in many split packages; its cache has to follow
+		// whichever of them were installed, updated or removed.
+		{"/usr/libexec/vlc/vlc-cache-gen", []string{"/usr/lib/vlc/plugins"}},
 		//{"update-mime-database", []string{"/usr/share/mime"}},
 		{"update-desktop-database", []string{"/usr/share/applications"}},
 		{"fc-cache", nil},

@@ -1428,6 +1428,7 @@ func Main() {
 
 		allSucceeded := true
 		removedMetaPackage := false
+		removedAny := false
 		removingSet := make(map[string]bool, len(packagesToUninstall))
 		for _, pkgName := range packagesToUninstall {
 			removingSet[pkgName] = true
@@ -1470,6 +1471,15 @@ func Main() {
 				colArrow.Print("-> ")
 				colSuccess.Printf("Package %s removed\n", pkgName)
 				removeFromWorld(pkgName)
+				removedAny = true
+			}
+		}
+
+		// Caches built from many packages' files (VLC plugins, gdk-pixbuf
+		// loaders, icons, desktop entries) must drop what was removed.
+		if removedAny {
+			if err := PostInstallTasks(RootExec, os.Stdout); err != nil {
+				fmt.Fprintf(os.Stderr, "post-remove tasks completed with warnings: %v\n", err)
 			}
 		}
 
