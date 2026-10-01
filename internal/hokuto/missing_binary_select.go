@@ -92,8 +92,10 @@ func pruneBuildIgnores(ignores map[string]buildIgnoreEntry) bool {
 
 // missingBinaryEntry is one row of the selection list.
 type missingBinaryEntry struct {
-	Name string
-	Info string // "4.1.0-4 -> 4.1.0-8 (icewm)"
+	Name   string
+	Info   string // "4.1.0-4 -> 4.1.0-8 (icewm)"
+	Reason string // "rebuild for libplist ABI change", or ""
+	Commit string // full message of the commit that set the current version
 }
 
 // selectMissingBinaryPackages shows the list and returns the packages to
@@ -153,8 +155,29 @@ func runMissingBinarySelector(entries []missingBinaryEntry, screen tcell.Screen)
 		}
 		table.SetCell(row, 0, tview.NewTableCell(tview.Escape(mark)).SetTextColor(markColor))
 		table.SetCell(row, 1, tview.NewTableCell(entries[i].Name).SetTextColor(nameColor))
-		table.SetCell(row, 2, tview.NewTableCell(tview.Escape(info)).SetTextColor(infoColor).SetExpansion(1))
+		table.SetCell(row, 2, tview.NewTableCell(tview.Escape(info)).SetTextColor(infoColor))
+		reasonColor := tcell.ColorDarkCyan
+		if blacklisted[i] {
+			reasonColor = tcell.ColorGray
+		}
+		table.SetCell(row, 3, tview.NewTableCell(tview.Escape(entries[i].Reason)).SetTextColor(reasonColor).SetExpansion(1))
 	}
+	// The full commit message of the highlighted package, which the reason
+	// column only summarizes.
+	commitView := tview.NewTextView().SetWrap(true).SetWordWrap(true)
+	commitView.SetBorder(true).SetTitle(" Commit ")
+	showCommit := func(row int) {
+		if row < 0 || row >= len(visible) {
+			commitView.SetText("")
+			return
+		}
+		message := entries[visible[row]].Commit
+		if message == "" {
+			message = "(no commit changed this recipe's version)"
+		}
+		commitView.SetText(message).ScrollToBeginning()
+	}
+	table.SetSelectionChangedFunc(func(row, _ int) { showCommit(row) })
 	refresh := func() {
 		table.Clear()
 		visible = visible[:0]
@@ -166,6 +189,8 @@ func runMissingBinarySelector(entries []missingBinaryEntry, screen tcell.Screen)
 			refreshRow(len(visible), i)
 			visible = append(visible, i)
 		}
+		row, _ := table.GetSelection()
+		showCommit(row)
 	}
 	refresh()
 	footer("")
@@ -259,6 +284,7 @@ func runMissingBinarySelector(entries []missingBinaryEntry, screen tcell.Screen)
 
 	flex := tview.NewFlex().SetDirection(tview.FlexRow).
 		AddItem(table, 0, 1, true).
+		AddItem(commitView, 6, 0, false).
 		AddItem(bottomPages, 3, 0, false)
 	if err := app.SetRoot(flex, true).SetFocus(table).Run(); err != nil {
 		return nil, nil, err

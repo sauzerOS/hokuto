@@ -514,6 +514,7 @@ func buildMissingRepositoryBinaries(cfg *Config, buildArgs []string, yes bool) e
 		return nil
 	}
 
+	commits := versionCommitMessages(packages)
 	entries := make([]missingBinaryEntry, len(packages))
 	for i, pkgName := range packages {
 		status := statuses[pkgName]
@@ -523,7 +524,12 @@ func buildMissingRepositoryBinaries(cfg *Config, buildArgs []string, yes bool) e
 		if transition := binaryVersionTransition(status, currentVersion, currentRevision); transition != "" {
 			info = transition + " (" + info + ")"
 		}
-		entries[i] = missingBinaryEntry{Name: pkgName, Info: info}
+		entries[i] = missingBinaryEntry{
+			Name:   pkgName,
+			Info:   info,
+			Reason: rebuildReason(commits[pkgName]),
+			Commit: commits[pkgName],
+		}
 	}
 
 	var selected []string
@@ -556,7 +562,11 @@ func buildMissingRepositoryBinaries(cfg *Config, buildArgs []string, yes bool) e
 			fmt.Printf("%2d) ", i+1)
 			color.Bold.Printf("%s", entry.Name)
 			fmt.Print(": ")
-			colNote.Printf("%s\n", entry.Info)
+			colNote.Printf("%s", entry.Info)
+			if entry.Reason != "" {
+				colInfo.Printf("  %s", entry.Reason)
+			}
+			fmt.Println()
 		}
 		indices, ok := AskForSelection("Build (a)ll, (q)uit, or select missing binary packages (numbers or -numbers):", len(packages))
 		if !ok {
