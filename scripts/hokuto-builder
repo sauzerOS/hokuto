@@ -23,6 +23,13 @@
 #   hokuto-builder update          update the container's own packages
 #   hokuto-builder destroy         delete the container
 #
+#   hokuto-builder --generic <command>
+#                                  the same in a second container whose own
+#                                  packages are all the generic variant, where
+#                                  hokuto builds generic packages
+#                                  (HOKUTO_GENERIC=1); bump and cross-sync stay
+#                                  in the optimized container
+#
 # Commands run as the invoking user (same name and uid as on the host), with
 # passwordless sudo inside the container. Shared with the host:
 #
@@ -44,9 +51,17 @@
 # The container location is asked for by 'create' and saved in
 # /etc/hokuto-builder.conf for the other commands.
 #
+# The generic container shares the same directories, except that it keeps its
+# own rebuild blacklist (build-ignore-generic.json) and does not publish build
+# status to the website, whose table has one entry per package. Both share the
+# binary cache, so only one container runs a command at a time; a second one
+# waits (interactive shells do not).
+#
 # Settings (environment):
-#   HOKUTO_BUILDER_ROOT   container root, overrides the saved location
-#   HOKUTO_BUILDER_NAME   machine name     (default hokuto-builder)
+#   HOKUTO_BUILDER_ROOT          container root, overrides the saved location
+#   HOKUTO_BUILDER_GENERIC_ROOT  the same for the generic container
+#   HOKUTO_BUILDER_NAME          machine name (default hokuto-builder; the
+#                                generic container adds -generic)
 
 set -euo pipefail
 
@@ -73,9 +88,16 @@ die() { printf '\033[0;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 info() { printf '\033[0;36m->\033[0m %s\n' "$*"; }
 
 usage() {
-    sed -n '3,24p' "$(readlink -f "$0")" | sed 's/^# \{0,1\}//'
+    sed -n '3,31p' "$(readlink -f "$0")" | sed 's/^# \{0,1\}//'
     exit "${1:-0}"
 }
+
+ORIG_ARGS=("$@")
+VARIANT=optimized
+if [ "${1:-}" = --generic ]; then
+    VARIANT=generic
+    shift
+fi
 
 case "${1:-}" in
     create | bump | build | rebuild | cross-sync | run | shell | update | destroy) ;;
@@ -83,8 +105,16 @@ case "${1:-}" in
     *) usage 1 ;;
 esac
 
+if [ "$VARIANT" = generic ]; then
+    case "$1" in
+        bump) die "bump runs in the optimized container; build the generic packages afterwards with 'hokuto-builder --generic rebuild'" ;;
+        cross-sync) die "cross-sync runs in the optimized container" ;;
+    esac
+fi
+
 if [ "$EUID" -ne 0 ]; then
-    exec sudo --preserve-env=HOKUTO_BUILDER_ROOT,HOKUTO_BUILDER_NAME "$(readlink -f "$0")" "$@"
+    exec sudo --preserve-env=HOKUTO_BUILDER_ROOT,HOKUTO_BUILDER_GENERIC_ROOT,HOKUTO_BUILDER_NAME \
+        "$(readlink -f "$0")" "${ORIG_ARGS[@]}"
 fi
 
 BUILD_USER=${SUDO_USER:-}
@@ -96,16 +126,45 @@ BUILD_GID=$(id -g "$BUILD_USER")
 BUILD_GROUP=$(id -gn "$BUILD_USER")
 BUILD_HOME=$(getent passwd "$BUILD_USER" | cut -d: -f6)
 
+# Where the rebuild blacklist lives inside the container, whichever host file
+# backs it.
+CONTAINER_BUILD_IGNORE=/var/db/hokuto/build-ignore.json
+ROOTFS_KEY=ROOTFS
+ROOTFS_OVERRIDE=${HOKUTO_BUILDER_ROOT:-}
+VARIANT_FLAG=""
+if [ "$VARIANT" = generic ]; then
+    VARIANT_FLAG=" --generic"
+    ROOTFS_KEY=GENERIC_ROOTFS
+    ROOTFS_OVERRIDE=${HOKUTO_BUILDER_GENERIC_ROOT:-}
+    DEFAULT_ROOTFS=/var/lib/hokuto-builder-generic
+    MACHINE=$MACHINE-generic
+    # A package that fails only as a generic build must not keep the
+    # optimized one from being rebuilt, and the other way round.
+    BUILD_IGNORE=/var/db/hokuto/build-ignore-generic.json
+fi
+
 # Container location: environment, then the location saved by 'create'.
 saved_rootfs() {
     # Must succeed without a config file: this runs in an assignment under
     # set -e, where a failing status ends the script silently.
     if [ -f "$CONFIG_FILE" ]; then
-        sed -n 's/^ROOTFS=//p' "$CONFIG_FILE" | tail -n 1
+        sed -n "s/^$ROOTFS_KEY=//p" "$CONFIG_FILE" | tail -n 1
     fi
 }
-ROOTFS=${HOKUTO_BUILDER_ROOT:-$(saved_rootfs)}
+ROOTFS=${ROOTFS_OVERRIDE:-$(saved_rootfs)}
 ROOTFS=${ROOTFS:-$DEFAULT_ROOTFS}
+
+# save_rootfs records this container's location, keeping the other one's.
+save_rootfs() {
+    local tmp
+    tmp=$(mktemp "$CONFIG_FILE.XXXXXX")
+    if [ -f "$CONFIG_FILE" ]; then
+        grep -v "^$ROOTFS_KEY=" "$CONFIG_FILE" >"$tmp" || true
+    fi
+    printf '%s=%s\n' "$ROOTFS_KEY" "$ROOTFS" >>"$tmp"
+    chmod 644 "$tmp"
+    mv -f "$tmp" "$CONFIG_FILE"
+}
 
 container_exists() {
     [ -d "$ROOTFS/var/db/hokuto/installed" ]
@@ -145,6 +204,12 @@ cmd_create() {
     read -r -p "Container location [$ROOTFS]: " answer
     ROOTFS=$(realpath -m -- "${answer:-$ROOTFS}")
     [ "$ROOTFS" != / ] || die "refusing to use / as the container location"
+    # The optimized and generic containers must be separate trees.
+    local other_key=GENERIC_ROOTFS other
+    [ "$VARIANT" = generic ] && other_key=ROOTFS
+    other=$(sed -n "s/^$other_key=//p" "$CONFIG_FILE" 2>/dev/null | tail -n 1 || true)
+    [ -z "$other" ] || [ "$(realpath -m -- "$other")" != "$ROOTFS" ] ||
+        die "$ROOTFS is the other hokuto-builder container; pick another location"
     container_exists && die "$ROOTFS already exists; use 'update', or 'destroy' and create it again"
     # Never install a system on top of existing data.
     if [ -e "$ROOTFS" ] && [ -n "$(ls -A -- "$ROOTFS" 2>/dev/null)" ]; then
@@ -152,13 +217,19 @@ cmd_create() {
     fi
     check_location "$ROOTFS"
     mkdir -p "$ROOTFS"
-    printf 'ROOTFS=%s\n' "$ROOTFS" >"$CONFIG_FILE"
+    save_rootfs
     info "Saved the location in $CONFIG_FILE"
 
-    info "Installing ${BASE_PACKAGES[*]} into $ROOTFS"
+    info "Installing ${BASE_PACKAGES[*]} ($VARIANT) into $ROOTFS"
     # --remote installs binaries from the mirror, so nothing is compiled on
-    # the host to create the container.
-    HOKUTO_ROOT="$ROOTFS" hokuto install -y --remote "${BASE_PACKAGES[@]}"
+    # the host to create the container. The generic container gets the
+    # generic variant of every package: a generic build links static pieces
+    # of them (libgcc.a, crt*.o, static libraries) into its output.
+    if [ "$VARIANT" = generic ]; then
+        HOKUTO_GENERIC=1 HOKUTO_ROOT="$ROOTFS" hokuto install -y --remote "${BASE_PACKAGES[@]}"
+    else
+        HOKUTO_ROOT="$ROOTFS" hokuto install -y --remote "${BASE_PACKAGES[@]}"
+    fi
 
     info "Creating user $BUILD_USER ($BUILD_UID:$BUILD_GID)"
     if [ -x "$ROOTFS/usr/bin/pwconv" ] || [ -x "$ROOTFS/usr/sbin/pwconv" ]; then
@@ -229,15 +300,30 @@ ensure_qemu_binfmt() {
     fi
 }
 
+# Both containers share /var/cache/hokuto: one's upload --sync would delete a
+# package the other just built and is about to install. Run one at a time.
+BUILDER_LOCK=/run/lock/hokuto-builder.lock
+EXCLUSIVE=1
+acquire_builder_lock() {
+    [ "$EXCLUSIVE" = 1 ] || return 0
+    exec 9>"$BUILDER_LOCK"
+    if ! flock -n 9; then
+        info "Another hokuto-builder command is running; waiting for it to finish"
+        flock 9
+    fi
+}
+
 # nspawn_run <user> <command...>
 nspawn_run() {
     local user=$1
     shift
-    container_exists || die "no container at $ROOTFS; run 'hokuto-builder create' first"
+    container_exists || die "no container at $ROOTFS; run 'hokuto-builder${VARIANT_FLAG} create' first"
     # Removable drives are remounted nosuid by udisks after a replug.
     check_location "$ROOTFS"
     check_sources_mount
-    ensure_qemu_binfmt
+    acquire_builder_lock
+    # Only the optimized container cross builds.
+    [ "$VARIANT" = generic ] || ensure_qemu_binfmt
 
     local args=(
         --quiet
@@ -253,6 +339,9 @@ nspawn_run() {
         --restrict-address-families="AF_INET AF_INET6 AF_UNIX AF_NETLINK"
         --bind-ro=/usr/bin/hokuto:/usr/local/bin/hokuto
     )
+    # Overrides the shared hokuto.conf: generic flags for every build, and the
+    # generic variant for every package hokuto installs in this container.
+    [ "$VARIANT" = generic ] && args+=(--setenv=HOKUTO_GENERIC=1)
     # Only the host's local hokuto files: the rest of /etc/hokuto belongs to
     # the container's hokuto package, which must be able to update them.
     local file
@@ -278,7 +367,7 @@ nspawn_run() {
     done
     # A separate mount below /var/cache/hokuto; bind it explicitly.
     mountpoint -q "$SOURCES_MOUNT" && args+=(--bind="$SOURCES_MOUNT")
-    [ -f "$BUMP_IGNORE" ] && args+=(--bind="$BUMP_IGNORE")
+    [ "$VARIANT" = optimized ] && [ -f "$BUMP_IGNORE" ] && args+=(--bind="$BUMP_IGNORE")
     # Created on the host when missing, so it can be bound; hokuto overwrites
     # it in place, and a blacklist made in the container lands on the host.
     if [ ! -e "$BUILD_IGNORE" ]; then
@@ -286,14 +375,18 @@ nspawn_run() {
         printf '[]\n' >"$BUILD_IGNORE"
         chmod 644 "$BUILD_IGNORE"
     fi
-    args+=(--bind="$BUILD_IGNORE")
-    local website
-    website=$(sed -n 's/^HOKUTO_WEBSITE_REPO=//p' /etc/hokuto/hokuto.conf 2>/dev/null | tail -n 1 | tr -d '"' || true)
-    website=${website:-$DEFAULT_WEBSITE_REPO}
-    if [ -d "$website/.git" ]; then
-        args+=(--bind="$website")
-    else
-        info "No website checkout at $website; build status will not be published"
+    args+=(--bind="$BUILD_IGNORE:$CONTAINER_BUILD_IGNORE")
+    # The website's status table has one row per package; generic builds
+    # would overwrite the optimized ones' status and logs.
+    if [ "$VARIANT" = optimized ]; then
+        local website
+        website=$(sed -n 's/^HOKUTO_WEBSITE_REPO=//p' /etc/hokuto/hokuto.conf 2>/dev/null | tail -n 1 | tr -d '"' || true)
+        website=${website:-$DEFAULT_WEBSITE_REPO}
+        if [ -d "$website/.git" ]; then
+            args+=(--bind="$website")
+        else
+            info "No website checkout at $website; build status will not be published"
+        fi
     fi
     for file in .gitconfig .git-credentials; do
         [ -f "$BUILD_HOME/$file" ] && args+=(--bind-ro="$BUILD_HOME/$file")
@@ -320,7 +413,10 @@ cmd_build() {
             args+=("$arg")
         fi
     done
-    [ ${#args[@]} -gt 0 ] || die "usage: hokuto-builder build <pkg>... [--no-upload]"
+    [ ${#args[@]} -gt 0 ] || die "usage: hokuto-builder${VARIANT_FLAG} build <pkg>... [--no-upload]"
+    # Build status goes to the website from the optimized container only.
+    local build_flags=(-i --no-install)
+    [ "$VARIANT" = optimized ] && build_flags+=(--index)
     # One container session; the arguments reach hokuto as "$@", unquoted
     # nowhere.
     # shellcheck disable=SC2016
@@ -328,14 +424,14 @@ cmd_build() {
         upload=$1
         shift
         status=0
-        /usr/local/bin/hokuto build -i --no-install --index "$@" || status=$?
+        /usr/local/bin/hokuto build "$@" || status=$?
         # A failed package must not keep the others off the mirror: upload
         # whatever was built, then report the build status.
         if [ "$upload" = 1 ]; then
             /usr/local/bin/hokuto upload --sync || { rc=$?; [ "$status" != 0 ] || status=$rc; }
         fi
         exit "$status"
-    ' hokuto-builder-build "$upload" "${args[@]}"
+    ' hokuto-builder-build "$upload" "${build_flags[@]}" "${args[@]}"
 }
 
 # A library whose new version drops a soname makes bump raise the revision of
@@ -422,7 +518,7 @@ case "$1" in
     rebuild) shift; cmd_rebuild "$@" ;;
     cross-sync) shift; cmd_cross_sync "$@" ;;
     run) shift; [ $# -gt 0 ] || usage 1; nspawn_run "$BUILD_USER" "$@" ;;
-    shell) nspawn_run "$BUILD_USER" /bin/bash -l ;;
+    shell) EXCLUSIVE=0 nspawn_run "$BUILD_USER" /bin/bash -l ;;
     update) nspawn_run "$BUILD_USER" /usr/local/bin/hokuto update -y ;;
     destroy) cmd_destroy ;;
 esac

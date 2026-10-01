@@ -3182,3 +3182,30 @@ func TestInstallCrossHostTools(t *testing.T) {
 		t.Fatalf("installed native meson not recognized: %v %v", installed, err)
 	}
 }
+
+func TestParallelCanBuildIgnoresNativeDependenciesInCrossBuild(t *testing.T) {
+	cfg, repo := withTempDependencyRepo(t)
+	cfg.Values["HOKUTO_CROSS_ARCH"] = "arm64"
+	writeTestPackage(t, repo, "libaio", "")
+	writeTestPackage(t, repo, "lvm2", "libaio\nreadline\nsystemd make\naarch64-libaio cross\n")
+
+	pm := &ParallelManager{
+		Config:    cfg,
+		BuildPlan: &BuildPlan{Order: []string{"lvm2"}},
+		Pending:   []string{"lvm2"},
+		Running:   make(map[string]time.Time),
+		Completed: make(map[string]bool),
+		Available: make(map[string]bool),
+		Failed:    make(map[string]error),
+	}
+
+	// Only the cross-tagged dependency counts; libaio, readline and systemd
+	// describe the native build and are not installed for a cross one.
+	if pm.canBuild("lvm2") {
+		t.Fatal("lvm2 must wait for its cross dependency aarch64-libaio")
+	}
+	writeInstalledTestPackage(t, "aarch64-libaio")
+	if !pm.canBuild("lvm2") {
+		t.Fatal("lvm2 should build once aarch64-libaio is installed, without its native dependencies")
+	}
+}

@@ -1072,22 +1072,15 @@ func (pm *ParallelManager) canBuildWithPolicy(pkgName string, acceptInstalledPen
 	}
 
 	for _, dep := range deps {
-		if dep.RuntimeOnly || dep.PostInstall || dep.Suggest {
+		// The same filter the sequential executor applies. In particular a
+		// cross build only waits on dependencies tagged for the cross target;
+		// the plain lines describe the native build and are never installed
+		// for it, so waiting on them deadlocks (lvm2's "libaio", "readline").
+		if !activeBuildDependency(dep, pm.Config, false) {
 			continue
 		}
 		if dep.MakeOpt {
 			continue
-		}
-		if dep.Optional {
-			continue
-		}
-		if dep.Cross && pm.Config.Values["HOKUTO_CROSS_ARCH"] == "" {
-			continue
-		}
-		if dep.CrossNative {
-			if pm.Config.Values["HOKUTO_CROSS_ARCH"] == "" || pm.Config.Values["HOKUTO_CROSS_SYSTEM"] == "1" {
-				continue
-			}
 		}
 
 		candidates, err := resolvedBuildDependencyCandidates(dep, false, pm.Config)
