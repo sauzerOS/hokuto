@@ -1,9 +1,11 @@
 package hokuto
 
 import (
+	"io"
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -58,5 +60,47 @@ func TestBuildDependencyRootsCoversCompiledPackagesOnly(t *testing.T) {
 	}
 	if has["freetype"] {
 		t.Errorf("harfbuzz is installed from a binary; its build dependencies are not needed: %v", roots)
+	}
+}
+
+func captureStderr(t *testing.T, fn func()) string {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := os.Stderr
+	os.Stderr = w
+	fn()
+	os.Stderr = old
+	w.Close()
+	data, _ := io.ReadAll(r)
+	return string(data)
+}
+
+func TestRepairInstalledRuntimeDepsSkipsWhatThePlanBuilds(t *testing.T) {
+	cfg, repo := withTempDependencyRepo(t)
+	oldMirror := BinaryMirror
+	BinaryMirror = ""
+	t.Cleanup(func() { BinaryMirror = oldMirror })
+
+	writeTestPackage(t, repo, "qemu", "gtk+3 make\n")
+	writeTestPackage(t, repo, "glycin", "")
+	writeInstalledDepends(t, "gtk+3", "gdk-pixbuf\n")
+	writeInstalledDepends(t, "gdk-pixbuf", "glycin\nlibjxl\n")
+	writeTestPackage(t, repo, "libjxl", "")
+
+	// A rebuild run builds glycin itself, so only libjxl is really missing.
+	plan := &BuildPlan{Order: []string{"glycin", "qemu"}}
+	out := captureStderr(t, func() {
+		if installed := repairInstalledRuntimeDeps(plan, cfg, true, true); len(installed) != 0 {
+			t.Errorf("nothing can be installed without binaries, got %v", installed)
+		}
+	})
+	if strings.Contains(out, "glycin") {
+		t.Errorf("glycin is built by this plan and must not be warned about:\n%s", out)
+	}
+	if !strings.Contains(out, "runtime dependency libjxl of gdk-pixbuf has no binary available") {
+		t.Errorf("libjxl is missing with no binary and must be reported:\n%s", out)
 	}
 }

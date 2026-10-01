@@ -5115,7 +5115,7 @@ func handleBuildCommand(args []string, cfg *Config) (err error) {
 			// dependencies breaks the build in ways that look unrelated (a
 			// pkg-config chain, a feature silently disabled).
 			if !*bootstrap {
-				for _, dep := range repairInstalledRuntimeDeps(buildDependencyRoots(initialPlan, cfg), cfg, *noRemote, quietDependencyInstalls) {
+				for _, dep := range repairInstalledRuntimeDeps(initialPlan, cfg, *noRemote, quietDependencyInstalls) {
 					addTemporaryBuildDep(dep)
 				}
 			}

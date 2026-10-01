@@ -88,10 +88,14 @@ func missingInstalledRuntimeDeps(roots []string, cfg *Config) map[string][]strin
 }
 
 // repairInstalledRuntimeDeps installs, from binaries, the runtime dependencies
-// missing below roots, and returns what it installed. A dependency that still
-// has no binary is warned about and left out.
-func repairInstalledRuntimeDeps(roots []string, cfg *Config, noRemote, quiet bool) []string {
-	missing := missingInstalledRuntimeDeps(roots, cfg)
+// missing below the build dependencies of plan, and returns what it installed.
+// Packages the plan builds itself are not missing: they are installed when
+// built. A dependency that has no binary is warned about and left out.
+func repairInstalledRuntimeDeps(plan *BuildPlan, cfg *Config, noRemote, quiet bool) []string {
+	missing := missingInstalledRuntimeDeps(buildDependencyRoots(plan, cfg), cfg)
+	for name := range providedByPlan(plan, cfg) {
+		delete(missing, name)
+	}
 	if len(missing) == 0 {
 		return nil
 	}
@@ -107,17 +111,23 @@ func repairInstalledRuntimeDeps(roots []string, cfg *Config, noRemote, quiet boo
 
 	var installed []string
 	for _, name := range names {
-		ok, err := installRuntimeDependencyBinaryOnly(name, cfg, noRemote, nil, quiet)
+		// The build dependency policy: the current revision's binary, or an
+		// older one while the current revision is not published yet.
+		ok, err := installAvailableBuildDependencyBinaryWithOptions(name, cfg, noRemote, quiet, true)
 		if err != nil {
 			colArrow.Print("-> ")
 			colWarn.Printf("Warning: failed to install %s: %v\n", name, err)
 			continue
 		}
-		if !ok {
-			warnMissingRuntimeDependency(name, strings.Join(missing[name], ", "))
+		if ok {
+			installed = append(installed, name)
 			continue
 		}
-		installed = append(installed, name)
+		// An earlier repair in this loop may have installed it as one of
+		// its own dependencies.
+		if !isPackageInstalled(name) {
+			warnMissingRuntimeDependency(name, strings.Join(missing[name], ", "))
+		}
 	}
 	return installed
 }
@@ -180,4 +190,23 @@ func buildDependencyRoots(plan *BuildPlan, cfg *Config) []string {
 		}
 	}
 	return roots
+}
+
+// providedByPlan lists the packages plan installs or builds, with the split
+// outputs of the sources it builds.
+func providedByPlan(plan *BuildPlan, cfg *Config) map[string]bool {
+	provided := make(map[string]bool)
+	if plan == nil {
+		return provided
+	}
+	for _, pkgName := range plan.Order {
+		provided[pkgName] = true
+		provided[getOutputPackageName(pkgName, cfg)] = true
+		if pkgDir, err := findPackageDir(pkgName); err == nil {
+			for _, split := range splitPackageNamesFromDir(pkgDir) {
+				provided[split] = true
+			}
+		}
+	}
+	return provided
 }
