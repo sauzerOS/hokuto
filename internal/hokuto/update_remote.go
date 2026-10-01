@@ -95,7 +95,7 @@ func remoteUpdateDependencyPlan(pkgName string, cfg *Config, remoteIndex []RepoE
 
 // checkForRemoteUpgrades implements 'hokuto update --remote'
 // It compares installed packages against the remote index and updates them if newer versions exist.
-func checkForRemoteUpgrades(_ context.Context, cfg *Config) error {
+func checkForRemoteUpgrades(_ context.Context, cfg *Config, yes bool) error {
 	colArrow.Print("-> ")
 	colSuccess.Println("Checking for Remote Package Upgrades (Binary Mirror)")
 
@@ -141,11 +141,19 @@ func checkForRemoteUpgrades(_ context.Context, cfg *Config) error {
 			pkg.RepoVersion, pkg.RepoRevision)
 	}
 
-	// 4. Prompt User
-	indices, ok := AskForSelection("Update (a)ll, (q)uit, or pick packages to update/ignore (numbers or -numbers):", len(upgradeList))
-	if !ok {
-		colNote.Println("Upgrade canceled by user.")
-		return nil
+	// 4. Prompt User; -y updates everything, as hokuto-builder rebuild expects.
+	var indices []int
+	if yes {
+		for i := range upgradeList {
+			indices = append(indices, i)
+		}
+	} else {
+		var ok bool
+		indices, ok = AskForSelection("Update (a)ll, (q)uit, or pick packages to update/ignore (numbers or -numbers):", len(upgradeList))
+		if !ok {
+			colNote.Println("Upgrade canceled by user.")
+			return nil
+		}
 	}
 
 	var pkgNames []string
@@ -162,7 +170,7 @@ func checkForRemoteUpgrades(_ context.Context, cfg *Config) error {
 	if len(fallbacksFound) > 0 {
 		colArrow.Print("-> ")
 		colSuccess.Printf("No optimized variants found for: %v\n", fallbacksFound)
-		if !askForConfirmation(colSuccess, "Use generic fallbacks for these packages?") {
+		if !yes && !askForConfirmation(colSuccess, "Use generic fallbacks for these packages?") {
 			cPrintln(colNote, "Upgrade canceled by user.")
 			return nil
 		}

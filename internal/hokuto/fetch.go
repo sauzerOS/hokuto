@@ -158,7 +158,7 @@ func parseGitSourceFragment(fragment string) (string, int, error) {
 }
 
 func runSystemGit(quiet bool, args ...string) error {
-	cmd := exec.Command("git", args...)
+	cmd := gitCommand(args...)
 	if quiet && !Debug {
 		cmd.Stdout = io.Discard
 		cmd.Stderr = io.Discard
@@ -1524,7 +1524,7 @@ func fetchSourcesWithOptions(pkgName, pkgDir string, processGit bool, quiet bool
 						cPrintf(colInfo, "Initializing shared git cache for %s\n", gitURL)
 					}
 					// Use --mirror for a complete copy of all refs in a bare repository
-					cmd := exec.Command("git", "clone", "--mirror", gitURL, cacheRepoPath)
+					cmd := gitCommand("clone", "--mirror", gitURL, cacheRepoPath)
 					if quiet && !Debug {
 						cmd.Stdout = io.Discard
 						cmd.Stderr = io.Discard

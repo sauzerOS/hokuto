@@ -1523,7 +1523,7 @@ func Main() {
 			exitHokuto(1)
 		}
 		if *remote {
-			if err := checkForRemoteUpgrades(ctx, cfg); err != nil {
+			if err := checkForRemoteUpgrades(ctx, cfg, *yes || *yesLong); err != nil {
 				fmt.Fprintf(os.Stderr, "Remote upgrade process failed: %v\n", err)
 				exitHokuto(1)
 			}

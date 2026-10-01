@@ -640,11 +640,41 @@ func getBaseRepoPath(fullPath string) string {
 	}
 }
 
-func updateRepoWithSystemGit(dir string) {
-	cmd := exec.Command("git", "pull")
-	cmd.Dir = dir
+// gitStallArgs make git abort an HTTP(S) transfer that stays below 1 KB/s
+// for a minute. Git has no network timeout of its own, so a connection the
+// server stops answering would otherwise block hokuto forever -- with output
+// captured, without any sign of what it is waiting for.
+var gitStallArgs = []string{"-c", "http.lowSpeedLimit=1000", "-c", "http.lowSpeedTime=60"}
 
+// gitCommand is exec.Command("git", args...) with gitStallArgs.
+func gitCommand(args ...string) *exec.Cmd {
+	return exec.Command("git", append(append([]string(nil), gitStallArgs...), args...)...)
+}
+
+// gitTransferStalled reports whether git output shows a transfer aborted by
+// gitStallArgs.
+func gitTransferStalled(output string) bool {
+	return strings.Contains(output, "Operation too slow") || strings.Contains(output, "transfer rate too low")
+}
+
+// gitPull runs git pull in dir, once more if the first attempt stalled: a
+// stalled connection is usually a one-off, and a new one works.
+func gitPull(dir string) ([]byte, error) {
+	cmd := gitCommand("pull")
+	cmd.Dir = dir
 	output, err := cmd.CombinedOutput()
+	if err != nil && gitTransferStalled(string(output)) {
+		colArrow.Print("-> ")
+		colWarn.Printf("Connection to the remote of %s stalled; retrying\n", dir)
+		cmd = gitCommand("pull")
+		cmd.Dir = dir
+		output, err = cmd.CombinedOutput()
+	}
+	return output, err
+}
+
+func updateRepoWithSystemGit(dir string) {
+	output, err := gitPull(dir)
 	outputStr := strings.TrimSpace(string(output))
 
 	if err != nil {
@@ -670,9 +700,7 @@ func updateRepoWithSystemGit(dir string) {
 					fmt.Printf("Warning: Error cleaning repository %s: %v\nOutput:\n%s\n", dir, cleanErr, strings.TrimSpace(string(cleanOutput)))
 				}
 
-				retryCmd := exec.Command("git", "pull")
-				retryCmd.Dir = dir
-				retryOutput, retryErr := retryCmd.CombinedOutput()
+				retryOutput, retryErr := gitPull(dir)
 				retryOutputStr := strings.TrimSpace(string(retryOutput))
 
 				if retryErr != nil {
