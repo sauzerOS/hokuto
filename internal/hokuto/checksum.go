@@ -105,6 +105,21 @@ func withSharedDownloadLocks(lockBases []string, fn func() error) error {
 	return fn()
 }
 
+// sourceLineHasFlag reports whether a sources line, split into fields, carries
+// flag after its URL (and after a "-> filename" override).
+func sourceLineHasFlag(parts []string, flag string) bool {
+	rest := parts[1:]
+	if len(rest) >= 2 && rest[0] == "->" {
+		rest = rest[2:]
+	}
+	for _, tok := range rest {
+		if tok == flag {
+			return true
+		}
+	}
+	return false
+}
+
 // checksumPolicy selects what to do when a source file's recorded checksum
 // does not match the file on disk.
 type checksumPolicy int
@@ -179,6 +194,7 @@ func verifyOrCreateChecksumsWithPolicy(pkgName, pkgDir string, force bool, polic
 	}
 
 	var expectedFiles []string
+	var unchecked []string
 	urlMap := make(map[string]string) // map[filename] -> url
 	for _, line := range strings.Split(string(sourceData), "\n") {
 		line = strings.TrimSpace(line)
@@ -192,6 +208,13 @@ func verifyOrCreateChecksumsWithPolicy(pkgName, pkgDir string, force bool, polic
 			fname := filepath.Base(src)
 			if len(parts) >= 3 && parts[1] == "->" {
 				fname = parts[2]
+			}
+			// "nochecksum": a source whose upstream file changes in place,
+			// such as a "latest" release asset. Pinning a checksum would only
+			// produce a mismatch prompt whenever it is fetched again.
+			if sourceLineHasFlag(parts, "nochecksum") {
+				unchecked = append(unchecked, fname)
+				continue
 			}
 			expectedFiles = append(expectedFiles, fname)
 			urlMap[fname] = src
@@ -367,6 +390,10 @@ func verifyOrCreateChecksumsWithPolicy(pkgName, pkgDir string, force bool, polic
 	// 5. FINALIZE: Write the new checksum file and print the summary report.
 	if err := os.WriteFile(checksumFile, []byte(strings.Join(finalChecksums, "\n")+"\n"), 0644); err != nil {
 		return fmt.Errorf("failed to write checksums file: %v", err)
+	}
+
+	for _, fname := range unchecked {
+		summary = append(summary, fmt.Sprintf("%s: skipped (nochecksum)", fname))
 	}
 
 	debugf("-> Checksums summary for %s:\n", pkgName)

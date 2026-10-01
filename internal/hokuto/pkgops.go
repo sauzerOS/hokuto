@@ -148,6 +148,8 @@ func prepareSources(pkgName, pkgDir, buildDir string, execCtx *Executor) error {
 			switch tok {
 			case "noextract":
 				noExtract = true
+			case "nochecksum":
+				// Only affects checksum verification.
 			default:
 				// treat as target subdir if not a flag
 				if targetSubdir == "" {
