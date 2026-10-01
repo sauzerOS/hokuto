@@ -39,6 +39,7 @@ type ParallelManager struct {
 	SplitDepsBySource map[string][]string
 	RebuildTriggers   map[string]map[string]bool // rebuild package -> packages that triggered it
 	rebuildDepPrep    map[string]bool            // dynamically discovered rebuilds need dependency preparation
+	libraryRebuilds   map[string]bool            // rebuilds queued only because an update removed a library they link
 
 	// Dep injection for testing
 	Builder   func(string, *Config, *Executor, BuildOptions) (time.Duration, error)
@@ -623,6 +624,14 @@ func (pm *ParallelManager) Run() error {
 									}
 									pm.rebuildDepPrep[rPkg] = true
 								}
+								if pm.libraryRebuilds == nil {
+									pm.libraryRebuilds = make(map[string]bool)
+								}
+								if dynamicRebuilds[rPkg] && !triggerSet[rPkg] {
+									pm.libraryRebuilds[rPkg] = true
+								} else {
+									delete(pm.libraryRebuilds, rPkg)
+								}
 								// Filesystem triggers (e.g. DKMS) must override the completed
 								// status. If nvidia-modules was already installed from binary
 								// earlier in this update, but a kernel update now triggers a
@@ -690,7 +699,12 @@ func (pm *ParallelManager) Run() error {
 			// 3. Batch Process Rebuild Prompts
 			pm.mu.Lock()
 			if len(pm.pendingRebuilds) > 0 {
-				rebuilds := append([]string(nil), pm.pendingRebuilds...)
+				rebuilds := pm.dropResolvedLibraryRebuildsLocked(pm.pendingRebuilds)
+				if len(rebuilds) == 0 {
+					pm.pendingRebuilds = nil
+					pm.mu.Unlock()
+					continue
+				}
 				var rebuildsNeedingPrep []string
 				for _, pkgName := range rebuilds {
 					if pm.rebuildDepPrep[pkgName] {
@@ -788,6 +802,35 @@ func (pm *ParallelManager) startCycleBreakerLocked() bool {
 		return true
 	}
 	return false
+}
+
+// dropResolvedLibraryRebuildsLocked returns rebuilds without the ones queued
+// only for a removed library that the installed package no longer needs. A
+// package flagged while its own update was still running -- bump's ABI
+// rebuild of it, built against the new library -- is installed by now, and
+// rebuilding it again would gain nothing. Nothing is running when this is
+// called, so what is installed is final.
+func (pm *ParallelManager) dropResolvedLibraryRebuildsLocked(rebuilds []string) []string {
+	var kept, resolved []string
+	for _, pkgName := range rebuilds {
+		if pm.libraryRebuilds[pkgName] && !libraryRebuildStillNeeded(pkgName) {
+			resolved = append(resolved, pkgName)
+			delete(pm.rebuildDepPrep, pkgName)
+			delete(pm.libraryRebuilds, pkgName)
+			continue
+		}
+		kept = append(kept, pkgName)
+	}
+	if len(resolved) > 0 {
+		pm.mu.Unlock()
+		WithPrompt(func() {
+			fmt.Print("\r\033[K")
+			colArrow.Print("-> ")
+			colNote.Printf("Not rebuilding %s: already updated against the new libraries\n", strings.Join(resolved, ", "))
+		})
+		pm.mu.Lock()
+	}
+	return kept
 }
 
 func (pm *ParallelManager) recordRebuildTriggerLocked(rebuildPkg, triggerPkg string) {

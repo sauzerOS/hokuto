@@ -3209,3 +3209,192 @@ func TestParallelCanBuildIgnoresNativeDependenciesInCrossBuild(t *testing.T) {
 		t.Fatal("lvm2 should build once aarch64-libaio is installed, without its native dependencies")
 	}
 }
+
+func TestFlushPackageSuggestionsSilentInHokutoBuilder(t *testing.T) {
+	withTempDependencyRepo(t)
+	t.Setenv("HOKUTO_BUILDER", "1")
+
+	root := t.TempDir()
+	rootDir = root
+	Installed = filepath.Join(root, "var", "db", "hokuto", "installed")
+	writeInstalledTestPackage(t, "udisks2")
+	if err := os.WriteFile(filepath.Join(Installed, "udisks2", "suggests"), []byte("btrfs-progs suggest for BTRFS support\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	packageSuggestions.Lock()
+	packageSuggestions.items = make(map[string]map[string]packageSuggestion)
+	packageSuggestions.Unlock()
+
+	collectPackageSuggestions("udisks2", rootDir)
+	var out bytes.Buffer
+	flushPackageSuggestions(&out, nil, false, true, false)
+	if out.Len() != 0 {
+		t.Fatalf("hokuto-builder must not show suggestions, got %q", out.String())
+	}
+	if hasPackageSuggestions() {
+		t.Fatal("suggestions must not be kept for a later flush")
+	}
+}
+
+// runLibraryRebuildScenario updates libplist and libtatsu in parallel. libtatsu
+// comes from a binary, so it is still running when installing libplist flags
+// it for linking the removed libplist-2.0.so.4. updateLibtatsu decides whether
+// its new binary links the new soname.
+func runLibraryRebuildScenario(t *testing.T, updateLibtatsu bool) (libtatsuBuilds int, rebuildQueued bool) {
+	t.Helper()
+	cfg, repo := withTempDependencyRepo(t)
+	writeTestPackage(t, repo, "libplist", "")
+	writeTestPackage(t, repo, "libtatsu", "libplist\n")
+	root := t.TempDir()
+	rootDir = root
+	Installed = filepath.Join(root, "var", "db", "hokuto", "installed")
+	writeLibdeps := func(libdeps string) {
+		t.Helper()
+		writeInstalledTestPackage(t, "libtatsu")
+		if err := os.WriteFile(filepath.Join(Installed, "libtatsu", "libdeps"), []byte(libdeps), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeLibdeps("elf64:libplist-2.0.so.4\n")
+	// libplist 2.8.0 ships only the new soname.
+	if err := os.MkdirAll(filepath.Join(root, "usr", "lib"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "usr", "lib", "libplist-2.0.so.5"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	plan := &BuildPlan{
+		Order:             []string{"libplist", "libtatsu"},
+		BinaryPackages:    map[string]bool{"libtatsu": true},
+		RebuildPackages:   make(map[string]bool),
+		PostRebuilds:      make(map[string][]string),
+		PostBuildRebuilds: make(map[string][]string),
+	}
+	pm := &ParallelManager{
+		MaxJobs: 2, Config: cfg, BuildPlan: plan,
+		Pending:     append([]string(nil), plan.Order...),
+		Running:     make(map[string]time.Time),
+		Completed:   make(map[string]bool),
+		Available:   make(map[string]bool),
+		Failed:      make(map[string]error),
+		LogFiles:    make(map[string]*os.File),
+		resultChan:  make(chan buildResult, 2),
+		promptPause: make(chan bool),
+		promptAck:   make(chan struct{}),
+		AutoYes:     true,
+	}
+	var mu sync.Mutex
+	pm.Builder = func(pkg string, _ *Config, _ *Executor, _ BuildOptions) (time.Duration, error) {
+		if pkg == "libtatsu" {
+			mu.Lock()
+			libtatsuBuilds++
+			first := libtatsuBuilds == 1
+			mu.Unlock()
+			if first {
+				time.Sleep(150 * time.Millisecond) // still fetching when libplist installs
+			}
+		}
+		return time.Millisecond, nil
+	}
+	pm.Installer = func(pkg string, _ io.Writer) (parallelInstallResult, error) {
+		switch pkg {
+		case "libplist":
+			return parallelInstallResult{Available: []string{pkg}, Rebuilds: []string{"libtatsu"}}, nil
+		case "libtatsu":
+			if updateLibtatsu {
+				writeLibdeps("elf64:libplist-2.0.so.5\n")
+			}
+		}
+		return parallelInstallResult{Available: []string{pkg}}, nil
+	}
+	go func() {
+		for range pm.promptPause {
+			pm.promptAck <- struct{}{}
+		}
+	}()
+	SetPromptHooks(func() { pm.promptPause <- true; <-pm.promptAck }, func() { pm.promptPause <- false; <-pm.promptAck })
+	t.Cleanup(func() { SetPromptHooks(nil, nil) })
+
+	if err := pm.Run(); err != nil {
+		t.Fatal(err)
+	}
+	return libtatsuBuilds, plan.RebuildPackages["libtatsu"]
+}
+
+func TestParallelUpdateSkipsLibraryRebuildAlreadyUpdated(t *testing.T) {
+	builds, queued := runLibraryRebuildScenario(t, true)
+	if builds != 1 || queued {
+		t.Fatalf("libtatsu was updated against the new libplist and must not be rebuilt: builds=%d queued=%v", builds, queued)
+	}
+}
+
+// libraryRebuildFixture installs libtatsu linking libplist-2.0.so.4 in a
+// fresh root, where only the new libplist-2.0.so.5 exists.
+func libraryRebuildFixture(t *testing.T) (setLibdeps func(string)) {
+	t.Helper()
+	withTempDependencyRepo(t)
+	root := t.TempDir()
+	rootDir = root
+	Installed = filepath.Join(root, "var", "db", "hokuto", "installed")
+	if err := os.MkdirAll(filepath.Join(root, "usr", "lib"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "usr", "lib", "libplist-2.0.so.5"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	setLibdeps = func(libdeps string) {
+		t.Helper()
+		writeInstalledTestPackage(t, "libtatsu")
+		if err := os.WriteFile(filepath.Join(Installed, "libtatsu", "libdeps"), []byte(libdeps), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	setLibdeps("elf64:libplist-2.0.so.4\n")
+	return setLibdeps
+}
+
+func TestParallelUpdateKeepsLibraryRebuildStillBroken(t *testing.T) {
+	libraryRebuildFixture(t)
+	pm := &ParallelManager{
+		libraryRebuilds: map[string]bool{"libtatsu": true},
+		rebuildDepPrep:  map[string]bool{"libtatsu": true},
+	}
+	pm.mu.Lock()
+	kept := pm.dropResolvedLibraryRebuildsLocked([]string{"libtatsu", "nvidia-modules"})
+	pm.mu.Unlock()
+	if strings.Join(kept, " ") != "libtatsu nvidia-modules" {
+		t.Fatalf("a package still linking a removed library, and a trigger rebuild, must stay queued: %v", kept)
+	}
+}
+
+func TestSequentialUpdateDefersLibraryRebuildOfBatchPackages(t *testing.T) {
+	setLibdeps := libraryRebuildFixture(t)
+
+	startUpdateBatch([]string{"libplist", "libtatsu"})
+	markUpdateBatchDone("libplist")
+	affected := map[string][]string{"libtatsu": {"libplist-2.0.so.4"}, "ifuse": {"libplist-2.0.so.4"}}
+	deferUpdateBatchRebuilds(affected)
+	if _, ok := affected["libtatsu"]; ok {
+		t.Fatal("libtatsu is updated later in this run; installing libplist must not prompt for it")
+	}
+	if _, ok := affected["ifuse"]; !ok {
+		t.Fatal("ifuse is not part of the update and must still be offered a rebuild")
+	}
+
+	// libtatsu's update installs a binary built against the new libplist.
+	markUpdateBatchDone("libtatsu")
+	setLibdeps("elf64:libplist-2.0.so.5\n")
+	if broken := finishUpdateBatch(); len(broken) != 0 {
+		t.Fatalf("libtatsu was fixed by its own update, got %v", broken)
+	}
+
+	// The same again, with a replacement still linked against the old soname.
+	setLibdeps("elf64:libplist-2.0.so.4\n")
+	startUpdateBatch([]string{"libtatsu"})
+	deferUpdateBatchRebuilds(map[string][]string{"libtatsu": {"libplist-2.0.so.4"}})
+	if broken := finishUpdateBatch(); len(broken["libtatsu"]) == 0 {
+		t.Fatalf("libtatsu still links the removed soname and must be reported, got %v", broken)
+	}
+}

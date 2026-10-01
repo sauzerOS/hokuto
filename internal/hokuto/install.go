@@ -255,7 +255,9 @@ func flushPackageSuggestions(logger io.Writer, cfg *Config, noRemote bool, promp
 	packageSuggestions.items = make(map[string]map[string]packageSuggestion)
 	packageSuggestions.Unlock()
 
-	if len(items) == 0 {
+	// hokuto-builder only builds packages; what its container has installed
+	// is build dependencies, which need no optional extras.
+	if len(items) == 0 || runningInHokutoBuilder() {
 		return
 	}
 
@@ -1654,6 +1656,12 @@ func pkgInstallWithRemotePolicy(tarballPath, pkgName string, cfg *Config, execCt
 	}
 
 	// --- Rebuild Affected Packages (Step 8) ---
+	// A sequential update that is about to replace an affected package
+	// rechecks it once the update is done instead (see library_rebuild.go);
+	// in managed mode the parallel manager makes that decision.
+	if !managed {
+		deferUpdateBatchRebuilds(affectedPackages)
+	}
 	if len(affectedPackages) > 0 {
 		affectedList := make([]string, 0, len(affectedPackages))
 		for pkg := range affectedPackages {

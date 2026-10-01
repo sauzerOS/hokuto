@@ -1674,7 +1674,19 @@ func checkForUpgrades(ctx context.Context, cfg *Config, maxJobs int, yes bool) e
 	var totalUpdateDuration time.Duration // Accumulator for the whole update process
 	totalToUpdate := len(pkgNames)
 
+	// A library removed by one update can affect a package this run updates
+	// later; the installer leaves those for the check after the loop.
+	batchOutputs := make([]string, 0, len(pkgNames))
+	for _, pkgName := range pkgNames {
+		batchOutputs = append(batchOutputs, getOutputPackageName(pkgName, cfg))
+	}
+	startUpdateBatch(batchOutputs)
+	defer reportBrokenUpdateBatch()
+
 	for i, pkgName := range pkgNames {
+		// From here on a removed library that affects this package is its
+		// own problem again: its update is the one running now.
+		markUpdateBatchDone(getOutputPackageName(pkgName, cfg))
 		colArrow.Print("\n-> ")
 		if userRequestedMap[pkgName] {
 			colSuccess.Printf("Executing update for:")

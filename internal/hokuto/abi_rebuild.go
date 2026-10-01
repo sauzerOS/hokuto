@@ -442,13 +442,19 @@ func handleABIRebuilds(built []string, cfg *Config, logMsg func(string, ...inter
 	return libs
 }
 
+// runningInHokutoBuilder reports whether hokuto runs in a hokuto-builder
+// container, which sets HOKUTO_BUILDER=1.
+func runningInHokutoBuilder() bool {
+	return os.Getenv("HOKUTO_BUILDER") == "1"
+}
+
 // printABIRebuildHint tells how to build what handleABIRebuilds bumped.
 func printABIRebuildHint(libs []string) {
 	if len(libs) == 0 {
 		return
 	}
 	command := "hokuto update --build-missing-binaries"
-	if os.Getenv("HOKUTO_BUILDER") == "1" {
+	if runningInHokutoBuilder() {
 		command = "hokuto-builder rebuild"
 	}
 	fmt.Println()

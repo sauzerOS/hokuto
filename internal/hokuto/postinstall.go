@@ -14,6 +14,13 @@ import (
 	"sync"
 )
 
+// systemdBooted reports whether systemd is the running init, the same test
+// sd_booted(3) makes.
+func systemdBooted() bool {
+	info, err := os.Stat("/run/systemd/system")
+	return err == nil && info.IsDir()
+}
+
 // PostInstallTasks runs global post-install hooks like ldconfig, icon cache updates, etc.
 func PostInstallTasks(execCtx *Executor, logger io.Writer) error {
 	if logger == nil {
@@ -56,6 +63,12 @@ func PostInstallTasks(execCtx *Executor, logger io.Writer) error {
 	}
 
 	for _, task := range sequentialTasks {
+		// A container that was not booted (hokuto-builder's nspawn, a
+		// chroot) has no systemd manager to reload.
+		if task.name == "systemctl" && !systemdBooted() {
+			debugf("Skipping systemctl daemon-reload: the system was not booted with systemd\n")
+			continue
+		}
 		if _, err := exec.LookPath(task.name); err == nil {
 			cmd := exec.Command(task.name, task.args...)
 			cmd.Stdout = io.Discard
