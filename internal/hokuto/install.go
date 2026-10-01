@@ -410,7 +410,7 @@ func installMissingPackageRuntimeDependencies(pkgName string, cfg *Config, logge
 				return fmt.Errorf("failed to install binary runtime dependency %s for %s: %w", depName, pkgName, err)
 			}
 			if !installed {
-				debugf("Skipping runtime dependency %s for %s during build: no binary available\n", depName, pkgName)
+				warnMissingRuntimeDependency(depName, pkgName)
 			} else if !quiet {
 				if logger == nil {
 					logger = os.Stdout

@@ -2785,7 +2785,7 @@ func ensureBinaryRuntimeDependenciesInstalledWithOptions(pkgName string, cfg *Co
 				return fmt.Errorf("failed to install binary runtime dependency %s for %s: %w", depName, pkgName, err)
 			}
 			if !installed {
-				debugf("Skipping runtime dependency %s for %s during build: no binary available\n", depName, pkgName)
+				warnMissingRuntimeDependency(depName, pkgName)
 			}
 			continue
 		}

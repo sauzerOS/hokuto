@@ -400,6 +400,32 @@ nspawn_run() {
     fi
 }
 
+# Shell functions put in front of the scripts below, which run in the
+# container. hokuto removes the build dependencies it installs, but a
+# dependency cycle can keep a whole tree installed (solid needs qt, which
+# needs gtk+3, ...), and that tree then changes what later builds link
+# against. So each command records the installed packages before its work
+# starts and removes whatever is new once everything, upload included, is
+# done. hokuto uninstall still refuses to remove a package that one recorded
+# before needs, e.g. a new dependency of a package that was updated.
+# shellcheck disable=SC2016
+LEFTOVER_FUNCS='
+installed_before=/tmp/hokuto-builder-installed.before
+snapshot_installed() {
+    ls -1 /var/db/hokuto/installed >"$installed_before"
+}
+remove_leftovers() {
+    [ -f "$installed_before" ] || return 0
+    leftovers=$(ls -1 /var/db/hokuto/installed | grep -vxF -f "$installed_before" || true)
+    rm -f "$installed_before"
+    [ -n "$leftovers" ] || return 0
+    printf "\033[0;36m->\033[0m Removing packages this run left installed: %s\n" "$(echo $leftovers)"
+    # shellcheck disable=SC2086
+    /usr/local/bin/hokuto uninstall -y $leftovers ||
+        printf "\033[0;33m->\033[0m Some packages could not be removed; check with hokuto-builder run hokuto list\n"
+}
+'
+
 # The build step of `hokuto bump --build` for packages that are already
 # bumped (e.g. after a failed build): idle, not installed, status and log
 # published to the website, then the mirror synced if the build succeeded.
@@ -420,9 +446,10 @@ cmd_build() {
     # One container session; the arguments reach hokuto as "$@", unquoted
     # nowhere.
     # shellcheck disable=SC2016
-    nspawn_run "$BUILD_USER" /bin/sh -c '
+    nspawn_run "$BUILD_USER" /bin/sh -c "$LEFTOVER_FUNCS"'
         upload=$1
         shift
+        snapshot_installed
         status=0
         /usr/local/bin/hokuto build "$@" || status=$?
         # A failed package must not keep the others off the mirror: upload
@@ -430,6 +457,7 @@ cmd_build() {
         if [ "$upload" = 1 ]; then
             /usr/local/bin/hokuto upload --sync || { rc=$?; [ "$status" != 0 ] || status=$rc; }
         fi
+        remove_leftovers
         exit "$status"
     ' hokuto-builder-build "$upload" "${build_flags[@]}" "${args[@]}"
 }
@@ -451,10 +479,12 @@ cmd_rebuild() {
         fi
     done
     # shellcheck disable=SC2016
-    nspawn_run "$BUILD_USER" /bin/sh -c '
+    nspawn_run "$BUILD_USER" /bin/sh -c "$LEFTOVER_FUNCS"'
         upload=$1
         shift
         /usr/local/bin/hokuto update --remote -y || exit
+        # After the update: what it installed stays in the container.
+        snapshot_installed
         status=0
         /usr/local/bin/hokuto update --build-missing-binaries -i "$@" || status=$?
         # A failed package must not keep the others off the mirror: upload
@@ -462,6 +492,7 @@ cmd_rebuild() {
         if [ "$upload" = 1 ]; then
             /usr/local/bin/hokuto upload --sync || { rc=$?; [ "$status" != 0 ] || status=$rc; }
         fi
+        remove_leftovers
         exit "$status"
     ' hokuto-builder-rebuild "$upload" "${args[@]}"
 }
@@ -483,9 +514,10 @@ cmd_cross_sync() {
         fi
     done
     # shellcheck disable=SC2016
-    nspawn_run "$BUILD_USER" /bin/sh -c '
+    nspawn_run "$BUILD_USER" /bin/sh -c "$LEFTOVER_FUNCS"'
         upload=$1
         shift
+        snapshot_installed
         status=0
         /usr/local/bin/hokuto cross-sync "$@" || status=$?
         # A failed package must not keep the others off the mirror: upload
@@ -493,6 +525,7 @@ cmd_cross_sync() {
         if [ "$upload" = 1 ]; then
             /usr/local/bin/hokuto upload --sync || { rc=$?; [ "$status" != 0 ] || status=$rc; }
         fi
+        remove_leftovers
         exit "$status"
     ' hokuto-builder-cross-sync "$upload" "${args[@]}"
 }
@@ -513,7 +546,17 @@ cmd_destroy() {
 
 case "$1" in
     create) cmd_create ;;
-    bump) shift; nspawn_run "$BUILD_USER" /usr/local/bin/hokuto bump --auto --build "$@" ;;
+    bump)
+        shift
+        # shellcheck disable=SC2016
+        nspawn_run "$BUILD_USER" /bin/sh -c "$LEFTOVER_FUNCS"'
+            snapshot_installed
+            status=0
+            /usr/local/bin/hokuto bump --auto --build "$@" || status=$?
+            remove_leftovers
+            exit "$status"
+        ' hokuto-builder-bump "$@"
+        ;;
     build) shift; cmd_build "$@" ;;
     rebuild) shift; cmd_rebuild "$@" ;;
     cross-sync) shift; cmd_cross_sync "$@" ;;

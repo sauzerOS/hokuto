@@ -5111,6 +5111,14 @@ func handleBuildCommand(args []string, cfg *Config) (err error) {
 			for _, dep := range installedMakeOpt {
 				addTemporaryBuildDep(dep)
 			}
+			// An installed build dependency missing one of its own runtime
+			// dependencies breaks the build in ways that look unrelated (a
+			// pkg-config chain, a feature silently disabled).
+			if !*bootstrap {
+				for _, dep := range repairInstalledRuntimeDeps(buildDependencyRoots(initialPlan, cfg), cfg, *noRemote, quietDependencyInstalls) {
+					addTemporaryBuildDep(dep)
+				}
+			}
 
 			progressCount := 0
 

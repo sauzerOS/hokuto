@@ -1559,6 +1559,8 @@ func checkForUpgrades(ctx context.Context, cfg *Config, maxJobs int, yes bool) e
 		} else {
 			debugf("Skipping devel package check: all source builds suppress it via binary or nodevel\n")
 		}
+		// Cleanup of what this installs is covered by the snapshot above.
+		repairInstalledRuntimeDeps(buildDependencyRoots(plan, cfg), cfg, false, quietDependencyInstalls)
 	}
 
 	requiredSplitDepsInstalled := func(sourcePkg string) bool {
