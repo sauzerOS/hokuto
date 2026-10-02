@@ -1007,13 +1007,13 @@ func pkgInstallWithRemotePolicy(tarballPath, pkgName string, cfg *Config, execCt
 				if err := keepCurrentFileInStaging(currentFile, stagingFile, execCtx); err != nil {
 					return nil, err
 				}
-				fmt.Fprintf(logger, "Kept modified %s; the version from %s was not installed\n", file, pkgName)
+				fmt.Fprintf(logger, "%s%s\n", colArrow.Sprint("-> "), colNote.Sprintf("Kept modified %s; the version from %s was not installed", file, pkgName))
 			} else {
 				backupPath, err := moveRemovedFileToBackup(currentFile, file, execCtx)
 				if err != nil {
 					return nil, err
 				}
-				fmt.Fprintf(logger, "%s", colInfo.Sprintf("%s no longer contains %s, which was modified here: moved it to %s\n", pkgName, file, backupPath))
+				fmt.Fprintf(logger, "%s%s\n", colArrow.Sprint("-> "), colNote.Sprintf("%s no longer contains %s, which was modified here: moved it to %s", pkgName, file, backupPath))
 			}
 			filesHandledInConflict[file] = true
 			continue
@@ -2305,7 +2305,7 @@ func backupModifiedFile(currentFile, relPath string, execCtx *Executor, logger i
 	}
 
 	if logger != nil {
-		fmt.Fprintf(logger, "%s", colInfo.Sprintf("Saved backup of %s to %s\n", currentFile, backupPath))
+		fmt.Fprintf(logger, "%s%s\n", colArrow.Sprint("-> "), colNote.Sprintf("Saved backup of %s to %s", currentFile, backupPath))
 	}
 	return nil
 }
