@@ -396,6 +396,9 @@ func installMissingPackageRuntimeDependencies(pkgName string, cfg *Config, logge
 		if depName == "" || depName == pkgName || shouldSkipMultilibMakeDep(dep, depName, cfg) {
 			continue
 		}
+		if hostLineOfCrossSystemPackage(pkgName, depName) {
+			continue
+		}
 		if _, inProgress := runtimeDependencyInstallInProgress.Load(depName); inProgress {
 			continue
 		}

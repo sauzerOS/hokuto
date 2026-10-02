@@ -104,3 +104,60 @@ func TestRepairInstalledRuntimeDepsSkipsWhatThePlanBuilds(t *testing.T) {
 		t.Errorf("libjxl is missing with no binary and must be reported:\n%s", out)
 	}
 }
+
+func TestMissingInstalledRuntimeDepsCrossSystemPackages(t *testing.T) {
+	cfg, repo := withTempDependencyRepo(t)
+	cfg.Values["HOKUTO_CROSS_ARCH"] = "arm64"
+	writeTestPackage(t, repo, "gcc", "")
+	if err := os.WriteFile(filepath.Join(repo, "gcc", "options"), []byte("host-tool\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// A sysroot library keeps its recipe's native lines (libxcb, xorgproto);
+	// they name host packages it does not use.
+	writeInstalledDepends(t, "aarch64-libx11", "aarch64-libxcb\nlibxcb\nxorgproto\nglibc\n")
+	writeInstalledDepends(t, "aarch64-libxcb", "aarch64-libxau cross\nlibxau\n")
+	// The cross compiler's programs run on the host and need gmp.
+	writeInstalledDepends(t, "aarch64-gcc", "aarch64-glibc cross\ngmp\nglibc\n")
+	writeInstalledDepends(t, "aarch64-glibc", "")
+	writeInstalledDepends(t, "glibc", "")
+	// A native host tool used by the cross build.
+	writeInstalledDepends(t, "cmake", "jsoncpp\nglibc\naarch64-gcc cross make\n")
+
+	got := missingInstalledRuntimeDeps([]string{"aarch64-libx11", "aarch64-gcc", "cmake"}, cfg)
+	want := map[string][]string{
+		"aarch64-libxau": {"aarch64-libxcb"},
+		"gmp":            {"aarch64-gcc"},
+		"jsoncpp":        {"cmake"},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("missing = %v, want %v", got, want)
+	}
+}
+
+func TestCrossSessionLooksUpHostRuntimeDependencyNatively(t *testing.T) {
+	cfg, repo := withTempDependencyRepo(t)
+	cfg.Values["HOKUTO_CROSS_ARCH"] = "arm64"
+	cfg.Values["HOKUTO_ARCH"] = "x86_64"
+	writeTestPackage(t, repo, "jsoncpp", "")
+	oldMirror := BinaryMirror
+	BinaryMirror = ""
+	t.Cleanup(func() { BinaryMirror = oldMirror })
+
+	native := packageBuildConfig("jsoncpp", cfg)
+	name := StandardizeRemoteName("jsoncpp", "1.0", "1", GetSystemArchForPackage(native, "jsoncpp"), GetSystemVariantForPackage(native, "jsoncpp"))
+	if err := os.MkdirAll(BinDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(BinDir, name), []byte("pkg"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, _, ok, _ := availableBinaryPackageTarball("jsoncpp", native, true); !ok {
+		t.Fatalf("the native %s must be found for cmake's runtime dependency", name)
+	}
+	// What the lookup used to do: ask for the cross target's binary.
+	if _, _, ok, _ := availableBinaryPackageTarball("jsoncpp", cfg, true); ok {
+		t.Fatal("expected the cross configuration to miss the native binary; the test no longer shows the difference")
+	}
+}

@@ -2804,6 +2804,9 @@ func ensureBinaryRuntimeDependenciesInstalledWithOptions(pkgName string, cfg *Co
 		if depName == "" || sameSourcePackage(depName, pkgName) || shouldSkipMultilibMakeDep(dep, depName, cfg) {
 			continue
 		}
+		if hostLineOfCrossSystemPackage(pkgName, depName) {
+			continue
+		}
 		if findInstalledDependencySatisfying(depName, dep.Op, dep.Version) != "" {
 			continue
 		}
@@ -2852,7 +2855,12 @@ func installRuntimeDependencyBinaryOnly(pkgName string, cfg *Config, noRemote bo
 		return false, nil
 	}
 
-	installName, tarballPath, ok, err := availableBinaryPackageTarball(pkgName, cfg, noRemote)
+	// A runtime dependency installed during a cross session is a host
+	// package unless it carries the target prefix (or is itself a requested
+	// cross target): find and install it with the native configuration, or
+	// the lookup asks for an aarch64 binary of, say, cmake's jsoncpp.
+	depCfg := packageBuildConfig(pkgName, cfg)
+	installName, tarballPath, ok, err := availableBinaryPackageTarball(pkgName, depCfg, noRemote)
 	if err != nil || !ok {
 		return false, err
 	}
@@ -2863,7 +2871,7 @@ func installRuntimeDependencyBinaryOnly(pkgName string, cfg *Config, noRemote bo
 	// pkgInstall also scans the installed depends file. Suppress that second pass;
 	// the recursive binary-only pass above has already handled it.
 	defer suppressRuntimeDependencyAutoInstallScope()()
-	return installBinaryTarballWithRemotePolicy(tarballPath, installName, cfg, quiet, noRemote)
+	return installBinaryTarballWithRemotePolicy(tarballPath, installName, depCfg, quiet, noRemote)
 }
 
 func dependencyInstallLogger(quiet bool) (io.Writer, bool) {

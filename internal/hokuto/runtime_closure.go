@@ -31,6 +31,33 @@ func warnMissingRuntimeDependency(depName, pkgName string) {
 	fmt.Fprintln(os.Stderr, colWarn.Sprintf("Warning: runtime dependency %s of %s has no binary available; %s is installed without it", depName, pkgName, pkgName))
 }
 
+// hostLineOfCrossSystemPackage reports whether depName, a runtime dependency
+// recorded for pkgName, is one of the native lines a cross-system library
+// package (aarch64-foo) carries over from its recipe. Those name host
+// packages the sysroot copy does not use; its real dependencies carry its own
+// prefix. A cross toolchain package (option host-tool: aarch64-gcc,
+// aarch64-binutils) is different: its programs run on the host and need its
+// native dependencies (gmp, mpfr, zstd, ...).
+func hostLineOfCrossSystemPackage(pkgName, depName string) bool {
+	prefix := archPrefixOf(pkgName)
+	if prefix == "" || archPrefixOf(depName) == prefix {
+		return false
+	}
+	return !crossSystemHostTool(pkgName, prefix)
+}
+
+// crossSystemHostTool reports whether the cross-system package pkgName is
+// built with the host-tool option, from its installed copy or its recipe.
+func crossSystemHostTool(pkgName, prefix string) bool {
+	if info, err := os.Stat(filepath.Join(Installed, pkgName, "options")); err == nil && !info.IsDir() {
+		return loadBuildOptions(filepath.Join(Installed, pkgName))["host-tool"]
+	}
+	if dir, err := findPackageMetadataDir(strings.TrimPrefix(pkgName, prefix)); err == nil {
+		return loadBuildOptions(dir)["host-tool"]
+	}
+	return false
+}
+
 // missingInstalledRuntimeDeps walks the installed runtime dependencies of
 // roots and returns the ones that are not installed, with the installed
 // packages that need them. Only installed packages are followed: a root that
@@ -54,8 +81,19 @@ func missingInstalledRuntimeDeps(roots []string, cfg *Config) map[string][]strin
 		if err != nil {
 			continue
 		}
+		// A cross-system package (aarch64-foo) also records its recipe's
+		// native lines, which name host packages it does not use; its real
+		// dependencies are the aarch64-* ones, cross-tagged or detected from
+		// its libraries. Everything else follows only its native lines.
 		for _, dep := range deps {
-			if dep.Make || dep.Optional || dep.Rebuild || dep.PostInstall || dep.Suggest || dep.Cross || dep.CrossNative {
+			if dep.Make || dep.Optional || dep.Rebuild || dep.PostInstall || dep.Suggest {
+				continue
+			}
+			if archPrefixOf(installedName) != "" {
+				if len(dep.Alternatives) > 0 || hostLineOfCrossSystemPackage(installedName, dep.Name) {
+					continue
+				}
+			} else if dep.Cross || dep.CrossNative {
 				continue
 			}
 			candidates := dep.Alternatives
@@ -113,7 +151,9 @@ func repairInstalledRuntimeDeps(plan *BuildPlan, cfg *Config, noRemote, quiet bo
 	for _, name := range names {
 		// The build dependency policy: the current revision's binary, or an
 		// older one while the current revision is not published yet.
-		ok, err := installAvailableBuildDependencyBinaryWithOptions(name, cfg, noRemote, quiet, true)
+		// In a cross session a plain name is a host package: look it up
+		// natively, not as a target binary.
+		ok, err := installAvailableBuildDependencyBinaryWithOptions(name, packageBuildConfig(name, cfg), noRemote, quiet, true)
 		if err != nil {
 			colArrow.Print("-> ")
 			colWarn.Printf("Warning: failed to install %s: %v\n", name, err)
