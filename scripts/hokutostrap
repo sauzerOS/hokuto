@@ -179,18 +179,12 @@ HOSTNAME="${input_hostname:-hokuto}"
 # 7. Installation
 log_info "Starting installation"
 
-# Define minimal package list or use what user requested
+# The sauzeros metapackage is the minimal install (/repo/sauzeros/.hokuto/
+# metapackages.toml), as hokuto-builder uses too. A hand-picked list here
+# drifts from it: one without gzip broke locale-gen, since glibc's localedef
+# needs gzip to read its compressed character maps.
 PACKAGES=(
-    "glibc"
-    "gcc"
-    "ncurses"
-    "readline"
-    "bash"
-    "coreutils"
-    "hokuto"
-    "shadow"
-    "nano"
-    "less"
+    "sauzeros"
 )
 
 # Convert array to space-separated string
