@@ -991,11 +991,31 @@ func pkgInstallWithRemotePolicy(tarballPath, pkgName string, cfg *Config, execCt
 		stagingFile := filepath.Join(stagingDir, file)
 		currentFile := filepath.Join(rootDir, file) // file under the install root
 
-		// Fast path: If user selected "Use new for [A]ll" (or "yes" mode),
-		// we skip expensive checks (owner lookup, conflicts, diffs) and default to "Use New".
-		if skipAllPrompts || yes {
-			// Implicit "Use New": do nothing, let it fall through.
-			// The file remains in staging and will overwrite the target during the final rsync.
+		// "Use new for [A]ll" was chosen: the file stays in staging and
+		// replaces the modified one.
+		if skipAllPrompts {
+			continue
+		}
+		// Without prompts (yes mode: remote updates, dependency installs,
+		// rebuilds, -y) no change made on this system is lost: /etc/passwd
+		// edited by useradd must survive a sauzeros-base update. A modified
+		// file the package still has is kept; one it dropped is moved to the
+		// backup directory. No diff is shown -- it would print files like
+		// /etc/shadow.
+		if yes && !fast {
+			if _, err := os.Lstat(stagingFile); err == nil {
+				if err := keepCurrentFileInStaging(currentFile, stagingFile, execCtx); err != nil {
+					return nil, err
+				}
+				fmt.Fprintf(logger, "Kept modified %s; the version from %s was not installed\n", file, pkgName)
+			} else {
+				backupPath, err := moveRemovedFileToBackup(currentFile, file, execCtx)
+				if err != nil {
+					return nil, err
+				}
+				fmt.Fprintf(logger, "%s", colInfo.Sprintf("%s no longer contains %s, which was modified here: moved it to %s\n", pkgName, file, backupPath))
+			}
+			filesHandledInConflict[file] = true
 			continue
 		}
 
@@ -1143,43 +1163,8 @@ func pkgInstallWithRemotePolicy(tarballPath, pkgName string, cfg *Config, execCt
 			}
 			switch strings.ToLower(input) {
 			case "k":
-				// Check if currentFile is a symlink
-				currentInfo, err := os.Lstat(currentFile)
-				if err == nil && currentInfo.Mode()&os.ModeSymlink != 0 {
-					// It's a symlink - preserve it by reading the target and recreating the symlink
-					linkTarget, err := os.Readlink(currentFile)
-					if err != nil {
-						return nil, fmt.Errorf("failed to read symlink %s: %v", currentFile, err)
-					}
-					// Remove existing file/symlink in staging if it exists (use executor or native if root)
-					if os.Geteuid() == 0 {
-						os.Remove(stagingFile)
-						if err := os.Symlink(linkTarget, stagingFile); err != nil {
-							return nil, fmt.Errorf("failed to recreate symlink %s -> %s natively: %v", stagingFile, linkTarget, err)
-						}
-					} else {
-						rmCmd := exec.Command("rm", "-f", stagingFile)
-						if err := execCtx.Run(rmCmd); err != nil {
-							return nil, fmt.Errorf("failed to remove existing file %s: %v", stagingFile, err)
-						}
-						// Recreate the symlink in staging using executor for proper permissions
-						lnCmd := exec.Command("ln", "-s", linkTarget, stagingFile)
-						if err := execCtx.Run(lnCmd); err != nil {
-							return nil, fmt.Errorf("failed to recreate symlink %s -> %s: %v", stagingFile, linkTarget, err)
-						}
-					}
-				} else {
-					// It's a regular file - copy it normally
-					if os.Geteuid() == 0 {
-						if err := copyFile(currentFile, stagingFile); err != nil {
-							return nil, fmt.Errorf("failed to overwrite %s natively: %v", stagingFile, err)
-						}
-					} else {
-						cpCmd := exec.Command("cp", "--remove-destination", currentFile, stagingFile)
-						if err := execCtx.Run(cpCmd); err != nil {
-							return nil, fmt.Errorf("failed to overwrite %s: %v", stagingFile, err)
-						}
-					}
+				if err := keepCurrentFileInStaging(currentFile, stagingFile, execCtx); err != nil {
+					return nil, err
 				}
 			case "u":
 				// keep staging file as-is
@@ -1289,25 +1274,8 @@ func pkgInstallWithRemotePolicy(tarballPath, pkgName string, cfg *Config, execCt
 				}
 			}
 			if ans == "y" {
-				stagingFileDir := filepath.Dir(stagingFile)
-				if os.Geteuid() == 0 {
-					if err := os.MkdirAll(stagingFileDir, 0755); err != nil {
-						return nil, fmt.Errorf("failed to create directory %s natively: %v", stagingFileDir, err)
-					}
-					if err := copyFile(currentFile, stagingFile); err != nil {
-						return nil, fmt.Errorf("failed to copy %s to staging natively: %v", file, err)
-					}
-				} else {
-					// ensure staging directory exists (run as root)
-					mkdirCmd := exec.Command("mkdir", "-p", stagingFileDir)
-					if err := execCtx.Run(mkdirCmd); err != nil {
-						return nil, fmt.Errorf("failed to create directory %s: %v", stagingFileDir, err)
-					}
-					// copy current file into staging preserving attributes
-					cpCmd := exec.Command("cp", "--preserve=mode,ownership,timestamps", currentFile, stagingFile)
-					if err := execCtx.Run(cpCmd); err != nil {
-						return nil, fmt.Errorf("failed to copy %s to staging: %v", file, err)
-					}
+				if err := copyRemovedFileIntoStaging(currentFile, stagingFile, execCtx); err != nil {
+					return nil, err
 				}
 				debugf("Kept modified file by copying %s into staging\n", file)
 			} else {
@@ -2229,6 +2197,86 @@ func formatBackupFileName(relPath string) string {
 	}
 	dirPart := strings.ReplaceAll(dir, "/", "_")
 	return dirPart + "-" + base
+}
+
+// keepCurrentFileInStaging replaces the package's version of a modified file
+// in staging with the installed one, so the install leaves it as it is.
+func keepCurrentFileInStaging(currentFile, stagingFile string, execCtx *Executor) error {
+	currentInfo, err := os.Lstat(currentFile)
+	if err == nil && currentInfo.Mode()&os.ModeSymlink != 0 {
+		// A symlink: recreate it in staging with the same target.
+		linkTarget, err := os.Readlink(currentFile)
+		if err != nil {
+			return fmt.Errorf("failed to read symlink %s: %v", currentFile, err)
+		}
+		if os.Geteuid() == 0 {
+			os.Remove(stagingFile)
+			if err := os.Symlink(linkTarget, stagingFile); err != nil {
+				return fmt.Errorf("failed to recreate symlink %s -> %s natively: %v", stagingFile, linkTarget, err)
+			}
+			return nil
+		}
+		rmCmd := exec.Command("rm", "-f", stagingFile)
+		if err := execCtx.Run(rmCmd); err != nil {
+			return fmt.Errorf("failed to remove existing file %s: %v", stagingFile, err)
+		}
+		lnCmd := exec.Command("ln", "-s", linkTarget, stagingFile)
+		if err := execCtx.Run(lnCmd); err != nil {
+			return fmt.Errorf("failed to recreate symlink %s -> %s: %v", stagingFile, linkTarget, err)
+		}
+		return nil
+	}
+	if os.Geteuid() == 0 {
+		if err := copyFile(currentFile, stagingFile); err != nil {
+			return fmt.Errorf("failed to overwrite %s natively: %v", stagingFile, err)
+		}
+		return nil
+	}
+	cpCmd := exec.Command("cp", "--remove-destination", currentFile, stagingFile)
+	if err := execCtx.Run(cpCmd); err != nil {
+		return fmt.Errorf("failed to overwrite %s: %v", stagingFile, err)
+	}
+	return nil
+}
+
+// moveRemovedFileToBackup moves a modified file that the new package no
+// longer contains into SaveDir and returns where it went.
+func moveRemovedFileToBackup(currentFile, relPath string, execCtx *Executor) (string, error) {
+	if err := backupModifiedFile(currentFile, relPath, execCtx, nil); err != nil {
+		return "", fmt.Errorf("failed to back up modified file %s: %w", currentFile, err)
+	}
+	if os.Geteuid() == 0 {
+		if err := os.Remove(currentFile); err != nil && !os.IsNotExist(err) {
+			return "", fmt.Errorf("failed to remove %s natively: %w", currentFile, err)
+		}
+	} else if err := execCtx.Run(exec.Command("rm", "-f", currentFile)); err != nil {
+		return "", fmt.Errorf("failed to remove %s: %w", currentFile, err)
+	}
+	return filepath.Join(SaveDir, formatBackupFileName(relPath)), nil
+}
+
+// copyRemovedFileIntoStaging puts a modified file the new package no longer
+// contains into staging, so it is kept instead of removed.
+func copyRemovedFileIntoStaging(currentFile, stagingFile string, execCtx *Executor) error {
+	stagingFileDir := filepath.Dir(stagingFile)
+	if os.Geteuid() == 0 {
+		if err := os.MkdirAll(stagingFileDir, 0755); err != nil {
+			return fmt.Errorf("failed to create directory %s natively: %v", stagingFileDir, err)
+		}
+		if err := copyFile(currentFile, stagingFile); err != nil {
+			return fmt.Errorf("failed to copy %s to staging natively: %v", currentFile, err)
+		}
+		return nil
+	}
+	mkdirCmd := exec.Command("mkdir", "-p", stagingFileDir)
+	if err := execCtx.Run(mkdirCmd); err != nil {
+		return fmt.Errorf("failed to create directory %s: %v", stagingFileDir, err)
+	}
+	cpCmd := exec.Command("cp", "--preserve=mode,ownership,timestamps", currentFile, stagingFile)
+	if err := execCtx.Run(cpCmd); err != nil {
+		return fmt.Errorf("failed to copy %s to staging: %v", currentFile, err)
+	}
+	return nil
 }
 
 // backupModifiedFile saves a backup copy of currentFile to SaveDir (e.g. /var/db/hokuto/save)
