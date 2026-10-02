@@ -1012,31 +1012,64 @@ func resolveUpdatedRepoLFS(repo *gogit.Repository, dir string) {
 	}
 }
 
-// updateRepos updates each unique repository found in repoPaths
+// localRepoPaths returns the HOKUTO_PATH entries that exist on this system.
+// A system installed from binaries has none: its recipes were never cloned.
+func localRepoPaths() []string {
+	var existing []string
+	for _, p := range strings.Split(repoPaths, ":") {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		if info, err := os.Stat(p); err == nil && info.IsDir() {
+			existing = append(existing, p)
+		}
+	}
+	return existing
+}
 
+// gitRepoRoot returns the git repository that contains path, if any.
+func gitRepoRoot(path string) (string, bool) {
+	root := getBaseRepoPath(path)
+	if root == "" {
+		return "", false
+	}
+	if _, err := os.Stat(filepath.Join(root, ".git")); err != nil {
+		return "", false
+	}
+	return root, true
+}
+
+// updateRepos pulls each git repository that holds one of the existing
+// HOKUTO_PATH entries. Entries that do not exist, or are not in a git
+// repository, are left alone.
 func updateRepos() {
-	// 1. Split the global repoPaths string by the path separator ":"
-	paths := strings.Split(repoPaths, ":")
+	uniqueRepoDirs := make(map[string]struct{})
+	for _, p := range localRepoPaths() {
+		if repoDir, ok := gitRepoRoot(p); ok {
+			uniqueRepoDirs[repoDir] = struct{}{}
+		} else {
+			debugf("%s is not in a git repository; not updating it\n", p)
+		}
+	}
+	if len(uniqueRepoDirs) == 0 {
+		return
+	}
+	dirs := make([]string, 0, len(uniqueRepoDirs))
+	for dir := range uniqueRepoDirs {
+		dirs = append(dirs, dir)
+	}
+	sort.Strings(dirs)
+
 	_, gitErr := exec.LookPath("git")
 	useGoGit := gitErr != nil
 	if useGoGit {
 		colArrow.Print("-> ")
 		colWarn.Println("git not found; updating repositories with internal go-git")
 	}
-
-	// 2. Determine the unique base repository directories
-	uniqueRepoDirs := make(map[string]struct{})
-	for _, p := range paths {
-		// Clean the path to get the base repository directory
-		repoDir := getBaseRepoPath(p)
-
-		if repoDir != "" {
-			uniqueRepoDirs[repoDir] = struct{}{}
-		}
-	}
 	colArrow.Print("-> ")
 	colSuccess.Println("Unique repositories to update:")
-	for dir := range uniqueRepoDirs {
+	for _, dir := range dirs {
 		colArrow.Print("-> ")
 		colSuccess.Printf("%s\n", dir)
 

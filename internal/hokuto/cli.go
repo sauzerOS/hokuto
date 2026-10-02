@@ -1532,6 +1532,12 @@ func Main() {
 			fmt.Fprintln(os.Stderr, "Error: --remote and --build-missing-binaries cannot be used together.")
 			exitHokuto(1)
 		}
+		// Without any local repository there is nothing to update from but
+		// the binary mirror.
+		if !*remote && !*buildMissingBinaries && len(localRepoPaths()) == 0 {
+			debugf("No repository from HOKUTO_PATH exists; updating from the binary mirror\n")
+			*remote = true
+		}
 		if *remote {
 			if err := checkForRemoteUpgrades(ctx, cfg, *yes || *yesLong); err != nil {
 				fmt.Fprintf(os.Stderr, "Remote upgrade process failed: %v\n", err)

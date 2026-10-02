@@ -9,7 +9,6 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"syscall"
 
 	"golang.org/x/term"
 )
@@ -137,15 +136,15 @@ func promptMirrorLogin(sent string) bool {
 		} else {
 			colWarn.Printf("The mirror login was not accepted by %s.\n", host)
 		}
+		// Shown as typed: it is a download password, and seeing it avoids
+		// typos. One reader for both lines, so nothing typed ahead is lost.
+		reader := bufio.NewReader(os.Stdin)
 		fmt.Print("   User: ")
-		line, _ := bufio.NewReader(os.Stdin).ReadString('\n')
+		line, _ := reader.ReadString('\n')
 		user = strings.TrimSpace(line)
 		fmt.Print("   Password: ")
-		secret, err := term.ReadPassword(int(syscall.Stdin))
-		fmt.Println()
-		if err == nil {
-			pass = string(secret)
-		}
+		line, _ = reader.ReadString('\n')
+		pass = strings.TrimRight(line, "\r\n")
 	})
 	if user == "" {
 		return false

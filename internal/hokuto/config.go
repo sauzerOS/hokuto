@@ -121,9 +121,11 @@ func initConfig(cfg *Config) {
 		WebsiteRepo = defaultWebsiteRepo
 	}
 
+	// Empty unless "hokuto init-repos" was run: a system installed from the
+	// binary mirror needs no recipe repositories.
 	repoPaths = cfg.Values["HOKUTO_PATH"]
 	if repoPaths == "" {
-		log.Printf("Warning: HOKUTO_PATH is not set")
+		debugf("HOKUTO_PATH is not set; no local repositories\n")
 	}
 
 	WantDebug = cfg.Values["HOKUTO_DEBUG"]
