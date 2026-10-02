@@ -137,6 +137,8 @@ A normal recipe directory may contain:
 - `files`: local recipe files;
 - `post-install` and `post-install.split`;
 - `libdeps.ignore` and `libdeps.ignore.<split>`;
+- `bump-follows`: a package whose new versions `bump` applies to this recipe
+  too (`linux-live` follows `linux`; see `bump_follows.go`);
 - `metadata.json`.
 
 The `build` script receives:

@@ -10,10 +10,11 @@ import (
 
 // parseHGSourceURL parses a Mercurial source URL and extracts the repo URL and revision.
 // Supported formats:
-//   hg+https://host/repo#tag=TAG
-//   hg+https://host/repo#branch=BRANCH
-//   hg+https://host/repo#revision=REV
-//   hg+https://host/repo#REV
+//
+//	hg+https://host/repo#tag=TAG
+//	hg+https://host/repo#branch=BRANCH
+//	hg+https://host/repo#revision=REV
+//	hg+https://host/repo#REV
 func parseHGSourceURL(rawURL string) (hgURL string, revision string, err error) {
 	realURL := strings.TrimPrefix(rawURL, "hg+")
 

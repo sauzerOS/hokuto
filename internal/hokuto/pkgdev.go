@@ -816,6 +816,12 @@ func handleSingleBumpCommand(pkgName, newVersion, commitMsg string, build bool, 
 		return err
 	}
 
+	// Recipes sharing this package's version (bump-follows) move with it.
+	followerDirs, err := bumpFollowingRecipes(bumpPkgName, newVersion)
+	if err != nil {
+		return fmt.Errorf("%s bumped, but bumping the recipes that follow it failed: %w", bumpPkgName, err)
+	}
+
 	// A new Perl API version breaks the XS modules built against the old one,
 	// so their recipes are bumped in the same push.
 	if oldPerlVersion != "" && perlAPIVersion(oldPerlVersion) != perlAPIVersion(newVersion) {
@@ -831,6 +837,20 @@ func handleSingleBumpCommand(pkgName, newVersion, commitMsg string, build bool, 
 	}
 	if err := pushGitRepo(repoRoot); err != nil {
 		return fmt.Errorf("git push failed: %v", err)
+	}
+	pushed := map[string]bool{repoRoot: true}
+	for _, dir := range followerDirs {
+		root, err := getGitRepoRoot(dir)
+		if err != nil {
+			return fmt.Errorf("failed to determine git repo root: %v", err)
+		}
+		if pushed[root] {
+			continue
+		}
+		pushed[root] = true
+		if err := pushGitRepo(root); err != nil {
+			return fmt.Errorf("git push failed: %v", err)
+		}
 	}
 
 	printGithubReleaseNotes(pkgDir)
@@ -866,11 +886,17 @@ func handleSetBumpCommand(pkgsetName, oldVersion, newVersion, commitMsg string, 
 			failed = append(failed, err.Error())
 			continue
 		}
-		// Collect repo root for later push
-		if repoRoot, err := getGitRepoRoot(pkgDir); err == nil {
-			repoRoots[repoRoot] = true
-		} else {
-			fmt.Fprintf(os.Stderr, "Warning: failed to determine git repo root for %s: %v\n", pkgName, err)
+		followerDirs, err := bumpFollowingRecipes(pkgName, newVersion)
+		if err != nil {
+			failed = append(failed, fmt.Sprintf("%s: bumping the recipes that follow it failed: %v", pkgName, err))
+		}
+		// Collect repo roots for later push
+		for _, dir := range append([]string{pkgDir}, followerDirs...) {
+			if repoRoot, err := getGitRepoRoot(dir); err == nil {
+				repoRoots[repoRoot] = true
+			} else {
+				fmt.Fprintf(os.Stderr, "Warning: failed to determine git repo root for %s: %v\n", dir, err)
+			}
 		}
 
 		if build {
@@ -1519,7 +1545,7 @@ func handleAutoBumpRepository(cfg *Config, autoBuild bool, assumeYes bool, repoU
 			pkgName = "fast_float"
 		case "cairo-graphics-library":
 			pkgName = "cairo"
-                case "utf8proc":
+		case "utf8proc":
 			pkgName = "libutf8proc"
 		case "python-dbus-python":
 			pkgName = "dbus-python"
