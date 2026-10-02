@@ -27,6 +27,10 @@ type packageSuggestion struct {
 	Alternates []string
 	Dependency string
 	Text       string
+	// Order is the position in the declaring suggests list, so prompts
+	// follow the order the packager chose (systemd before linux, whose
+	// post-install needs udev).
+	Order int
 }
 
 var packageSuggestions = struct {
@@ -191,7 +195,8 @@ func collectPackageSuggestions(pkgName, rootDir string) {
 	packageSuggestions.Lock()
 	defer packageSuggestions.Unlock()
 
-	for _, item := range declared {
+	for i, item := range declared {
+		item.Order = i
 		if packageSuggestions.items[item.Package] == nil {
 			packageSuggestions.items[item.Package] = make(map[string]packageSuggestion)
 		}
@@ -210,7 +215,7 @@ func collectMetaPackageSuggestions(meta MetaPackage) {
 	if packageSuggestions.items[meta.Name] == nil {
 		packageSuggestions.items[meta.Name] = make(map[string]packageSuggestion)
 	}
-	for _, depSpec := range meta.Suggests {
+	for order, depSpec := range meta.Suggests {
 		alternates := append([]string(nil), depSpec.Alternatives...)
 		if len(alternates) == 0 && depSpec.Name != "" {
 			alternates = []string{depSpec.Name}
@@ -227,6 +232,7 @@ func collectMetaPackageSuggestions(meta MetaPackage) {
 		item := packageSuggestion{
 			Package: meta.Name, Name: depSpec.Name, Op: depSpec.Op, Version: depSpec.Version,
 			Alternates: alternates, Dependency: dependency, Text: depSpec.SuggestText,
+			Order: order,
 		}
 		key := item.Dependency + "\x00" + item.Text
 		packageSuggestions.items[meta.Name][key] = item
@@ -290,6 +296,9 @@ func flushPackageSuggestions(logger io.Writer, cfg *Config, noRemote bool, promp
 
 		suggestions := pending[pkg]
 		sort.Slice(suggestions, func(i, j int) bool {
+			if suggestions[i].Order != suggestions[j].Order {
+				return suggestions[i].Order < suggestions[j].Order
+			}
 			if suggestions[i].Dependency == suggestions[j].Dependency {
 				return suggestions[i].Text < suggestions[j].Text
 			}

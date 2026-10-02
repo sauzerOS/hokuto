@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 
@@ -164,7 +165,7 @@ func TestReadPackageMetadataRecordsLibdeps(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if entry.MetadataVersion != repoEntryLibdepsMetadataVersion || !reflect.DeepEqual(entry.Libdeps, []string{"elf64:libc.so.6", "elf64:libfoo.so.3"}) {
+	if entry.MetadataVersion != repoEntryMetadataVersion || !reflect.DeepEqual(entry.Libdeps, []string{"elf64:libc.so.6", "elf64:libfoo.so.3"}) {
 		t.Fatalf("entry: version %d libdeps %v", entry.MetadataVersion, entry.Libdeps)
 	}
 	// Older index entries still count as having dependency metadata, so
@@ -202,7 +203,7 @@ func TestBumpABIConsumersCommitsAndPushes(t *testing.T) {
 	gitIn(t, repo, "add", "app/build")
 
 	consumers := map[string][]string{"app": {"libfoo.so.3"}, "tool": {"libfoo.so.3"}, "edited": {"libfoo.so.3"}}
-	result, err := bumpABIConsumers(consumers, map[string][]string{"libfoo": {"libfoo.so.3"}})
+	result, err := bumpABIConsumers(consumers, abiRebuildCommitMessage(map[string][]string{"libfoo": {"libfoo.so.3"}}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -266,5 +267,150 @@ func TestDetectABIBreak(t *testing.T) {
 	want := []libDepRef{{ABI: "elf64", Name: "libfoo.so.3"}, {ABI: "elf32", Name: "libfoo.so.3"}}
 	if brk.Version != "4.0" || !reflect.DeepEqual(brk.Removed, want) {
 		t.Fatalf("break: %+v", brk)
+	}
+}
+
+func TestMajorMinor(t *testing.T) {
+	for version, want := range map[string]string{"6.12.0": "6.12", "6.12": "6.12", "26.08.1": "26.08", "2026e": "2026e", "1.53.0-0": "1.53"} {
+		if got := majorMinor(version); got != want {
+			t.Errorf("majorMinor(%q) = %q, want %q", version, got, want)
+		}
+	}
+}
+
+func TestDetectPrivateAPIChange(t *testing.T) {
+	cfg, repo := withTempDependencyRepo(t)
+	cfg.Values["HOKUTO_ARCH"] = "x86_64"
+	writeTestPackage(t, repo, "qt", "")
+	setVersion := func(v string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(repo, "qt", "version"), []byte(v+" 1\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	variant := GetSystemVariantForPackage(cfg, "qt")
+	built := func(version string) {
+		writeTestArchive(t, filepath.Join(BinDir, StandardizeRemoteName("qt", version, "1", "x86_64", variant)),
+			map[string]string{"usr/lib/libQt6Gui.so.6." + strings.ReplaceAll(version, ".", ""): "elf"},
+			map[string]string{"usr/lib/libQt6Gui.so.6": "libQt6Gui.so.6.x", "usr/lib/libQt6Core.so.6": "libQt6Core.so.6.x"})
+	}
+
+	// A minor update: 6.11.2 is published, 6.12.0 was just built.
+	setVersion("6.12.0")
+	built("6.12.0")
+	index := []RepoEntry{{Name: "qt", Version: "6.11.2", Revision: "1", Arch: "x86_64", Variant: "optimized"}}
+	change, err := detectPrivateAPIChange("qt", cfg, index)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if change.Previous != "6.11.2" || !slices.Contains(change.Sonames, "libQt6Core.so.6") || !slices.Contains(change.Sonames, "libQt6Gui.so.6") {
+		t.Fatalf("minor update: %+v", change)
+	}
+
+	// A patch release keeps private API compatibility.
+	setVersion("6.12.1")
+	built("6.12.1")
+	index = []RepoEntry{{Name: "qt", Version: "6.12.0", Revision: "1", Arch: "x86_64", Variant: "optimized"}}
+	if change, err := detectPrivateAPIChange("qt", cfg, index); err != nil || len(change.Sonames) != 0 {
+		t.Fatalf("patch release must not trigger: %+v %v", change, err)
+	}
+}
+
+func TestPrivateAPIConsumers(t *testing.T) {
+	_, repo := withTempDependencyRepo(t)
+	for _, name := range []string{"qt", "kwin", "dolphin", "konsole", "plasma-src", "prebuilt"} {
+		writeTestPackage(t, repo, name, "")
+	}
+	if err := os.WriteFile(filepath.Join(repo, "plasma-src", "depends.plasma-split"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "prebuilt", "options"), []byte("binary\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	v3 := repoEntryPrivateDepsMetadataVersion
+	entry := func(name string, deps ...string) RepoEntry {
+		return RepoEntry{Name: name, Version: "1.0", Revision: "1", Arch: "x86_64", Variant: "optimized", MetadataVersion: v3, PrivateDeps: deps}
+	}
+	index := []RepoEntry{
+		entry("kwin", "libQt6Gui.so.6", "libQt6Core.so.6"),
+		entry("dolphin", "libQt6Gui.so.6"),
+		entry("konsole"), // links Qt, but only its public API
+		entry("plasma-split", "libQt6Gui.so.6"),
+		entry("prebuilt", "libQt6Gui.so.6"),
+		entry("qt", "libQt6Core.so.6"), // the library itself
+		{Name: "old", Version: "1.0", Revision: "1", Arch: "x86_64", Variant: "optimized", MetadataVersion: repoEntryLibdepsMetadataVersion},
+	}
+	change := privateAPIChange{Library: "qt", Version: "6.12.0", Sonames: []string{"libQt6Core.so.6", "libQt6Gui.so.6"}}
+	got, unknown := privateAPIConsumers(index, "x86_64", change)
+	want := map[string][]string{
+		"kwin":       {"libQt6Gui.so.6", "libQt6Core.so.6"},
+		"dolphin":    {"libQt6Gui.so.6"},
+		"plasma-src": {"libQt6Gui.so.6"},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("consumers: got %v want %v", got, want)
+	}
+	if unknown != 1 {
+		t.Fatalf("expected 1 package without privatedeps, got %d", unknown)
+	}
+}
+
+func TestRebuildCommitMessageForPrivateAPI(t *testing.T) {
+	msg := rebuildCommitMessage(map[string][]string{"libfoo": {"libfoo.so.3"}}, []string{"qt 6.12"})
+	if msg != "rebuild for libfoo (libfoo.so.3) ABI change; rebuild for qt 6.12 private API" {
+		t.Fatalf("message: %q", msg)
+	}
+	if got := rebuildReason(msg); got != "rebuild for libfoo ABI change; rebuild for qt 6.12 private API" {
+		t.Fatalf("rebuild list reason: %q", got)
+	}
+}
+
+func TestCollectPrivateAPILibsFromRealLibrary(t *testing.T) {
+	src, err := filepath.EvalSymlinks("/usr/lib/libkwin.so.6")
+	if err != nil {
+		t.Skip("no KWin library on this system")
+	}
+	data, err := os.ReadFile(src)
+	if err != nil {
+		t.Skip(err)
+	}
+	out := t.TempDir()
+	write := func(rel string, content []byte) {
+		t.Helper()
+		if err := os.MkdirAll(filepath.Join(out, filepath.Dir(rel)), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(out, rel), content, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("usr/lib/libkwin.so.6", data)
+	libs, err := collectPrivateAPILibs(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(libs, []string{"libQt6Gui.so.6"}) {
+		t.Fatalf("KWin uses Qt GUI private API, got %v", libs)
+	}
+
+	// A library the package ships itself does not count.
+	write("usr/lib/libQt6Gui.so.6", []byte("not elf"))
+	if libs, _ := collectPrivateAPILibs(out); len(libs) != 0 {
+		t.Fatalf("own library must be left out, got %v", libs)
+	}
+}
+
+func TestReadPackageMetadataRecordsPrivateDeps(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "kwin-6.7.5-1-x86_64-optimized.tar.zst")
+	writeTestArchive(t, path, map[string]string{
+		"var/db/hokuto/installed/kwin/pkginfo":     "name=kwin\nversion=6.7.5\nrevision=1\narch=x86_64\ngeneric=0\nmultilib=0\n",
+		"var/db/hokuto/installed/kwin/privatedeps": "libQt6Gui.so.6\n",
+	}, nil)
+	entry, err := ReadPackageMetadata(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(entry.PrivateDeps, []string{"libQt6Gui.so.6"}) || entry.MetadataVersion < repoEntryPrivateDepsMetadataVersion {
+		t.Fatalf("entry: version %d privatedeps %v", entry.MetadataVersion, entry.PrivateDeps)
 	}
 }

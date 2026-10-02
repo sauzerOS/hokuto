@@ -922,6 +922,7 @@ func downloadFileWithOptions(originalURL, finalURL, destFile string, opt downloa
 		req.Header.Set("User-Agent", downloadUserAgents[uaIndex])
 		req.Header.Set("Accept", "*/*")
 		req.Header.Set("Connection", "keep-alive")
+		mirrorLoginSent := setMirrorAuthHeader(req)
 
 		resp, err = client.Do(req)
 		if err != nil {
@@ -1029,7 +1030,21 @@ func downloadFileWithOptions(originalURL, finalURL, destFile string, opt downloa
 				debugf("Download successful: %s\n", filepath.Base(finalURL))
 			}
 			debugf("\nDownload successful with native Go HTTP client.\n")
+			if isMirrorURL(finalURL) {
+				saveMirrorAuthIfNew()
+			}
 			return nil
+		}
+
+		// The binary mirror wants a login: ask for it and retry. wget would
+		// only get the same answer.
+		if resp.StatusCode == http.StatusUnauthorized && isMirrorURL(finalURL) {
+			resp.Body.Close()
+			if promptMirrorLogin(mirrorLoginSent) {
+				i-- // a new login does not consume a retry
+				continue
+			}
+			return mirrorLoginError()
 		}
 
 		// 403/418/451 are usually aimed at *who we claim to be*, not at the

@@ -298,7 +298,7 @@ type abiRebuildResult struct {
 // version files, one commit per git repository, then pushes like a version
 // bump. A version file with uncommitted changes is not touched, so none of
 // your own edits end up in the commit.
-func bumpABIConsumers(consumers map[string][]string, reasons map[string][]string) (abiRebuildResult, error) {
+func bumpABIConsumers(consumers map[string][]string, msg string) (abiRebuildResult, error) {
 	var result abiRebuildResult
 	names := make([]string, 0, len(consumers))
 	for name := range consumers {
@@ -338,7 +338,6 @@ func bumpABIConsumers(consumers map[string][]string, reasons map[string][]string
 		byRepo[root] = append(byRepo[root], versionPath)
 	}
 
-	msg := abiRebuildCommitMessage(reasons)
 	for _, root := range repoOrder {
 		// Commit only these paths so unrelated staged changes stay out.
 		args := append([]string{"-C", root, "commit", "-m", msg, "--"}, byRepo[root]...)
@@ -350,6 +349,22 @@ func bumpABIConsumers(consumers map[string][]string, reasons map[string][]string
 		}
 	}
 	return result, nil
+}
+
+// rebuildCommitMessage combines the soname breaks and private API changes of
+// one run: "rebuild for libfoo (libfoo.so.3) ABI change; rebuild for qt 6.13
+// private API".
+func rebuildCommitMessage(reasons map[string][]string, privateReasons []string) string {
+	var parts []string
+	if len(reasons) > 0 {
+		parts = append(parts, abiRebuildCommitMessage(reasons))
+	}
+	if len(privateReasons) > 0 {
+		sorted := append([]string(nil), privateReasons...)
+		sort.Strings(sorted)
+		parts = append(parts, "rebuild for "+strings.Join(sorted, ", ")+" private API")
+	}
+	return strings.Join(parts, "; ")
 }
 
 // abiRebuildCommitMessage: "rebuild for libfoo ABI change (libfoo.so.3)".
@@ -364,6 +379,128 @@ func abiRebuildCommitMessage(reasons map[string][]string) string {
 		parts = append(parts, fmt.Sprintf("%s (%s)", lib, strings.Join(reasons[lib], ", ")))
 	}
 	return "rebuild for " + strings.Join(parts, ", ") + " ABI change"
+}
+
+// majorMinor is the "X.Y" of a version ("6.12.0" -> "6.12"), the part a
+// library's private API compatibility is tied to.
+func majorMinor(version string) string {
+	parts := strings.SplitN(version, ".", 3)
+	if len(parts) < 2 {
+		return version
+	}
+	return parts[0] + "." + parts[1]
+}
+
+// privateAPIChange is one library recipe whose new build changed its
+// major.minor version, which ends the compatibility of its private API.
+type privateAPIChange struct {
+	Library  string   // recipe name, e.g. "qt"
+	Version  string   // its new version
+	Previous string   // its previously published version
+	Sonames  []string // the libraries it ships, e.g. libQt6Gui.so.6
+}
+
+// detectPrivateAPIChange reports the shared libraries the just built recipe
+// pkgName ships when its major.minor version differs from what is published.
+// A first build, a patch release (6.12.0 -> 6.12.1) or a package without
+// shared libraries reports nothing.
+func detectPrivateAPIChange(pkgName string, cfg *Config, index []RepoEntry) (privateAPIChange, error) {
+	change := privateAPIChange{Library: pkgName}
+	version, revision, err := getRepoVersion2(pkgName)
+	if err != nil {
+		return change, err
+	}
+	change.Version = version
+	pkgDir, err := findPackageMetadataDir(pkgName)
+	if err != nil {
+		return change, err
+	}
+	outputs := append([]string{getOutputPackageName(pkgName, cfg)}, splitPackageNamesFromDir(pkgDir)...)
+	current := RepoEntry{Version: version, Revision: revision}
+	seen := make(map[string]bool)
+	for _, output := range outputs {
+		arch := GetSystemArchForPackage(cfg, output)
+		var prev *RepoEntry
+		for i := range index {
+			e := &index[i]
+			if e.Name != output || e.Arch != arch || e.Type == "meta" || !isNewer(current, *e) {
+				continue
+			}
+			if prev == nil || isNewer(*e, *prev) {
+				prev = e
+			}
+		}
+		if prev == nil || majorMinor(prev.Version) == majorMinor(version) {
+			continue
+		}
+		change.Previous = prev.Version
+		newTarball := findCachedBinaryTarballVersion(output, version, revision, cfg)
+		if newTarball == "" {
+			continue
+		}
+		paths, err := tarballSharedLibraryPaths(newTarball)
+		if err != nil {
+			return change, err
+		}
+		for _, p := range paths {
+			name := path.Base(p)
+			if !seen[name] {
+				seen[name] = true
+				change.Sonames = append(change.Sonames, name)
+			}
+		}
+	}
+	sort.Strings(change.Sonames)
+	return change, nil
+}
+
+// privateAPIConsumers maps the recipes of the published arch packages that
+// use private API of the changed library to the libraries concerned. unknown
+// counts packages whose index entry has no privatedeps yet (not reindexed).
+func privateAPIConsumers(index []RepoEntry, arch string, change privateAPIChange) (consumers map[string][]string, unknown int) {
+	consumers = make(map[string][]string)
+	ships := make(map[string]bool, len(change.Sonames))
+	for _, soname := range change.Sonames {
+		ships[soname] = true
+	}
+	for _, e := range latestIndexEntries(index) {
+		if e.Arch != arch {
+			continue
+		}
+		if e.MetadataVersion < repoEntryPrivateDepsMetadataVersion {
+			unknown++
+			continue
+		}
+		var hit []string
+		for _, lib := range e.PrivateDeps {
+			if ships[lib] && !slices.Contains(hit, lib) {
+				hit = append(hit, lib)
+			}
+		}
+		if len(hit) == 0 {
+			continue
+		}
+		recipe := e.Name
+		if _, err := findPackageMetadataDir(recipe); err != nil {
+			source, _, ok := findSplitPackageSource(recipe)
+			if !ok {
+				continue
+			}
+			recipe = source
+		}
+		if sameSourcePackage(recipe, change.Library) {
+			continue
+		}
+		if pkgDir, err := findPackageMetadataDir(recipe); err == nil && loadBuildOptions(pkgDir)["binary"] {
+			continue
+		}
+		for _, lib := range hit {
+			if !slices.Contains(consumers[recipe], lib) {
+				consumers[recipe] = append(consumers[recipe], lib)
+			}
+		}
+	}
+	return consumers, unknown
 }
 
 // handleABIRebuilds checks the recipes built in this run for dropped shared
@@ -382,7 +519,40 @@ func handleABIRebuilds(built []string, cfg *Config, logMsg func(string, ...inter
 
 	consumers := make(map[string][]string) // recipe -> libraries
 	reasons := make(map[string][]string)   // library recipe -> removed sonames
-	unknown := 0
+	var privateReasons []string            // "qt 6.13"
+	unknown, privateUnknown := 0, 0
+	builtHere := make(map[string]bool, len(built))
+	for _, pkgName := range built {
+		builtHere[resolveBumpSourcePackage(pkgName)] = true
+	}
+	addConsumers := func(found map[string][]string) {
+		for recipe, libs := range found {
+			// Built in this same run, so already against the new library.
+			if builtHere[recipe] {
+				continue
+			}
+			for _, lib := range libs {
+				if !slices.Contains(consumers[recipe], lib) {
+					consumers[recipe] = append(consumers[recipe], lib)
+				}
+			}
+		}
+	}
+	for _, pkgName := range built {
+		change, err := detectPrivateAPIChange(resolveBumpSourcePackage(pkgName), cfg, index)
+		if err != nil {
+			colWarn.Printf("Warning: private API check of %s failed: %v\n", pkgName, err)
+		} else if len(change.Sonames) > 0 {
+			found, missing := privateAPIConsumers(index, arch, change)
+			privateUnknown = missing
+			if len(found) > 0 {
+				colArrow.Print("-> ")
+				colWarn.Printf("%s %s -> %s: packages using its private API need a rebuild\n", pkgName, change.Previous, change.Version)
+				privateReasons = append(privateReasons, fmt.Sprintf("%s %s", pkgName, majorMinor(change.Version)))
+				addConsumers(found)
+			}
+		}
+	}
 	for _, pkgName := range built {
 		brk, err := detectABIBreak(resolveBumpSourcePackage(pkgName), cfg, index)
 		if err != nil {
@@ -404,16 +574,13 @@ func handleABIRebuilds(built []string, cfg *Config, logMsg func(string, ...inter
 			continue
 		}
 		reasons[pkgName] = names
-		for recipe, libs := range found {
-			for _, lib := range libs {
-				if !slices.Contains(consumers[recipe], lib) {
-					consumers[recipe] = append(consumers[recipe], lib)
-				}
-			}
-		}
+		addConsumers(found)
 	}
 	if unknown > 0 && len(reasons) > 0 {
 		colWarn.Printf("Warning: %d published packages have no libdeps in the index yet and were not checked; run `hokuto upload --reindex` once\n", unknown)
+	}
+	if privateUnknown > 0 && len(privateReasons) > 0 {
+		colWarn.Printf("Warning: %d published packages have no privatedeps in the index yet and were not checked; run `hokuto upload --reindex` once\n", privateUnknown)
 	}
 	if len(consumers) == 0 {
 		return nil
@@ -421,7 +588,8 @@ func handleABIRebuilds(built []string, cfg *Config, logMsg func(string, ...inter
 
 	colArrow.Print("-> ")
 	colSuccess.Printf("Bumping the revision of %d package(s) for the ABI change\n", len(consumers))
-	result, err := bumpABIConsumers(consumers, reasons)
+	msg := rebuildCommitMessage(reasons, privateReasons)
+	result, err := bumpABIConsumers(consumers, msg)
 	for _, skipped := range result.Skipped {
 		colWarn.Printf("Warning: not bumped: %s\n", skipped)
 	}
@@ -432,12 +600,13 @@ func handleABIRebuilds(built []string, cfg *Config, logMsg func(string, ...inter
 	if len(result.Bumped) == 0 {
 		return nil
 	}
-	logMsg("ABI_REBUILD_BUMPED: %s: %v\n", abiRebuildCommitMessage(reasons), result.Bumped)
+	logMsg("ABI_REBUILD_BUMPED: %s: %v\n", msg, result.Bumped)
 
-	libs := make([]string, 0, len(reasons))
+	libs := make([]string, 0, len(reasons)+len(privateReasons))
 	for lib := range reasons {
 		libs = append(libs, lib)
 	}
+	libs = append(libs, privateReasons...)
 	sort.Strings(libs)
 	return libs
 }

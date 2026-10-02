@@ -38,7 +38,94 @@ func generateLibDeps(outputDir, libdepsFile string, execCtx *Executor) error {
 		return err
 	}
 	debugf("Library dependencies written to %s (%d deps)\n", libdepsFile, len(libs))
+
+	// Written even when empty: an empty file says "uses no private API",
+	// where a missing one only says "not recorded".
+	private, err := collectPrivateAPILibs(outputDir)
+	if err != nil {
+		debugf("Private API scan of %s failed: %v\n", outputDir, err)
+		return nil
+	}
+	privateFile := filepath.Join(filepath.Dir(libdepsFile), "privatedeps")
+	if err := writeLibDeps(privateFile, private, execCtx); err != nil {
+		return err
+	}
 	return nil
+}
+
+// collectPrivateAPILibs lists the shared libraries (by soname) that the ELF
+// files in outputDir import private-API symbols from: symbols whose version
+// ends in _PRIVATE_API, such as Qt's Qt_6_PRIVATE_API. Such a library keeps
+// no compatibility for those symbols between its minor releases, so its
+// users need a rebuild then, even though its soname stays the same (KWin
+// against Qt 6.11 cannot start with Qt 6.12). Libraries the package ships
+// itself are left out.
+func collectPrivateAPILibs(outputDir string) ([]string, error) {
+	provided := make(map[string]bool)
+	var files []string
+	err := filepath.WalkDir(outputDir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.Type()&fs.ModeSymlink != 0 {
+			provided[filepath.Base(path)] = true
+			return nil
+		}
+		if !d.Type().IsRegular() {
+			return nil
+		}
+		provided[filepath.Base(path)] = true
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+		if info.Mode().Perm()&0o111 != 0 {
+			files = append(files, path)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	seen := make(map[string]bool)
+	for _, file := range files {
+		for _, lib := range elfPrivateAPILibraries(file) {
+			if !provided[lib] {
+				seen[lib] = true
+			}
+		}
+	}
+	libs := make([]string, 0, len(seen))
+	for lib := range seen {
+		libs = append(libs, lib)
+	}
+	sort.Strings(libs)
+	return libs, nil
+}
+
+// elfPrivateAPILibraries returns the libraries path imports _PRIVATE_API
+// versioned symbols from; nothing for a file that is not a readable ELF.
+func elfPrivateAPILibraries(path string) []string {
+	f, err := elf.Open(path)
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+	symbols, err := f.ImportedSymbols()
+	if err != nil {
+		return nil
+	}
+	var libs []string
+	seen := make(map[string]bool)
+	for _, sym := range symbols {
+		if sym.Library == "" || !strings.HasSuffix(sym.Version, "_PRIVATE_API") || seen[sym.Library] {
+			continue
+		}
+		seen[sym.Library] = true
+		libs = append(libs, sym.Library)
+	}
+	return libs
 }
 
 // providedLibDepKey is how a file the package itself ships is matched against

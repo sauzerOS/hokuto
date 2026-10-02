@@ -37,8 +37,9 @@
 #   /var/cache/hokuto            binary cache (and the sources mount below it)
 #   /var/tmp/hokuto              TMPDIR, on the host's zram disk
 #   /var/tmpdir/hokuto           TMPDIR2, disk-backed, for "noram" builds
-#   /etc/hokuto/hokuto.conf, hokuto.lock, keys/   config, mirror credentials,
-#                                version locks and the signing key
+#   /etc/hokuto/hokuto.conf, hokuto.lock, keys/, mirror-auth   config, mirror
+#                                credentials and login, version locks and the
+#                                signing key
 #   /usr/local/bin/hokuto        the host's hokuto, so both run the same version;
 #                                it comes first in PATH. The container's own
 #                                hokuto package (/usr/bin/hokuto, hokuto.update,
@@ -345,7 +346,7 @@ nspawn_run() {
     # Only the host's local hokuto files: the rest of /etc/hokuto belongs to
     # the container's hokuto package, which must be able to update them.
     local file
-    for file in hokuto.conf hokuto.lock keys; do
+    for file in hokuto.conf hokuto.lock keys mirror-auth; do
         [ -e "/etc/hokuto/$file" ] && args+=(--bind-ro="/etc/hokuto/$file")
     done
     # hokuto stages installs on the root's own filesystem so it can hard link

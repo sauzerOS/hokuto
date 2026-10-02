@@ -3420,3 +3420,27 @@ func TestPackageHasSelfBuildDependencyDoesNotPromptForAlternatives(t *testing.T)
 		t.Fatal("rust lists itself among its build alternatives")
 	}
 }
+
+func TestFlushPackageSuggestionsKeepsDeclaredOrder(t *testing.T) {
+	withTempDependencyRepo(t)
+	root := t.TempDir()
+	rootDir = root
+	Installed = filepath.Join(root, "var", "db", "hokuto", "installed")
+	writeInstalledTestPackage(t, "base")
+	// systemd first: the kernel's post-install needs its udev.
+	if err := os.WriteFile(filepath.Join(Installed, "base", "suggests"), []byte("systemd suggest init\nlinux suggest kernel\nlimine suggest bootloader\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	packageSuggestions.Lock()
+	packageSuggestions.items = make(map[string]map[string]packageSuggestion)
+	packageSuggestions.Unlock()
+
+	collectPackageSuggestions("base", rootDir)
+	var out bytes.Buffer
+	flushPackageSuggestions(&out, nil, false, false, false)
+	got := out.String()
+	s, l, b := strings.Index(got, "systemd"), strings.Index(got, "linux"), strings.Index(got, "limine")
+	if s < 0 || l < 0 || b < 0 || !(s < l && l < b) {
+		t.Fatalf("suggestions must keep their declared order (systemd, linux, limine):\n%s", got)
+	}
+}
