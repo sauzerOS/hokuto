@@ -656,11 +656,10 @@ func packageHasSelfBuildDependency(pkgName string, cfg *Config) bool {
 		if !dep.Make || dep.MakeOpt || !activeBuildDependency(dep, cfg, false) {
 			continue
 		}
-		candidates, err := resolvedBuildDependencyCandidates(dep, false, cfg)
-		if err != nil {
-			continue
-		}
-		for _, candidate := range candidates {
+		// Every option of an alternative group: this only asks whether the
+		// package needs itself, and must not make the user choose between
+		// "rust | rustup" for a package that is installed from a binary.
+		for _, candidate := range buildDependencyMatchCandidates(dep) {
 			// Historical sources are planned as pkg-MAJOR while their depends
 			// files retain the canonical constraint (for example,
 			// java-openjdk-17 depending on java-openjdk==17*).

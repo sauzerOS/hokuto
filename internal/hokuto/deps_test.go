@@ -3398,3 +3398,25 @@ func TestSequentialUpdateDefersLibraryRebuildOfBatchPackages(t *testing.T) {
 		t.Fatalf("libtatsu still links the removed soname and must be reported, got %v", broken)
 	}
 }
+
+func TestPackageHasSelfBuildDependencyDoesNotPromptForAlternatives(t *testing.T) {
+	cfg, repo := withTempDependencyRepo(t)
+	writeTestPackage(t, repo, "rust", "rust | rustup make\n")
+	writeTestPackage(t, repo, "rustup", "")
+	writeTestPackage(t, repo, "halloy", "rust | rustup make\n")
+	dep := DepSpec{Name: "rust", Alternatives: []string{"rust", "rustup"}, Make: true}
+
+	// halloy is updated from a binary: checking whether it needs itself must
+	// not make the user choose between rust and rustup.
+	if packageHasSelfBuildDependency("halloy", cfg) {
+		t.Fatal("halloy does not build-depend on itself")
+	}
+	if choice, ok := cachedAlternativeDep(dep); ok {
+		t.Fatalf("the check resolved the rust | rustup alternative (chose %q)", choice)
+	}
+
+	// rust bootstraps with an installed rust: one of the alternatives is itself.
+	if !packageHasSelfBuildDependency("rust", cfg) {
+		t.Fatal("rust lists itself among its build alternatives")
+	}
+}

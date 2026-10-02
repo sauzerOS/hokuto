@@ -1405,6 +1405,35 @@ func cachedAlternativeDep(dep DepSpec) (string, bool) {
 	return "", false
 }
 
+// buildDependencyMatchCandidates lists every package a dependency line can be
+// satisfied by, without choosing between alternatives. It is for questions
+// that hold for any choice ("does this name the package itself?"), where
+// resolvedBuildDependencyCandidates would ask the user to pick one.
+func buildDependencyMatchCandidates(dep DepSpec) []string {
+	names := dep.Alternatives
+	if len(names) == 0 {
+		names = []string{dep.Name}
+	}
+	var candidates []string
+	for _, name := range names {
+		if name == "" {
+			continue
+		}
+		if dep.Op != "" && dep.Version != "" {
+			if installed := findInstalledDependencySatisfying(name, dep.Op, dep.Version); installed != "" {
+				candidates = append(candidates, installed)
+				continue
+			}
+			if source := findSourcePackageSatisfying(name, dep.Op, dep.Version); source != "" {
+				candidates = append(candidates, source)
+				continue
+			}
+		}
+		candidates = append(candidates, wildcardMajorDependencyName(name, dep.Op, dep.Version))
+	}
+	return candidates
+}
+
 func resolvedBuildDependencyCandidates(dep DepSpec, yes bool, cfg *Config) ([]string, error) {
 	resolved := dep.Name
 	if len(dep.Alternatives) > 0 {
