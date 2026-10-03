@@ -86,7 +86,14 @@ BUILD_IGNORE=/var/db/hokuto/build-ignore.json
 DEFAULT_WEBSITE_REPO=/home/dbz/Documents/sauzerOS.github.io
 
 die() { printf '\033[0;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
-info() { printf '\033[0;36m->\033[0m %s\n' "$*"; }
+# hokuto's colors: a #FFEB3B arrow and #1976D2 text, on a terminal only.
+info() {
+    if [ -t 1 ]; then
+        printf '\033[38;2;255;235;59m->\033[0m \033[38;2;25;118;210m%s\033[0m\n' "$*"
+    else
+        printf -- '-> %s\n' "$*"
+    fi
+}
 
 usage() {
     sed -n '3,31p' "$(readlink -f "$0")" | sed 's/^# \{0,1\}//'
@@ -415,15 +422,30 @@ installed_before=/tmp/hokuto-builder-installed.before
 snapshot_installed() {
     ls -1 /var/db/hokuto/installed >"$installed_before"
 }
+# In hokuto colors, on a terminal: #FFEB3B arrow, #1976D2 text, #0ba913 names.
+leftover_note() {
+    if [ -t 1 ]; then
+        printf "\033[38;2;255;235;59m->\033[0m \033[38;2;25;118;210m%s\033[0m \033[38;2;11;169;19m%s\033[0m\n" "$1" "$2"
+    else
+        printf -- "-> %s %s\n" "$1" "$2"
+    fi
+}
+leftover_warn() {
+    if [ -t 1 ]; then
+        printf "\033[38;2;255;235;59m->\033[0m \033[1;33m%s\033[0m\n" "$1"
+    else
+        printf -- "-> %s\n" "$1"
+    fi
+}
 remove_leftovers() {
     [ -f "$installed_before" ] || return 0
     leftovers=$(ls -1 /var/db/hokuto/installed | grep -vxF -f "$installed_before" || true)
     rm -f "$installed_before"
     [ -n "$leftovers" ] || return 0
-    printf "\033[0;36m->\033[0m Removing packages this run left installed: %s\n" "$(echo $leftovers)"
+    leftover_note "Removing packages this run left installed:" "$(echo $leftovers)"
     # shellcheck disable=SC2086
     /usr/local/bin/hokuto uninstall -y $leftovers ||
-        printf "\033[0;33m->\033[0m Some packages could not be removed; check with hokuto-builder run hokuto list\n"
+        leftover_warn "Some packages could not be removed; check with hokuto-builder run hokuto list"
 }
 '
 

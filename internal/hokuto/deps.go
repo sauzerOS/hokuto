@@ -1056,8 +1056,14 @@ func resolveMissingDeps(pkgName string, processed map[string]bool, missing *[]st
 		}
 		depName = wildcardMajorDependencyName(depName, dep.Op, dep.Version)
 
-		// Safety check: a package cannot depend on itself.
+		// Safety check: a package cannot depend on itself. In a cross build,
+		// a bare cross dependency on its own name is the native package, a
+		// host tool the build runs (wayland needs the host's
+		// wayland-scanner): installCrossHostTools installs it first.
 		if sameSourcePackage(depName, pkgName) {
+			if dep.Cross {
+				noteCrossHostTool(depName, cfg)
+			}
 			continue
 		}
 

@@ -3444,3 +3444,34 @@ func TestFlushPackageSuggestionsKeepsDeclaredOrder(t *testing.T) {
 		t.Fatalf("suggestions must keep their declared order (systemd, linux, limine):\n%s", got)
 	}
 }
+
+// wayland's cross build runs the host's wayland-scanner: "wayland cross make"
+// names the native package, not the cross target itself, so it must be noted
+// as a host tool (installed first) rather than dropped as a self dependency.
+func TestResolveMissingDepsNotesSelfNamedHostTool(t *testing.T) {
+	cfg, repo := withTempDependencyRepo(t)
+	writeTestPackage(t, repo, "libffi", "")
+	writeTestPackage(t, repo, "wayland", "libffi\nwayland cross make\n")
+
+	resolve := func() {
+		t.Helper()
+		cfg.CrossHostTools = nil
+		var missing []string
+		if err := resolveMissingDeps("wayland", map[string]bool{}, &missing, map[string]bool{"wayland": true}, cfg, true); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	cfg.CrossOutputPackages = map[string]bool{"wayland": true}
+	resolve()
+	if len(cfg.CrossHostTools) != 0 {
+		t.Fatalf("native build noted host tools: %v", cfg.CrossHostTools)
+	}
+
+	cfg.Values["HOKUTO_CROSS_ARCH"] = "arm64"
+	cfg.Values["HOKUTO_CROSS_SYSTEM"] = "1"
+	resolve()
+	if len(cfg.CrossHostTools) != 1 || !cfg.CrossHostTools["wayland"] {
+		t.Fatalf("expected the native wayland as a host tool, got %v", cfg.CrossHostTools)
+	}
+}
