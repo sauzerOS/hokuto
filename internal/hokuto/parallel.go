@@ -433,10 +433,12 @@ func installBinaryPlanDependencies(depsToInstall []binaryPlanDependency, cfg *Co
 			colSuccess.Printf("Installing available binary dependency:")
 			colNote.Printf(" %s\n", dep.Name)
 		}
-		// Unlike required build dependencies, makeopt never contributes its own
-		// dependency graph to the plan. Install its packaged runtime dependencies
-		// so the optional bootstrap tool is actually runnable.
-		ok, err := installAvailableBuildDependencyBinaryWithOptions(dep.Name, cfg, noRemote, quiet, dep.MakeOpt)
+		// A binary comes with its packaged runtime dependencies: the plan
+		// does not walk them for a dependency it does not build. That left
+		// gcc without the sanitizer libraries of its own recipe (libasan,
+		// libubsan, ...), which repairInstalledRuntimeDeps then reported as
+		// missing. Builds and updates install them from binaries only.
+		ok, err := installAvailableBuildDependencyBinaryWithOptions(dep.Name, cfg, noRemote, quiet, true)
 		if err != nil {
 			return installed, fmt.Errorf("failed to install binary dependency %s: %w", dep.Name, err)
 		}
