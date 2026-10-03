@@ -74,7 +74,7 @@ func printHelp() {
 			{"cross-sync", "[-system] [-no-install] [-jN] [-i]", "Build missing native aarch64 packages (or, with -system, outdated aarch64-* cross-system packages)"},
 			{"init-repos", "", "Initialize repositories"},
 			{"perl-rebuild", "", "Bump the revision of Perl modules and packages that depend on perl"},
-			{"python-rebuild", "", "Rebuild all python packages"},
+			{"python-rebuild", "[build [build flags] | list | bump <msg>]", "Test-build the recipes marked python-rebuild against the installed python and report failures; bump their revisions"},
 			{"settings", "", "Manage hokuto configuration interactively"},
 			{"version, --version", "", "Version information"},
 		},
@@ -436,7 +436,7 @@ func Main() {
 		}
 
 	case "python-rebuild":
-		if err := handlePythonRebuildCommand(cfg); err != nil {
+		if err := handlePythonRebuildCommand(os.Args[2:], cfg); err != nil {
 			fmt.Fprintf(os.Stderr, "Python rebuild failed: %v\n", err)
 			exitHokuto(1)
 		}

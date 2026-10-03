@@ -1897,6 +1897,11 @@ func packageSplitOutputs(parentPkgName, pkgDir, splitRoot, version, revision, ta
 		if err := generateDepends(outputSplitName, pkgDir, splitOutputDir, rootDir, buildExec, opts.Bootstrap); err != nil {
 			return fmt.Errorf("failed to generate depends for split package %s: %w", outputSplitName, err)
 		}
+		splitLogger := opts.LogWriter
+		if splitLogger == nil {
+			splitLogger = os.Stdout
+		}
+		warnMissingPythonRebuildOption(parentPkgName, outputSplitName, splitOutputDir, splitOptions, splitLogger)
 
 		splitShouldStrip := shouldStrip && !splitOptions["nostrip"]
 		if splitShouldStrip {
@@ -2128,6 +2133,7 @@ func finalizeBuiltPackage(in builtPackageFinalization) error {
 	debugf("Depends written to %s\n", filepath.Join(installedDir, "depends"))
 
 	warnMissingPerlXSOption(in.outputPkgName, in.outputDir, in.options, in.logger)
+	warnMissingPythonRebuildOption(in.sourcePkgName, in.outputPkgName, in.outputDir, in.options, in.logger)
 
 	if in.shouldStrip {
 		if err := stripPackage(in.outputDir, in.options["staticlibs"], in.stripBin, in.buildExec, in.logger); err != nil {

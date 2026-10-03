@@ -187,7 +187,9 @@ make dependencies for a confirmed binary target.
 - `binary`, `nodevel`, `devel`;
 - `multilib`, `generic`;
 - `nolto`, `nostrip`, `staticlibs`, `clang`;
-- `cross-simple`, `host-tool`, `nocrossopt`.
+- `cross-simple`, `host-tool`, `nocrossopt`;
+- `perlxs`, `python-rebuild`: recipes whose packages must be rebuilt after a
+  Perl API or Python minor upgrade (`perl_rebuild.go`, `python_rebuild.go`).
 
 Base-devel policy is centralized by `packageNeedsDevelPackages`:
 

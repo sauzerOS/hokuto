@@ -77,10 +77,11 @@ func warnMissingPerlXSOption(pkgName, outputDir string, options map[string]bool,
 		pkgName, objects[0], perlXSOption))
 }
 
-// perlDependentRecipes returns the recipe directories marked perlxs, keyed
-// by package name. When a name exists in more than one repository, the first
-// one in HOKUTO_PATH wins, as it does for builds.
-func perlDependentRecipes() map[string]string {
+// recipesWithOption returns the recipe directories whose options file has
+// option (perlxs, python-rebuild), keyed by package name. When a name exists
+// in more than one repository, the first one in HOKUTO_PATH wins, as it does
+// for builds.
+func recipesWithOption(option string) map[string]string {
 	recipes := make(map[string]string)
 	seen := make(map[string]bool)
 	for _, repoPath := range filepath.SplitList(repoPaths) {
@@ -102,7 +103,7 @@ func perlDependentRecipes() map[string]string {
 				continue
 			}
 			seen[name] = true
-			if loadBuildOptions(pkgDir)[perlXSOption] {
+			if loadBuildOptions(pkgDir)[option] {
 				recipes[name] = pkgDir
 			}
 		}
@@ -162,13 +163,20 @@ func currentRecipeVersion(pkgName string) (string, error) {
 	return fields[0], nil
 }
 
-// bumpPerlDependents bumps the revision of every perlxs recipe, then commits the version files, one
-// commit per git repository. Nothing is pushed.
+// bumpPerlDependents bumps the revision of every perlxs recipe, then commits
+// the version files, one commit per git repository. Nothing is pushed.
 func bumpPerlDependents(perlVersion string) error {
-	recipes := perlDependentRecipes()
+	return bumpRecipesWithOption(perlXSOption, fmt.Sprintf("perl %s", perlVersion), fmt.Sprintf("perl %s: bump revision of dependent packages", perlVersion))
+}
+
+// bumpRecipesWithOption bumps the revision of every recipe marked option and
+// commits the version files with msg, one commit per git repository. Nothing
+// is pushed. reason names the upgrade in the progress output.
+func bumpRecipesWithOption(option, reason, msg string) error {
+	recipes := recipesWithOption(option)
 	if len(recipes) == 0 {
 		colArrow.Print("-> ")
-		colSuccess.Printf("No recipes are marked %s.\n", perlXSOption)
+		colSuccess.Printf("No recipes are marked %s.\n", option)
 		return nil
 	}
 	names := make([]string, 0, len(recipes))
@@ -178,7 +186,7 @@ func bumpPerlDependents(perlVersion string) error {
 	sort.Strings(names)
 
 	colArrow.Print("-> ")
-	colSuccess.Printf("Bumping %d recipe(s) for perl %s\n", len(names), perlVersion)
+	colSuccess.Printf("Bumping %d recipe(s) for %s\n", len(names), reason)
 	byRepo := make(map[string][]string)
 	var repoOrder []string
 	for _, name := range names {
@@ -199,7 +207,6 @@ func bumpPerlDependents(perlVersion string) error {
 		byRepo[root] = append(byRepo[root], filepath.Join(pkgDir, "version"))
 	}
 
-	msg := fmt.Sprintf("perl %s: bump revision of dependent packages", perlVersion)
 	for _, root := range repoOrder {
 		// Commit only these paths so unrelated staged changes stay out.
 		args := append([]string{"-C", root, "commit", "-m", msg, "--"}, byRepo[root]...)
