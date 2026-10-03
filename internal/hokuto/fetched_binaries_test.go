@@ -1,6 +1,8 @@
 package hokuto
 
 import (
+	"context"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -94,5 +96,40 @@ func TestKeepFetchedBinariesLeavesDownloads(t *testing.T) {
 	removeFetchedBinaries()
 	if _, err := os.Stat(filepath.Join(BinDir, filename)); err != nil {
 		t.Fatalf("hokuto fetch downloads must be kept: %v", err)
+	}
+}
+
+// A build dependency can pull the mirror's copy of the very package being
+// rebuilt (aarch64-glycin needs aarch64-librsvg, which needs
+// aarch64-gdk-pixbuf). The build then writes its package over that download,
+// and the new package must survive the cleanup of this run's downloads.
+func TestBuiltPackageOverDownloadIsKept(t *testing.T) {
+	mirrorDir := withFetchedBinariesTestEnv(t)
+	cfg := &Config{Values: map[string]string{"HOKUTO_ARCH": "x86_64"}}
+	filename, sum := publishTestPackage(t, mirrorDir, "rebuilt", cfg)
+	if err := fetchSpecificBinaryPackage("rebuilt", "1.0", "1", "generic", cfg, true, sum, false); err != nil {
+		t.Fatal(err)
+	}
+
+	outputDir := filepath.Join(t.TempDir(), "out")
+	if err := os.MkdirAll(filepath.Join(outputDir, "usr", "bin"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(outputDir, "usr", "bin", "rebuilt"), []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Use the built-in tar+zstd rather than this test binary as a filter.
+	t.Setenv("PATH", filepath.Join(t.TempDir(), "no-tools"))
+	if err := createPackageTarball("rebuilt", "1.0", "1", "x86_64", "generic", outputDir, &Executor{Context: context.Background(), Stdout: io.Discard, Stderr: io.Discard}, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+
+	removeFetchedBinaries()
+	path := filepath.Join(BinDir, filename)
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("the package built over a download was removed: %v", err)
+	}
+	if got, _ := ComputeChecksum(path, nil); got == sum {
+		t.Fatal("the binary cache holds the mirror's copy, not the build")
 	}
 }

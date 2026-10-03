@@ -26,6 +26,14 @@ func trackFetchedBinary(path string) {
 	fetchedBinaries.paths[path] = true
 }
 
+// untrackFetchedBinary makes path a file hokuto did not download, after a
+// build wrote its own package over a download of the same name.
+func untrackFetchedBinary(path string) {
+	fetchedBinaries.Lock()
+	defer fetchedBinaries.Unlock()
+	delete(fetchedBinaries.paths, path)
+}
+
 // keepFetchedBinaries makes this process leave its downloads in BinDir.
 func keepFetchedBinaries() {
 	fetchedBinaries.Lock()

@@ -458,6 +458,10 @@ func createPackageTarball(pkgName, pkgVer, pkgRev, arch, variant, outputDir stri
 		return err
 	}
 	tarballPath := filepath.Join(BinDir, StandardizeRemoteName(pkgName, pkgVer, pkgRev, arch, variant))
+	// The mirror's copy of this file may have been downloaded earlier in the
+	// run (a build dependency needing the package being rebuilt); the build
+	// replaced it, so it must not be removed with this run's downloads.
+	untrackFetchedBinary(tarballPath)
 	if entry, err := repoEntryFromPackageOutput(tarballPath, outputDir, pkgName); err == nil {
 		recordUploadCacheEntry(tarballPath, entry)
 	} else {
