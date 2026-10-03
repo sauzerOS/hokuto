@@ -5,6 +5,7 @@ package hokuto
 
 import (
 	"bufio"
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -166,7 +167,8 @@ func pkgUninstallWithRemovalSet(pkgName string, cfg *Config, execCtx *Executor, 
 	// 3. Build list of files and directories from manifest.
 	var files []fileMetadata // CHANGED: Use new struct to store B3Sum
 	var dirs []string
-	var fileCount int // Track only installable files for confirmation message
+	dirManifestPaths := make(map[string]string) // absolute path -> path as the manifest lists it
+	var fileCount int                           // Track only installable files for confirmation message
 
 	sc := bufio.NewScanner(strings.NewReader(string(manifestBytes)))
 	for sc.Scan() {
@@ -194,6 +196,7 @@ func pkgUninstallWithRemovalSet(pkgName string, cfg *Config, execCtx *Executor, 
 
 		if strings.HasSuffix(pathInManifest, "/") {
 			dirs = append(dirs, absPath)
+			dirManifestPaths[absPath] = pathInManifest
 			continue
 		}
 
@@ -440,6 +443,16 @@ func pkgUninstallWithRemovalSet(pkgName string, cfg *Config, execCtx *Executor, 
 	// 8. Try to rmdir directories recorded in manifest, deepest first
 	sort.Slice(dirs, func(i, j int) bool { return len(dirs[i]) > len(dirs[j]) })
 
+	// A directory another installed package also lists stays, empty or not:
+	// sauzeros-base creates the sysroot's /usr/aarch64-linux-gnu/usr/bin for
+	// its bin -> usr/bin link, and removing aarch64-glibc took it away while
+	// emptying it, leaving the link dangling.
+	manifestDirs := make([]string, 0, len(dirManifestPaths))
+	for _, d := range dirs {
+		manifestDirs = append(manifestDirs, dirManifestPaths[d])
+	}
+	sharedDirs := directoriesListedElsewhere(filepath.Join(hRoot, "var", "db", "hokuto", "installed"), pkgName, manifestDirs)
+
 	var batch []string
 	const directoryBatchSize = 100
 
@@ -481,6 +494,11 @@ func pkgUninstallWithRemovalSet(pkgName string, cfg *Config, execCtx *Executor, 
 
 	for _, d := range dirs {
 		clean := filepath.Clean(d)
+
+		if sharedDirs[dirManifestPaths[d]] {
+			debugf("Keeping %s: another installed package lists it\n", clean)
+			continue
+		}
 
 		// Safety check 1: Don't attempt to rmdir outside HOKUTO_ROOT.
 		if !strings.HasPrefix(clean, filepath.Clean(hRoot)) {
@@ -566,4 +584,45 @@ func pkgUninstallWithRemovalSet(pkgName string, cfg *Config, execCtx *Executor, 
 		return fmt.Errorf("some removals failed:\n%s", strings.Join(failed, "\n"))
 	}
 	return nil
+}
+
+// directoriesListedElsewhere returns which of dirs (manifest paths, "/usr/x/")
+// the manifest of an installed package other than pkgName also lists.
+func directoriesListedElsewhere(installedRoot, pkgName string, dirs []string) map[string]bool {
+	shared := make(map[string]bool)
+	if len(dirs) == 0 {
+		return shared
+	}
+	entries, err := os.ReadDir(installedRoot)
+	if err != nil {
+		return shared
+	}
+	needles := make(map[string][]byte, len(dirs))
+	for _, d := range dirs {
+		needles[d] = []byte("\n" + d + "\n")
+	}
+	for _, e := range entries {
+		if !e.IsDir() || e.Name() == pkgName {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(installedRoot, e.Name(), "manifest"))
+		if err != nil {
+			continue
+		}
+		// Directory lines carry no checksum, so a whole line is the path.
+		data = append([]byte("\n"), data...)
+		if len(data) > 0 && data[len(data)-1] != '\n' {
+			data = append(data, '\n')
+		}
+		for d, needle := range needles {
+			if bytes.Contains(data, needle) {
+				shared[d] = true
+				delete(needles, d)
+			}
+		}
+		if len(needles) == 0 {
+			break
+		}
+	}
+	return shared
 }
