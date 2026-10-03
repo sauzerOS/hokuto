@@ -351,11 +351,18 @@ nspawn_run() {
     # generic variant for every package hokuto installs in this container.
     [ "$VARIANT" = generic ] && args+=(--setenv=HOKUTO_GENERIC=1)
     # Only the host's local hokuto files: the rest of /etc/hokuto belongs to
-    # the container's hokuto package, which must be able to update them.
+    # the container's packages, which must be able to update them.
     local file
-    for file in hokuto.conf hokuto.lock keys mirror-auth; do
+    for file in hokuto.lock keys mirror-auth; do
         [ -e "/etc/hokuto/$file" ] && args+=(--bind-ro="/etc/hokuto/$file")
     done
+    # sauzeros-base ships hokuto.conf, and an install renames its new copy
+    # over the file, which a bind mount refuses (EBUSY). Copied instead, on
+    # every run, so the host's settings win over whatever an update put there.
+    if [ -f /etc/hokuto/hokuto.conf ]; then
+        install -d "$ROOTFS/etc/hokuto"
+        cp --preserve=mode,ownership /etc/hokuto/hokuto.conf "$ROOTFS/etc/hokuto/hokuto.conf"
+    fi
     # hokuto stages installs on the root's own filesystem so it can hard link
     # them into place; /var/cache/hokuto is the host's here, so it uses this
     # one, which the build user must own (hokuto creates entries as that user).
