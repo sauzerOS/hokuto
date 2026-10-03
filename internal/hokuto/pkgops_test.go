@@ -177,7 +177,7 @@ func TestCopyDirContentsFallbackPreservesSymlinks(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := copyDirContentsFallback(src, dst); err != nil {
+	if err := copyDirContents(src, dst); err != nil {
 		t.Fatal(err)
 	}
 
@@ -217,7 +217,7 @@ func TestCopyDirContentsFallbackFollowsRootSymlink(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := copyDirContentsFallback(srcLink, dst); err != nil {
+	if err := copyDirContents(srcLink, dst); err != nil {
 		t.Fatal(err)
 	}
 

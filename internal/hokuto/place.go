@@ -24,8 +24,8 @@ import (
 )
 
 // noHardlinkPlacementEnv disables the hard link fast path and forces placement
-// back onto rsync. Kept as an escape hatch for filesystems that accept link()
-// but behave oddly afterwards.
+// onto the internal tar copy (placeStagingLocally). Kept as an escape hatch for
+// filesystems that accept link() but behave oddly afterwards.
 const noHardlinkPlacementEnv = "HOKUTO_NO_HARDLINK_INSTALL"
 
 // placementTmpSuffix marks the transient name a new entry is created under
@@ -371,7 +371,7 @@ func placementMode(info fs.FileInfo) os.FileMode {
 
 // lchownFromInfo copies ownership from info onto path without following a
 // symlink. Lack of privilege is not fatal: an unprivileged install simply keeps
-// the invoking user as the owner, which is what the rsync path does too.
+// the invoking user as the owner, which is what the tar copy does too.
 func lchownFromInfo(path string, info fs.FileInfo) error {
 	st, ok := info.Sys().(*syscall.Stat_t)
 	if !ok {

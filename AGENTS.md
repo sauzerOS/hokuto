@@ -301,7 +301,8 @@ added to `world`.
 4. detect file conflicts and alternatives;
 5. calculate obsolete files;
 6. detect removed/upgraded libraries and back them up;
-7. rsync staging into `HOKUTO_ROOT`;
+7. place staging into `HOKUTO_ROOT` (hard links on the same filesystem,
+   otherwise the internal tar copy; see `place.go` and `staging.go`);
 8. remove obsolete files;
 9. execute package post-install and ensure runtime dependencies;
 10. discover rebuild triggers/affected reverse dependencies;

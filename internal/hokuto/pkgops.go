@@ -18,7 +18,7 @@ import (
 	"sync"
 )
 
-func copyDirContentsFallback(src, dst string) error {
+func copyDirContents(src, dst string) error {
 	walkRoot, err := filepath.EvalSymlinks(src)
 	if err != nil {
 		return err
@@ -73,20 +73,12 @@ func copyDirContentsFallback(src, dst string) error {
 	})
 }
 
-func copySourceContents(srcPath, targetDir, sourceKind string, execCtx *Executor) error {
-	if _, err := exec.LookPath("rsync"); err == nil {
-		rsyncCmd := exec.Command("rsync", "-a", srcPath+"/", targetDir)
-		if err := execCtx.Run(rsyncCmd); err == nil {
-			return nil
-		} else {
-			debugf("rsync failed while copying %s source %s to %s, falling back to internal copy: %v\n", sourceKind, srcPath, targetDir, err)
-		}
-	} else {
-		debugf("rsync not found, using internal copy for %s source %s\n", sourceKind, srcPath)
-	}
-
-	if err := copyDirContentsFallback(srcPath, targetDir); err != nil {
-		return fmt.Errorf("internal copy failed for %s source contents from %s to %s: %w", sourceKind, srcPath, targetDir, err)
+// copySourceContents copies a checked-out source tree (git, SVN, Mercurial)
+// into the build directory. Like the rest of prepareSources it writes with
+// hokuto's own permissions, so it needs no external tool.
+func copySourceContents(srcPath, targetDir, sourceKind string) error {
+	if err := copyDirContents(srcPath, targetDir); err != nil {
+		return fmt.Errorf("failed to copy %s source contents from %s to %s: %w", sourceKind, srcPath, targetDir, err)
 	}
 	return nil
 }
@@ -198,7 +190,7 @@ func prepareSources(pkgName, pkgDir, buildDir string, execCtx *Executor) error {
 				return fmt.Errorf("git source %s exists but is not a directory: %s", relPath, srcPath)
 			}
 
-			if err := copySourceContents(srcPath, targetDir, "git", execCtx); err != nil {
+			if err := copySourceContents(srcPath, targetDir, "git"); err != nil {
 				return fmt.Errorf("failed to copy git source contents from %s to %s: %v", srcPath, targetDir, err)
 			}
 			// Git source handled, move to the next line
@@ -218,7 +210,7 @@ func prepareSources(pkgName, pkgDir, buildDir string, execCtx *Executor) error {
 				return fmt.Errorf("SVN source %s exists but is not a directory: %s", relPath, srcPath)
 			}
 
-			if err := copySourceContents(srcPath, targetDir, "SVN", execCtx); err != nil {
+			if err := copySourceContents(srcPath, targetDir, "SVN"); err != nil {
 				return fmt.Errorf("failed to copy SVN source contents from %s to %s: %v", srcPath, targetDir, err)
 			}
 			// SVN source handled, move to the next line
@@ -238,7 +230,7 @@ func prepareSources(pkgName, pkgDir, buildDir string, execCtx *Executor) error {
 				return fmt.Errorf("HG source %s exists but is not a directory: %s", relPath, srcPath)
 			}
 
-			if err := copySourceContents(srcPath, targetDir, "HG", execCtx); err != nil {
+			if err := copySourceContents(srcPath, targetDir, "HG"); err != nil {
 				return fmt.Errorf("failed to copy HG source contents from %s to %s: %v", srcPath, targetDir, err)
 			}
 			// HG source handled, move to the next line
