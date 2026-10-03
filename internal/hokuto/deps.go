@@ -993,6 +993,9 @@ func resolveMissingDeps(pkgName string, processed map[string]bool, missing *[]st
 		}
 	}
 
+	// A host tool and its cross runtime used together must match.
+	noteCrossToolchainPairs(dependencies, cfg)
+
 	// --- 5. Recursively check all dependencies ---
 	for _, dep := range dependencies {
 		if dep.RuntimeOnly || dep.PostInstall || dep.Suggest {
@@ -3229,9 +3232,15 @@ func availableBuildDependencyBinaryTarball(pkgName string, cfg *Config, noRemote
 		name, path, version, revision, variant string
 		entry                                  *RepoEntry
 	}
+	// The cross runtime of a host tool the build also uses (aarch64-rust
+	// with rust) must be its release; see cross_toolchain.go.
+	requiredVersion := crossToolchainVersion(lookupName, cfg, noRemote)
 	var best *candidate
 	consider := func(c candidate) {
 		if !releaseIsOlder(c.version, c.revision, currentVersion, currentRevision) {
+			return
+		}
+		if requiredVersion != "" && compareVersions(c.version, requiredVersion) != 0 {
 			return
 		}
 		if _, accepted := variantRank[c.variant]; !accepted {
@@ -3282,6 +3291,9 @@ func availableBuildDependencyBinaryTarball(pkgName string, cfg *Config, noRemote
 	}
 
 	if best == nil {
+		if requiredVersion != "" {
+			debugf("No binary of %s matches its host tool's version %s; it is built instead\n", lookupName, requiredVersion)
+		}
 		return "", "", false, nil
 	}
 	if best.entry != nil {

@@ -214,6 +214,13 @@ because it returns package names.
   or remote archives.
 - `resolveRemoteDependencies` is for remote-only planning.
 
+A build dependency may fall back to an older binary while its current
+revision is not published (`availableBuildDependencyBinaryTarball`). A cross
+package used next to the native host tool of the same recipe
+(`aarch64-rust cross make` with `rust cross make`) is the exception: an older
+binary must have the host tool's version, otherwise it is built first
+(`cross_toolchain.go`).
+
 `BuildPlan` is the shared contract between resolution and execution:
 
 - `Order`: build/install order;
