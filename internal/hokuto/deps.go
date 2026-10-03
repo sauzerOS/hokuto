@@ -1322,6 +1322,19 @@ func resolveAlternativeDep(dep DepSpec, yes bool, cfg *Config, requestingPkg ...
 		return available[0], nil
 	}
 
+	// A build-only choice between toolchains (rust | rustup, go | go-bin)
+	// does not need asking: the first listed one with a binary package is
+	// installed for the build and removed afterwards. Runtime choices (which
+	// Vulkan driver, which kernel) depend on the machine and are still asked.
+	if dep.Make {
+		for _, alt := range available {
+			if alternativeHasBinary(alt, cfg) {
+				alternativeDepCache[cacheKey] = alt
+				return alt, nil
+			}
+		}
+	}
+
 	// Multiple alternatives available (none installed) - prompt user
 	if yes {
 		// In --yes mode, use the first available alternative and cache it
@@ -1392,6 +1405,22 @@ func resolveAlternativeDep(dep DepSpec, yes bool, cfg *Config, requestingPkg ...
 	chosen := available[choice-1]
 	alternativeDepCache[cacheKey] = chosen
 	return chosen, nil
+}
+
+// alternativeHasBinary reports whether a binary package of name is in the
+// local binary cache or the remote index. A plain name in a cross session is
+// a host tool, so it is looked up natively.
+func alternativeHasBinary(name string, cfg *Config) bool {
+	lookupCfg := packageBuildConfig(name, cfg)
+	if findCachedBinaryTarball(name, lookupCfg) != "" {
+		return true
+	}
+	index, err := GetCachedRemoteIndex(lookupCfg)
+	if err != nil {
+		return false
+	}
+	_, err = GetRemotePackageEntry(name, lookupCfg, index)
+	return err == nil
 }
 
 func alternativeDepCacheKey(dep DepSpec) string {

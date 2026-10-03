@@ -3525,3 +3525,54 @@ func TestResolveMissingDepsLooksUpHostToolNatively(t *testing.T) {
 		t.Fatalf("missing = %v: the native glycin binary was not found", missing)
 	}
 }
+
+// A build-only toolchain choice takes the first alternative with a binary
+// package instead of asking; a runtime choice is still asked.
+func TestResolveMakeAlternativePrefersBinaryWithoutPrompt(t *testing.T) {
+	cfg, repo := withTempDependencyRepo(t)
+	cfg.Values["HOKUTO_ARCH"] = "x86_64"
+	writeTestPackage(t, repo, "rustup", "")
+	writeTestPackage(t, repo, "rust", "")
+
+	oldIndex, oldErr, oldLoaded := GlobalRemoteIndex, GlobalRemoteIndexErr, GlobalRemoteIndexLoaded
+	GlobalRemoteIndex = []RepoEntry{{Name: "rust", Version: "1.99.0", Revision: "1", Arch: "x86_64", Variant: "optimized"}}
+	GlobalRemoteIndexErr, GlobalRemoteIndexLoaded = nil, true
+	t.Cleanup(func() { GlobalRemoteIndex, GlobalRemoteIndexErr, GlobalRemoteIndexLoaded = oldIndex, oldErr, oldLoaded })
+
+	// The prompt reads its answer from stdin; "1" would pick rustup.
+	answer := func(t *testing.T, text string) {
+		t.Helper()
+		r, w, err := os.Pipe()
+		if err != nil {
+			t.Fatal(err)
+		}
+		w.WriteString(text)
+		w.Close()
+		old := os.Stdin
+		os.Stdin = r
+		t.Cleanup(func() { os.Stdin = old; r.Close() })
+	}
+
+	for _, tc := range []struct {
+		name string
+		make bool
+		want string
+	}{
+		{"make dependency", true, "rust"},
+		{"runtime dependency", false, "rustup"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			alternativeDepCache = make(map[string]string)
+			t.Cleanup(func() { alternativeDepCache = make(map[string]string) })
+			answer(t, "1\n")
+			dep := DepSpec{Name: "rustup", Make: tc.make, Alternatives: []string{"rustup", "rust"}}
+			got, err := resolveAlternativeDep(dep, false, cfg, "resources")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != tc.want {
+				t.Fatalf("got %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
