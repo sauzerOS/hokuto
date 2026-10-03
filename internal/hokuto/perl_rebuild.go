@@ -25,10 +25,12 @@ import (
 // scripts survive an API change and don't carry it.
 const perlXSOption = "perlxs"
 
-// isPerlXSSymbol matches the symbols an XS object imports from the
-// interpreter: Perl_* functions and PL_* globals.
+// isPerlXSSymbol matches the interpreter functions an XS object imports. Every
+// XS module calls some (Perl_xs_handshake when it loads, since perl 5.22);
+// the PL_* globals are optional and the prefix is shared with NSPR's PL_*
+// functions (PL_strdup, PL_ArenaAllocate), which made libnss3 look like one.
 func isPerlXSSymbol(name string) bool {
-	return strings.HasPrefix(name, "Perl_") || strings.HasPrefix(name, "PL_")
+	return strings.HasPrefix(name, "Perl_")
 }
 
 // findPerlXSObjects returns the shared objects under root, relative to it,

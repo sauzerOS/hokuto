@@ -138,3 +138,20 @@ func TestFindPerlXSObjects(t *testing.T) {
 		t.Fatalf("got %v, want %v", got, want)
 	}
 }
+
+func TestIsPerlXSSymbol(t *testing.T) {
+	for name, want := range map[string]bool{
+		"Perl_xs_handshake":    true,
+		"Perl_croak_nocontext": true,
+		// PL_* globals alone do not make an XS object, and NSPR's PL_*
+		// functions are no Perl API at all (libnss3 imports them).
+		"PL_strdup":        false,
+		"PL_ArenaAllocate": false,
+		"PL_thr_key":       false,
+		"PR_Malloc":        false,
+	} {
+		if got := isPerlXSSymbol(name); got != want {
+			t.Errorf("isPerlXSSymbol(%q) = %v, want %v", name, got, want)
+		}
+	}
+}
