@@ -695,7 +695,7 @@ func pkgInstallWithRemotePolicy(tarballPath, pkgName string, cfg *Config, execCt
 					fmt.Fprintln(os.Stdout, colArrow.Sprint("->"), colSuccess.Sprint("glibc installed successfully via direct extraction"))
 				}
 			} else {
-				extractErr = fmt.Errorf("System tar missing or broken, run hokuto as root!")
+				extractErr = fmt.Errorf("installing as a normal user needs a working tar with zstd; install tar and zstd, or run hokuto as root")
 			}
 		}
 
@@ -776,12 +776,15 @@ func pkgInstallWithRemotePolicy(tarballPath, pkgName string, cfg *Config, execCt
 	}
 
 	if !tarSuccess {
-		if os.Geteuid() == 0 || execCtx.ShouldRunAsRoot {
-			if err := unpackTarballFallback(tarballPath, stagingDir); err != nil {
-				return nil, fmt.Errorf("failed to unpack tarball (native): %v", err)
-			}
-		} else {
-			return nil, fmt.Errorf("System tar missing or broken, run hokuto as root!")
+		// The internal unpacker runs in this process: only as root does it
+		// give the files their owners. Run as a normal user (installing
+		// through sudo or run0) it would stage, and so install, every file
+		// owned by that user.
+		if os.Geteuid() != 0 {
+			return nil, fmt.Errorf("cannot unpack %s: installing as a normal user needs a working tar with zstd (tar --zstd); install tar and zstd, or run hokuto as root", filepath.Base(tarballPath))
+		}
+		if err := unpackTarballFallback(tarballPath, stagingDir); err != nil {
+			return nil, fmt.Errorf("failed to unpack tarball (native): %v", err)
 		}
 	}
 
