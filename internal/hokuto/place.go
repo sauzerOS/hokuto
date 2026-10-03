@@ -357,6 +357,18 @@ func replaceAtomically(dstPath string, create func(tmp string) error) error {
 		return err
 	}
 	if err := os.Rename(tmp, dstPath); err != nil {
+		// rename() cannot replace a directory with anything else. Like rsync,
+		// an empty one gives way (sauzeros-base turns /var/lock into a link
+		// to ../run/lock); a directory that still holds files is not dropped.
+		if fi, lerr := os.Lstat(dstPath); lerr == nil && fi.IsDir() {
+			if rerr := os.Remove(dstPath); rerr != nil {
+				_ = os.Remove(tmp)
+				return fmt.Errorf("cannot replace directory %s: %w", dstPath, rerr)
+			}
+			if err = os.Rename(tmp, dstPath); err == nil {
+				return nil
+			}
+		}
 		_ = os.Remove(tmp)
 		return err
 	}

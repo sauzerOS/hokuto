@@ -124,3 +124,50 @@ func TestCopyFilePreservingMetadataKeepsSetuid(t *testing.T) {
 		t.Errorf("mode %v, want setuid 0755", got.Mode())
 	}
 }
+
+// sauzeros-base ships /var/lock as a link to ../run/lock; a root where it is
+// still an empty directory must take the link in both placement paths, while
+// a directory holding files is kept and reported.
+func TestPlacementReplacesEmptyDirectoryWithSymlink(t *testing.T) {
+	place := map[string]func(staging, root string) error{
+		"hardlink": placeStagingByHardlink,
+		"tar": func(staging, root string) error {
+			return copyTreeWithTar(staging, root, &Executor{})
+		},
+	}
+	for name, fn := range place {
+		t.Run(name, func(t *testing.T) {
+			staging, root := t.TempDir(), t.TempDir()
+			if err := os.MkdirAll(filepath.Join(staging, "var"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink("../run/lock", filepath.Join(staging, "var", "lock")); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.MkdirAll(filepath.Join(root, "var", "lock"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := fn(staging, root); err != nil {
+				t.Fatalf("placing over an empty directory: %v", err)
+			}
+			if target, err := os.Readlink(filepath.Join(root, "var", "lock")); err != nil || target != "../run/lock" {
+				t.Fatalf("/var/lock = %q, %v; want the link", target, err)
+			}
+
+			root = t.TempDir()
+			kept := filepath.Join(root, "var", "lock", "LCK..ttyS0")
+			if err := os.MkdirAll(filepath.Dir(kept), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(kept, nil, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := fn(staging, root); err == nil {
+				t.Fatal("placing over a directory with files succeeded")
+			}
+			if _, err := os.Stat(kept); err != nil {
+				t.Fatalf("file in the kept directory: %v", err)
+			}
+		})
+	}
+}
