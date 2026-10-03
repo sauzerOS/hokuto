@@ -143,9 +143,10 @@ func repairInstalledRuntimeDeps(plan *BuildPlan, cfg *Config, noRemote, quiet bo
 	}
 	sort.Strings(names)
 
-	prepareDependencyProgressLogOutput()
-	colArrow.Print("-> ")
-	colWarn.Printf("Installed build dependencies are missing runtime dependencies: %s\n", formatMissingRuntimeDeps(names, missing))
+	// Usual for a binary build dependency, whose package lists runtime
+	// dependencies its recipe does not (rust needs clang and lld), so this
+	// is only worth a warning for one that cannot be installed below.
+	debugf("Installing runtime dependencies of build dependencies: %s\n", formatMissingRuntimeDeps(names, missing))
 
 	var installed []string
 	for _, name := range names {
