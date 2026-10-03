@@ -1850,7 +1850,8 @@ func copyEffectivePackageMetadata(pkgDir, packageName, sourcePackage, installedD
 	return writeRootFile(filepath.Join(installedDir, "metadata.json"), encoded, 0o644, execCtx)
 }
 
-func packageSplitOutputs(parentPkgName, pkgDir, splitRoot, version, revision, targetArch, cflagsVal string, isGeneric bool, shouldStrip bool, buildExec *Executor, cfg *Config, opts BuildOptions, elapsed time.Duration) error {
+// record, when set, is told about each split package created.
+func packageSplitOutputs(parentPkgName, pkgDir, splitRoot, version, revision, targetArch, cflagsVal string, isGeneric bool, shouldStrip bool, buildExec *Executor, cfg *Config, opts BuildOptions, elapsed time.Duration, record func(WebsiteOutputSource)) error {
 	splitNames, err := discoverSplitOutputDirs(splitRoot)
 	if err != nil {
 		return fmt.Errorf("failed to read split output dir: %w", err)
@@ -1962,6 +1963,13 @@ func packageSplitOutputs(parentPkgName, pkgDir, splitRoot, version, revision, ta
 		if err := createPackageTarball(outputSplitName, version, revision, targetArch, variant, splitOutputDir, buildExec, opts.LogWriter); err != nil {
 			return fmt.Errorf("failed to package split tarball %s: %w", outputSplitName, err)
 		}
+		if record != nil {
+			record(WebsiteOutputSource{
+				Name:      outputSplitName,
+				OutputDir: splitOutputDir,
+				Tarball:   filepath.Join(BinDir, StandardizeRemoteName(outputSplitName, version, revision, targetArch, variant)),
+			})
+		}
 	}
 	return nil
 }
@@ -1985,9 +1993,10 @@ type builtPackageFinalization struct {
 	stripBin      string
 	isGeneric     bool
 	bootstrap     bool
-	updateWebsite bool
 	crossSysroot  string
-	kmod          *kmodTarget // set for kernel module package instances
+	// tarball, when set, receives the path of the package archive created.
+	tarball *string
+	kmod    *kmodTarget // set for kernel module package instances
 }
 
 func removePathFromOutput(outputDir, relPath string, execCtx *Executor) {
@@ -2174,11 +2183,6 @@ func finalizeBuiltPackage(in builtPackageFinalization) error {
 		fmt.Fprintf(os.Stderr, "Warning: failed to compress build log: %v\n", err)
 	}
 
-	if in.updateWebsite {
-		fullVer := fmt.Sprintf("%s-%s", in.version, in.revision)
-		UpdateWebsiteStatus(in.sourcePkgName, fullVer, "success", logXZPath)
-	}
-
 	isMultilib := detectMultilib(in.outputPkgName, in.outputDir)
 	pkginfoExec := in.buildExec
 	if in.buildExec.ShouldRunAsRoot {
@@ -2208,6 +2212,9 @@ func finalizeBuiltPackage(in builtPackageFinalization) error {
 	variant := IdentifyVariant(in.sourcePkgName, in.isGeneric, isMultilib)
 	if err := createPackageTarball(in.outputPkgName, in.version, in.revision, in.targetArch, variant, in.outputDir, in.buildExec, in.logger); err != nil {
 		return fmt.Errorf("failed to package tarball: %w", err)
+	}
+	if in.tarball != nil {
+		*in.tarball = filepath.Join(BinDir, StandardizeRemoteName(in.outputPkgName, in.version, in.revision, in.targetArch, variant))
 	}
 
 	return nil
@@ -3259,8 +3266,14 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, opts BuildOptions)
 		logPath := filepath.Join(logDir, "build-log.txt")
 
 		if opts.UpdateWebsite {
-			fullVer := fmt.Sprintf("%s-%s", version, revision)
-			UpdateWebsiteStatus(pkgName, fullVer, "failed", logPath)
+			UpdateWebsiteStatus(WebsiteBuildResult{
+				PkgName:   pkgName,
+				Arch:      websiteBuildArch(getArchivePackageName(pkgName, cfg), defaults["HOKUTO_ARCH"], cfg),
+				Version:   fmt.Sprintf("%s-%s", version, revision),
+				Status:    "failed",
+				LogPath:   logPath,
+				BuildTime: time.Since(startTime),
+			})
 		}
 
 		// If interactive, let user follow the log; otherwise show last N lines and continue.
@@ -3307,6 +3320,11 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, opts BuildOptions)
 	// Determine if this is a generic build
 	isGeneric := isGenericBuildVariant(targetArch, cfg, options)
 
+	websiteArch := ""
+	if opts.UpdateWebsite {
+		websiteArch = websiteBuildArch(outputPkgName, targetArch, cfg)
+	}
+	var tarballPath string
 	if err := finalizeBuiltPackage(builtPackageFinalization{
 		sourcePkgName: pkgName,
 		outputPkgName: outputPkgName,
@@ -3326,15 +3344,34 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, opts BuildOptions)
 		stripBin:      stripBinary(cfg, options),
 		isGeneric:     isGeneric,
 		bootstrap:     opts.Bootstrap,
-		updateWebsite: opts.UpdateWebsite,
 		crossSysroot:  crossSystemSysrootFor(cfg, defaults),
 		kmod:          kmod,
+		tarball:       &tarballPath,
 	}); err != nil {
 		return 0, err
 	}
 
-	if err := packageSplitOutputs(pkgName, pkgDir, splitRoot, version, revision, targetArch, cflagsVal, isGeneric, shouldStrip, buildExec, cfg, opts, elapsed); err != nil {
+	websiteOutputs := []WebsiteOutputSource{{Name: outputPkgName, OutputDir: outputDir, Tarball: tarballPath}}
+	var recordSplit func(WebsiteOutputSource)
+	if websiteArch != "" {
+		recordSplit = func(out WebsiteOutputSource) { websiteOutputs = append(websiteOutputs, out) }
+	}
+	if err := packageSplitOutputs(pkgName, pkgDir, splitRoot, version, revision, targetArch, cflagsVal, isGeneric, shouldStrip, buildExec, cfg, opts, elapsed, recordSplit); err != nil {
 		return 0, err
+	}
+
+	// Published once every package exists, so the site lists their sizes and
+	// manifests; the staged outputs are removed below.
+	if websiteArch != "" {
+		UpdateWebsiteStatus(WebsiteBuildResult{
+			PkgName:   pkgName,
+			Arch:      websiteArch,
+			Version:   fmt.Sprintf("%s-%s", version, revision),
+			Status:    "success",
+			LogPath:   filepath.Join(outputDir, "var", "db", "hokuto", "installed", outputPkgName, "log.xz"),
+			BuildTime: elapsed,
+			Outputs:   websiteOutputs,
+		})
 	}
 
 	// Cleanup tmpdirs
