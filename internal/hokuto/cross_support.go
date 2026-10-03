@@ -175,11 +175,19 @@ var crossContainmentExemptPrefixes = []string{"/var/db/hokuto/"}
 // support files: /usr/bin/aarch64-linux-gnu-gcc,
 // /usr/lib/gcc/aarch64-linux-gnu/16.2.0/cc1. Such a path cannot collide with a
 // native host file, so it is where a cross compiler (aarch64-gcc,
-// aarch64-binutils) legitimately installs outside the sysroot.
+// aarch64-binutils) legitimately installs outside the sysroot. The vendor
+// form of the triplet counts too: aarch64-rust links the target's standard
+// library into the host rustc's /usr/lib/rustlib/aarch64-unknown-linux-gnu.
 func pathNamesCrossTarget(abs, triplet string) bool {
+	names := []string{triplet}
+	if arch, rest, ok := strings.Cut(triplet, "-"); ok {
+		names = append(names, arch+"-unknown-"+rest)
+	}
 	for _, part := range strings.Split(abs, "/") {
-		if part == triplet || strings.HasPrefix(part, triplet+"-") {
-			return true
+		for _, name := range names {
+			if part == name || strings.HasPrefix(part, name+"-") {
+				return true
+			}
 		}
 	}
 	return false

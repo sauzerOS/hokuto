@@ -55,6 +55,8 @@ func TestVerifyCrossSystemContainmentAcceptsCrossToolchainLayout(t *testing.T) {
 	stageFile(t, dir, "usr/bin/aarch64-linux-gnu-gcc")
 	stageFile(t, dir, "usr/lib/gcc/aarch64-linux-gnu/16.2.0/cc1")
 	stageFile(t, dir, "usr/lib/gcc/aarch64-linux-gnu/16.2.0/include/arm_neon.h")
+	// aarch64-rust's link for the host rustc uses the vendor triplet.
+	stageFile(t, dir, "usr/lib/rustlib/aarch64-unknown-linux-gnu")
 
 	if err := verifyCrossSystemContainment(dir, "/usr/aarch64-linux-gnu"); err != nil {
 		t.Fatalf("cross toolchain layout should pass, got %v", err)
@@ -63,8 +65,9 @@ func TestVerifyCrossSystemContainmentAcceptsCrossToolchainLayout(t *testing.T) {
 	// Anything a native package could also own still fails.
 	stageFile(t, dir, "usr/share/info/gcc.info")
 	stageFile(t, dir, "usr/lib/gcc/x86_64-pc-linux-gnu/16.2.0/cc1")
+	stageFile(t, dir, "usr/lib/rustlib/x86_64-unknown-linux-gnu/lib/libstd.rlib")
 	err := verifyCrossSystemContainment(dir, "/usr/aarch64-linux-gnu")
-	if err == nil || !strings.Contains(err.Error(), "2 file(s)") {
+	if err == nil || !strings.Contains(err.Error(), "3 file(s)") {
 		t.Fatalf("host-named paths must still be rejected, got %v", err)
 	}
 }
