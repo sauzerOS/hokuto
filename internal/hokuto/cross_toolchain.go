@@ -60,3 +60,16 @@ func crossToolchainVersion(pkgName string, cfg *Config, noRemote bool) string {
 	}
 	return ""
 }
+
+// crossToolchainBinaryUnusable reports whether pkgName is paired with a host
+// tool and no binary of it has that tool's version, so it will be built:
+// dependency resolution must then walk what building it needs (aarch64-rust
+// 1.98.1 exists next to rust 1.99.0; building aarch64-rust needs
+// aarch64-llvm).
+func crossToolchainBinaryUnusable(pkgName string, cfg *Config, noRemote bool) bool {
+	if crossToolchainVersion(pkgName, cfg, noRemote) == "" {
+		return false
+	}
+	_, _, ok, err := availableBuildDependencyBinaryTarball(pkgName, cfg, noRemote)
+	return err == nil && !ok
+}

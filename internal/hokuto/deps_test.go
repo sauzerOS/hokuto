@@ -3475,3 +3475,53 @@ func TestResolveMissingDepsNotesSelfNamedHostTool(t *testing.T) {
 		t.Fatalf("expected the native wayland as a host tool, got %v", cfg.CrossHostTools)
 	}
 }
+
+// A cross package resolved as a dependency (aarch64-gdk-pixbuf for libnotify)
+// records the host tools of its own cross build ("glycin cross"). Using it does
+// not need them: following glycin would pull in its build dependencies
+// (aarch64-rust), so a libnotify cross build once set out to build rust.
+func TestResolveMissingDepsSkipsHostLinesOfCrossDependency(t *testing.T) {
+	cfg, repo := withTempDependencyRepo(t)
+	cfg.Values["HOKUTO_CROSS_ARCH"] = "arm64"
+	cfg.Values["HOKUTO_CROSS_SYSTEM"] = "1"
+	cfg.CrossOutputPackages = map[string]bool{"libnotify": true}
+	writeTestPackage(t, repo, "libnotify", "aarch64-gdk-pixbuf cross make\n")
+	writeTestPackage(t, repo, "glycin", "rust make\naarch64-rust cross make\n")
+	writeTestPackage(t, repo, "rust", "")
+	writeInstalledTestPackageWithDepends(t, "aarch64-gdk-pixbuf", "aarch64-glib cross\nglycin cross\nglib\n")
+	writeInstalledTestPackage(t, "aarch64-glib")
+
+	var missing []string
+	if err := resolveMissingDeps("libnotify", map[string]bool{}, &missing, map[string]bool{"libnotify": true}, cfg, true); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"glycin", "aarch64-rust", "rust"} {
+		if containsString(missing, name) {
+			t.Fatalf("missing = %v: %s came from a host line of aarch64-gdk-pixbuf", missing, name)
+		}
+	}
+}
+
+// A host tool of a cross build is a native package: its binary is the
+// host's. Looking it up as an aarch64 package found none and took it for a
+// source build, collecting its build dependencies.
+func TestResolveMissingDepsLooksUpHostToolNatively(t *testing.T) {
+	cfg, repo := withTempDependencyRepo(t)
+	cfg.Values["HOKUTO_ARCH"] = "x86_64"
+	cfg.Values["HOKUTO_CROSS_ARCH"] = "arm64"
+	cfg.Values["HOKUTO_CROSS_SYSTEM"] = "1"
+	cfg.CrossOutputPackages = map[string]bool{"libnotify": true}
+	writeTestPackage(t, repo, "libnotify", "glycin cross make\n")
+	writeTestPackage(t, repo, "glycin", "rust make\naarch64-rust cross make\n")
+	writeTestPackage(t, repo, "rust", "")
+	path := filepath.Join(BinDir, StandardizeRemoteName("glycin", "1.0", "1", "x86_64", "optimized"))
+	writeTestBinaryTarball(t, path, "glycin", "1.0", "1")
+
+	var missing []string
+	if err := resolveMissingDeps("libnotify", map[string]bool{}, &missing, map[string]bool{"libnotify": true}, cfg, true); err != nil {
+		t.Fatal(err)
+	}
+	if containsString(missing, "aarch64-rust") || containsString(missing, "rust") {
+		t.Fatalf("missing = %v: the native glycin binary was not found", missing)
+	}
+}

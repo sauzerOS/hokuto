@@ -948,13 +948,18 @@ func resolveMissingDeps(pkgName string, processed map[string]bool, missing *[]st
 		return nil
 	}
 
-	binaryAvailableForPkg := !forceBuild[pkgName] && dependencyBinaryAvailable(pkgName, cfg, noRemote)
+	// In a cross session a plain package that is not a cross target is a
+	// native one (a host tool such as glycin): its binary is the host's,
+	// not an aarch64 package of that name.
+	pkgCfg := packageBuildConfig(pkgName, cfg)
+	binaryAvailableForPkg := !forceBuild[pkgName] && dependencyBinaryAvailable(pkgName, pkgCfg, noRemote) &&
+		!crossToolchainBinaryUnusable(pkgName, pkgCfg, noRemote)
 
 	// --- 3. Find the Package Source Directory (pkgDir) ---
 	pkgDir, err := findPackageMetadataDir(pkgName)
 	var dependencies []DepSpec
 	if err != nil {
-		archiveDeps, found, depErr := resolveBinaryDependenciesFromArchive(pkgName, cfg, nil, !noRemote)
+		archiveDeps, found, depErr := resolveBinaryDependenciesFromArchive(pkgName, pkgCfg, nil, !noRemote)
 		if depErr != nil {
 			return depErr
 		}
@@ -989,7 +994,7 @@ func resolveMissingDeps(pkgName string, processed map[string]bool, missing *[]st
 			return fmt.Errorf("failed to parse dependencies for %s: %w", pkgName, err)
 		}
 		if binaryAvailableForPkg && !isPackageInstalled(pkgName) {
-			dependencies = append(dependencies, recordedBinaryDependencySpecs(pkgName, cfg, noRemote)...)
+			dependencies = append(dependencies, recordedBinaryDependencySpecs(pkgName, pkgCfg, noRemote)...)
 		}
 	}
 
@@ -1007,6 +1012,15 @@ func resolveMissingDeps(pkgName string, processed map[string]bool, missing *[]st
 			continue
 		}
 		if dep.Optional && !forceBuild[pkgName] {
+			continue
+		}
+
+		// A cross package (aarch64-gdk-pixbuf) also records the host tools of
+		// its own cross build ("glycin cross"); using it needs none of them,
+		// and following one pulls in that tool's own build dependencies. A
+		// cross package that is built here (aarch64-rust) needs them.
+		usedAsBinary := (binaryAvailableForPkg || isPackageInstalled(pkgName)) && !forceBuild[pkgName]
+		if usedAsBinary && hostLineOfCrossSystemPackage(pkgName, dep.Name) {
 			continue
 		}
 
