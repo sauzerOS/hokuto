@@ -54,6 +54,7 @@ func TestRunParallelBuildsClearsPromptHooksAfterUILoop(t *testing.T) {
 		true,
 		false,
 		false,
+		false,
 		nil,
 		nil,
 	)

@@ -1712,7 +1712,7 @@ func checkForUpgrades(ctx context.Context, cfg *Config, maxJobs int, yes bool) e
 			return pkgBuild(pkgName, cfg, exec, opts)
 		}
 
-		if _, err := RunParallelBuilds(updatePlan, cfg, maxJobs, userRequestedMap, yes, true, false, splitDepsBySource, smartBuilder); err != nil {
+		if _, err := RunParallelBuilds(updatePlan, cfg, maxJobs, userRequestedMap, yes, true, false, false, splitDepsBySource, smartBuilder); err != nil {
 			return err
 		}
 
@@ -1888,7 +1888,7 @@ func checkForUpgrades(ctx context.Context, cfg *Config, maxJobs int, yes bool) e
 			colArrow.Print("-> ")
 			colSuccess.Printf("Installing")
 			colNote.Printf(" %s\n", outputPkgName)
-			if _, err := pkgInstall(tarballPath, outputPkgName, cfg, RootExec, false, false, false, nil); err != nil {
+			if _, err := pkgInstallWithRemotePolicy(tarballPath, outputPkgName, cfg, RootExec, false, false, false, false, nil); err != nil {
 				isCriticalAtomic.Store(0)
 				color.Danger.Printf("Installation failed for %s: %v\n", outputPkgName, err)
 				failedPackages = append(failedPackages, pkgName)

@@ -713,7 +713,7 @@ func installAvailableBinaryBuildDeps(plan *BuildPlan, userRequested, declined ma
 		isCriticalAtomic.Store(1)
 		logger, fast := dependencyInstallLogger(quiet)
 		handlePreInstallUninstall(cand.outputPkgName, cfg, RootExec, false, logger)
-		if _, err := pkgInstall(cand.tarballPath, cand.outputPkgName, cfg, RootExec, false, fast, false, logger); err != nil {
+		if _, err := pkgInstallWithRemotePolicy(cand.tarballPath, cand.outputPkgName, cfg, RootExec, false, fast, false, noRemote, logger); err != nil {
 			isCriticalAtomic.Store(0)
 			return installedAny, fmt.Errorf("fatal error installing binary %s: %w", cand.name, err)
 		}
@@ -4777,7 +4777,7 @@ func handleBuildCommand(args []string, cfg *Config) (err error) {
 			tarballPath := filepath.Join(BinDir, StandardizeRemoteName(archivePkgName, version, revision, arch, variant))
 			isCriticalAtomic.Store(1)
 			handlePreInstallUninstall(outputPkgName, installCfg, RootExec, false, nil)
-			if _, installErr := pkgInstall(tarballPath, outputPkgName, installCfg, RootExec, true, false, false, nil); installErr != nil {
+			if _, installErr := pkgInstallWithRemotePolicy(tarballPath, outputPkgName, installCfg, RootExec, true, false, false, *noRemote, nil); installErr != nil {
 				isCriticalAtomic.Store(0)
 				colArrow.Print("-> ")
 				color.Danger.Printf("Installation failed for %s: %v\n", outputPkgName, installErr)
@@ -4956,7 +4956,7 @@ func handleBuildCommand(args []string, cfg *Config) (err error) {
 					logger, fast := dependencyInstallLogger(quietDependencyInstalls)
 					isCriticalAtomic.Store(1)
 					handlePreInstallUninstall(outputDepPkg, depCfg, RootExec, false, logger)
-					if _, err := pkgInstall(tarballPath, outputDepPkg, depCfg, RootExec, false, fast, false, logger); err != nil {
+					if _, err := pkgInstallWithRemotePolicy(tarballPath, outputDepPkg, depCfg, RootExec, false, fast, false, *noRemote, logger); err != nil {
 						isCriticalAtomic.Store(0)
 						return fmt.Errorf("fatal error installing binary %s: %v", depPkg, err)
 					}
@@ -5237,7 +5237,7 @@ func handleBuildCommand(args []string, cfg *Config) (err error) {
 				for _, dep := range installedBinaryDeps {
 					addTemporaryBuildDep(dep)
 				}
-				installedParallelDeps, err := RunParallelBuilds(initialPlan, cfg, maxJobs, userRequestedMap, true, *autoInstall, true, splitDepsBySource, smartBuildBuilder)
+				installedParallelDeps, err := RunParallelBuilds(initialPlan, cfg, maxJobs, userRequestedMap, true, *autoInstall, true, *noRemote, splitDepsBySource, smartBuildBuilder)
 				if err != nil {
 					return err
 				}
@@ -5292,7 +5292,7 @@ func handleBuildCommand(args []string, cfg *Config) (err error) {
 						tarballPath := filepath.Join(BinDir, StandardizeRemoteName(archiveFinalPkg, version, revision, arch, variant))
 						isCriticalAtomic.Store(1)
 						handlePreInstallUninstall(outputFinalPkg, cfg, RootExec, false, nil)
-						if _, err := pkgInstall(tarballPath, outputFinalPkg, cfg, RootExec, false, false, false, nil); err != nil {
+						if _, err := pkgInstallWithRemotePolicy(tarballPath, outputFinalPkg, cfg, RootExec, false, false, false, *noRemote, nil); err != nil {
 							isCriticalAtomic.Store(0)
 							colArrow.Print("-> ")
 							color.Danger.Printf("Installation failed for %s: %v\n", outputFinalPkg, err)
@@ -5615,7 +5615,7 @@ func executeBuildPass(plan *BuildPlan, _ string, installAllTargets bool, cfg *Co
 					}
 					isCriticalAtomic.Store(1)
 					handlePreInstallUninstall(outputPkgName, installCfg, RootExec, false, installLogger)
-					if _, installErr := pkgInstall(tarballPath, outputPkgName, installCfg, RootExec, true, installFast, false, installLogger); installErr != nil {
+					if _, installErr := pkgInstallWithRemotePolicy(tarballPath, outputPkgName, installCfg, RootExec, true, installFast, false, noRemote, installLogger); installErr != nil {
 						isCriticalAtomic.Store(0)
 						colArrow.Print("-> ")
 						color.Danger.Printf("Installation failed for %s: %v\n", outputPkgName, installErr)
@@ -5777,7 +5777,7 @@ func executeBuildPass(plan *BuildPlan, _ string, installAllTargets bool, cfg *Co
 						tarballPath := filepath.Join(BinDir, StandardizeRemoteName(archiveParent, version, revision, arch, variant))
 						isCriticalAtomic.Store(1)
 						handlePreInstallUninstall(outputParent, cfg, RootExec, false, nil)
-						if _, installErr := pkgInstall(tarballPath, outputParent, cfg, RootExec, true, false, false, nil); installErr != nil {
+						if _, installErr := pkgInstallWithRemotePolicy(tarballPath, outputParent, cfg, RootExec, true, false, false, noRemote, nil); installErr != nil {
 							isCriticalAtomic.Store(0)
 							colArrow.Print("-> ")
 							color.Danger.Printf("Installation failed for rebuilt %s: %v\n", outputParent, installErr)
@@ -5827,7 +5827,7 @@ func executeBuildPass(plan *BuildPlan, _ string, installAllTargets bool, cfg *Co
 					isCriticalAtomic.Store(1)
 					handlePreInstallUninstall(outputRebuildPkg, cfg, RootExec, false, nil)
 					// Always run this non-interactively
-					if _, installErr := pkgInstall(tarballPath, outputRebuildPkg, cfg, RootExec, true, false, false, nil); installErr != nil {
+					if _, installErr := pkgInstallWithRemotePolicy(tarballPath, outputRebuildPkg, cfg, RootExec, true, false, false, noRemote, nil); installErr != nil {
 						isCriticalAtomic.Store(0)
 						colArrow.Print("-> ")
 						color.Danger.Printf("Installation failed for post-build %s: %v\n", outputRebuildPkg, installErr)

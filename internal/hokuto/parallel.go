@@ -15,12 +15,15 @@ import (
 
 // ParallelManager handles the execution of parallel builds
 type ParallelManager struct {
-	MaxJobs             int
-	Config              *Config
-	BuildPlan           *BuildPlan
-	Context             context.Context
-	Cancel              context.CancelFunc
-	AutoYes             bool
+	MaxJobs   int
+	Config    *Config
+	BuildPlan *BuildPlan
+	Context   context.Context
+	Cancel    context.CancelFunc
+	AutoYes   bool
+	// NoRemote keeps installs from fetching dependencies from the mirror
+	// (build -no-remote). An update may always use it.
+	NoRemote            bool
 	AutoInstall         bool
 	AddRequestedToWorld bool
 	UserRequested       map[string]bool
@@ -99,7 +102,7 @@ func snapshotInstalledPackageNames() map[string]bool {
 }
 
 // RunParallelBuilds executes the build plan in parallel
-func RunParallelBuilds(plan *BuildPlan, cfg *Config, maxJobs int, userRequestedMap map[string]bool, autoYes bool, autoInstall bool, addRequestedToWorld bool, splitDepsBySource map[string][]string, customBuilder func(string, *Config, *Executor, BuildOptions) (time.Duration, error)) ([]string, error) {
+func RunParallelBuilds(plan *BuildPlan, cfg *Config, maxJobs int, userRequestedMap map[string]bool, autoYes bool, autoInstall bool, addRequestedToWorld bool, noRemote bool, splitDepsBySource map[string][]string, customBuilder func(string, *Config, *Executor, BuildOptions) (time.Duration, error)) ([]string, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -126,6 +129,7 @@ func RunParallelBuilds(plan *BuildPlan, cfg *Config, maxJobs int, userRequestedM
 		promptAck:           make(chan struct{}),
 		Builder:             pkgBuild,
 		AutoYes:             autoYes,
+		NoRemote:            noRemote,
 		AutoInstall:         autoInstall,
 		AddRequestedToWorld: addRequestedToWorld,
 	}
@@ -326,7 +330,7 @@ func (pm *ParallelManager) installDeferredTargets() error {
 
 		isCriticalAtomic.Store(1)
 		handlePreInstallUninstall(outputPkgName, pm.Config, RootExec, false, nil)
-		if _, err := pkgInstall(tarballPath, outputPkgName, pm.Config, RootExec, false, false, false, nil); err != nil {
+		if _, err := pkgInstallWithRemotePolicy(tarballPath, outputPkgName, pm.Config, RootExec, false, false, false, pm.NoRemote, nil); err != nil {
 			isCriticalAtomic.Store(0)
 			return fmt.Errorf("final installation failed for %s: %w", outputPkgName, err)
 		}
@@ -1011,7 +1015,7 @@ func (pm *ParallelManager) installPackage(pkgName string, userRequestedMap map[s
 	var rebuilds []string
 	if installMainOutput {
 		handlePreInstallUninstall(outputPkgName, installCfg, installExec, pm.AutoYes, logger)
-		rebuilds, err = pkgInstall(tarballPath, outputPkgName, installCfg, installExec, pm.AutoYes, true, true, logger)
+		rebuilds, err = pkgInstallWithRemotePolicy(tarballPath, outputPkgName, installCfg, installExec, pm.AutoYes, true, true, pm.NoRemote, logger)
 		if err == nil {
 			result.Available = append(result.Available, pkgName)
 		}
