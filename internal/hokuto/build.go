@@ -5035,10 +5035,7 @@ func handleBuildCommand(args []string, cfg *Config) (err error) {
 				colWarn.Println("Warning: -ordered flag is only supported for a single target package. Using default build mode.")
 			}
 
-			var buildListInput []string
-			for pkg := range packagesThatMustBeBuilt {
-				buildListInput = append(buildListInput, pkg)
-			}
+			buildListInput := orderedBuildList(packagesThatMustBeBuilt, packagesToProcess)
 
 			var initialPlan *BuildPlan
 			var err error
@@ -5843,4 +5840,28 @@ func executeBuildPass(plan *BuildPlan, _ string, installAllTargets bool, cfg *Co
 		}
 	}
 	return failed, successfullyBuiltTargets, totalElapsedTime, installedBuildDeps
+}
+
+// orderedBuildList returns the packages to build in the order the user named
+// them, then the rest sorted. The plan walks its input in order, so where the
+// dependency graph leaves the order open (a cycle through cross or optional
+// dependencies, as gdk-pixbuf and librsvg have) the command line decides it,
+// and the same command always plans the same order.
+func orderedBuildList(toBuild map[string]bool, requested []string) []string {
+	list := make([]string, 0, len(toBuild))
+	seen := make(map[string]bool, len(toBuild))
+	for _, pkg := range requested {
+		if toBuild[pkg] && !seen[pkg] {
+			list = append(list, pkg)
+			seen[pkg] = true
+		}
+	}
+	var rest []string
+	for pkg := range toBuild {
+		if !seen[pkg] {
+			rest = append(rest, pkg)
+		}
+	}
+	sort.Strings(rest)
+	return append(list, rest...)
 }
