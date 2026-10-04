@@ -287,12 +287,21 @@ func flushPackageSuggestions(logger io.Writer, cfg *Config, noRemote bool, promp
 	}
 	sort.Strings(packages)
 
-	fmt.Fprint(logger, colArrow.Sprint("-> "))
-	fmt.Fprintln(logger, colSuccess.Sprint("Suggested optional runtime dependencies:"))
+	// Each suggestion is asked about below, with its text; the list is
+	// only for runs that do not ask. Suggestions are optional and default to
+	// No, so -y (and the auto-bump's global yes) takes that default: they
+	// are listed but never installed without an explicit answer.
+	asking := promptInstall && cfg != nil && !autoYes && !GlobalAssumeYes
+	if !asking {
+		fmt.Fprint(logger, colArrow.Sprint("-> "))
+		fmt.Fprintln(logger, colSuccess.Sprint("Suggested optional runtime dependencies:"))
+	}
 	var installPrompts []packageSuggestion
 	for _, pkg := range packages {
-		fmt.Fprint(logger, colArrow.Sprint("-> "))
-		fmt.Fprintln(logger, colNote.Sprintf("%s:", pkg))
+		if !asking {
+			fmt.Fprint(logger, colArrow.Sprint("-> "))
+			fmt.Fprintln(logger, colNote.Sprintf("%s:", pkg))
+		}
 
 		suggestions := pending[pkg]
 		sort.Slice(suggestions, func(i, j int) bool {
@@ -306,14 +315,16 @@ func flushPackageSuggestions(logger io.Writer, cfg *Config, noRemote bool, promp
 		})
 
 		for _, item := range suggestions {
-			fmt.Fprint(logger, colArrow.Sprint("-> "))
-			fmt.Fprint(logger, "  ")
-			fmt.Fprint(logger, colNote.Sprint(item.Dependency))
-			if item.Text != "" {
-				fmt.Fprintf(logger, " - %s", item.Text)
+			if !asking {
+				fmt.Fprint(logger, colArrow.Sprint("-> "))
+				fmt.Fprint(logger, "  ")
+				fmt.Fprint(logger, colNote.Sprint(item.Dependency))
+				if item.Text != "" {
+					fmt.Fprintf(logger, " - %s", item.Text)
+				}
+				fmt.Fprintln(logger)
 			}
-			fmt.Fprintln(logger)
-			if promptInstall && cfg != nil {
+			if asking {
 				installPrompts = append(installPrompts, item)
 			}
 		}
@@ -328,17 +339,14 @@ func flushPackageSuggestions(logger io.Writer, cfg *Config, noRemote bool, promp
 			if altName == "" || isPackageInstalled(altName) {
 				continue
 			}
-			prompt := fmt.Sprintf("Install suggested dependency %s for %s?", colNote.Sprint(altName), colNote.Sprint(item.Package))
+			// Every piece is colored: a name's color ends with a reset, which
+			// would leave the text after it uncolored.
+			prompt := colSuccess.Sprint("Install suggested dependency ") + colNote.Sprint(altName) +
+				colSuccess.Sprint(" for ") + colNote.Sprint(item.Package) + colSuccess.Sprint("?")
 			if item.Text != "" {
-				prompt = fmt.Sprintf("%s (%s)", prompt, item.Text)
+				prompt += colSuccess.Sprintf(" (%s)", item.Text)
 			}
-			// Suggestions are optional and default to No, so -y (and the
-			// auto-bump's global yes) takes that default: they are listed
-			// above but never installed without an explicit answer.
-			if autoYes || GlobalAssumeYes {
-				continue
-			}
-			if !askForConfirmationDefaultNo(colInfo, "%s%s", colArrow.Sprint("-> "), prompt) {
+			if !askForConfirmationDefaultNo(colSuccess, "%s%s", colArrow.Sprint("-> "), prompt) {
 				continue
 			}
 
@@ -409,6 +417,9 @@ func installMissingPackageRuntimeDependencies(pkgName string, cfg *Config, logge
 			continue
 		}
 		if _, inProgress := runtimeDependencyInstallInProgress.Load(depName); inProgress {
+			continue
+		}
+		if _, planned := installPlanPending.Load(depName); planned {
 			continue
 		}
 		if findInstalledDependencySatisfying(depName, dep.Op, dep.Version) != "" {

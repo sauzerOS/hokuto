@@ -27,6 +27,14 @@ var dependencyBinaryVersionlessLogOnce sync.Map
 
 var runtimeDependencyInstallInProgress sync.Map
 
+// installPlanPending holds the packages an install plan still has to
+// install. A package's runtime dependencies that are among them are left to
+// the plan: with a dependency cycle (libheif -> ffmpeg -> ... -> libheif)
+// some package comes before a dependency, and installing that dependency
+// from inside its install pulled in most of the rest of the plan, nested and
+// off the progress bar (an mpv install sat at 25% for 8 s, then jumped).
+var installPlanPending sync.Map
+
 var suppressRuntimeDependencyAutoInstall atomic.Int32
 
 // binaryOnlyRuntimeDependencyInstall is enabled while handling a build command.

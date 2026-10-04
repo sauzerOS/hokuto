@@ -892,7 +892,10 @@ func Main() {
 		if len(extraDeps) > 0 {
 			sort.Strings(extraDeps)
 			colArrow.Print("-> ")
-			colSuccess.Print("The following extra dependencies will be installed: [")
+			// [extra dependencies/all packages in the plan]
+			colSuccess.Print("The following extra dependencies will be installed ")
+			colNote.Printf("[%d/%d]", len(extraDeps), len(installPlan))
+			colSuccess.Print(": [")
 			for i, dep := range extraDeps {
 				if i > 0 {
 					colSuccess.Print(" ")
@@ -942,7 +945,22 @@ func Main() {
 		// Iterate through the calculated plan
 		var bar *progressbar.ProgressBar
 		if effectiveFast && len(installPlan) > 0 {
-			bar = progressbar.Default(int64(len(installPlan)), colSuccess.Sprint("Installing Packages"))
+			// progressbar.Default without its 65 ms throttle: with it, a
+			// label set while packages go by quickly was not drawn, and a
+			// slow post-install hook that followed sat under the name of an
+			// earlier package (shared-mime-info's 3 s update-mime-database
+			// looked like x265 hanging). The bar is redrawn once per package.
+			bar = progressbar.NewOptions64(int64(len(installPlan)),
+				progressbar.OptionSetDescription(colSuccess.Sprint("Installing Packages")),
+				progressbar.OptionSetWriter(os.Stderr),
+				progressbar.OptionSetWidth(10),
+				progressbar.OptionShowCount(),
+				progressbar.OptionShowIts(),
+				progressbar.OptionOnCompletion(func() { fmt.Fprint(os.Stderr, "\n") }),
+				progressbar.OptionSpinnerType(14),
+				progressbar.OptionFullWidth(),
+				progressbar.OptionSetRenderBlankState(true),
+			)
 		}
 		installProgressLineActive := bar != nil
 		finishInstallProgressLine := func() {
@@ -953,7 +971,11 @@ func Main() {
 		}
 		deactivateInstallProgressLine := activateProgressLineFinisher(finishInstallProgressLine)
 
+		for _, arg := range installPlan {
+			installPlanPending.Store(arg, true)
+		}
 		for i, arg := range installPlan {
+			installPlanPending.Delete(arg)
 			var tarballPath, pkgName, resolvedVersion string
 			parallelVersionRequest := false
 			explicitlyRequested := userRequestedMap[arg]
@@ -1334,6 +1356,8 @@ func Main() {
 
 			if effectiveFast && bar != nil {
 				bar.Describe(colSuccess.Sprint("Installing ") + colNote.Sprint(pkgName))
+				// Describe only stores the label; draw it now.
+				_ = bar.RenderBlank()
 				installProgressLineActive = true
 			} else {
 				colArrow.Print("-> ")
@@ -1381,6 +1405,8 @@ func Main() {
 			finishInstallProgressLine()
 		}
 		deactivateInstallProgressLine()
+		// A failed or canceled plan leaves entries behind.
+		installPlanPending.Clear()
 
 		if allSucceeded {
 			metaNames := make([]string, 0, len(requestedMetas))
