@@ -396,6 +396,12 @@ func Main() {
 			fmt.Fprintf(os.Stderr, "hokuto: staging placement failed: %v\n", err)
 			exitHokuto(1)
 		}
+		// Still privileged: remove the (root-owned) staging tree here rather
+		// than with a second sudo call from the caller.
+		if err := os.RemoveAll(os.Args[2]); err != nil {
+			fmt.Fprintf(os.Stderr, "hokuto: failed to remove staging dir %s: %v\n", os.Args[2], err)
+			exitHokuto(1)
+		}
 
 	case "__complete":
 		if len(os.Args) >= 3 {
@@ -932,6 +938,20 @@ func Main() {
 			var tarballPath, pkgName, resolvedVersion string
 			parallelVersionRequest := false
 			explicitlyRequested := userRequestedMap[arg]
+
+			// A dependency is only in the plan because it was missing when the
+			// plan was made. Installing an earlier package also installs the
+			// runtime and post-install dependencies its archive lists, which
+			// can run ahead of the plan: such an entry is already installed by
+			// now, and installing it again doubles the work (most of an mpv
+			// install, 123 of 175 packages, was placed twice).
+			if !explicitlyRequested && !strings.HasSuffix(arg, ".tar.zst") && !strings.Contains(arg, "@") && checkPackageExactMatch(arg) {
+				debugf("%s was installed earlier in this run; skipping it\n", arg)
+				if effectiveFast && bar != nil {
+					bar.Add(1)
+				}
+				continue
+			}
 
 			if strings.HasSuffix(arg, ".tar.zst") {
 				// Case A: Direct Tarball

@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -76,8 +77,23 @@ func (e *Executor) ensurePrivilege() error {
 // It handles interactive re-authentication by running `sudo -v` with a proper TTY
 // if the non-interactive check `sudo -nv` fails.
 // No action needed if we are already root or the command doesn't require root.
+// sudoTicketRecheckInterval is how long a confirmed sudo ticket is trusted
+// without asking sudo again; sudo's own timeout is 5 minutes by default.
+const sudoTicketRecheckInterval = 30 * time.Second
+
+// lastSudoTicketCheck is when "sudo -nv" last succeeded (UnixNano), 0 if not
+// confirmed.
+var lastSudoTicketCheck atomic.Int64
+
 func (e *Executor) ensureSudo() error {
 	if hasProcessPrivileges() || !e.ShouldRunAsRoot {
+		return nil
+	}
+	// A ticket confirmed valid moments ago still is: sudo keeps it for
+	// minutes. Checking with "sudo -nv" before every privileged command
+	// doubled the sudo processes of an install (about 10 ms each, 400
+	// commands for 175 packages).
+	if last := lastSudoTicketCheck.Load(); last != 0 && time.Since(time.Unix(0, last)) < sudoTicketRecheckInterval {
 		return nil
 	}
 	// Keep the normal valid-ticket path lock-free. The mutex below only
@@ -86,8 +102,10 @@ func (e *Executor) ensureSudo() error {
 	checkCmd.Stdout = io.Discard
 	checkCmd.Stderr = io.Discard
 	if err := checkCmd.Run(); err == nil {
+		lastSudoTicketCheck.Store(time.Now().UnixNano())
 		return nil
 	}
+	lastSudoTicketCheck.Store(0)
 
 	sudoAuthenticationMu.Lock()
 	defer sudoAuthenticationMu.Unlock()
@@ -111,6 +129,7 @@ func (e *Executor) ensureSudo() error {
 
 		if err := checkCmd.Run(); err == nil {
 			// Success (exit code 0): The sudo ticket is valid. Nothing more to do.
+			lastSudoTicketCheck.Store(time.Now().UnixNano())
 			return nil
 		}
 
@@ -131,6 +150,7 @@ func (e *Executor) ensureSudo() error {
 		if err == nil {
 			colArrow.Print("-> ")
 			colSuccess.Println("Re-authenticated via sudo successfully.")
+			lastSudoTicketCheck.Store(time.Now().UnixNano())
 			return nil
 		}
 

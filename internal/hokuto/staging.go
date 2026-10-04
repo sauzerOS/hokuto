@@ -37,12 +37,43 @@ func (s *fileOwnershipSnapshot) ownerOtherThan(path, excludePkg string) string {
 	return ""
 }
 
+// fileOwnershipCache maps every installed path to the packages that own it.
+// It is kept up to date incrementally: a package whose manifest changed has
+// only its own paths taken out and put back. Rebuilding the whole map after
+// every install made each install cost as much as everything installed
+// before it (1.9 s of an 18 s, 175-package install). The snapshot shares the
+// map, which installs (always one at a time) read between updates.
 type fileOwnershipCache struct {
 	mu           sync.Mutex
 	rootDir      string
 	installedDir string
 	packages     map[string]packageOwnershipEntry
+	owners       map[string][]string
 	snapshot     *fileOwnershipSnapshot
+}
+
+// addOwnership and removeOwnership update c.owners for one package.
+func (c *fileOwnershipCache) addOwnership(pkgName string, paths []string) {
+	for _, path := range paths {
+		c.owners[path] = appendUniqueOwner(c.owners[path], pkgName)
+	}
+}
+
+func (c *fileOwnershipCache) removeOwnership(pkgName string, paths []string) {
+	for _, path := range paths {
+		owners := c.owners[path]
+		kept := owners[:0:0]
+		for _, owner := range owners {
+			if owner != pkgName {
+				kept = append(kept, owner)
+			}
+		}
+		if len(kept) == 0 {
+			delete(c.owners, path)
+		} else {
+			c.owners[path] = kept
+		}
+	}
 }
 
 var globalFileOwnershipCache fileOwnershipCache
@@ -62,8 +93,10 @@ func (c *fileOwnershipCache) invalidatePackage(pkgName string) {
 	if c.packages == nil {
 		return
 	}
-	delete(c.packages, pkgName)
-	c.snapshot = nil
+	if entry, ok := c.packages[pkgName]; ok {
+		c.removeOwnership(pkgName, entry.paths)
+		delete(c.packages, pkgName)
+	}
 }
 
 func (c *fileOwnershipCache) snapshotFor(rootDir, installedDir string) *fileOwnershipSnapshot {
@@ -74,17 +107,18 @@ func (c *fileOwnershipCache) snapshotFor(rootDir, installedDir string) *fileOwne
 		c.rootDir = rootDir
 		c.installedDir = installedDir
 		c.packages = make(map[string]packageOwnershipEntry)
-		c.snapshot = nil
+		c.owners = make(map[string][]string)
+		c.snapshot = &fileOwnershipSnapshot{owners: c.owners}
 	}
 
 	entries, err := os.ReadDir(installedDir)
 	if err != nil {
 		c.packages = make(map[string]packageOwnershipEntry)
-		c.snapshot = &fileOwnershipSnapshot{owners: make(map[string][]string)}
+		c.owners = make(map[string][]string)
+		c.snapshot = &fileOwnershipSnapshot{owners: c.owners}
 		return c.snapshot
 	}
 
-	changed := c.snapshot == nil
 	dirCache := make(map[string]string)
 	seen := make(map[string]bool, len(entries))
 	for _, e := range entries {
@@ -97,9 +131,9 @@ func (c *fileOwnershipCache) snapshotFor(rootDir, installedDir string) *fileOwne
 		manifestPath := filepath.Join(installedDir, pkgName, "manifest")
 		info, err := os.Stat(manifestPath)
 		if err != nil {
-			if _, ok := c.packages[pkgName]; ok {
+			if cached, ok := c.packages[pkgName]; ok {
+				c.removeOwnership(pkgName, cached.paths)
 				delete(c.packages, pkgName)
-				changed = true
 			}
 			continue
 		}
@@ -107,6 +141,9 @@ func (c *fileOwnershipCache) snapshotFor(rootDir, installedDir string) *fileOwne
 		cached, ok := c.packages[pkgName]
 		if ok && cached.manifestPath == manifestPath && cached.modTime.Equal(info.ModTime()) && cached.size == info.Size() {
 			continue
+		}
+		if ok {
+			c.removeOwnership(pkgName, cached.paths)
 		}
 
 		paths := readManifestOwnershipPaths(manifestPath, rootDir, dirCache)
@@ -116,24 +153,14 @@ func (c *fileOwnershipCache) snapshotFor(rootDir, installedDir string) *fileOwne
 			size:         info.Size(),
 			paths:        paths,
 		}
-		changed = true
+		c.addOwnership(pkgName, paths)
 	}
 
-	for pkgName := range c.packages {
+	for pkgName, entry := range c.packages {
 		if !seen[pkgName] {
+			c.removeOwnership(pkgName, entry.paths)
 			delete(c.packages, pkgName)
-			changed = true
 		}
-	}
-
-	if changed {
-		owners := make(map[string][]string)
-		for pkgName, entry := range c.packages {
-			for _, path := range entry.paths {
-				owners[path] = appendUniqueOwner(owners[path], pkgName)
-			}
-		}
-		c.snapshot = &fileOwnershipSnapshot{owners: owners}
 	}
 
 	return c.snapshot
@@ -369,15 +396,18 @@ func buildFileOwnerIndex(excludePkg, rootDir string) map[string]string {
 func placeStaging(stagingDir, rootDir string, execCtx *Executor) error {
 	stagingPath := filepath.Clean(stagingDir)
 
-	// Ensure rootDir exists
-	if os.Geteuid() == 0 {
-		if err := os.MkdirAll(rootDir, 0755); err != nil {
-			return fmt.Errorf("failed to create rootDir %s natively: %v", rootDir, err)
-		}
-	} else {
-		mkdirCmd := exec.Command("mkdir", "-p", rootDir)
-		if err := execCtx.Run(mkdirCmd); err != nil {
-			return fmt.Errorf("failed to create rootDir %s: %v", rootDir, err)
+	// Ensure rootDir exists. It nearly always does; asking sudo to create it
+	// cost a privileged process start per installed package.
+	if info, err := os.Stat(rootDir); err != nil || !info.IsDir() {
+		if os.Geteuid() == 0 {
+			if err := os.MkdirAll(rootDir, 0755); err != nil {
+				return fmt.Errorf("failed to create rootDir %s natively: %v", rootDir, err)
+			}
+		} else {
+			mkdirCmd := exec.Command("mkdir", "-p", rootDir)
+			if err := execCtx.Run(mkdirCmd); err != nil {
+				return fmt.Errorf("failed to create rootDir %s: %v", rootDir, err)
+			}
 		}
 	}
 
@@ -401,8 +431,23 @@ func placeStaging(stagingDir, rootDir string, execCtx *Executor) error {
 	if err := execCtx.Run(cmd); err != nil {
 		return fmt.Errorf("staging placement failed: %w", err)
 	}
+	// The privileged helper removed the staging tree after placing it.
+	return nil
+}
 
-	return removeStagingDir(stagingDir, execCtx)
+// removeAllPrivilegedFallback removes a path hokuto created as the invoking
+// user, directly, and through the privileged executor only when that fails
+// (root-owned files left inside). Every sudo call costs a process start with
+// PAM and logging, about 10 ms, and an install used to make several per
+// package for directories the user could remove alone.
+func removeAllPrivilegedFallback(path string, execCtx *Executor) error {
+	if err := os.RemoveAll(path); err == nil {
+		return nil
+	}
+	if execCtx == nil {
+		return os.RemoveAll(path)
+	}
+	return execCtx.Run(exec.Command("rm", "-rf", path))
 }
 
 // removeStagingDir discards the staging tree once its contents have been

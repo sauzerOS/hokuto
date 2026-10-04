@@ -1339,13 +1339,8 @@ func pkgInstallWithRemotePolicy(tarballPath, pkgName string, cfg *Config, execCt
 	}
 
 	// Delete stagingManifest2dir
-	if os.Geteuid() == 0 {
-		os.RemoveAll(stagingManifest2dir)
-	} else {
-		rmCmd := exec.Command("rm", "-rf", stagingManifest2dir)
-		if err := execCtx.Run(rmCmd); err != nil {
-			fmt.Fprintf(os.Stderr, "Failed to remove StagingManifest: %v", err)
-		}
+	if err := removeAllPrivilegedFallback(stagingManifest2dir, execCtx); err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to remove StagingManifest: %v", err)
 	}
 
 	// 3.5. Check for conflicts with existing files (for both fresh installs and upgrades)
@@ -1385,8 +1380,7 @@ func pkgInstallWithRemotePolicy(tarballPath, pkgName string, cfg *Config, execCt
 	// CLEANUP: Ensure the backup directory is removed on exit
 	defer func() {
 		if !Debug {
-			rmCmd := exec.Command("rm", "-rf", tempLibBackupDir)
-			if err := execCtx.Run(rmCmd); err != nil {
+			if err := removeAllPrivilegedFallback(tempLibBackupDir, execCtx); err != nil {
 				fmt.Fprintf(os.Stderr, "warning: failed to cleanup temporary library backup: %v\n", err)
 			}
 		} else {
@@ -1810,8 +1804,7 @@ func pkgInstallWithRemotePolicy(tarballPath, pkgName string, cfg *Config, execCt
 	}
 
 	// 9. Cleanup
-	rmCmd2 := exec.Command("rm", "-rf", pkgTmpDir)
-	if err := execCtx.Run(rmCmd2); err != nil {
+	if err := removeAllPrivilegedFallback(pkgTmpDir, execCtx); err != nil {
 		fmt.Fprintf(os.Stderr, "failed to cleanup: %v\n", err)
 	}
 

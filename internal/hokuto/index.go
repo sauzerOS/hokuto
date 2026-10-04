@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 
 	"os/exec"
 	"runtime"
@@ -305,6 +306,50 @@ func scanTarballMetadata(tarballPath string) (map[string]string, []string, error
 // package's libdeps entries. Only hokuto's own metadata directory counts, not
 // a payload file that happens to be called libdeps.
 func scanTarballMetadataWithLibdeps(tarballPath string) (map[string]string, []string, []string, []string, error) {
+	key, cacheable := tarballScanKeyFor(tarballPath)
+	if cacheable {
+		if v, ok := tarballMetadataCache.Load(key); ok {
+			r := v.(tarballMetadataResult)
+			return r.metadata, r.deps, r.libdeps, r.privatedeps, nil
+		}
+	}
+	metadata, deps, libdeps, privatedeps, err := scanTarballMetadataUncached(tarballPath)
+	if err == nil && cacheable {
+		tarballMetadataCache.Store(key, tarballMetadataResult{metadata, deps, libdeps, privatedeps})
+	}
+	return metadata, deps, libdeps, privatedeps, err
+}
+
+// The metadata of a package archive is read again and again during one
+// command (dependency resolution, variant checks, the install itself), and
+// each read decompresses the archive up to hokuto's metadata files, usually
+// all of it. Results are kept per file, keyed by its size and mtime so a
+// rewritten archive is read afresh. Callers must not modify what they get.
+type tarballScanKey struct {
+	path  string
+	size  int64
+	mtime int64
+}
+
+type tarballMetadataResult struct {
+	metadata                   map[string]string
+	deps, libdeps, privatedeps []string
+}
+
+var (
+	tarballMetadataCache sync.Map // tarballScanKey -> tarballMetadataResult
+	tarballDepSpecsCache sync.Map // tarballScanKey -> []DepSpec
+)
+
+func tarballScanKeyFor(tarballPath string) (tarballScanKey, bool) {
+	info, err := os.Stat(tarballPath)
+	if err != nil || !info.Mode().IsRegular() {
+		return tarballScanKey{}, false
+	}
+	return tarballScanKey{path: tarballPath, size: info.Size(), mtime: info.ModTime().UnixNano()}, true
+}
+
+func scanTarballMetadataUncached(tarballPath string) (map[string]string, []string, []string, []string, error) {
 	f, err := os.Open(tarballPath)
 	if err != nil {
 		return nil, nil, nil, nil, err
@@ -379,6 +424,20 @@ func scanTarballMetadataWithLibdeps(tarballPath string) (map[string]string, []st
 }
 
 func scanTarballDependencySpecs(tarballPath string) ([]DepSpec, error) {
+	key, cacheable := tarballScanKeyFor(tarballPath)
+	if cacheable {
+		if v, ok := tarballDepSpecsCache.Load(key); ok {
+			return v.([]DepSpec), nil
+		}
+	}
+	deps, err := scanTarballDependencySpecsUncached(tarballPath)
+	if err == nil && cacheable {
+		tarballDepSpecsCache.Store(key, deps)
+	}
+	return deps, err
+}
+
+func scanTarballDependencySpecsUncached(tarballPath string) ([]DepSpec, error) {
 	f, err := os.Open(tarballPath)
 	if err != nil {
 		return nil, err
