@@ -672,60 +672,47 @@ func packageHasSelfBuildDependency(pkgName string, cfg *Config) bool {
 }
 
 func installAvailableBinaryBuildDeps(plan *BuildPlan, userRequested, declined map[string]bool, cfg *Config, addTemporaryBuildDep func(string), noRemote bool, prompt bool, quiet bool) (bool, error) {
-	installedAny := false
-	type binaryBuildDep struct {
-		name          string
-		outputPkgName string
-		tarballPath   string
-		selfBootstrap bool
-	}
-	var candidates []binaryBuildDep
+	// Located without downloading, then planned, downloaded and installed
+	// at once (build_deps_install.go).
+	var installs []buildDepInstall
+	selfBootstrap := make(map[string]bool)
 	for _, pkgName := range plan.Order {
 		selfBuildDependency := userRequested[pkgName] && packageHasSelfBuildDependency(pkgName, cfg)
 		if (userRequested[pkgName] && !selfBuildDependency) || declined[pkgName] || plan.RebuildPackages[pkgName] || isPackageInstalled(pkgName) {
 			continue
 		}
 
-		outputPkgName, tarballPath, ok, err := availableBuildDependencyBinaryTarball(pkgName, packageBuildConfig(pkgName, cfg), noRemote)
+		depCfg := packageBuildConfig(pkgName, cfg)
+		b, ok, err := locateBuildDependencyBinaryTarball(pkgName, depCfg, noRemote)
 		if err != nil || !ok {
 			continue
 		}
-
-		candidates = append(candidates, binaryBuildDep{
-			name:          pkgName,
-			outputPkgName: outputPkgName,
-			tarballPath:   tarballPath,
-			selfBootstrap: selfBuildDependency,
-		})
-	}
-
-	bar := newDependencyInstallProgress(len(candidates), "Installing Build Dependencies", quiet && !prompt)
-	deactivateProgress := activateDependencyInstallProgress(bar)
-	defer deactivateProgress()
-	for _, cand := range candidates {
-		if !useAvailableBuildDependencyBinary(prompt, "Dependency '%s' is missing. Use available binary package?", cand.name) {
-			declined[cand.name] = true
-			advanceDependencyInstallProgress(bar)
+		// Asked before anything is installed now, not between installs.
+		declined[pkgName] = true
+		if !useAvailableBuildDependencyBinary(prompt, "Dependency '%s' is missing. Use available binary package?", pkgName) {
 			continue
 		}
-
-		describeDependencyInstallProgress(bar, cand.outputPkgName)
-		isCriticalAtomic.Store(1)
-		logger, fast := dependencyInstallLogger(quiet)
-		handlePreInstallUninstall(cand.outputPkgName, cfg, RootExec, false, logger)
-		if _, err := pkgInstallWithRemotePolicy(cand.tarballPath, cand.outputPkgName, cfg, RootExec, false, fast, false, noRemote, logger); err != nil {
-			isCriticalAtomic.Store(0)
-			return installedAny, fmt.Errorf("fatal error installing binary %s: %w", cand.name, err)
+		if selfBuildDependency {
+			selfBootstrap[b.name] = true
 		}
-		isCriticalAtomic.Store(0)
-		advanceDependencyInstallProgress(bar)
-		if !cand.selfBootstrap {
-			addTemporaryBuildDep(cand.outputPkgName)
-		}
-		declined[cand.name] = true
-		installedAny = true
+		installs = append(installs, buildDepInstall{name: pkgName, cfg: depCfg, tarball: b})
 	}
-	return installedAny, nil
+	if len(installs) == 0 {
+		return false, nil
+	}
+
+	installs = withBuildDepRuntimeClosure(installs, cfg, noRemote)
+	installedAny := false
+	track := func(name string) {
+		installedAny = true
+		// A package's binary used to build itself stays: it is what the
+		// build replaces.
+		if !selfBootstrap[name] {
+			addTemporaryBuildDep(name)
+		}
+	}
+	err := installBuildDependencyPlan(installs, noRemote, quiet && !prompt, track, func(string, string) {})
+	return installedAny, err
 }
 
 // getScriptExitCode extracts the exit code from a script log file
@@ -4885,14 +4872,18 @@ func handleBuildCommand(args []string, cfg *Config) (err error) {
 				packagesThatMustBeBuilt[pkg] = true
 			}
 
-			missingDepBar := newDependencyInstallProgress(len(missingDeps), "Installing Build Dependencies", quietDependencyInstalls && !*promptBinaryDeps)
+			// Decide what each missing dependency is, from the index and the
+			// cache only; the installs follow in one planned pass
+			// (build_deps_install.go).
+			var depInstalls []buildDepInstall
+			missingDepBar := newDependencyInstallProgress(len(missingDeps), "Checking Build Dependencies", quietDependencyInstalls && !*promptBinaryDeps)
 			deactivateMissingDepProgress := activateDependencyInstallProgress(missingDepBar)
 			for _, depPkg := range missingDeps {
 				describeDependencyCheckProgress(missingDepBar, depPkg)
-				if err := func() error {
+				func() {
 					defer advanceDependencyInstallProgress(missingDepBar)
 					if packagesThatMustBeBuilt[depPkg] {
-						return nil
+						return
 					}
 					// A plain build-time dependency pulled in during a cross
 					// session (e.g. "pahole make") is a native host tool: look
@@ -4902,75 +4893,55 @@ func handleBuildCommand(args []string, cfg *Config) (err error) {
 					depCfg := packageBuildConfig(depPkg, cfg)
 					if _, err := findPackageMetadataDir(depPkg); err != nil {
 						if isPackageInstalled(depPkg) {
-							return nil
+							return
 						}
 						if sourcePkg, ok := findSplitDependencySource(depPkg); ok {
 							if !binaryDeclined[depPkg] && dependencyBinaryAvailable(depPkg, depCfg, *noRemote) {
 								if useAvailableBuildDependencyBinary(*promptBinaryDeps, "Dependency '%s' is missing. Use available binary package?", depPkg) {
-									installed, installErr := installAvailableSplitDependencyBinary(sourcePkg, depPkg, depCfg, *noRemote, nil, quietDependencyInstalls)
-									if installErr == nil {
-										if installed {
-											addTemporaryBuildDep(depPkg)
-										}
-										return nil
-									}
-									colWarn.Printf("Warning: failed to install available binary dependency %s: %v\n", depPkg, installErr)
-								} else {
-									binaryDeclined[depPkg] = true
+									depInstalls = append(depInstalls, buildDepInstall{name: depPkg, cfg: depCfg, splitSource: sourcePkg})
+									return
 								}
+								binaryDeclined[depPkg] = true
 							}
-							clearDependencyInstallProgress(missingDepBar)
-							colArrow.Print("-> ")
 							debugf("Dependency %s is a split package; scheduling %s to build it\n", depPkg, sourcePkg)
 							packagesThatMustBeBuilt[sourcePkg] = true
 							addMappedSplitDependency(splitDepsBySource, sourcePkg, depPkg)
-							return nil
+							return
 						}
-						installed, installErr := ensurePackageInstalledWithOptions(depPkg, depCfg, *noRemote, nil, quietDependencyInstalls)
-						if installErr == nil {
-							if installed {
-								addTemporaryBuildDep(depPkg)
-							}
-							return nil
-						}
-						return fmt.Errorf("error: dependency %s has no source package and could not be installed as a binary package: %w", depPkg, installErr)
+						depInstalls = append(depInstalls, buildDepInstall{name: depPkg, cfg: depCfg, ensure: true})
+						return
 					}
 
-					outputDepPkg, tarballPath, binaryAvailable, binaryErr := availableBuildDependencyBinaryTarball(depPkg, depCfg, *noRemote)
+					tarball, binaryAvailable, binaryErr := locateBuildDependencyBinaryTarball(depPkg, depCfg, *noRemote)
 					if binaryErr != nil {
 						debugf("Binary dependency lookup failed for %s; falling back to source build: %v\n", depPkg, binaryErr)
 						packagesThatMustBeBuilt[depPkg] = true
-						return nil
+						return
 					}
 					if !binaryAvailable {
 						packagesThatMustBeBuilt[depPkg] = true
-						return nil
+						return
 					}
 
 					if !useAvailableBuildDependencyBinary(*promptBinaryDeps, "Dependency '%s' is missing. Use available binary package?", depPkg) {
 						binaryDeclined[depPkg] = true
 						packagesThatMustBeBuilt[depPkg] = true
-						return nil
+						return
 					}
-
-					logger, fast := dependencyInstallLogger(quietDependencyInstalls)
-					isCriticalAtomic.Store(1)
-					handlePreInstallUninstall(outputDepPkg, depCfg, RootExec, false, logger)
-					if _, err := pkgInstallWithRemotePolicy(tarballPath, outputDepPkg, depCfg, RootExec, false, fast, false, *noRemote, logger); err != nil {
-						isCriticalAtomic.Store(0)
-						return fmt.Errorf("fatal error installing binary %s: %v", depPkg, err)
-					}
-					isCriticalAtomic.Store(0)
-					addTemporaryBuildDep(outputDepPkg)
-					return nil
-				}(); err != nil {
-					clearDependencyInstallProgress(missingDepBar)
-					deactivateMissingDepProgress()
-					return err
-				}
+					depInstalls = append(depInstalls, buildDepInstall{name: depPkg, cfg: depCfg, tarball: tarball})
+				}()
 			}
 			clearDependencyInstallProgress(missingDepBar)
 			deactivateMissingDepProgress()
+
+			depInstalls = withBuildDepRuntimeClosure(depInstalls, cfg, *noRemote)
+			scheduleSplitBuild := func(sourcePkg, depPkg string) {
+				packagesThatMustBeBuilt[sourcePkg] = true
+				addMappedSplitDependency(splitDepsBySource, sourcePkg, depPkg)
+			}
+			if err := installBuildDependencyPlan(depInstalls, *noRemote, quietDependencyInstalls && !*promptBinaryDeps, addTemporaryBuildDep, scheduleSplitBuild); err != nil {
+				return err
+			}
 		}
 
 		if len(packagesThatMustBeBuilt) == 0 {

@@ -70,6 +70,6 @@ func crossToolchainBinaryUnusable(pkgName string, cfg *Config, noRemote bool) bo
 	if crossToolchainVersion(pkgName, cfg, noRemote) == "" {
 		return false
 	}
-	_, _, ok, err := availableBuildDependencyBinaryTarball(pkgName, cfg, noRemote)
+	_, ok, err := locateBuildDependencyBinaryTarball(pkgName, cfg, noRemote)
 	return err == nil && !ok
 }

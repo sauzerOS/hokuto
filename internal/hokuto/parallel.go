@@ -388,7 +388,7 @@ func collectAvailableBinaryDependenciesForPlan(plan *BuildPlan, cfg *Config, noR
 					continue
 				}
 				if !dependencyBinaryAvailable(cand, cfg, noRemote) {
-					if _, _, fallbackOK, _ := availableBuildDependencyBinaryTarball(cand, cfg, noRemote); !fallbackOK {
+					if _, fallbackOK, _ := locateBuildDependencyBinaryTarball(cand, cfg, noRemote); !fallbackOK {
 						continue
 					}
 				}
@@ -425,35 +425,38 @@ func installBinaryPlanDependencies(depsToInstall []binaryPlanDependency, cfg *Co
 		return nil, nil
 	}
 
-	bar := newDependencyInstallProgress(len(depsToInstall), "Installing Build Dependencies", quiet)
-	deactivateProgress := activateDependencyInstallProgress(bar)
-	defer deactivateProgress()
-
-	var installed []string
+	// A binary comes with its packaged runtime dependencies: the plan does
+	// not walk them for a dependency it does not build. That left gcc
+	// without the sanitizer libraries of its own recipe (libasan, libubsan,
+	// ...), which repairInstalledRuntimeDeps then reported as missing. They
+	// are planned from the index with the binaries, downloaded with them
+	// and installed in order (build_deps_install.go).
+	var installs []buildDepInstall
+	worldMake := make(map[string]bool)
 	for _, dep := range depsToInstall {
-		describeDependencyInstallProgress(bar, dep.Name)
-		if !quiet {
-			colArrow.Print("-> ")
-			colSuccess.Printf("Installing available binary dependency:")
-			colNote.Printf(" %s\n", dep.Name)
-		}
-		// A binary comes with its packaged runtime dependencies: the plan
-		// does not walk them for a dependency it does not build. That left
-		// gcc without the sanitizer libraries of its own recipe (libasan,
-		// libubsan, ...), which repairInstalledRuntimeDeps then reported as
-		// missing. Builds and updates install them from binaries only.
-		ok, err := installAvailableBuildDependencyBinaryWithOptions(dep.Name, cfg, noRemote, quiet, true)
+		b, ok, err := locateBuildDependencyBinaryTarball(dep.Name, cfg, noRemote)
 		if err != nil {
-			return installed, fmt.Errorf("failed to install binary dependency %s: %w", dep.Name, err)
+			return nil, fmt.Errorf("failed to install binary dependency %s: %w", dep.Name, err)
 		}
-		advanceDependencyInstallProgress(bar)
 		if !ok {
 			continue
 		}
-		installed = append(installed, dep.Name)
 		if dep.Make && !dep.MakeOpt {
-			addToWorldMake(dep.Name)
+			worldMake[b.name] = true
 		}
+		installs = append(installs, buildDepInstall{name: dep.Name, cfg: cfg, tarball: b})
+	}
+	installs = withBuildDepRuntimeClosure(installs, cfg, noRemote)
+
+	var installed []string
+	track := func(name string) {
+		installed = append(installed, name)
+		if worldMake[name] {
+			addToWorldMake(name)
+		}
+	}
+	if err := installBuildDependencyPlan(installs, noRemote, quiet, track, func(string, string) {}); err != nil {
+		return installed, fmt.Errorf("failed to install binary dependency: %w", err)
 	}
 	return installed, nil
 }

@@ -101,20 +101,36 @@ func prefetchInstallPlan(plan []string, cfg *Config, remoteIndex []RepoEntry) {
 	if BinaryMirror == "" || len(remoteIndex) == 0 {
 		return
 	}
-	var todo []RepoEntry
-	var total int64
+	var entries []RepoEntry
 	for _, arg := range plan {
 		if strings.HasSuffix(arg, ".tar.zst") {
 			continue
 		}
-		entry, err := GetRemotePackageEntry(arg, cfg, remoteIndex)
-		if err != nil || entry.Filename == "" {
+		if entry, err := GetRemotePackageEntry(arg, cfg, remoteIndex); err == nil {
+			entries = append(entries, *entry)
+		}
+	}
+	prefetchRepoEntries(entries, cfg)
+}
+
+// prefetchRepoEntries downloads, several at a time, the archives of entries
+// the local cache does not hold.
+func prefetchRepoEntries(entries []RepoEntry, cfg *Config) {
+	if BinaryMirror == "" {
+		return
+	}
+	var todo []RepoEntry
+	var total int64
+	seen := make(map[string]bool)
+	for _, entry := range entries {
+		if entry.Filename == "" || seen[entry.Filename] {
 			continue
 		}
+		seen[entry.Filename] = true
 		if info, err := os.Stat(filepath.Join(BinDir, entry.Filename)); err == nil && info.Size() == entry.Size {
 			continue
 		}
-		todo = append(todo, *entry)
+		todo = append(todo, entry)
 		total += entry.Size
 	}
 	if len(todo) == 0 {

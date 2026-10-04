@@ -14,7 +14,6 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"time"
 
 	"github.com/gookit/color"
 	"github.com/schollz/progressbar/v3"
@@ -2491,27 +2490,24 @@ func installBuildDependenciesWithOptions(pkgName string, cfg *Config, noRemote b
 		installQueue = append(installQueue, depPkg)
 	}
 
-	bar := newDependencyInstallProgress(len(installQueue), "Installing Build Dependencies", quiet)
-	deactivateProgress := activateDependencyInstallProgress(bar)
-	defer deactivateProgress()
+	// A binary when there is one, else the general install; planned and
+	// installed as in build_deps_install.go.
+	var installs []buildDepInstall
 	for _, depPkg := range installQueue {
-		// Try to install from binary or build
-		describeDependencyInstallProgress(bar, depPkg)
-		installed, err := installAvailableBuildDependencyBinaryWithOptions(depPkg, cfg, noRemote, quiet, false)
-		if err == nil && !installed {
-			installed, err = ensurePackageInstalledWithOptions(depPkg, cfg, noRemote, nil, quiet)
-		}
+		b, ok, err := locateBuildDependencyBinaryTarball(depPkg, cfg, noRemote)
 		if err != nil {
 			return newlyInstalled, err
 		}
-		advanceDependencyInstallProgress(bar)
-		if installed {
-			outputName := getOutputPackageName(depPkg, cfg)
-			newlyInstalled = append(newlyInstalled, outputName)
+		if ok {
+			installs = append(installs, buildDepInstall{name: depPkg, cfg: cfg, tarball: b})
+		} else {
+			installs = append(installs, buildDepInstall{name: depPkg, cfg: cfg, ensure: true})
 		}
 	}
-
-	return newlyInstalled, nil
+	installs = withBuildDepRuntimeClosure(installs, cfg, noRemote)
+	addInstalled := func(name string) { newlyInstalled = append(newlyInstalled, name) }
+	err = installBuildDependencyPlan(installs, noRemote, quiet, addInstalled, func(string, string) {})
+	return newlyInstalled, err
 }
 
 func installRebuildDependenciesWithOptions(pkgNames []string, cfg *Config, noRemote bool, quiet bool) ([]string, error) {
@@ -2965,7 +2961,9 @@ func newDependencyInstallProgress(total int, description string, quiet bool) *pr
 		progressbar.OptionSetWidth(12),
 		progressbar.OptionUseANSICodes(true),
 		progressbar.OptionShowTotalBytes(true),
-		progressbar.OptionThrottle(65*time.Millisecond),
+		// No throttle: the bar is redrawn once per package, and with one a
+		// label set by Describe was not drawn until a later package, so a
+		// slow install showed an earlier package's name.
 		progressbar.OptionShowCount(),
 		progressbar.OptionShowIts(),
 		progressbar.OptionOnCompletion(func() { fmt.Fprintln(os.Stderr) }),
@@ -3003,12 +3001,15 @@ func formatDependencyProgressPackageName(pkgName string) string {
 func describeDependencyInstallProgress(bar *progressbar.ProgressBar, pkgName string) {
 	if bar != nil {
 		bar.Describe(colArrow.Sprint("-> ") + colSuccess.Sprint("Installing ") + colNote.Sprint(formatDependencyProgressPackageName(pkgName)))
+		// Describe only stores the label; draw it now.
+		_ = bar.RenderBlank()
 	}
 }
 
 func describeDependencyCheckProgress(bar *progressbar.ProgressBar, pkgName string) {
 	if bar != nil {
 		bar.Describe(colArrow.Sprint("-> ") + colSuccess.Sprint("Checking ") + colNote.Sprint(formatDependencyProgressPackageName(pkgName)))
+		_ = bar.RenderBlank()
 	}
 }
 
@@ -3120,67 +3121,121 @@ func ensureBinaryOnlyPackageInstalled(pkgName string, cfg *Config, noRemote bool
 }
 
 func fetchExactBinaryTarballIfAvailable(pkgName, version, revision, variant string, cfg *Config, noRemote bool) (string, bool, error) {
-	if noRemote || BinaryMirror == "" {
+	entry := locateExactBinaryEntry(pkgName, version, revision, variant, cfg, noRemote)
+	if entry == nil {
 		return "", false, nil
+	}
+	path, err := remoteBinaryTarball(entry.Name, entry, cfg).fetch(cfg)
+	if err != nil {
+		return "", false, err
+	}
+	return path, true, nil
+}
+
+// locateExactBinaryEntry is the remote index entry of exactly this release
+// and variant, or nil.
+func locateExactBinaryEntry(pkgName, version, revision, variant string, cfg *Config, noRemote bool) *RepoEntry {
+	if noRemote || BinaryMirror == "" {
+		return nil
 	}
 
 	index, err := GetCachedRemoteIndex(cfg)
 	if err != nil {
 		debugf("Skipping remote binary install check for %s: %v\n", pkgName, err)
-		return "", false, nil
+		return nil
 	}
 
 	arch := GetSystemArchForPackage(cfg, pkgName)
 	archivePkgName := canonicalParallelPackageName(pkgName)
-	for _, entry := range index {
+	for i := range index {
+		entry := &index[i]
 		if entry.Name != archivePkgName || entry.Version != version || entry.Revision != revision || entry.Arch != arch || entry.Variant != variant {
 			continue
 		}
-		if err := fetchSpecificBinaryPackage(entry.Name, entry.Version, entry.Revision, entry.Variant, cfg, true, entry.B3Sum, false); err != nil {
-			return "", false, err
-		}
-		tarballPath := filepath.Join(BinDir, StandardizeRemoteName(entry.Name, entry.Version, entry.Revision, entry.Arch, entry.Variant))
-		return tarballPath, true, nil
+		return entry
 	}
 
-	return "", false, nil
+	return nil
+}
+
+// binaryTarball is where the archive of a package to install is: in BinDir
+// already, or, with entry set, still on the mirror (path is where fetch puts
+// it). Locating a binary and downloading it are separate steps, so a plan
+// can decide what it installs before downloading everything at once.
+type binaryTarball struct {
+	name  string
+	path  string
+	entry *RepoEntry
+}
+
+func cachedBinaryTarball(name, path string) binaryTarball {
+	return binaryTarball{name: name, path: path}
+}
+
+func remoteBinaryTarball(name string, entry *RepoEntry, cfg *Config) binaryTarball {
+	arch := GetSystemArchForPackage(cfg, entry.Name)
+	return binaryTarball{
+		name:  name,
+		path:  filepath.Join(BinDir, StandardizeRemoteName(entry.Name, entry.Version, entry.Revision, arch, entry.Variant)),
+		entry: entry,
+	}
+}
+
+// fetch downloads the archive unless it is in BinDir, and returns its path.
+func (b binaryTarball) fetch(cfg *Config) (string, error) {
+	if b.entry == nil {
+		return b.path, nil
+	}
+	e := b.entry
+	if err := fetchSpecificBinaryPackage(e.Name, e.Version, e.Revision, e.Variant, cfg, true, e.B3Sum, false); err != nil {
+		return "", err
+	}
+	return b.path, nil
 }
 
 func availableBinaryPackageTarball(pkgName string, cfg *Config, noRemote bool) (installName, tarballPath string, ok bool, err error) {
+	b, ok, err := locateBinaryPackageTarball(pkgName, cfg, noRemote)
+	if err != nil || !ok {
+		return "", "", false, err
+	}
+	if tarballPath, err = b.fetch(cfg); err != nil {
+		return "", "", false, err
+	}
+	return b.name, tarballPath, true, nil
+}
+
+// locateBinaryPackageTarball is availableBinaryPackageTarball without the
+// download: the archive of the current release, cached or on the mirror.
+func locateBinaryPackageTarball(pkgName string, cfg *Config, noRemote bool) (binaryTarball, bool, error) {
 	lookupName := pkgName
 	if idx := strings.Index(pkgName, "@"); idx != -1 {
 		lookupName = pkgName[:idx]
 	}
 
 	if tarballPath, ok := findCachedVersionedBinaryTarball(lookupName, cfg); ok {
-		return lookupName, tarballPath, true, nil
+		return cachedBinaryTarball(lookupName, tarballPath), true, nil
 	}
 	if _, _, versioned := splitVersionedPackageName(lookupName); versioned {
 		if noRemote || BinaryMirror == "" {
-			return "", "", false, nil
+			return binaryTarball{}, false, nil
 		}
 		index, err := GetCachedRemoteIndex(cfg)
 		if err != nil {
 			debugf("Skipping remote versioned binary check for %s: %v\n", lookupName, err)
-			return "", "", false, nil
+			return binaryTarball{}, false, nil
 		}
-		entryRef, err := GetRemotePackageEntry(lookupName, cfg, index)
+		entry, err := GetRemotePackageEntry(lookupName, cfg, index)
 		if err != nil {
-			return "", "", false, nil
+			return binaryTarball{}, false, nil
 		}
-		entry := *entryRef
-		if err := fetchSpecificBinaryPackage(entry.Name, entry.Version, entry.Revision, entry.Variant, cfg, true, entry.B3Sum, false); err != nil {
-			return "", "", false, err
-		}
-		tarballPath := filepath.Join(BinDir, StandardizeRemoteName(entry.Name, entry.Version, entry.Revision, entry.Arch, entry.Variant))
-		return lookupName, tarballPath, true, nil
+		return remoteBinaryTarball(lookupName, entry, cfg), true, nil
 	}
 
 	if _, sourceErr := findPackageMetadataDir(lookupName); sourceErr != nil {
 		if sourcePkg, sourceDir, splitOK := findSplitPackageSource(lookupName); splitOK {
 			version, revision, err := getRepoVersion2(sourcePkg)
 			if err != nil {
-				return "", "", false, err
+				return binaryTarball{}, false, err
 			}
 
 			options := loadBuildOptions(sourceDir)
@@ -3193,59 +3248,52 @@ func availableBinaryPackageTarball(pkgName string, cfg *Config, noRemote bool) (
 			tarballName := StandardizeRemoteName(lookupName, version, revision, arch, variant)
 			tarballPath := filepath.Join(BinDir, tarballName)
 			if _, err := os.Stat(tarballPath); err == nil {
-				return lookupName, tarballPath, true, nil
+				return cachedBinaryTarball(lookupName, tarballPath), true, nil
 			}
-			tarballPath, ok, err := fetchExactBinaryTarballIfAvailable(lookupName, version, revision, variant, cfg, noRemote)
-			if err != nil || ok {
-				return lookupName, tarballPath, ok, err
+			if entry := locateExactBinaryEntry(lookupName, version, revision, variant, cfg, noRemote); entry != nil {
+				return remoteBinaryTarball(lookupName, entry, cfg), true, nil
 			}
-			return "", "", false, nil
+			return binaryTarball{}, false, nil
 		}
 
 		if tarballPath := findCachedBinaryTarball(lookupName, cfg); tarballPath != "" {
-			return lookupName, tarballPath, true, nil
+			return cachedBinaryTarball(lookupName, tarballPath), true, nil
 		}
 		if noRemote || BinaryMirror == "" {
-			return "", "", false, nil
+			return binaryTarball{}, false, nil
 		}
 		index, err := GetCachedRemoteIndex(cfg)
 		if err != nil {
 			debugf("Skipping remote binary install check for %s: %v\n", lookupName, err)
-			return "", "", false, nil
+			return binaryTarball{}, false, nil
 		}
-		entryRef, err := GetRemotePackageEntry(lookupName, cfg, index)
+		entry, err := GetRemotePackageEntry(lookupName, cfg, index)
 		if err != nil {
-			return "", "", false, nil
+			return binaryTarball{}, false, nil
 		}
-		entry := *entryRef
-		if err := fetchSpecificBinaryPackage(entry.Name, entry.Version, entry.Revision, entry.Variant, cfg, true, entry.B3Sum, false); err != nil {
-			return "", "", false, err
-		}
-		arch := GetSystemArchForPackage(cfg, entry.Name)
-		tarballPath := filepath.Join(BinDir, StandardizeRemoteName(entry.Name, entry.Version, entry.Revision, arch, entry.Variant))
-		return entry.Name, tarballPath, true, nil
+		return remoteBinaryTarball(entry.Name, entry, cfg), true, nil
 	}
 
 	version, revision, err := getRepoVersion2(lookupName)
 	if err != nil {
-		return "", "", false, nil
+		return binaryTarball{}, false, nil
 	}
 	outputName := getOutputPackageName(lookupName, cfg)
 	if tarballPath := findCachedBinaryTarballVersion(outputName, version, revision, cfg); tarballPath != "" {
-		return outputName, tarballPath, true, nil
+		return cachedBinaryTarball(outputName, tarballPath), true, nil
 	}
 
 	variant := GetSystemVariantForPackage(cfg, lookupName)
-	if tarballPath, ok, err := fetchExactBinaryTarballIfAvailable(outputName, version, revision, variant, cfg, noRemote); err != nil || ok {
-		return outputName, tarballPath, ok, err
+	if entry := locateExactBinaryEntry(outputName, version, revision, variant, cfg, noRemote); entry != nil {
+		return remoteBinaryTarball(outputName, entry, cfg), true, nil
 	}
 	if outputName != lookupName {
-		if tarballPath, ok, err := fetchExactBinaryTarballIfAvailable(lookupName, version, revision, variant, cfg, noRemote); err != nil || ok {
-			return lookupName, tarballPath, ok, err
+		if entry := locateExactBinaryEntry(lookupName, version, revision, variant, cfg, noRemote); entry != nil {
+			return remoteBinaryTarball(lookupName, entry, cfg), true, nil
 		}
 	}
 
-	return "", "", false, nil
+	return binaryTarball{}, false, nil
 }
 
 func releaseIsOlder(version, revision, currentVersion, currentRevision string) bool {
@@ -3260,8 +3308,21 @@ func releaseIsOlder(version, revision, currentVersion, currentRevision string) b
 // falls back to the newest older binary. This policy is intentionally limited to
 // temporary build dependencies; requested packages still require an exact build.
 func availableBuildDependencyBinaryTarball(pkgName string, cfg *Config, noRemote bool) (installName, tarballPath string, ok bool, err error) {
-	if installName, tarballPath, ok, err = availableBinaryPackageTarball(pkgName, cfg, noRemote); err != nil || ok {
-		return installName, tarballPath, ok, err
+	b, ok, err := locateBuildDependencyBinaryTarball(pkgName, cfg, noRemote)
+	if err != nil || !ok {
+		return "", "", false, err
+	}
+	if tarballPath, err = b.fetch(cfg); err != nil {
+		return "", "", false, err
+	}
+	return b.name, tarballPath, true, nil
+}
+
+// locateBuildDependencyBinaryTarball is availableBuildDependencyBinaryTarball
+// without the download.
+func locateBuildDependencyBinaryTarball(pkgName string, cfg *Config, noRemote bool) (binaryTarball, bool, error) {
+	if b, ok, err := locateBinaryPackageTarball(pkgName, cfg, noRemote); err != nil || ok {
+		return b, ok, err
 	}
 
 	lookupName := pkgName
@@ -3275,7 +3336,7 @@ func availableBuildDependencyBinaryTarball(pkgName string, cfg *Config, noRemote
 		}
 	}
 	if versionErr != nil {
-		return "", "", false, nil
+		return binaryTarball{}, false, nil
 	}
 
 	outputName := getOutputPackageName(lookupName, cfg)
@@ -3355,17 +3416,13 @@ func availableBuildDependencyBinaryTarball(pkgName string, cfg *Config, noRemote
 		if requiredVersion != "" {
 			debugf("No binary of %s matches its host tool's version %s; it is built instead\n", lookupName, requiredVersion)
 		}
-		return "", "", false, nil
-	}
-	if best.entry != nil {
-		entry := best.entry
-		if err := fetchSpecificBinaryPackage(entry.Name, entry.Version, entry.Revision, entry.Variant, cfg, true, entry.B3Sum, false); err != nil {
-			return "", "", false, err
-		}
-		best.path = filepath.Join(BinDir, StandardizeRemoteName(entry.Name, entry.Version, entry.Revision, entry.Arch, entry.Variant))
+		return binaryTarball{}, false, nil
 	}
 	debugf("Using older binary %s %s-%s as build dependency; repository version is %s-%s\n", best.name, best.version, best.revision, currentVersion, currentRevision)
-	return best.name, best.path, true, nil
+	if best.entry != nil {
+		return remoteBinaryTarball(best.name, best.entry, cfg), true, nil
+	}
+	return cachedBinaryTarball(best.name, best.path), true, nil
 }
 
 func installAvailableBuildDependencyBinaryWithOptions(pkgName string, cfg *Config, noRemote bool, quiet bool, installRuntimeDeps bool) (bool, error) {
@@ -3594,28 +3651,28 @@ func ensureDevelPackagesInstalledForBuild(cfg *Config, building []string, includ
 	colArrow.Print("-> ")
 	colSuccess.Printf("Installing missing devel packages: %s\n", strings.Join(missing, ", "))
 
-	var newlyInstalled []string
-	bar := newDependencyInstallProgress(len(missing), "Installing Build Dependencies", quiet)
-	deactivateProgress := activateDependencyInstallProgress(bar)
-	defer deactivateProgress()
+	// Planned like the other build dependencies (build_deps_install.go):
+	// located first, their runtime dependencies added from the index,
+	// downloaded at once, installed in order under one bar.
+	var installs []buildDepInstall
 	for _, pkgName := range missing {
-		describeDependencyInstallProgress(bar, pkgName)
 		installCfg := develInstallConfig(pkgName, cfg)
-		installed, err := installAvailableBuildDependencyBinaryWithOptions(pkgName, installCfg, noRemote, quiet, true)
+		b, ok, err := locateBuildDependencyBinaryTarball(pkgName, installCfg, noRemote)
 		if err != nil {
-			return newlyInstalled, err
+			return nil, err
 		}
-		if !installed && !isPackageInstalled(pkgName) {
-			return newlyInstalled, fmt.Errorf("required devel package %s has no available binary package; install it manually or build it in bootstrap mode", pkgName)
+		if !ok {
+			return nil, fmt.Errorf("required devel package %s has no available binary package; install it manually or build it in bootstrap mode", pkgName)
 		}
-		advanceDependencyInstallProgress(bar)
-		if installed {
-			outputName := getOutputPackageName(pkgName, installCfg)
-			newlyInstalled = append(newlyInstalled, outputName)
-		}
+		installs = append(installs, buildDepInstall{name: pkgName, cfg: installCfg, tarball: b})
 	}
+	installs = withBuildDepRuntimeClosure(installs, cfg, noRemote)
 
-	return newlyInstalled, nil
+	var newlyInstalled []string
+	addInstalled := func(name string) { newlyInstalled = append(newlyInstalled, name) }
+	noSplits := func(string, string) {}
+	err := installBuildDependencyPlan(installs, noRemote, quiet, addInstalled, noSplits)
+	return newlyInstalled, err
 }
 
 // uninstallBuildDependencies uninstalls a list of packages in reverse order.
