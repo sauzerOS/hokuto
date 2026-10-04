@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/gookit/color"
+	"golang.org/x/term"
 )
 
 func bestRemoteUpdateEntry(pkgName string, cfg *Config, remoteIndex []RepoEntry) (RepoEntry, bool, bool) {
@@ -116,7 +117,7 @@ func checkForRemoteUpgrades(_ context.Context, cfg *Config, yes bool) error {
 	}
 
 	// 3. Identify Upgrades
-	upgradeList, _, fallbackMap := remoteUpgradeCandidates(installedPackages, cfg, remoteIndex)
+	upgradeList, targets, fallbackMap := remoteUpgradeCandidates(installedPackages, cfg, remoteIndex)
 
 	if len(upgradeList) == 0 {
 		colArrow.Print("-> ")
@@ -189,6 +190,19 @@ func checkForRemoteUpgrades(_ context.Context, cfg *Config, yes bool) error {
 		colArrow.Printf("-> ")
 		colSuccess.Println("Updating Hokuto")
 		pkgNames = []string{"hokuto"}
+	}
+
+	// As pacman does: what the update downloads and how much the installed
+	// size grows or shrinks, then confirm. Only on a terminal, so scripts
+	// keep working; -y skips it.
+	printRemoteUpdateSizes(computeRemoteUpdateSizes(pkgNames, targets, cfg, remoteIndex))
+	if !yes && term.IsTerminal(int(os.Stdin.Fd())) {
+		colArrow.Print("-> ")
+		if !askForConfirmation(colSuccess, "Proceed with installation?") {
+			colArrow.Print("-> ")
+			colWarn.Println("Upgrade canceled.")
+			return nil
+		}
 	}
 
 	// We'll iterate the upgrade list.

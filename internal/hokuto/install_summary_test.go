@@ -71,3 +71,46 @@ func TestComputeInstallPlanSizes(t *testing.T) {
 		t.Errorf("installed = %d (+%d unknown), want 1500 (+1)", sizes.installed, sizes.unknownInstalled)
 	}
 }
+
+func TestComputeRemoteUpdateSizesNetChange(t *testing.T) {
+	cfg, _ := withTempDependencyRepo(t)
+	cfg.Values["HOKUTO_ARCH"] = "x86_64"
+	root := t.TempDir()
+	rootDir = root
+
+	// foo is installed: one 1000-byte file and a hard link to it.
+	writeInstalledTestPackage(t, "foo")
+	if err := os.MkdirAll(filepath.Join(root, "usr", "bin"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "usr", "bin", "foo"), make([]byte, 1000), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(filepath.Join(root, "usr", "bin", "foo"), filepath.Join(root, "usr", "bin", "foo2")); err != nil {
+		t.Fatal(err)
+	}
+	manifest := "/usr/\n/usr/bin/\n/usr/bin/foo  aaaa\n/usr/bin/foo2  aaaa\n"
+	if err := os.WriteFile(filepath.Join(Installed, "foo", "manifest"), []byte(manifest), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if size, ok := installedPackageFootprint("foo"); !ok || size != 1000 {
+		t.Fatalf("footprint = %d, %v; want 1000 (hard link counted once)", size, ok)
+	}
+
+	// The upgrade shrinks it to 400 bytes and brings bar (100 bytes).
+	foo := RepoEntry{Name: "foo", Version: "2", Revision: "1", Arch: "x86_64", Variant: "optimized",
+		Filename: "foo-2-1-x86_64-optimized.tar.zst", Size: 300, Depends: []string{"bar"},
+		InstalledSize: 400, MetadataVersion: repoEntryMetadataVersion}
+	bar := RepoEntry{Name: "bar", Version: "1", Revision: "1", Arch: "x86_64", Variant: "optimized",
+		Filename: "bar-1-1-x86_64-optimized.tar.zst", Size: 50,
+		InstalledSize: 100, MetadataVersion: repoEntryMetadataVersion}
+	index := []RepoEntry{foo, bar}
+
+	sizes := computeRemoteUpdateSizes([]string{"foo"}, map[string]RepoEntry{"foo": foo}, cfg, index)
+	if sizes.download != 350 || sizes.net != -500 || sizes.unknown != 0 || sizes.known != 2 {
+		t.Fatalf("sizes = %+v, want download 350, net -500", sizes)
+	}
+	if got := formatSignedSize(sizes.net); got != "-500 B" {
+		t.Fatalf("formatSignedSize = %q", got)
+	}
+}

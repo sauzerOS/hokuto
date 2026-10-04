@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/schollz/progressbar/v3"
@@ -172,4 +173,132 @@ func prefetchRepoEntries(entries []RepoEntry, cfg *Config) {
 	close(jobs)
 	wg.Wait()
 	bar.Finish()
+}
+
+// remoteUpdateSizes is what a remote update downloads and how much the
+// installed size changes: pacman's Total Download Size and Net Upgrade Size.
+type remoteUpdateSizes struct {
+	download int64
+	net      int64
+	// unknown counts packages whose old or new installed size is not known
+	// (an index entry from before metadata version 4, a missing manifest).
+	unknown int
+	// known counts the packages net includes.
+	known int
+}
+
+// computeRemoteUpdateSizes adds up the upgrades in pkgNames, which replace
+// what is installed, and the new dependencies they bring, which add to it.
+func computeRemoteUpdateSizes(pkgNames []string, targets map[string]RepoEntry, cfg *Config, remoteIndex []RepoEntry) remoteUpdateSizes {
+	var sizes remoteUpdateSizes
+	addDownload := func(entry RepoEntry) {
+		if entry.Filename != "" {
+			if info, err := os.Stat(filepath.Join(BinDir, entry.Filename)); err == nil && info.Size() == entry.Size {
+				return
+			}
+		}
+		sizes.download += entry.Size
+	}
+
+	counted := make(map[string]bool)
+	for _, name := range pkgNames {
+		counted[name] = true
+	}
+	for _, name := range pkgNames {
+		// New dependencies first, as the update installs them.
+		if plan, err := remoteUpdateDependencyPlan(name, cfg, remoteIndex); err == nil {
+			for _, dep := range plan {
+				if counted[dep] {
+					continue
+				}
+				counted[dep] = true
+				entry, err := GetRemotePackageEntry(dep, cfg, remoteIndex)
+				if err != nil {
+					sizes.unknown++
+					continue
+				}
+				addDownload(*entry)
+				if entry.InstalledSize > 0 {
+					sizes.net += entry.InstalledSize
+					sizes.known++
+				} else {
+					sizes.unknown++
+				}
+			}
+		}
+
+		entry, ok := targets[name]
+		if !ok {
+			sizes.unknown++
+			continue
+		}
+		addDownload(entry)
+		oldSize, known := installedPackageFootprint(name)
+		if entry.InstalledSize > 0 && known {
+			sizes.net += entry.InstalledSize - oldSize
+			sizes.known++
+		} else {
+			sizes.unknown++
+		}
+	}
+	return sizes
+}
+
+// installedPackageFootprint is what an installed package takes, from its
+// manifest, counted as installed_size counts it when the package is built
+// (regular files, hard links once, its own metadata included), so the two
+// can be subtracted. installedPackageSize, for "hokuto size", counts the
+// way it reports.
+func installedPackageFootprint(pkgName string) (int64, bool) {
+	entries, err := parseManifest(filepath.Join(Installed, pkgName, "manifest"))
+	if err != nil || len(entries) == 0 {
+		return 0, false
+	}
+	var total int64
+	seen := make(map[[2]uint64]bool)
+	for path := range entries {
+		if strings.HasSuffix(path, "/") {
+			continue
+		}
+		info, err := os.Lstat(filepath.Join(rootDir, path))
+		if err != nil || !info.Mode().IsRegular() {
+			continue
+		}
+		if st, ok := info.Sys().(*syscall.Stat_t); ok && st.Nlink > 1 {
+			key := [2]uint64{uint64(st.Dev), st.Ino}
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+		}
+		total += info.Size()
+	}
+	return total, true
+}
+
+// printRemoteUpdateSizes prints the totals as pacman does before it asks.
+func printRemoteUpdateSizes(sizes remoteUpdateSizes) {
+	colArrow.Print("-> ")
+	colSuccess.Print("Total Download Size: ")
+	colNote.Println(humanReadableSize(sizes.download))
+	colArrow.Print("-> ")
+	colSuccess.Print("Total Upgrade Size:  ")
+	if sizes.known == 0 && sizes.unknown > 0 {
+		// Nothing to add up: "0 B" would claim the size does not change.
+		colNote.Println("unknown")
+		return
+	}
+	colNote.Print(formatSignedSize(sizes.net))
+	if sizes.unknown > 0 {
+		colSuccess.Printf(" (+%d package(s) of unknown size)", sizes.unknown)
+	}
+	colSuccess.Println()
+}
+
+// formatSignedSize is humanReadableSize with a minus sign for a shrink.
+func formatSignedSize(b int64) string {
+	if b < 0 {
+		return "-" + humanReadableSize(-b)
+	}
+	return humanReadableSize(b)
 }
