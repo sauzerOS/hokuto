@@ -673,6 +673,13 @@ func GetRemotePackageEntry(pkgName string, cfg *Config, remoteIndex []RepoEntry)
 	}
 
 	arch := GetSystemArch(cfg)
+	// A cross-system package (aarch64-linux-api-headers on an x86_64 host)
+	// is published for its own architecture. Without this, "update --remote"
+	// found its upgrade (bestRemoteUpdateEntry asks the same) and then failed
+	// with "dependency metadata ... is unavailable".
+	if archPrefixOf(lookupName) != "" {
+		arch = GetSystemArchForPackage(cfg, lookupName)
+	}
 	variant := GetSystemVariantForPackage(cfg, lookupName)
 	versionedBase, versionedLine, versionedName := splitVersionedPackageName(lookupName)
 	if targetVersion == "" && versionedName {

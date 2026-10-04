@@ -501,6 +501,35 @@ func TestGetRemotePackageEntryFiltersVersionedPackageMajor(t *testing.T) {
 	}
 }
 
+func TestGetRemotePackageEntryCrossSystemPackageOnNativeHost(t *testing.T) {
+	cfg, _ := withTempDependencyRepo(t)
+	cfg.Values["HOKUTO_ARCH"] = "x86_64"
+	index := []RepoEntry{
+		{Name: "aarch64-linux-api-headers", Version: "7.2.8", Revision: "1", Arch: "aarch64", Variant: "generic", MetadataVersion: repoEntryMetadataVersion},
+		{Name: "aarch64-linux-api-headers", Version: "7.2.9", Revision: "1", Arch: "aarch64", Variant: "generic", MetadataVersion: repoEntryMetadataVersion},
+		{Name: "cmake", Version: "4.4.4", Revision: "1", Arch: "x86_64", Variant: "optimized"},
+		{Name: "cmake", Version: "4.4.4", Revision: "1", Arch: "aarch64", Variant: "optimized"},
+	}
+
+	// The x86_64 host looked for an x86_64 archive of it; "update --remote"
+	// then failed with "dependency metadata ... is unavailable".
+	entry, err := GetRemotePackageEntry("aarch64-linux-api-headers", cfg, index)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if entry.Version != "7.2.9" || entry.Arch != "aarch64" {
+		t.Fatalf("expected the newest aarch64 entry, got %+v", entry)
+	}
+	if deps, found, err := resolveBinaryDependenciesFromArchive("aarch64-linux-api-headers", cfg, index, true); err != nil || !found || len(deps) != 0 {
+		t.Fatalf("dependency metadata: deps=%v found=%v err=%v", deps, found, err)
+	}
+
+	// A plain name is still the host's package.
+	if entry, err := GetRemotePackageEntry("cmake", cfg, index); err != nil || entry.Arch != "x86_64" {
+		t.Fatalf("cmake should resolve to the host archive, got %+v, %v", entry, err)
+	}
+}
+
 func TestGetRemotePackageEntryHonorsPreparedExactVersion(t *testing.T) {
 	cfg, _ := withTempDependencyRepo(t)
 	cfg.Values["HOKUTO_ARCH"] = "x86_64"
