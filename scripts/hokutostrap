@@ -2,6 +2,11 @@
 
 # Hokuto Web Installer
 # Installs Hokuto OS from a remote web server.
+#
+# On an x86_64 host it can also make an aarch64 (arm64) root, e.g. for a
+# Raspberry Pi or sauzeros-live-vm: QEMU user-mode emulation (binfmt_misc)
+# runs the arm64 programs, so post-install hooks, dracut and the systemd
+# setup work in its chroot as they do natively.
 
 set -e
 
@@ -35,6 +40,10 @@ case "$ARCH" in
 esac
 
 log_info "Detected architecture: ${GREEN}$ARCH${RESET}"
+
+# The hokuto binary runs here, so it is the host's ($ARCH); the system it
+# installs can be arm64 on an x86_64 host (TARGET_ARCH).
+TARGET_ARCH="$ARCH"
 
 # 2. Preparation
 TMP_DIR=$(mktemp -d)
@@ -147,6 +156,19 @@ default_root="/"
 read -p "Target Installation Directory [${default_root}]: " input_root
 HOKUTO_ROOT="${input_root:-$default_root}"
 
+# Target architecture: an x86_64 host can also make an arm64 root.
+if [ "$ARCH" == "amd64" ]; then
+    read -p "Target Architecture (amd64 or arm64) [amd64]: " input_arch
+    case "${input_arch:-amd64}" in
+        amd64|x86_64) TARGET_ARCH="amd64" ;;
+        arm64|aarch64) TARGET_ARCH="arm64" ;;
+        *) log_error "Unknown architecture '$input_arch' (amd64 or arm64)." ;;
+    esac
+    if [ "$TARGET_ARCH" == "arm64" ] && [ "$HOKUTO_ROOT" == "/" ]; then
+        log_error "An arm64 system cannot replace this x86_64 one; choose a target directory."
+    fi
+fi
+
 # Generic Mode
 read -p "Enable Generic Optimization (portable binaries)? [y/N]: " input_generic
 if [[ "$input_generic" =~ ^[Yy]$ ]]; then
@@ -157,7 +179,7 @@ fi
 
 # Multilib (only for amd64)
 HOKUTO_MULTILIB="0"
-if [ "$ARCH" == "amd64" ]; then
+if [ "$TARGET_ARCH" == "amd64" ]; then
     read -p "Enable Multilib Support (32-bit libs)? [y/N]: " input_multilib
     if [[ "$input_multilib" =~ ^[Yy]$ ]]; then
         HOKUTO_MULTILIB="1"
@@ -175,6 +197,15 @@ fi
 # Hostname
 read -p "Enter Hostname [hokuto]: " input_hostname
 HOSTNAME="${input_hostname:-hokuto}"
+
+# Helper to run commands as root if needed
+do_as_root() {
+    if [ "$EUID" -ne 0 ]; then
+        sudo "$@"
+    else
+        "$@"
+    fi
+}
 
 # 7. Installation
 log_info "Starting installation"
@@ -206,12 +237,71 @@ fi
 chmod +x "$BIN"
 log_info "Using binary: $BIN"
 
+# hokuto's names for the architectures.
+case "$TARGET_ARCH" in
+    amd64) HOKUTO_TARGET_ARCH="x86_64" ;;
+    arm64) HOKUTO_TARGET_ARCH="aarch64" ;;
+esac
+
+# An arm64 root on an x86_64 host: its programs (post-install hooks, dracut,
+# systemd's setup, chpasswd, locale-gen below) run in a chroot through QEMU
+# user-mode emulation. binfmt_misc hands them to a static qemu-aarch64; the F
+# flag makes the kernel open it once, at registration, so it is found from
+# inside the chroot too. An existing registration with F is used as it is
+# (hokuto-builder makes one); otherwise qemu-user-static comes from the
+# mirror into a scratch root, nothing is installed on this host.
+ensure_aarch64_emulation() {
+    local binfmt=/proc/sys/fs/binfmt_misc entry=/proc/sys/fs/binfmt_misc/qemu-aarch64
+    if [ -e "$entry" ]; then
+        if grep -q '^enabled' "$entry" && grep -q '^flags:.*F' "$entry"; then
+            log_info "Using the registered arm64 emulation ($(sed -n 's/^interpreter //p' "$entry"))"
+            return 0
+        fi
+        log_error "qemu-aarch64 is registered with binfmt_misc without the F flag, so arm64 programs cannot run in the chroot.
+       Remove that registration (echo -1 | sudo tee $entry) and run hokutostrap again."
+    fi
+    if ! mountpoint -q "$binfmt"; then
+        do_as_root mount -t binfmt_misc binfmt_misc "$binfmt" || log_error "Cannot mount binfmt_misc; arm64 programs cannot run here."
+    fi
+
+    log_info "Fetching QEMU user-mode emulation (qemu-user-static) for the arm64 root"
+    local qemu_root="$TMP_DIR/qemu-root"
+    # A host package: the target's generic/multilib choices do not apply.
+    HOKUTO_ROOT="$qemu_root" HOKUTO_GENERIC=0 HOKUTO_MULTILIB=0 HOKUTO_ARCH=x86_64 \
+        "$BIN" install -y --remote qemu-user-static ||
+        log_error "Could not fetch qemu-user-static."
+    local conf="$qemu_root/usr/lib/binfmt.d/qemu-aarch64-static.conf"
+    local interp="$qemu_root/usr/bin/qemu-aarch64-static"
+    [ -f "$conf" ] && [ -x "$interp" ] || log_error "qemu-user-static has no qemu-aarch64-static or its binfmt rule."
+    # Fields: :name:type:offset:magic:mask:interpreter:flags
+    local rule
+    rule=$(grep -m1 '^:qemu-aarch64:' "$conf" | awk -F: -v OFS=: -v interp="$interp" \
+        '{ $7 = interp; if ($8 !~ /F/) $8 = $8 "F"; print }')
+    [ -n "$rule" ] || log_error "No qemu-aarch64 rule in $conf."
+    printf '%s' "$rule" | do_as_root tee "$binfmt/register" >/dev/null ||
+        log_error "Could not register qemu-aarch64 with binfmt_misc."
+    # With F the kernel holds the interpreter open: the scratch copy can go,
+    # the registration lasts until the next reboot.
+    do_as_root rm -rf "$qemu_root"
+    log_success "arm64 emulation registered"
+}
+
 export HOKUTO_ROOT="$HOKUTO_ROOT"
 export HOKUTO_GENERIC="$HOKUTO_GENERIC"
 export HOKUTO_MULTILIB="$HOKUTO_MULTILIB"
 
-# Run install
-"$BIN" install --remote $PKG_LIST
+if [ "$TARGET_ARCH" == "$ARCH" ]; then
+    "$BIN" install --remote $PKG_LIST
+else
+    ensure_aarch64_emulation
+    export HOKUTO_ARCH="$HOKUTO_TARGET_ARCH"
+    # sauzeros-base first: it brings the root's hokuto.conf, which hokuto
+    # reads for everything after it (CFLAGS_ARM64 tells it the arm64
+    # packages are the optimized builds). In a single run hokuto would keep
+    # the empty configuration of the fresh root throughout.
+    "$BIN" install --remote -arm64 sauzeros-base
+    "$BIN" install --remote -arm64 $PKG_LIST
+fi
 
 # 8. Update Configuration
 CONF_DIR="$HOKUTO_ROOT/etc/hokuto"
@@ -219,22 +309,13 @@ CONF_FILE="$CONF_DIR/hokuto.conf"
 
 log_info "Updating configuration at $CONF_FILE"
 
-# Helper to run commands as root if needed
-do_as_root() {
-    if [ "$EUID" -ne 0 ]; then
-        sudo "$@"
-    else
-        "$@"
-    fi
-}
-
 do_as_root mkdir -p "$CONF_DIR"
 
 if [ ! -f "$CONF_FILE" ]; then
     cat <<EOF | do_as_root tee "$CONF_FILE" >/dev/null
 # Hokuto Configuration File
 
-HOKUTO_ARCH="$ARCH"
+HOKUTO_ARCH="$HOKUTO_TARGET_ARCH"
 HOKUTO_GENERIC=$HOKUTO_GENERIC
 HOKUTO_MULTILIB=$HOKUTO_MULTILIB
 HOKUTO_LTO=$HOKUTO_LTO
@@ -250,6 +331,9 @@ else
         fi
     }
 
+    # An arm64 root says so, so hokuto run against it from an x86_64 host
+    # (HOKUTO_ROOT=...) picks arm64 packages without being told.
+    [ "$TARGET_ARCH" == "$ARCH" ] || update_conf "HOKUTO_ARCH" "$HOKUTO_TARGET_ARCH"
     update_conf "HOKUTO_GENERIC" $HOKUTO_GENERIC
     update_conf "HOKUTO_MULTILIB" $HOKUTO_MULTILIB
     update_conf "HOKUTO_LTO" $HOKUTO_LTO
