@@ -50,21 +50,6 @@ ASSETS="hokuto-$VERSION-amd64.tar.xz hokuto-$VERSION-arm64.tar.xz
 hokuto-$VERSION-amd64.tar.xz.sig hokuto-$VERSION-arm64.tar.xz.sig
 scripts/hokutostrap scripts/hokuto-builder"
 
-# Check if release exists
-if gh release view "$TAG" >/dev/null 2>&1; then
-    echo "Release $TAG exists, uploading assets"
-    # shellcheck disable=SC2086
-    gh release upload "$TAG" $ASSETS --clobber
-else
-    tmpfile=$(mktemp)
-    ${EDITOR:-nano} "$tmpfile"
-    # shellcheck disable=SC2086
-    gh release create "$TAG" $ASSETS \
-        --title "hokuto $TAG" \
-        --notes-file "$tmpfile"
-    rm "$tmpfile"
-fi
-
 # recipe_version prints the version of the hokuto recipe, found in
 # HOKUTO_PATH (the environment's, else hokuto.conf's) as hokuto finds it.
 recipe_version() {
@@ -103,10 +88,29 @@ changes_since() {
         sed 's/^/- /'
 }
 
+RECIPE_VERSION=$(recipe_version)
+
+# Check if release exists
+if gh release view "$TAG" >/dev/null 2>&1; then
+    echo "Release $TAG exists, uploading assets"
+    # shellcheck disable=SC2086
+    gh release upload "$TAG" $ASSETS --clobber
+else
+    # The release notes are the changes since the previous release, as in
+    # the recipe's commit below.
+    notes=""
+    if [ -n "$RECIPE_VERSION" ] && [ "$RECIPE_VERSION" != "$VERSION" ]; then
+        notes=$(changes_since "$RECIPE_VERSION")
+    fi
+    # shellcheck disable=SC2086
+    gh release create "$TAG" $ASSETS \
+        --title "hokuto $TAG" \
+        --notes "${notes:-hokuto $VERSION}"
+fi
+
 # Package the release: a new VERSION becomes the recipe's version, a rebuild
 # of the same one bumps its revision. Runs after the upload, since bump
 # fetches the release tarball to update the checksums.
-RECIPE_VERSION=$(recipe_version)
 if [ -z "$RECIPE_VERSION" ]; then
     echo "No hokuto recipe found in HOKUTO_PATH; not bumping it."
 elif [ "$RECIPE_VERSION" = "$VERSION" ]; then
