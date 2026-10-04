@@ -227,7 +227,7 @@ func checkForRemoteUpgrades(_ context.Context, cfg *Config, yes bool) error {
 				continue
 			}
 			// Install dep
-			if err := installRemotePackage(dep, cfg, remoteIndex); err != nil {
+			if err := installRemotePackage(dep, cfg, remoteIndex, yes); err != nil {
 				color.Danger.Printf("Failed to install dependency %s: %v\n", dep, err)
 				failed = append(failed, fmt.Sprintf("%s (dependency %s: %v)", pkgName, dep, err))
 				dependencyFailed = true
@@ -241,7 +241,7 @@ func checkForRemoteUpgrades(_ context.Context, cfg *Config, yes bool) error {
 		}
 
 		// 6b. Install the Package Update (Target)
-		if err := installRemotePackage(pkgName, cfg, remoteIndex); err != nil {
+		if err := installRemotePackage(pkgName, cfg, remoteIndex, yes); err != nil {
 			color.Danger.Printf("Failed to update %s: %v\n", pkgName, err)
 			failed = append(failed, fmt.Sprintf("%s: %v", pkgName, err))
 		} else {
@@ -266,8 +266,12 @@ func checkForRemoteUpgrades(_ context.Context, cfg *Config, yes bool) error {
 	return nil
 }
 
-// installRemotePackage fetches and installs a package from the remote index
-func installRemotePackage(pkgName string, cfg *Config, remoteIndex []RepoEntry) error {
+// installRemotePackage fetches and installs a package from the remote index.
+// yes is the update's own -y: without it the installer asks what to do with
+// a file modified on this system, as "hokuto install" does, instead of
+// keeping it silently (a /usr/bin/hokuto copied in by hand stayed in place
+// through a hokuto update).
+func installRemotePackage(pkgName string, cfg *Config, remoteIndex []RepoEntry, yes bool) error {
 	// Find entry
 	var entry RepoEntry
 	arch := GetSystemArchForPackage(cfg, pkgName)
@@ -315,9 +319,7 @@ func installRemotePackage(pkgName string, cfg *Config, remoteIndex []RepoEntry) 
 
 	// Install
 	handlePreInstallUninstall(pkgName, cfg, RootExec, false, nil)
-	// We use 'true' for force/yes usually for updates? or pass explicit 'yes' flag?
-	// Implicit 'yes' for updates usually.
-	if _, err := pkgInstallWithRemotePolicy(tarballPath, pkgName, cfg, RootExec, true, false, false, false, nil); err != nil {
+	if _, err := pkgInstallWithRemotePolicy(tarballPath, pkgName, cfg, RootExec, yes, false, false, false, nil); err != nil {
 		return err
 	}
 	return nil
