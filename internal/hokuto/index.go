@@ -129,7 +129,8 @@ func GetSystemVariantForPackage(cfg *Config, pkgName string) string {
 //	1: depends
 //	2: libdeps
 //	3: privatedeps
-const repoEntryMetadataVersion = 3
+//	4: installed_size, post_install_depends
+const repoEntryMetadataVersion = 4
 
 // repoEntryDependsMetadataVersion is the first metadata version with a
 // scanned depends list. Clients check this one, not repoEntryMetadataVersion,
@@ -163,7 +164,15 @@ type RepoEntry struct {
 	// PrivateDeps are the libraries (sonames) the package uses private API
 	// of, as in its privatedeps file (libQt6Gui.so.6). Known from metadata
 	// version 3 on.
-	PrivateDeps     []string `json:"privatedeps,omitempty"`
+	PrivateDeps []string `json:"privatedeps,omitempty"`
+	// PostInstallDepends are the dependencies only the package's post-install
+	// script needs (dracut post-install), which Depends leaves out. With
+	// them an install knows every package it will need before it starts.
+	// Known from metadata version 4 on.
+	PostInstallDepends []string `json:"post_install_depends,omitempty"`
+	// InstalledSize is what the package takes once installed: the sum of
+	// its files, hard links counted once. Known from metadata version 4 on.
+	InstalledSize   int64    `json:"installed_size,omitempty"`
 	Suggests        []string `json:"suggests,omitempty"`
 	Description     string   `json:"description,omitempty"`
 	MetadataVersion int      `json:"metadata_version,omitempty"`
@@ -190,12 +199,14 @@ func ReadPackageMetadata(tarballPath string) (RepoEntry, error) {
 	entry.B3Sum = sum
 
 	// 2. Scan tarball once for all metadata (pkginfo, depends and libdeps)
-	metadata, deps, libdeps, privatedeps, err := scanTarballMetadataWithLibdeps(tarballPath)
+	r, err := scanTarballFull(tarballPath)
 	if err != nil {
 		return entry, fmt.Errorf("failed to scan tarball metadata: %w", err)
 	}
 
-	fillRepoEntryMetadata(&entry, metadata, deps, libdeps, privatedeps)
+	fillRepoEntryMetadata(&entry, r.metadata, r.deps, r.libdeps, r.privatedeps)
+	entry.PostInstallDepends = r.postInstallDeps
+	entry.InstalledSize = r.installedSize
 	return entry, nil
 }
 
@@ -234,9 +245,10 @@ func repoEntryFromPackageOutput(tarballPath, outputDir, pkgName string) (RepoEnt
 	if err != nil {
 		return entry, err
 	}
-	var deps []string
+	var deps, postInstallDeps []string
 	if data, err := os.ReadFile(filepath.Join(metaDir, "depends")); err == nil {
 		deps = runtimeDependsForIndex(data, tarballPath)
+		postInstallDeps = postInstallDependsForIndex(data, tarballPath)
 	}
 	libdeps := []string{}
 	if data, err := os.ReadFile(filepath.Join(metaDir, "libdeps")); err == nil {
@@ -247,6 +259,10 @@ func repoEntryFromPackageOutput(tarballPath, outputDir, pkgName string) (RepoEnt
 		privatedeps = privateDepsForIndex(data)
 	}
 	fillRepoEntryMetadata(&entry, ParsePkgInfo(pkginfo), deps, libdeps, privatedeps)
+	entry.PostInstallDepends = postInstallDeps
+	if entry.InstalledSize, err = installedSize(outputDir); err != nil {
+		return entry, fmt.Errorf("failed to measure %s: %w", outputDir, err)
+	}
 	if entry.Name == "" || entry.Version == "" {
 		return entry, fmt.Errorf("pkginfo in %s has no name or version", metaDir)
 	}
@@ -296,6 +312,28 @@ func runtimeDependsForIndex(data []byte, source string) []string {
 	return dependencies
 }
 
+// postInstallDependsForIndex returns the post-install dependencies of a
+// depends file, as the index stores them ("a | b", constraints kept).
+func postInstallDependsForIndex(data []byte, source string) []string {
+	depSpecs, err := parseDependsData(data)
+	if err != nil {
+		debugf("Warning: failed to parse depends data for %s: %v\n", source, err)
+		return nil
+	}
+	var dependencies []string
+	for _, d := range depSpecs {
+		if !d.PostInstall || d.Suggest {
+			continue
+		}
+		name := d.Name
+		if len(d.Alternatives) > 1 {
+			name = strings.Join(d.Alternatives, " | ")
+		}
+		dependencies = append(dependencies, name+d.Op+d.Version)
+	}
+	return dependencies
+}
+
 // scanTarballMetadata reads pkginfo and depends files from a .tar.zst archive in one pass.
 func scanTarballMetadata(tarballPath string) (map[string]string, []string, error) {
 	metadata, deps, _, _, err := scanTarballMetadataWithLibdeps(tarballPath)
@@ -306,18 +344,28 @@ func scanTarballMetadata(tarballPath string) (map[string]string, []string, error
 // package's libdeps entries. Only hokuto's own metadata directory counts, not
 // a payload file that happens to be called libdeps.
 func scanTarballMetadataWithLibdeps(tarballPath string) (map[string]string, []string, []string, []string, error) {
+	r, err := scanTarballFull(tarballPath)
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+	return r.metadata, r.deps, r.libdeps, r.privatedeps, nil
+}
+
+// scanTarballFull is the cached archive scan with everything the index
+// records: what scanTarballMetadataWithLibdeps returns, the post-install
+// dependencies and the installed size.
+func scanTarballFull(tarballPath string) (tarballMetadataResult, error) {
 	key, cacheable := tarballScanKeyFor(tarballPath)
 	if cacheable {
 		if v, ok := tarballMetadataCache.Load(key); ok {
-			r := v.(tarballMetadataResult)
-			return r.metadata, r.deps, r.libdeps, r.privatedeps, nil
+			return v.(tarballMetadataResult), nil
 		}
 	}
-	metadata, deps, libdeps, privatedeps, err := scanTarballMetadataUncached(tarballPath)
+	r, err := scanTarballMetadataUncached(tarballPath)
 	if err == nil && cacheable {
-		tarballMetadataCache.Store(key, tarballMetadataResult{metadata, deps, libdeps, privatedeps})
+		tarballMetadataCache.Store(key, r)
 	}
-	return metadata, deps, libdeps, privatedeps, err
+	return r, err
 }
 
 // The metadata of a package archive is read again and again during one
@@ -334,6 +382,8 @@ type tarballScanKey struct {
 type tarballMetadataResult struct {
 	metadata                   map[string]string
 	deps, libdeps, privatedeps []string
+	postInstallDeps            []string
+	installedSize              int64
 }
 
 var (
@@ -349,16 +399,17 @@ func tarballScanKeyFor(tarballPath string) (tarballScanKey, bool) {
 	return tarballScanKey{path: tarballPath, size: info.Size(), mtime: info.ModTime().UnixNano()}, true
 }
 
-func scanTarballMetadataUncached(tarballPath string) (map[string]string, []string, []string, []string, error) {
+func scanTarballMetadataUncached(tarballPath string) (tarballMetadataResult, error) {
+	var r tarballMetadataResult
 	f, err := os.Open(tarballPath)
 	if err != nil {
-		return nil, nil, nil, nil, err
+		return r, err
 	}
 	defer f.Close()
 
 	zsr, err := zstd.NewReader(f)
 	if err != nil {
-		return nil, nil, nil, nil, err
+		return r, err
 	}
 	defer zsr.Close()
 
@@ -374,13 +425,19 @@ func scanTarballMetadataUncached(tarballPath string) (map[string]string, []strin
 			break
 		}
 		if err != nil {
-			return nil, nil, nil, nil, err
+			return r, err
+		}
+
+		// Installed size: every file the package unpacks (hard links,
+		// stored as TypeLink with no data, count once).
+		if header.Typeflag == tar.TypeReg {
+			r.installedSize += header.Size
 		}
 
 		if strings.HasSuffix(header.Name, "/privatedeps") && strings.Contains(header.Name, "var/db/hokuto/installed/") {
 			data, err := io.ReadAll(tr)
 			if err != nil {
-				return nil, nil, nil, nil, fmt.Errorf("failed to read privatedeps from %s: %w", tarballPath, err)
+				return r, fmt.Errorf("failed to read privatedeps from %s: %w", tarballPath, err)
 			}
 			privatedeps = append(privatedeps, privateDepsForIndex(data)...)
 			continue
@@ -389,7 +446,7 @@ func scanTarballMetadataUncached(tarballPath string) (map[string]string, []strin
 		if strings.HasSuffix(header.Name, "/libdeps") && strings.Contains(header.Name, "var/db/hokuto/installed/") {
 			data, err := io.ReadAll(tr)
 			if err != nil {
-				return nil, nil, nil, nil, fmt.Errorf("failed to read libdeps from %s: %w", tarballPath, err)
+				return r, fmt.Errorf("failed to read libdeps from %s: %w", tarballPath, err)
 			}
 			libdeps = append(libdeps, libdepsForIndex(data)...)
 			continue
@@ -399,7 +456,7 @@ func scanTarballMetadataUncached(tarballPath string) (map[string]string, []strin
 		if strings.HasSuffix(header.Name, "/pkginfo") {
 			data, err := io.ReadAll(tr)
 			if err != nil {
-				return nil, nil, nil, nil, fmt.Errorf("failed to read pkginfo from %s: %w", tarballPath, err)
+				return r, fmt.Errorf("failed to read pkginfo from %s: %w", tarballPath, err)
 			}
 			metadata = ParsePkgInfo(data)
 			continue
@@ -409,18 +466,20 @@ func scanTarballMetadataUncached(tarballPath string) (map[string]string, []strin
 		if strings.HasSuffix(header.Name, "/depends") {
 			data, err := io.ReadAll(tr)
 			if err != nil {
-				return nil, nil, nil, nil, fmt.Errorf("failed to read depends from %s: %w", tarballPath, err)
+				return r, fmt.Errorf("failed to read depends from %s: %w", tarballPath, err)
 			}
 			dependencies = append(dependencies, runtimeDependsForIndex(data, tarballPath)...)
+			r.postInstallDeps = append(r.postInstallDeps, postInstallDependsForIndex(data, tarballPath)...)
 			continue
 		}
 	}
 
 	if metadata == nil {
-		return nil, nil, nil, nil, fmt.Errorf("pkginfo not found in %s", tarballPath)
+		return r, fmt.Errorf("pkginfo not found in %s", tarballPath)
 	}
 
-	return metadata, dependencies, libdeps, privatedeps, nil
+	r.metadata, r.deps, r.libdeps, r.privatedeps = metadata, dependencies, libdeps, privatedeps
+	return r, nil
 }
 
 func scanTarballDependencySpecs(tarballPath string) ([]DepSpec, error) {

@@ -497,7 +497,7 @@ func resolveBinaryDependenciesFromArchive(pkgName string, cfg *Config, remoteInd
 	entry := *entryRef
 
 	if repoEntryHasDependencyMetadata(entry) {
-		return depSpecsFromNames(entry.Depends), true, nil
+		return append(depSpecsFromNames(entry.Depends), depSpecsFromNames(entry.PostInstallDepends)...), true, nil
 	}
 
 	if err := fetchSpecificBinaryPackage(entry.Name, entry.Version, entry.Revision, entry.Variant, cfg, !Debug, entry.B3Sum, false); err != nil {
@@ -1207,6 +1207,10 @@ func resolveRemoteDependencies(pkgName string, visited map[string]bool, plan *[]
 	if repoEntryHasDependencyMetadata(entry) {
 		// Optimization: Use pre-resolved dependencies from index
 		deps = depSpecsFromNames(entry.Depends)
+		// The post-install dependencies too (metadata version 4): the hook
+		// would install them anyway, so the plan, its summary and its
+		// download list are complete only with them.
+		deps = append(deps, depSpecsFromNames(entry.PostInstallDepends)...)
 	} else {
 		// Fallback: Fetch binary package to read depends (older index or missing info)
 		if err := fetchSpecificBinaryPackage(entry.Name, entry.Version, entry.Revision, entry.Variant, cfg, !Debug, entry.B3Sum, false); err != nil {
@@ -1220,12 +1224,12 @@ func resolveRemoteDependencies(pkgName string, visited map[string]bool, plan *[]
 		tarballPath := filepath.Join(BinDir, tarballName)
 
 		// 5. Scan metadata (pkginfo and depends)
-		_, entryDeps, err := scanTarballMetadata(tarballPath)
+		scan, err := scanTarballFull(tarballPath)
 		if err != nil {
 			return fmt.Errorf("failed to scan metadata from %s: %w", tarballName, err)
 		}
 
-		deps = depSpecsFromNames(entryDeps)
+		deps = append(depSpecsFromNames(scan.deps), depSpecsFromNames(scan.postInstallDeps)...)
 	}
 
 	// 7. Recurse

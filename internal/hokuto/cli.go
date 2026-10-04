@@ -22,6 +22,7 @@ import (
 	"github.com/gookit/color"
 	"github.com/schollz/progressbar/v3"
 	"golang.org/x/sys/unix"
+	"golang.org/x/term"
 )
 
 // printHelp prints the commands table
@@ -907,10 +908,28 @@ func Main() {
 			exitHokuto(0)
 		}
 
+		if len(installPlan) > 0 {
+			printInstallPlanSizes(computeInstallPlanSizes(installPlan, cfg, remoteIndex))
+		}
+
 		if *ask && !confirmInstallPlanWithAsk(installPlan, requestedMetas) {
 			colArrow.Print("-> ")
 			colWarn.Println("Install canceled.")
 			break
+		}
+		// As pacman does: confirm the plan and its sizes before anything is
+		// downloaded. Only on a terminal, so scripts and pipes keep working;
+		// -y (and --ask, which asked already) skip it.
+		if !*ask && !effectiveYes && len(installPlan) > 0 && term.IsTerminal(int(os.Stdin.Fd())) {
+			colArrow.Print("-> ")
+			if !askForConfirmation(colSuccess, "Proceed with installation?") {
+				colArrow.Print("-> ")
+				colWarn.Println("Install canceled.")
+				break
+			}
+		}
+		if !*noRemote {
+			prefetchInstallPlan(installPlan, cfg, remoteIndex)
 		}
 
 		// Set to CRITICAL (1) for the entire installation process
