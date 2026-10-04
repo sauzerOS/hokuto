@@ -127,13 +127,18 @@ func missingInstalledRuntimeDeps(roots []string, cfg *Config) map[string][]strin
 
 // repairInstalledRuntimeDeps installs, from binaries, the runtime dependencies
 // missing below the build dependencies of plan, and returns what it installed.
-// Packages the plan builds itself are not missing: they are installed when
-// built. A dependency that has no binary is warned about and left out.
+// A dependency that has no binary is warned about and left out, unless the
+// plan builds it.
+//
+// A package the plan builds is installed when built, but that can be after
+// the builds that need it: building openal, harfbuzz and glycin in that
+// order, gdk-pixbuf (under ffmpeg, under openal's examples) had no glycin
+// when openal linked, since glycin's new revision was not published yet. Its
+// published binary, of an older revision if need be, is installed now and
+// replaced by the build.
 func repairInstalledRuntimeDeps(plan *BuildPlan, cfg *Config, noRemote, quiet bool) []string {
 	missing := missingInstalledRuntimeDeps(buildDependencyRoots(plan, cfg), cfg)
-	for name := range providedByPlan(plan, cfg) {
-		delete(missing, name)
-	}
+	planned := providedByPlan(plan, cfg)
 	if len(missing) == 0 {
 		return nil
 	}
@@ -166,7 +171,7 @@ func repairInstalledRuntimeDeps(plan *BuildPlan, cfg *Config, noRemote, quiet bo
 		}
 		// An earlier repair in this loop may have installed it as one of
 		// its own dependencies.
-		if !isPackageInstalled(name) {
+		if _, built := planned[name]; !built && !isPackageInstalled(name) {
 			warnMissingRuntimeDependency(name, strings.Join(missing[name], ", "))
 		}
 	}

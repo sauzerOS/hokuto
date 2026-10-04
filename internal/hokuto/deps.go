@@ -2924,7 +2924,13 @@ func installRuntimeDependencyBinaryOnly(pkgName string, cfg *Config, noRemote bo
 	// cross target): find and install it with the native configuration, or
 	// the lookup asks for an aarch64 binary of, say, cmake's jsoncpp.
 	depCfg := packageBuildConfig(pkgName, cfg)
-	installName, tarballPath, ok, err := availableBinaryPackageTarball(pkgName, depCfg, noRemote)
+	// The build dependency policy, as for the build dependency that needs
+	// it: the current revision's binary, or an older one while the current
+	// revision is not published. With the exact revision only, a recipe
+	// bumped in the same run lost its package under the others: building
+	// openal before glycin 2.2.1-4, gdk-pixbuf (under ffmpeg) was installed
+	// without glycin and openal's alffplay failed to link.
+	installName, tarballPath, ok, err := availableBuildDependencyBinaryTarball(pkgName, depCfg, noRemote)
 	if err != nil || !ok {
 		return false, err
 	}
