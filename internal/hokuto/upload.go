@@ -557,7 +557,7 @@ func handleUploadCommand(args []string, cfg *Config) error {
 			// dependency list is valid and must not force another archive download.
 			if existing, ok := oldByFilename[obj.Key]; ok &&
 				existing.Size == obj.Size &&
-				existing.MetadataVersion >= repoEntryMetadataVersion {
+				repoEntryMetadataCurrent(existing) {
 				key := fmt.Sprintf("%s-%s-%s-%s-%s", existing.Name, existing.Version, existing.Revision, existing.Arch, existing.Variant)
 				reconciledMap[key] = existing
 				continue
@@ -924,7 +924,7 @@ func scanLocalBinaries(files []string, cache map[string]uploadCacheEntry) []loca
 		if cached, ok := cache[filepath.Base(file)]; ok &&
 			cached.Size == info.Size() &&
 			cached.Mtime.Equal(info.ModTime()) &&
-			cached.Entry.MetadataVersion >= repoEntryMetadataVersion {
+			repoEntryMetadataCurrent(cached.Entry) {
 			results[i].entry = cached.Entry
 			results[i].ok = true
 			continue

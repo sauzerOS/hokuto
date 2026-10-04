@@ -30,7 +30,7 @@ func TestScanLocalBinariesUsesCacheAndKeepsOrder(t *testing.T) {
 		cache[name] = uploadCacheEntry{
 			Size:  info.Size(),
 			Mtime: info.ModTime(),
-			Entry: RepoEntry{Name: name, Version: "1", Revision: strconv.Itoa(i), MetadataVersion: repoEntryMetadataVersion},
+			Entry: RepoEntry{Name: name, Version: "1", Revision: strconv.Itoa(i), InstalledSize: 1024, MetadataVersion: repoEntryMetadataVersion},
 		}
 	}
 
@@ -183,7 +183,7 @@ func TestRecordFetchedUploadCacheEntryUsesVerifiedIndexEntry(t *testing.T) {
 	}
 	entry := RepoEntry{
 		Name: "zlib-ng", Version: "2.3.3", Revision: "2", Filename: filepath.Base(path),
-		Size: int64(len("package")), B3Sum: "sum", MetadataVersion: repoEntryMetadataVersion,
+		Size: int64(len("package")), B3Sum: "sum", InstalledSize: 1024, MetadataVersion: repoEntryMetadataVersion,
 	}
 	GlobalRemoteIndexMu.Lock()
 	GlobalRemoteIndex, GlobalRemoteIndexLoaded = []RepoEntry{entry}, true
@@ -196,5 +196,20 @@ func TestRecordFetchedUploadCacheEntryUsesVerifiedIndexEntry(t *testing.T) {
 	recordFetchedUploadCacheEntry(path, "sum")
 	if got := loadUploadCache(uploadCachePath())[entry.Filename]; got.Entry.Name != "zlib-ng" {
 		t.Fatalf("fetched package was not recorded, got %+v", got)
+	}
+}
+
+func TestRepoEntryMetadataCurrentRejectsStrippedEntries(t *testing.T) {
+	complete := RepoEntry{Name: "mpv", InstalledSize: 6361968, MetadataVersion: repoEntryMetadataVersion}
+	if !repoEntryMetadataCurrent(complete) {
+		t.Fatal("a version 4 entry with its installed size is current")
+	}
+	// What hokuto 0.4.22 left behind when it rewrote a version 4 index.
+	stripped := RepoEntry{Name: "mpv", MetadataVersion: repoEntryMetadataVersion}
+	if repoEntryMetadataCurrent(stripped) {
+		t.Fatal("a version 4 entry without installed_size must be rescanned")
+	}
+	if repoEntryMetadataCurrent(RepoEntry{Name: "mpv", InstalledSize: 1, MetadataVersion: repoEntryMetadataVersion - 1}) {
+		t.Fatal("an older metadata version is never current")
 	}
 }

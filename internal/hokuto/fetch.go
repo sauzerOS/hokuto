@@ -1215,7 +1215,7 @@ func recordFetchedUploadCacheEntry(path, sum string) {
 	}
 	filename := filepath.Base(path)
 	for _, entry := range index {
-		if entry.Filename == filename && entry.B3Sum == sum && entry.MetadataVersion >= repoEntryMetadataVersion {
+		if entry.Filename == filename && entry.B3Sum == sum && repoEntryMetadataCurrent(entry) {
 			recordUploadCacheEntry(path, entry)
 			return
 		}

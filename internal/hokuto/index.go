@@ -132,6 +132,17 @@ func GetSystemVariantForPackage(cfg *Config, pkgName string) string {
 //	4: installed_size, post_install_depends
 const repoEntryMetadataVersion = 4
 
+// repoEntryMetadataCurrent reports whether entry was written with everything
+// the current metadata version records, so it can be reused without scanning
+// its archive again. The version alone is not enough: a hokuto from before
+// version 4 that rewrites the index keeps metadata_version 4 on the entries
+// but drops the fields it does not know (an upload with 0.4.22 left 4789
+// entries without installed_size and post_install_depends). Every package
+// has a non-zero installed size, so an entry without one is rescanned.
+func repoEntryMetadataCurrent(entry RepoEntry) bool {
+	return entry.MetadataVersion >= repoEntryMetadataVersion && entry.InstalledSize > 0
+}
+
 // repoEntryDependsMetadataVersion is the first metadata version with a
 // scanned depends list. Clients check this one, not repoEntryMetadataVersion,
 // so an index that has not been reindexed yet does not make them download
