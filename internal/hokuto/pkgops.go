@@ -1177,14 +1177,10 @@ func handlePreInstallUninstall(pkgName string, cfg *Config, execCtx *Executor, f
 
 	// --- Now, only proceed if there are real packages to uninstall ---
 	if len(depsToActuallyUninstall) > 0 {
-		// Only print if not in parallel/force mode to avoid terminal clutter
-		if !forceYes || logger == os.Stdout {
-			fcPrintf(logger, colArrow, "-> ")
-			// The message is now more accurate, as it only lists packages we KNOW are installed.
-			fcPrintf(logger, colSuccess, "Uninstalling")
-			fcPrintf(logger, colNote, " %v", strings.Join(depsToActuallyUninstall, ", "))
-			fcPrintf(logger, colSuccess, " to avoid install conflicts\n")
-		}
+		// Only in debug mode: it is routine (every python-* package removes
+		// its old copy first) and printed under the install progress bar,
+		// which it pushed onto a new line for each such package.
+		debugf("Uninstalling %s to avoid install conflicts\n", strings.Join(depsToActuallyUninstall, ", "))
 
 		removingSet := make(map[string]bool, len(depsToActuallyUninstall))
 		for _, dep := range depsToActuallyUninstall {
