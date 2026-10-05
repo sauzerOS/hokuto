@@ -407,7 +407,11 @@ func Main() {
 		if len(os.Args) >= 3 {
 			switch os.Args[2] {
 			case "install":
-				printInstallCompletionCandidates(cfg)
+				word := ""
+				if len(os.Args) >= 4 {
+					word = os.Args[3]
+				}
+				printInstallCompletionCandidates(cfg, word)
 			case "log":
 				printLogCompletionCandidates(cfg)
 			}
