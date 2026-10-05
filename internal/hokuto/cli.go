@@ -1550,6 +1550,7 @@ func Main() {
 		var verboseLong = updateCmd.Bool("verbose", false, "Enable verbose output.")
 		var remote = updateCmd.Bool("remote", false, "Check for updates from remote binary mirror only.")
 		var buildMissingBinaries = updateCmd.Bool("build-missing-binaries", false, "Build current repository packages missing from the binary cache and remote mirror.")
+		var indexBuilds = updateCmd.Bool("index", false, "With --build-missing-binaries: update the github.io build status table, as build --index does.")
 		var yes = updateCmd.Bool("y", false, "Assume 'yes' to all prompts.")
 		var yesLong = updateCmd.Bool("yes", false, "Assume 'yes' to all prompts.")
 
@@ -1609,6 +1610,9 @@ func Main() {
 			}
 			if *verbose || *verboseLong {
 				buildArgs = append(buildArgs, "--verbose")
+			}
+			if *indexBuilds {
+				buildArgs = append(buildArgs, "--index")
 			}
 			if err := buildMissingRepositoryBinaries(cfg, buildArgs, effectiveYes); err != nil {
 				fmt.Fprintf(os.Stderr, "Missing binary build failed: %v\n", err)

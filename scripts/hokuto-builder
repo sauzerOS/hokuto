@@ -508,6 +508,10 @@ cmd_rebuild() {
             args+=("$arg")
         fi
     done
+    # Build status goes to the website from the optimized container only,
+    # as with build.
+    local rebuild_flags=()
+    [ "$VARIANT" = optimized ] && rebuild_flags+=(--index)
     # shellcheck disable=SC2016
     nspawn_run "$BUILD_USER" /bin/sh -c "$LEFTOVER_FUNCS"'
         upload=$1
@@ -524,7 +528,7 @@ cmd_rebuild() {
         fi
         remove_leftovers
         exit "$status"
-    ' hokuto-builder-rebuild "$upload" "${args[@]}"
+    ' hokuto-builder-rebuild "$upload" "${rebuild_flags[@]}" "${args[@]}"
 }
 
 # hokuto cross-sync: build the native aarch64 packages, or with -system the
