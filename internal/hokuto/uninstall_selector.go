@@ -6,7 +6,9 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
@@ -41,15 +43,24 @@ func (w *tuiLogWriter) Write(p []byte) (int, error) {
 	return w.ansi.Write(p)
 }
 
-type uninstallListEntry struct {
+// installedListEntry is one row of "hokuto list": an installed package or
+// metapackage.
+type installedListEntry struct {
 	Name      string
+	Version   string
 	Size      int64
 	HasSize   bool
+	Platform  string // arch and variant, "x86_64 native (multi)"
+	BuildTime string
 	Meta      string
 	Protected bool
+	IsMeta    bool
 }
 
-func installedUninstallListEntries() ([]uninstallListEntry, error) {
+// installedListEntries lists the installed packages and metapackages, sorted
+// by name. Sizes come from installedPackageSizes (the size recorded at
+// install), not from walking manifests.
+func installedListEntries() ([]installedListEntry, error) {
 	entries, err := os.ReadDir(Installed)
 	if err != nil && !os.IsNotExist(err) {
 		return nil, fmt.Errorf("failed to read installed packages: %w", err)
@@ -63,35 +74,94 @@ func installedUninstallListEntries() ([]uninstallListEntry, error) {
 	}
 	sizes := installedPackageSizes(names)
 
-	var result []uninstallListEntry
-	for _, entry := range entries {
-		if !entry.IsDir() {
-			continue
-		}
-		name := entry.Name()
+	var result []installedListEntry
+	for _, name := range names {
 		version := "unknown"
 		if data, readErr := os.ReadFile(filepath.Join(Installed, name, "version")); readErr == nil {
 			version = strings.TrimSpace(string(data))
 		}
-		size := sizes[name]
+		size, hasSize := sizes[name]
 		protected := name == protectedBasePackage
+		meta := ""
 		if protected {
-			version += " | protected base filesystem"
+			meta = "protected base filesystem"
 		}
-		result = append(result, uninstallListEntry{Name: name, Size: size, HasSize: true, Meta: version, Protected: protected})
+		result = append(result, installedListEntry{
+			Name:      name,
+			Version:   version,
+			Size:      size,
+			HasSize:   hasSize,
+			Platform:  installedPackagePlatform(name),
+			BuildTime: installedPackageBuildTime(name),
+			Meta:      meta,
+			Protected: protected,
+		})
 	}
 	for _, name := range installedMetaPackageNames() {
-		meta := "metapackage"
-		if pkg, ok := readInstalledMetaPackageMarker(name); ok && pkg.Description != "" {
-			meta += " | " + pkg.Description
+		meta := ""
+		if pkg, ok := readInstalledMetaPackageMarker(name); ok {
+			meta = pkg.Description
 		}
-		result = append(result, uninstallListEntry{Name: name, Meta: meta})
+		result = append(result, installedListEntry{Name: name, Version: "metapackage", Meta: meta, IsMeta: true})
 	}
 	sort.Slice(result, func(i, j int) bool { return result[i].Name < result[j].Name })
 	return result, nil
 }
 
-func sortUninstallListEntries(entries []uninstallListEntry, sortMode string) {
+// installedPackagePlatform is the arch and variant a package was built for,
+// read from its pkginfo: "x86_64 native", "x86_64 generic (multi)".
+func installedPackagePlatform(name string) string {
+	data, err := os.ReadFile(filepath.Join(Installed, name, "pkginfo"))
+	if err != nil {
+		return "? ?"
+	}
+	meta := ParsePkgInfo(data)
+	arch := meta["arch"]
+	if arch == "" {
+		arch = "?"
+	}
+	variant := "native"
+	if meta["generic"] == "1" {
+		variant = "generic"
+	}
+	if meta["multilib"] == "1" {
+		variant += " (multi)"
+	}
+	return arch + " " + variant
+}
+
+// installedPackageBuildTime is how long the package took to build, as
+// recorded at build time, or "" when unknown.
+func installedPackageBuildTime(name string) string {
+	data, err := os.ReadFile(filepath.Join(Installed, name, "buildtime"))
+	if err != nil {
+		return ""
+	}
+	raw := strings.TrimSpace(string(data))
+	if raw == "" {
+		return ""
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		// Old format: plain float seconds.
+		if secs, err := strconv.ParseFloat(raw, 64); err == nil {
+			return fmt.Sprintf("%.2fs", secs)
+		}
+		return raw
+	}
+	switch {
+	case d >= time.Minute:
+		return d.Truncate(time.Second).String()
+	case d >= time.Second:
+		return fmt.Sprintf("%.2fs", d.Seconds())
+	case d >= time.Millisecond:
+		return fmt.Sprintf("%.2fms", float64(d)/float64(time.Millisecond))
+	default:
+		return d.Truncate(time.Microsecond).String()
+	}
+}
+
+func sortInstalledListEntries(entries []installedListEntry, sortMode string) {
 	sort.SliceStable(entries, func(i, j int) bool {
 		if sortMode == "alphabetical" {
 			return entries[i].Name < entries[j].Name
@@ -109,7 +179,7 @@ func sortUninstallListEntries(entries []uninstallListEntry, sortMode string) {
 	})
 }
 
-func uninstallSortLabel(sortMode string) string {
+func installedListSortLabel(sortMode string) string {
 	switch sortMode {
 	case "size-desc":
 		return "size ↓"
@@ -182,7 +252,11 @@ func orderPackagesForUninstall(packages []string) []string {
 	return ordered
 }
 
-func selectPackagesToUninstall(entries []uninstallListEntry, cfg *Config, initialForce bool) error {
+// runInstalledPackagesTUI is "hokuto list" on a terminal: the installed
+// packages, searchable and sortable, selectable for removal. sortMode is the
+// initial order (alphabetical, size-desc or size-asc) and search the initial
+// search.
+func runInstalledPackagesTUI(entries []installedListEntry, cfg *Config, sortMode, search string, initialForce bool) error {
 	if !term.IsTerminal(int(os.Stdout.Fd())) {
 		return fmt.Errorf("interactive package selection requires a terminal")
 	}
@@ -191,7 +265,7 @@ func selectPackagesToUninstall(entries []uninstallListEntry, cfg *Config, initia
 	}
 
 	selected := make(map[string]bool, len(entries))
-	sortMode := "alphabetical"
+	sortInstalledListEntries(entries, sortMode)
 	force := initialForce
 	busy := false
 	app := tview.NewApplication()
@@ -203,7 +277,8 @@ func selectPackagesToUninstall(entries []uninstallListEntry, cfg *Config, initia
 		AddPage("status", status, true, true).
 		AddPage("search", searchInput, true, false)
 	searching := false
-	searchQuery := ""
+	searchQuery := search
+	searchInput.SetText(search)
 	var visibleIndices []int
 	logView := tview.NewTextView().SetDynamicColors(true).SetScrollable(true)
 	logView.SetBorder(true).SetTitle(" Uninstall Log ")
@@ -241,21 +316,39 @@ func selectPackagesToUninstall(entries []uninstallListEntry, cfg *Config, initia
 		}
 		table.SetCell(row, 0, tview.NewTableCell(tview.Escape(mark)).SetTextColor(markColor).SetExpansion(0))
 		table.SetCell(row, 1, tview.NewTableCell(entries[entryIndex].Name).SetTextColor(nameColor).SetExpansion(1))
-		table.SetCell(row, 2, tview.NewTableCell(humanReadableSize(entries[entryIndex].Size)).SetTextColor(tcell.ColorYellow).SetExpansion(0).SetAlign(tview.AlignRight))
-		table.SetCell(row, 3, tview.NewTableCell(entries[entryIndex].Meta).SetTextColor(tcell.ColorGray).SetExpansion(0))
+		entry := entries[entryIndex]
+		versionColor := tcell.ColorGreen
+		if entry.IsMeta {
+			versionColor = tcell.ColorGray
+		}
+		size := ""
+		if entry.HasSize {
+			size = humanReadableSize(entry.Size)
+		} else if !entry.IsMeta {
+			size = "?"
+		}
+		table.SetCell(row, 2, tview.NewTableCell(tview.Escape(entry.Version)).SetTextColor(versionColor).SetExpansion(0))
+		table.SetCell(row, 3, tview.NewTableCell(size).SetTextColor(tcell.ColorYellow).SetExpansion(0).SetAlign(tview.AlignRight))
+		table.SetCell(row, 4, tview.NewTableCell(tview.Escape(entry.Platform)).SetTextColor(tcell.ColorDarkCyan).SetExpansion(0))
+		table.SetCell(row, 5, tview.NewTableCell(entry.BuildTime).SetTextColor(tcell.ColorYellow).SetExpansion(0).SetAlign(tview.AlignRight))
+		table.SetCell(row, 6, tview.NewTableCell(tview.Escape(entry.Meta)).SetTextColor(tcell.ColorGray).SetExpansion(0))
 	}
 	refreshStatus = func() {
 		mode := "[green]normal[white]"
 		if force {
 			mode = "[red]force[white]"
 		}
-		status.SetText(fmt.Sprintf("[gray]Space toggles, a selects all, n selects none, / searches, s sorts size, S sorts alphabetically, f toggles mode, u uninstalls, o cleans orphans, l toggles log, q quits.\nMode: %s | Sort: %s", mode, uninstallSortLabel(sortMode)))
+		status.SetText(fmt.Sprintf("[gray]Space toggles, a selects all, n selects none, / searches, s sorts size, S sorts alphabetically, f toggles mode, u uninstalls, o cleans orphans, l toggles log, q quits.\nMode: %s | Sort: %s", mode, installedListSortLabel(sortMode)))
 	}
 	refreshTable := func() {
 		table.Clear()
-		table.SetTitle(" Installed Packages | " + uninstallSortLabel(sortMode) + " ")
 		visibleIndices = visibleIndices[:0]
 		query := strings.ToLower(strings.TrimSpace(searchQuery))
+		title := " Installed Packages | " + installedListSortLabel(sortMode) + " "
+		if query != "" {
+			title += "| search: " + tview.Escape(query) + " "
+		}
+		table.SetTitle(title)
 		for i := range entries {
 			if query != "" && !strings.Contains(strings.ToLower(entries[i].Name), query) {
 				continue
@@ -284,6 +377,29 @@ func selectPackagesToUninstall(entries []uninstallListEntry, cfg *Config, initia
 	refreshStatus()
 
 	runUninstall := func(packages []string, forceMode bool, actionName string) {
+		// "hokuto list" starts unprivileged: authenticate on the first
+		// removal, with the interface suspended so sudo or run0 can prompt.
+		if os.Geteuid() != 0 && activePrivilegeBackend == privilegeBackendUnset {
+			var authErr error
+			if !app.Suspend(func() { authErr = authenticateOnce(false) }) {
+				authErr = fmt.Errorf("unable to suspend the interface for authentication")
+			}
+			if authErr != nil {
+				fcPrintf(logger, colArrow, "-> ")
+				fcPrintf(logger, colError, "ERROR: ")
+				fcPrintf(logger, colSuccess, "authentication failed: %v\n", authErr)
+				app.QueueUpdateDraw(func() {
+					busy = false
+					logStatus = "[red]Authentication failed. l to return or press q to quit.[white]"
+					if showingLog {
+						status.SetText(logStatus)
+					} else {
+						refreshStatus()
+					}
+				})
+				return
+			}
+		}
 		defer func() { isCriticalAtomic.Store(0) }()
 		isCriticalAtomic.Store(1)
 		packages = orderPackagesForUninstall(packages)
@@ -443,13 +559,13 @@ func selectPackagesToUninstall(entries []uninstallListEntry, cfg *Config, initia
 				} else {
 					sortMode = "size-desc"
 				}
-				sortUninstallListEntries(entries, sortMode)
+				sortInstalledListEntries(entries, sortMode)
 				refreshTable()
 				refreshStatus()
 				return nil
 			case 'S':
 				sortMode = "alphabetical"
-				sortUninstallListEntries(entries, sortMode)
+				sortInstalledListEntries(entries, sortMode)
 				refreshTable()
 				refreshStatus()
 				return nil

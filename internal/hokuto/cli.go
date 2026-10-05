@@ -549,6 +549,8 @@ func Main() {
 		var remote = lsCmd.Bool("remote", false, "List packages from the remote repository.")
 		var sortSize = lsCmd.Bool("size", false, "Sort packages by size, largest first.")
 		var checkIntegrity = lsCmd.Bool("check-integrity", false, "Check installed manifests for missing or modified files and offer to reinstall affected packages.")
+		var force = lsCmd.Bool("f", false, "Start the interactive list in force mode (uninstall ignores dependency checks).")
+		var forceLong = lsCmd.Bool("force", false, "Start the interactive list in force mode (uninstall ignores dependency checks).")
 		if err := lsCmd.Parse(os.Args[2:]); err != nil {
 			fmt.Fprintf(os.Stderr, "Error parsing ls flags: %v\n", err)
 			exitHokuto(1)
@@ -573,7 +575,7 @@ func Main() {
 				exitCode = 1
 			}
 		} else {
-			if err := listPackages(pkg, *sortSize); err != nil {
+			if err := listPackages(pkg, *sortSize, cfg, *force || *forceLong); err != nil {
 				// If it's the "not found" error, the friendly message was already printed.
 				if errors.Is(err, errPackageNotFound) {
 					exitCode = 1
@@ -1418,7 +1420,6 @@ func Main() {
 		uninstallCmd := flag.NewFlagSet("uninstall", flag.ExitOnError)
 		var force = uninstallCmd.Bool("f", false, "Force uninstallation, ignoring dependency checks.")
 		var yes = uninstallCmd.Bool("y", false, "Assume 'yes' to all prompts.")
-		var list = uninstallCmd.Bool("list", false, "Select installed packages to uninstall in an interactive interface.")
 		var purge = uninstallCmd.Bool("p", false, "Also remove the packages the removal leaves orphaned.")
 		var purgeLong = uninstallCmd.Bool("purge", false, "Also remove the packages the removal leaves orphaned.")
 		// Also support long flags for consistency
@@ -1433,23 +1434,6 @@ func Main() {
 		packagesToUninstall := uninstallCmd.Args()
 		effectiveForce := *force || *forceLong
 		effectiveYes := *yes || *yesLong
-		if *list {
-			if len(packagesToUninstall) > 0 {
-				fmt.Fprintln(os.Stderr, "Error: --list cannot be combined with package arguments.")
-				exitHokuto(1)
-			}
-			entries, err := installedUninstallListEntries()
-			if err != nil {
-				fmt.Fprintln(os.Stderr, "Error listing installed packages:", err)
-				exitHokuto(1)
-			}
-			if err := selectPackagesToUninstall(entries, cfg, effectiveForce); err != nil {
-				fmt.Fprintln(os.Stderr, "Error selecting packages:", err)
-				exitHokuto(1)
-			}
-			break
-		}
-
 		if len(packagesToUninstall) == 0 {
 			fmt.Println("Usage: hokuto uninstall [options] <pkgname> [pkgname...]")
 			fmt.Println("Options:")

@@ -16,9 +16,9 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/gookit/color"
+	"golang.org/x/term"
 )
 
 type packageIntegrityIssue struct {
@@ -247,166 +247,63 @@ func checkInstalledPackageIntegrity(searchTerm string, cfg *Config) error {
 	return nil
 }
 
-func listPackages(searchTerm string, sortBySize bool) error {
-	// Step 1: Always get the full list of installed package directories first.
-	entries, err := os.ReadDir(Installed)
+// listPackages is "hokuto list": on a terminal, the interactive list of
+// installed packages (search, sort, select and uninstall); otherwise the
+// plain list, for scripts.
+func listPackages(searchTerm string, sortBySize bool, cfg *Config, force bool) error {
+	entries, err := installedListEntries()
 	if err != nil {
-		// Handle cases where the 'Installed' directory might not exist yet
-		if os.IsNotExist(err) {
-			fmt.Println("No packages installed.")
-			return nil
-		}
 		return err
 	}
-
-	var allPkgs []string
-	for _, e := range entries {
-		if e.IsDir() {
-			allPkgs = append(allPkgs, e.Name())
-		}
-	}
-
-	// Step 2: Filter the list if a search term was provided.
-	var pkgsToShow []string
-	if searchTerm != "" {
-		// Partial matching
-		for _, pkg := range allPkgs {
-			if strings.Contains(pkg, searchTerm) {
-				pkgsToShow = append(pkgsToShow, pkg)
-			}
-		}
-	} else {
-		// If no search term, show everything
-		pkgsToShow = allPkgs
-	}
-
-	// Step 3: Handle the case where no packages were found after filtering.
-	if len(pkgsToShow) == 0 {
-		if searchTerm != "" {
-			colArrow.Print("-> ")
-			colSuccess.Printf("No packages found matching: %s\n", searchTerm)
-			// --- MODIFICATION: Return the specific sentinel error ---
-			return errPackageNotFound
-		}
+	if len(entries) == 0 {
+		fmt.Println("No packages installed.")
 		return nil
 	}
-
-	// Step 4: Collect the information for the final list of packages.
-	sizes := installedPackageSizes(pkgsToShow)
-	var output []SortablePagerLine
-	for _, p := range pkgsToShow {
-		versionFile := filepath.Join(Installed, p, "version")
-		versionInfo := "unknown"
-		if data, err := os.ReadFile(versionFile); err == nil {
-			versionInfo = strings.TrimSpace(string(data))
-		}
-
-		sizeInfo := "?"
-		sizeBytes := int64(0)
-		hasSize := false
-		if total, ok := sizes[p]; ok {
-			sizeInfo = humanReadableSize(total)
-			sizeBytes = total
-			hasSize = true
-		}
-
-		// Read pkginfo for Arch/Variant
-		pkgInfoFile := filepath.Join(Installed, p, "pkginfo")
-		arch := "?"
-		variantDisplay := "?"
-		multiSuffix := ""
-
-		if data, err := os.ReadFile(pkgInfoFile); err == nil {
-			meta := ParsePkgInfo(data)
-			if v, ok := meta["arch"]; ok {
-				arch = v
-			}
-
-			// Compute variant display string
-			isGeneric := meta["generic"] == "1"
-			isMultilib := meta["multilib"] == "1"
-			variant := "optimized"
-			if isGeneric {
-				variant = "generic"
-			}
-
-			variantDisplay = variant
-			if variantDisplay == "optimized" {
-				variantDisplay = "native"
-			}
-
-			if isMultilib {
-				multiSuffix = " (multi)"
+	if searchTerm != "" {
+		found := false
+		for _, entry := range entries {
+			if strings.Contains(strings.ToLower(entry.Name), strings.ToLower(searchTerm)) {
+				found = true
+				break
 			}
 		}
-
-		// Read buildtime (duration string) if present.
-		buildtimeFile := filepath.Join(Installed, p, "buildtime")
-		buildtimeStr := ""
-
-		if data, err := os.ReadFile(buildtimeFile); err == nil {
-			raw := strings.TrimSpace(string(data))
-			if raw != "" {
-				// Try to parse the content as a time.Duration string.
-				if d, err := time.ParseDuration(raw); err == nil {
-
-					// Apply formatting rules based on magnitude:
-					if d >= time.Minute {
-						// >= 1 minute: Truncate to the nearest whole second (e.g., 18m53s)
-						buildtimeStr = d.Truncate(time.Second).String()
-					} else if d >= time.Second {
-						// 1s to 59s: Convert to raw seconds and format with 2 decimal places (e.g., 8.15s)
-						buildtimeStr = fmt.Sprintf("%.2fs", d.Seconds())
-					} else if d >= time.Millisecond {
-						// 1ms to 999ms: Format using milliseconds with limited precision (e.g., 35.29ms)
-						// This converts to floating point milliseconds and formats with 2 decimal places.
-						buildtimeStr = fmt.Sprintf("%.2fms", float64(d)/float64(time.Millisecond))
-					} else {
-						// < 1ms: Use the standard duration string (e.g., 476µs or 500ns)
-						// Truncate to the nearest microsecond to keep it clean.
-						buildtimeStr = d.Truncate(time.Microsecond).String()
-					}
-
-				} else {
-					// Fallback for old format (plain float seconds)
-					if secs, err := strconv.ParseFloat(raw, 64); err == nil {
-						buildtimeStr = fmt.Sprintf("%.2fs", secs)
-					} else {
-						// Fallback: show the raw value.
-						buildtimeStr = raw
-					}
-				}
-			}
+		if !found {
+			colArrow.Print("-> ")
+			colSuccess.Printf("No packages found matching: %s\n", searchTerm)
+			return errPackageNotFound
 		}
-
-		// Add to output slice
-		prefix := colArrow.Sprint("->")
-
-		// Format: -> Name Version Arch Variant(multi) [BuildTime]
-		pkgStr := fmt.Sprintf("%s %s %s %s",
-			prefix,
-			colSuccess.Sprintf("%-25s", fitPackageListColumn(p, 25)),
-			colNote.Sprintf("%-15s", fitPackageListColumn(versionInfo, 15)),
-			color.Yellow.Sprintf("%10s", sizeInfo))
-		pkgStr += fmt.Sprintf(" %s",
-			color.Cyan.Sprintf("%-10s %s%s",
-				fitPackageListColumn(arch, 10),
-				variantDisplay,
-				multiSuffix))
-
-		if buildtimeStr != "" {
-			pkgStr += fmt.Sprintf(" %s", color.Yellow.Sprint(buildtimeStr))
-		}
-
-		output = append(output, SortablePagerLine{
-			Line:    pkgStr,
-			Name:    p,
-			Size:    sizeBytes,
-			HasSize: hasSize,
-		})
 	}
 
-	return RunSortablePager("Installed Packages", output, sortBySize)
+	sortMode := "alphabetical"
+	if sortBySize {
+		sortMode = "size-desc"
+	}
+	if term.IsTerminal(int(os.Stdout.Fd())) {
+		return runInstalledPackagesTUI(entries, cfg, sortMode, searchTerm, force)
+	}
+
+	sortInstalledListEntries(entries, sortMode)
+	for _, entry := range entries {
+		if entry.IsMeta || (searchTerm != "" && !strings.Contains(entry.Name, searchTerm)) {
+			continue
+		}
+		sizeInfo := "?"
+		if entry.HasSize {
+			sizeInfo = humanReadableSize(entry.Size)
+		}
+		arch, variant, _ := strings.Cut(entry.Platform, " ")
+		line := fmt.Sprintf("%s %s %s %s %s",
+			colArrow.Sprint("->"),
+			colSuccess.Sprintf("%-25s", fitPackageListColumn(entry.Name, 25)),
+			colNote.Sprintf("%-15s", fitPackageListColumn(entry.Version, 15)),
+			color.Yellow.Sprintf("%10s", sizeInfo),
+			color.Cyan.Sprintf("%-10s %s", fitPackageListColumn(arch, 10), variant))
+		if entry.BuildTime != "" {
+			line += " " + color.Yellow.Sprint(entry.BuildTime)
+		}
+		fmt.Println(line)
+	}
+	return nil
 }
 
 func FetchRemoteIndex(cfg *Config) ([]RepoEntry, error) {

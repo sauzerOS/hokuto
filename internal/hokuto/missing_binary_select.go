@@ -1,7 +1,7 @@
 package hokuto
 
 // Selection for `hokuto update --build-missing-binaries`: a full-screen list
-// like `hokuto uninstall --list`, with a blacklist. A blacklisted package is
+// like `hokuto list`, with a blacklist. A blacklisted package is
 // left out of later runs until its recipe's version or revision changes.
 
 import (

@@ -113,7 +113,7 @@ func TestSelectableEntryMatchesPathCaseInsensitively(t *testing.T) {
 		t.Fatal("expected search to be case-insensitive")
 	}
 	if selectableEntryMatches(entry, "modified") {
-		t.Fatal("search should filter by the displayed path like uninstall --list filters by package name")
+		t.Fatal("search should filter by the displayed path like hokuto list filters by package name")
 	}
 }
 
