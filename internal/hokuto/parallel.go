@@ -1106,17 +1106,19 @@ func (pm *ParallelManager) canBuildWithPolicy(pkgName string, acceptInstalledPen
 	if pm.BuildPlan.NoDeps {
 		return true
 	}
-	if pm.BuildPlan.BinaryPackages[pkgName] {
-		return true
-	}
 
-	// Check manual prerequisites from hokuto.update
+	// Prerequisites: the order from hokuto.update, and what an installed or
+	// binary dependency needs that this run builds (resolveBuildPlan). A
+	// binary package waits for them too.
 	if prereqs, ok := pm.BuildPlan.ManualPrereqs[pkgName]; ok {
 		for _, prereq := range prereqs {
 			if !pm.Completed[prereq] {
 				return false
 			}
 		}
+	}
+	if pm.BuildPlan.BinaryPackages[pkgName] {
+		return true
 	}
 
 	pkgDir, err := findPackageDir(pkgName)

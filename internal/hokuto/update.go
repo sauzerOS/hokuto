@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -2043,7 +2044,18 @@ func applyUpdateOrder(pkgNames []string) ([]string, map[string][]string) {
 
 func prepareUpdateBuildPlan(plan *BuildPlan, order []string, manualPrereqs map[string][]string, cfg *Config) map[string][]string {
 	plan.Order = order
-	plan.ManualPrereqs = manualPrereqs
+	// Merged: the plan may already hold prerequisites of its own
+	// (resolveBuildPlan's, for runtime dependencies of installed packages).
+	if plan.ManualPrereqs == nil {
+		plan.ManualPrereqs = make(map[string][]string)
+	}
+	for pkgName, prereqs := range manualPrereqs {
+		for _, prereq := range prereqs {
+			if !slices.Contains(plan.ManualPrereqs[pkgName], prereq) {
+				plan.ManualPrereqs[pkgName] = append(plan.ManualPrereqs[pkgName], prereq)
+			}
+		}
+	}
 	splitDepsBySource := collectSplitDependenciesForPlan(plan, cfg)
 	addPostRebuildSplitDependencies(plan, splitDepsBySource)
 	return splitDepsBySource

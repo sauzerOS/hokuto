@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -1665,6 +1666,27 @@ func resolveBuildPlan(targetPackages []string, userRequestedPackages map[string]
 	}
 
 	var processPkg func(pkgName string) error
+
+	// requirePlannedRuntimeDeps puts the runtime dependencies of provider
+	// (an installed package, or a binary of this plan) that are missing and
+	// built in this plan ahead of pkgName: first in the order, and as its
+	// prerequisites for the parallel builder, whose own check reads only
+	// pkgName's recipe.
+	requirePlannedRuntimeDeps := func(pkgName, provider string, deps []DepSpec) error {
+		for _, planned := range plannedRuntimeDeps(deps, sourceBuildPackages) {
+			if planned == pkgName || sameSourcePackage(planned, provider) {
+				continue
+			}
+			if err := processPkg(planned); err != nil {
+				return err
+			}
+			if !slices.Contains(plan.ManualPrereqs[pkgName], planned) {
+				plan.ManualPrereqs[pkgName] = append(plan.ManualPrereqs[pkgName], planned)
+			}
+		}
+		return nil
+	}
+
 	processPkg = func(pkgName string) error {
 		// --- SMART CYCLE DETECTION ---
 		// If we are already in the middle of processing this package, just return.
@@ -1698,6 +1720,14 @@ func resolveBuildPlan(targetPackages []string, userRequestedPackages map[string]
 		// metadata is authoritative and is handled by pkgInstall.
 		if binaryAvailable != nil && binaryAvailable[pkgName] && !plan.RebuildPackages[pkgName] {
 			plan.BinaryPackages[pkgName] = true
+			// What the archive needs that this plan builds comes first.
+			if (sourceBuildPackages[pkgName] || !isInstalled) && !alreadyInOrder[pkgName] {
+				if archiveDeps, found, _ := resolveBinaryDependenciesFromArchive(pkgName, cfg, nil, true); found {
+					if err := requirePlannedRuntimeDeps(pkgName, pkgName, archiveDeps); err != nil {
+						return err
+					}
+				}
+			}
 			if (sourceBuildPackages[pkgName] || !isInstalled) && !alreadyInOrder[pkgName] {
 				plan.Order = append(plan.Order, pkgName)
 				alreadyInOrder[pkgName] = true
@@ -1886,6 +1916,17 @@ func resolveBuildPlan(targetPackages []string, userRequestedPackages map[string]
 			if err := processPkg(depName); err != nil {
 				return err
 			}
+			// An installed dependency can still lack runtime dependencies this
+			// plan builds: gparted needs the gtkmm3 binary installed for it,
+			// which needs glibmm-2.66, built here. Without this gparted was
+			// built first, against a gtkmm3 missing its libraries.
+			if !alreadyInOrder[depName] && isPackageInstalled(depName) {
+				if installedDeps, err := parseDependsFile(filepath.Join(Installed, depName)); err == nil {
+					if err := requirePlannedRuntimeDeps(pkgName, depName, installedDeps); err != nil {
+						return err
+					}
+				}
+			}
 		}
 
 		// Now, decide if the package itself needs to be in the build order.
@@ -1921,6 +1962,42 @@ func resolveBuildPlan(targetPackages []string, userRequestedPackages map[string]
 	prunePostRebuilds(plan)
 
 	return plan, nil
+}
+
+// plannedRuntimeDeps lists the hard runtime dependencies in deps that are
+// not installed and that the plan builds (planned): the name itself, its
+// ==2.66* parallel name (glibmm-2.66), or a parallel name of it for a
+// constraint (glew-2 for glew<2.3).
+func plannedRuntimeDeps(deps []DepSpec, planned map[string]bool) []string {
+	var result []string
+	add := func(name string) {
+		if !slices.Contains(result, name) {
+			result = append(result, name)
+		}
+	}
+	for _, dep := range deps {
+		if dep.Make || dep.Optional || dep.Rebuild || dep.PostInstall || dep.Suggest || dep.Name == "" {
+			continue
+		}
+		if findInstalledDependencySatisfying(dep.Name, dep.Op, dep.Version) != "" {
+			continue
+		}
+		if planned[dep.Name] {
+			add(dep.Name)
+			continue
+		}
+		if dep.Op == "" {
+			continue
+		}
+		for target := range planned {
+			if base, line, ok := splitVersionedPackageName(target); ok && base == dep.Name &&
+				(versionSatisfies(line, dep.Op, dep.Version) || strings.HasPrefix(dep.Version, line)) {
+				add(target)
+			}
+		}
+	}
+	sort.Strings(result)
+	return result
 }
 
 func prunePostRebuilds(plan *BuildPlan) {
