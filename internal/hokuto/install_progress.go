@@ -14,22 +14,32 @@ import (
 // nothing.
 type installProgress struct {
 	bar        *progressbar.ProgressBar
+	verb       string
 	lineActive bool
 	deactivate func()
 }
 
 func newInstallProgress(total int) *installProgress {
+	return newPackageProgress(total, "Installing")
+}
+
+// newRemoveProgress is the same bar for "hokuto uninstall --purge".
+func newRemoveProgress(total int) *installProgress {
+	return newPackageProgress(total, "Removing")
+}
+
+func newPackageProgress(total int, verb string) *installProgress {
 	if total <= 0 {
 		return nil
 	}
-	p := &installProgress{}
+	p := &installProgress{verb: verb}
 	// progressbar.Default without its 65 ms throttle: with it, a label set
 	// while packages go by quickly was not drawn, and a slow post-install
 	// hook that followed sat under the name of an earlier package
 	// (shared-mime-info's 3 s update-mime-database looked like x265
 	// hanging). The bar is redrawn once per package.
 	p.bar = progressbar.NewOptions64(int64(total),
-		progressbar.OptionSetDescription(colSuccess.Sprint("Installing Packages")),
+		progressbar.OptionSetDescription(colSuccess.Sprint(verb+" Packages")),
 		progressbar.OptionSetWriter(os.Stderr),
 		progressbar.OptionSetWidth(10),
 		progressbar.OptionShowCount(),
@@ -60,7 +70,7 @@ func (p *installProgress) start(pkgName string) {
 	if p == nil {
 		return
 	}
-	p.bar.Describe(colSuccess.Sprint("Installing ") + colNote.Sprint(pkgName))
+	p.bar.Describe(colSuccess.Sprint(p.verb+" ") + colNote.Sprint(pkgName))
 	// Describe only stores the label; draw it now.
 	_ = p.bar.RenderBlank()
 	p.lineActive = true

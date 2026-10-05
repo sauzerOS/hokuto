@@ -360,6 +360,13 @@ func addMetaRuntimeRequirements(meta MetaPackage, required map[string]bool, seen
 // by reading the /var/db/hokuto/installed/<pkg>/depends file.
 
 func findOrphans() ([]string, error) {
+	return findOrphansWithout(nil)
+}
+
+// findOrphansWithout is findOrphans for the system as it will be once the
+// packages (and metapackages) in removing are gone: they keep nothing, and
+// are not listed themselves.
+func findOrphansWithout(removing map[string]bool) ([]string, error) {
 	// 1. Read World File
 	worldData, err := os.ReadFile(WorldFile)
 	if err != nil && !os.IsNotExist(err) {
@@ -380,15 +387,20 @@ func findOrphans() ([]string, error) {
 
 	// Initialize with World packages that are actually installed
 	for pkg := range worldPkgs {
-		if checkPackageExactMatch(pkg) {
+		if !removing[pkg] && checkPackageExactMatch(pkg) {
 			keepSet[pkg] = true
 			queue = append(queue, pkg)
 		}
 	}
 	metaRequired := make(map[string]bool)
-	addInstalledMetaRuntimeRequirements(metaRequired)
+	seenMetas := make(map[string]bool)
+	for _, meta := range installedMetaPackages() {
+		if !removing[meta.Name] {
+			addMetaRuntimeRequirements(meta, metaRequired, seenMetas)
+		}
+	}
 	for pkg := range metaRequired {
-		if checkPackageExactMatch(pkg) && !keepSet[pkg] {
+		if !removing[pkg] && checkPackageExactMatch(pkg) && !keepSet[pkg] {
 			keepSet[pkg] = true
 			queue = append(queue, pkg)
 		}
@@ -407,7 +419,7 @@ func findOrphans() ([]string, error) {
 
 		for _, dep := range deps {
 			// If dependency is installed and not yet kept
-			if !keepSet[dep] && checkPackageExactMatch(dep) {
+			if !keepSet[dep] && !removing[dep] && checkPackageExactMatch(dep) {
 				keepSet[dep] = true
 				queue = append(queue, dep)
 			}
@@ -426,7 +438,7 @@ func findOrphans() ([]string, error) {
 			continue
 		}
 		pkg := e.Name()
-		if !keepSet[pkg] {
+		if !keepSet[pkg] && !removing[pkg] {
 			orphans = append(orphans, pkg)
 		}
 	}

@@ -1414,6 +1414,8 @@ func Main() {
 		var force = uninstallCmd.Bool("f", false, "Force uninstallation, ignoring dependency checks.")
 		var yes = uninstallCmd.Bool("y", false, "Assume 'yes' to all prompts.")
 		var list = uninstallCmd.Bool("list", false, "Select installed packages to uninstall in an interactive interface.")
+		var purge = uninstallCmd.Bool("p", false, "Also remove the packages the removal leaves orphaned.")
+		var purgeLong = uninstallCmd.Bool("purge", false, "Also remove the packages the removal leaves orphaned.")
 		// Also support long flags for consistency
 		var forceLong = uninstallCmd.Bool("force", false, "Force uninstallation, ignoring dependency checks.")
 		var yesLong = uninstallCmd.Bool("yes", false, "Assume 'yes' to all prompts.")
@@ -1448,6 +1450,15 @@ func Main() {
 			fmt.Println("Options:")
 			uninstallCmd.PrintDefaults()
 			exitHokuto(1)
+		}
+
+		if *purge || *purgeLong {
+			if err := runPurgeUninstall(packagesToUninstall, cfg, effectiveForce, effectiveYes); err != nil {
+				colArrow.Print("-> ")
+				color.Light.Printf("Error: %v\n", err)
+				exitHokuto(1)
+			}
+			break
 		}
 
 		// critical section for the entire operation
