@@ -217,7 +217,7 @@ func pkgUninstallWithRemovalSet(pkgName string, cfg *Config, execCtx *Executor, 
 	if !yes {
 		fcPrintf(logger, colArrow, "-> ")
 		fcPrintf(logger, color.Danger, "About to remove package %s and %d file(s). Continue?", pkgName, fileCount)
-		fmt.Fprint(logger, " [Y/n]: ")
+		fmt.Fprint(logger, " "+colArrow.Sprint("[Y/n]")+": ")
 		var answer string
 		fmt.Scanln(&answer)
 		answer = strings.ToLower(strings.TrimSpace(answer))
@@ -340,7 +340,7 @@ func pkgUninstallWithRemovalSet(pkgName string, cfg *Config, execCtx *Executor, 
 
 			// Prompt user unless 'yes' is set
 			if !yes {
-				fmt.Fprintf(logger, "File content mismatch. Remove anyway? [Y/n]: ")
+				fmt.Fprint(logger, colSuccess.Sprint("File content mismatch. Remove anyway?")+" "+colArrow.Sprint("[Y/n]")+": ")
 				var answer string
 				fmt.Scanln(&answer)
 				answer = strings.ToLower(strings.TrimSpace(answer))

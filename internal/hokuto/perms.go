@@ -249,12 +249,12 @@ func ensureHokutoOwnership(cfg *Config, createCacheDirs bool) error {
 			}
 		}
 
-		// Inform user that ownership was fixed
-		colArrow.Print("-> ")
+		// Only in debug mode: it is routine, and printed in the middle of an
+		// install it pushed the progress bar onto a new line.
 		if len(pathsToFix) == 1 {
-			colSuccess.Printf("Fixed ownership for %s\n", pathsToFix[0])
+			debugf("Fixed ownership for %s\n", pathsToFix[0])
 		} else {
-			colSuccess.Printf("Fixed ownership for %d directories\n", len(pathsToFix))
+			debugf("Fixed ownership for %d directories\n", len(pathsToFix))
 			if Debug {
 				for _, p := range pathsToFix {
 					colNote.Printf("   - %s\n", p)

@@ -397,7 +397,8 @@ func askMissingBinaryScope() (bool, bool) {
 	scanner := bufio.NewScanner(os.Stdin)
 	for {
 		colArrow.Print("-> ")
-		colNote.Print("Check (a)ll repository packages or only packages with an existing binary? [E/a]: ")
+		colSuccess.Print("Check (a)ll repository packages or only packages with an existing binary?")
+		fmt.Print(" " + colArrow.Sprint("[E/a]") + ": ")
 		if !scanner.Scan() {
 			return false, false
 		}

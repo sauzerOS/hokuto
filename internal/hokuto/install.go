@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -1070,16 +1071,16 @@ func pkgInstallWithRemotePolicy(tarballPath, pkgName string, cfg *Config, execCt
 					if isSymlink && symlinkTarget != "" {
 						// Existing file is a symlink
 						if stagingIsSymlink && stagingSymlinkTarget != "" {
-							printChoicePrompt(styledPrompt("Symlink ", file+" -> "+symlinkTarget, " is already installed from ", conflictPkg, ":"), fmt.Sprintf("[K]eep %s symlink, [u]se %s symlink", conflictPkg, pkgName))
+							printKeyChoicePrompt(styledPrompt("Symlink ", file+" -> "+symlinkTarget, " is already installed from ", conflictPkg, ":"), fmt.Sprintf("[K]eep %s symlink, [u]se %s symlink", conflictPkg, pkgName))
 						} else {
-							printChoicePrompt(styledPrompt("Symlink ", file+" -> "+symlinkTarget, " is already installed from ", conflictPkg, ":"), fmt.Sprintf("[K]eep %s symlink, [u]se %s file", conflictPkg, pkgName))
+							printKeyChoicePrompt(styledPrompt("Symlink ", file+" -> "+symlinkTarget, " is already installed from ", conflictPkg, ":"), fmt.Sprintf("[K]eep %s symlink, [u]se %s file", conflictPkg, pkgName))
 						}
 					} else {
 						// Existing file is a regular file
 						if stagingIsSymlink && stagingSymlinkTarget != "" {
-							printChoicePrompt(styledPrompt("File ", file, " is already installed from ", conflictPkg, ":"), fmt.Sprintf("[K]eep %s file, [u]se %s symlink", conflictPkg, pkgName))
+							printKeyChoicePrompt(styledPrompt("File ", file, " is already installed from ", conflictPkg, ":"), fmt.Sprintf("[K]eep %s file, [u]se %s symlink", conflictPkg, pkgName))
 						} else {
-							printChoicePrompt(styledPrompt("File ", file, " is already installed from ", conflictPkg, ":"), fmt.Sprintf("[K]eep %s file, [u]se %s file", conflictPkg, pkgName))
+							printKeyChoicePrompt(styledPrompt("File ", file, " is already installed from ", conflictPkg, ":"), fmt.Sprintf("[K]eep %s file, [u]se %s file", conflictPkg, pkgName))
 						}
 					}
 					os.Stdout.Sync()
@@ -1167,7 +1168,7 @@ func pkgInstallWithRemotePolicy(tarballPath, pkgName string, cfg *Config, execCt
 
 			var input string
 			if (!yes && !skipAllPrompts) || fast {
-				printChoicePrompt(styledPrompt("File ", file, " was modified here (owner: ", ownerPkg, "). Choose:"), "[K]eep current, [u]se new, [b]ackup, [e]dit, use new for [A]ll")
+				printKeyChoicePrompt(styledPrompt("File ", file, " was modified here (owner: ", ownerPkg, "). Choose:"), "[K]eep current, [u]se new, [b]ackup, [e]dit, use new for [A]ll")
 				// Flush stdout to ensure prompt is visible
 				os.Stdout.Sync()
 				// Use the shared, robust bufio.Reader
@@ -2016,7 +2017,7 @@ func checkStagingConflicts(pkgName, stagingDir, rootDir, stagingManifest string,
 			for _, c := range conflicts {
 				fmt.Println("   " + colNote.Sprint(c.filePath))
 			}
-			printChoicePrompt(styledPrompt("Use the files of ", pkgName, " or keep those of ", conflictPkg, "?"), "[N]ew, keep [o]riginal")
+			printKeyChoicePrompt(styledPrompt("Use the files of ", pkgName, " or keep those of ", conflictPkg, "?"), "[N]ew, keep [o]riginal")
 			os.Stdout.Sync()
 			response, err := stdinReader.ReadString('\n')
 			if err != nil {
@@ -2094,7 +2095,7 @@ func checkStagingConflicts(pkgName, stagingDir, rootDir, stagingManifest string,
 			for _, c := range unmanagedConflicts {
 				fmt.Println("   " + colNote.Sprint(c.filePath))
 			}
-			printChoicePrompt(styledPrompt("Use the files of ", pkgName, " or keep the existing ones?"), "[N]ew, [k]eep original")
+			printKeyChoicePrompt(styledPrompt("Use the files of ", pkgName, " or keep the existing ones?"), "[N]ew, [k]eep original")
 			os.Stdout.Sync()
 			response, err := stdinReader.ReadString('\n')
 			if err != nil {
@@ -2351,12 +2352,29 @@ func styledPrompt(parts ...string) string {
 	return b.String()
 }
 
-// printChoicePrompt prints a question and its choices, the choices in the
-// terminal's default color, as the [Y/n] prompts do.
+// printKeyChoicePrompt is printChoicePrompt for choices spelled out as
+// words ("[K]eep current, [u]se new"): the key of each, with its brackets,
+// in the arrow's yellow, the words in the default color.
+func printKeyChoicePrompt(question, choices string) {
+	printQuestion(question, choiceKeyPattern.ReplaceAllStringFunc(choices, func(key string) string {
+		return colArrow.Sprint(key)
+	}))
+}
+
+// choiceKeyPattern matches the key of a choice: [K], [u], [A].
+var choiceKeyPattern = regexp.MustCompile(`\[[A-Za-z]\]`)
+
+// printChoicePrompt prints a question and its choices ([y/N],
+// [Y/n/a(ll)/q(uit)]), the choices in the arrow's yellow, as the [Y/n]
+// prompts do.
 func printChoicePrompt(question, choices string) {
+	printQuestion(question, colArrow.Sprint(choices))
+}
+
+func printQuestion(question, coloredChoices string) {
 	colArrow.Print("-> ")
 	fmt.Print(question)
-	fmt.Printf(" %s: ", choices)
+	fmt.Printf(" %s: ", coloredChoices)
 }
 
 // affectedLibraryLine is one entry of the library rebuild list: the package

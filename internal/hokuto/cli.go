@@ -767,7 +767,8 @@ func Main() {
 		for _, legacy := range legacyKmods {
 			colWarn.Printf("%s was installed before kernel modules were tracked per kernel; it is replaced by the per-kernel package(s).\n", legacy)
 			if !effectiveYes {
-				fmt.Printf("Uninstall %s now? [Y/n]: ", legacy)
+				colArrow.Print("-> ")
+				fmt.Print(styledPrompt("Uninstall ", legacy, " now?") + " " + colArrow.Sprint("[Y/n]") + ": ")
 				answer, _ := stdinReader.ReadString('\n')
 				if a := strings.ToLower(strings.TrimSpace(answer)); a != "" && a != "y" && a != "yes" {
 					fmt.Fprintf(os.Stderr, "Aborted: %s must be removed before its per-kernel packages can be installed.\n", legacy)

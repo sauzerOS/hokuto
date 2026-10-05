@@ -737,7 +737,7 @@ func (pm *ParallelManager) Run() error {
 						cPrintf(colInfo, "Proceeding with rebuild (--yes).\n")
 					} else {
 						cPrintf(colInfo, "Proceed with rebuild?")
-						fmt.Print(" [Y/n] ")
+						fmt.Print(" " + colArrow.Sprint("[Y/n]") + " ")
 						reader := bufio.NewReader(os.Stdin)
 						input, _ := reader.ReadString('\n')
 						input = strings.TrimSpace(strings.ToLower(input))
