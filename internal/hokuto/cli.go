@@ -1818,10 +1818,13 @@ func Main() {
 		var yesLong = bumpCmd.Bool("yes", false, "Assume 'yes' to all prompts")
 		var msg = bumpCmd.String("m", "", "Commit message")
 		var msgLong = bumpCmd.String("message", "", "Commit message")
+		var jobs = bumpCmd.Int("j", autoBumpBuildJobs, "With --auto --build: packages built at once")
+		var jobsLong = bumpCmd.Int("parallel", 0, "With --auto --build: packages built at once")
 		if err := bumpCmd.Parse(os.Args[2:]); err != nil {
 			fmt.Fprintf(os.Stderr, "Error parsing bump flags: %v\n", err)
 			exitHokuto(1)
 		}
+		autoBumpBuildJobs = max(*jobs, *jobsLong)
 
 		if *auto {
 			effectiveYes := *yes || *yesLong

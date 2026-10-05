@@ -757,6 +757,47 @@ func (snap recipeSnapshot) restore() error {
 // buildBumpedPackage builds a bumped package through the regular build command
 // orchestration so dependency resolution, base-devel preparation, cleanup, and
 // recipe options stay consistent with `hokuto build`.
+// autoBumpBuildJobs is how many packages "bump --auto --build" builds at
+// once (bump -j).
+var autoBumpBuildJobs = 4
+
+// buildBumpedPackages builds, in one parallel build, the packages a bump
+// run bumped, and returns those built and those that failed. The bumps all
+// come first: one failing to download or commit no longer holds up the
+// others' builds, the build orders the bumped packages among themselves
+// (python-sip before python-pyqt6-sip), and one failed build does not stop
+// the rest.
+func buildBumpedPackages(pkgNames []string, cfg *Config) (built, failed []string) {
+	if len(pkgNames) == 0 {
+		return nil, nil
+	}
+	jobs := max(autoBumpBuildJobs, 1)
+	colNote.Printf(">> [BUILDING] %s (idle mode, %d jobs)\n", strings.Join(pkgNames, " "), jobs)
+	args := []string{"-i", "--no-install", "--index", "--parallel", strconv.Itoa(jobs)}
+	if err := handleBuildCommand(append(args, pkgNames...), cfg); err != nil {
+		debugf("Build of the bumped packages: %v\n", err)
+	}
+	// What was built is what now has a package of its new release.
+	for _, pkgName := range pkgNames {
+		if bumpedPackageBuilt(pkgName, cfg) {
+			built = append(built, pkgName)
+		} else {
+			failed = append(failed, pkgName)
+		}
+	}
+	return built, failed
+}
+
+// bumpedPackageBuilt reports whether BinDir has the package of pkgName's
+// current recipe release.
+func bumpedPackageBuilt(pkgName string, cfg *Config) bool {
+	version, revision, err := getRepoVersion2(pkgName)
+	if err != nil {
+		return false
+	}
+	return findCachedBinaryTarballVersion(getOutputPackageName(pkgName, cfg), version, revision, cfg) != ""
+}
+
 func buildBumpedPackage(pkgName string, cfg *Config) error {
 	colNote.Printf(">> [BUILDING] %s (idle mode)\n", pkgName)
 	return handleBuildCommand([]string{"-i", "--no-install", "--index", pkgName}, cfg)
@@ -1709,6 +1750,7 @@ func handleAutoBumpRepository(cfg *Config, autoBuild bool, assumeYes bool, repoU
 	var failedBumps []string
 	var successfullyBuilt []string
 	var failedBuilds []string
+	var toBuild []string
 
 	for _, idx := range indices {
 		cand := candidates[idx]
@@ -1737,36 +1779,27 @@ func handleAutoBumpRepository(cfg *Config, autoBuild bool, assumeYes bool, repoU
 			if autoBuild && skipBuild[idx] {
 				colNote.Printf(">> [SKIP BUILD] %s bumped only, as selected.\n", pkgName)
 			} else if autoBuild {
-				var buildErrs []error
 				if isPkgSet {
-					for _, p := range sets[pkgName] {
-						if err := buildBumpedPackage(p, cfg); err != nil {
-							buildErrs = append(buildErrs, fmt.Errorf("%s: %v", p, err))
-						} else {
-							successfullyBuilt = append(successfullyBuilt, p)
-						}
-					}
+					toBuild = append(toBuild, sets[pkgName]...)
 				} else {
-					if err := buildBumpedPackage(pkgName, cfg); err != nil {
-						buildErrs = append(buildErrs, err)
-					} else {
-						successfullyBuilt = append(successfullyBuilt, pkgName)
-					}
-				}
-
-				if len(buildErrs) > 0 {
-					for _, be := range buildErrs {
-						colError.Printf(">> [ERROR] build failed for %s: %v\n", pkgName, be)
-						logMsg("BUILD_FAILED: %s: %v\n", pkgName, be)
-					}
-					failedBuilds = append(failedBuilds, pkgName)
-				} else {
-					colSuccess.Printf(">> [SUCCESS] %s built.\n", pkgName)
-					logMsg("BUILD_SUCCESS: %s\n", pkgName)
+					toBuild = append(toBuild, pkgName)
 				}
 			}
 		}
 		fmt.Println("------------------------------------------------")
+	}
+
+	// Then the successful bumps are built together.
+	if autoBuild && len(toBuild) > 0 {
+		successfullyBuilt, failedBuilds = buildBumpedPackages(toBuild, cfg)
+		for _, pkgName := range successfullyBuilt {
+			colSuccess.Printf(">> [SUCCESS] %s built.\n", pkgName)
+			logMsg("BUILD_SUCCESS: %s\n", pkgName)
+		}
+		for _, pkgName := range failedBuilds {
+			colError.Printf(">> [ERROR] build failed for %s\n", pkgName)
+			logMsg("BUILD_FAILED: %s\n", pkgName)
+		}
 	}
 
 	// Published packages linked against a library these builds dropped get a
