@@ -4605,7 +4605,12 @@ func handleBuildCommand(args []string, cfg *Config) (err error) {
 		// cross-system build installs them under their arch-prefixed output
 		// name, which is not what the world file records, so keep them
 		// explicitly or the orphan sweep below would remove them.
-		if cfg.Values["HOKUTO_CROSS_ARCH"] != "" {
+		// With -no-install nothing is installed as a deliverable: a package of
+		// a target's name (the host binutils base-devel brings, an older
+		// aarch64-binutils the cross toolchain brings, while building
+		// aarch64-binutils) is a build dependency like any other, and was left
+		// installed.
+		if cfg.Values["HOKUTO_CROSS_ARCH"] != "" && !*noInstall {
 			for pkgName := range userRequestedMap {
 				retainTemporaryBuildDep(pkgName)
 			}
