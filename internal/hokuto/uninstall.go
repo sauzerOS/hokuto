@@ -371,8 +371,10 @@ func pkgUninstallWithRemovalSet(pkgName string, cfg *Config, execCtx *Executor, 
 					}
 				}
 			}
-			fcPrintf(logger, colArrow, "-> ")
-			fcPrintf(logger, colSuccess, "Removed %d files natively\n", removedCount)
+			// Only in debug mode: the caller reports the package removed, and
+			// removals done for it (post-install dependencies, orphans) used
+			// to print one such line each.
+			debugf("Removed %d files of %s natively\n", removedCount, pkgName)
 		} else {
 			// Preserve the original single-command removal behavior. rm continues
 			// processing its arguments after an individual path fails, so a non-zero
@@ -436,8 +438,7 @@ func pkgUninstallWithRemovalSet(pkgName string, cfg *Config, execCtx *Executor, 
 					}
 				}
 			}
-			fcPrintf(logger, colArrow, "-> ")
-			fcPrintf(logger, colSuccess, "Removed %d files\n", removedCount)
+			debugf("Removed %d files of %s\n", removedCount, pkgName)
 		}
 	}
 
