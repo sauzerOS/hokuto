@@ -141,7 +141,7 @@ func runPurgeUninstall(packages []string, cfg *Config, force, yes bool) error {
 	if len(orphans) > 0 {
 		colArrow.Print("-> ")
 		colSuccess.Print("The following orphans will be removed ")
-		colNote.Printf("[%d]", len(orphans))
+		fmt.Printf("[%d]", len(orphans))
 		colSuccess.Print(": [")
 		for i, pkg := range orphans {
 			if i > 0 {
@@ -156,8 +156,9 @@ func runPurgeUninstall(packages []string, cfg *Config, force, yes bool) error {
 	colNote.Println(humanReadableSize(total))
 	if !yes {
 		colArrow.Print("-> ")
-		question := fmt.Sprintf("About to remove %s and %d orphan(s). Continue?", strings.Join(packages, ", "), len(orphans))
-		if !askForConfirmation(colWarn, "%s", question) {
+		question := colSuccess.Sprint("About to remove ") + colNote.Sprint(strings.Join(packages, ", ")) +
+			colSuccess.Sprintf(" and %d orphan(s). Continue?", len(orphans))
+		if !askForConfirmation(colSuccess, "%s", question) {
 			colArrow.Print("-> ")
 			colWarn.Println("Uninstall canceled.")
 			return nil

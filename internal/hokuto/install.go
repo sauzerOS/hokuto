@@ -344,7 +344,7 @@ func flushPackageSuggestions(logger io.Writer, cfg *Config, noRemote bool, promp
 			prompt := colSuccess.Sprint("Install suggested dependency ") + colNote.Sprint(altName) +
 				colSuccess.Sprint(" for ") + colNote.Sprint(item.Package) + colSuccess.Sprint("?")
 			if item.Text != "" {
-				prompt += colSuccess.Sprintf(" (%s)", item.Text)
+				prompt += fmt.Sprintf(" (%s)", item.Text)
 			}
 			if !askForConfirmationDefaultNo(colSuccess, "%s%s", colArrow.Sprint("-> "), prompt) {
 				continue
@@ -1044,8 +1044,6 @@ func pkgInstallWithRemotePolicy(tarballPath, pkgName string, cfg *Config, execCt
 			ownerPkg = "UNMANAGED" // Use UNMANAGED if no manifest lists the file
 		}
 
-		ownerDisplay := fmt.Sprintf("(Owner: %s) ", ownerPkg)
-
 		if _, err := os.Stat(stagingFile); err == nil {
 			// file exists in staging
 
@@ -1072,16 +1070,16 @@ func pkgInstallWithRemotePolicy(tarballPath, pkgName string, cfg *Config, execCt
 					if isSymlink && symlinkTarget != "" {
 						// Existing file is a symlink
 						if stagingIsSymlink && stagingSymlinkTarget != "" {
-							cPrintf(colInfo, "Symlink %s -> %s already installed from %s package: [K]eep %s symlink, [u]se %s symlink: ", file, symlinkTarget, conflictPkg, conflictPkg, pkgName)
+							printChoicePrompt(styledPrompt("Symlink ", file+" -> "+symlinkTarget, " is already installed from ", conflictPkg, ":"), fmt.Sprintf("[K]eep %s symlink, [u]se %s symlink", conflictPkg, pkgName))
 						} else {
-							cPrintf(colInfo, "Symlink %s -> %s already installed from %s package: [K]eep %s symlink, [u]se %s file: ", file, symlinkTarget, conflictPkg, conflictPkg, pkgName)
+							printChoicePrompt(styledPrompt("Symlink ", file+" -> "+symlinkTarget, " is already installed from ", conflictPkg, ":"), fmt.Sprintf("[K]eep %s symlink, [u]se %s file", conflictPkg, pkgName))
 						}
 					} else {
 						// Existing file is a regular file
 						if stagingIsSymlink && stagingSymlinkTarget != "" {
-							cPrintf(colInfo, "File %s already installed from %s package: [K]eep %s file, [u]se %s symlink: ", file, conflictPkg, conflictPkg, pkgName)
+							printChoicePrompt(styledPrompt("File ", file, " is already installed from ", conflictPkg, ":"), fmt.Sprintf("[K]eep %s file, [u]se %s symlink", conflictPkg, pkgName))
 						} else {
-							cPrintf(colInfo, "File %s already installed from %s package: [K]eep %s file, [u]se %s file: ", file, conflictPkg, conflictPkg, pkgName)
+							printChoicePrompt(styledPrompt("File ", file, " is already installed from ", conflictPkg, ":"), fmt.Sprintf("[K]eep %s file, [u]se %s file", conflictPkg, pkgName))
 						}
 					}
 					os.Stdout.Sync()
@@ -1159,7 +1157,8 @@ func pkgInstallWithRemotePolicy(tarballPath, pkgName string, cfg *Config, execCt
 			// sudoers) is not shown: its contents would end up on the
 			// terminal and in its scrollback.
 			if rootOnlyReadable(currentFile) {
-				cPrintf(colNote, "(%s is readable by root only; its changes are not shown)\n", file)
+				colArrow.Print("-> ")
+				fmt.Println(styledPrompt("The changes to ", file, " are not shown: only root may read it."))
 			} else {
 				runDiffWithFallback(currentFile, stagingFile, true)
 			}
@@ -1168,7 +1167,7 @@ func pkgInstallWithRemotePolicy(tarballPath, pkgName string, cfg *Config, execCt
 
 			var input string
 			if (!yes && !skipAllPrompts) || fast {
-				cPrintf(colInfo, "File %s modified, %schoose action: [K]eep current, [u]se new, [b]ackup, [e]dit, use new for [A]ll: ", file, ownerDisplay)
+				printChoicePrompt(styledPrompt("File ", file, " was modified here (owner: ", ownerPkg, "). Choose:"), "[K]eep current, [u]se new, [b]ackup, [e]dit, use new for [A]ll")
 				// Flush stdout to ensure prompt is visible
 				os.Stdout.Sync()
 				// Use the shared, robust bufio.Reader
@@ -1287,7 +1286,7 @@ func pkgInstallWithRemotePolicy(tarballPath, pkgName string, cfg *Config, execCt
 			// file does NOT exist in staging
 			ans := "n" // Default to not keeping the file
 			if !yes {
-				cPrintf(colInfo, "User modified %s, but new package has no file. Keep it? [y/N]: ", file)
+				printChoicePrompt(styledPrompt("File ", file, " was modified here, but the new package no longer has it. Keep it?"), "[y/N]")
 				// Use the shared, robust bufio.Reader
 				response, err := stdinReader.ReadString('\n')
 				if err == nil {
@@ -1676,19 +1675,17 @@ func pkgInstallWithRemotePolicy(tarballPath, pkgName string, cfg *Config, execCt
 			colArrow.Print("\n-> ")
 			cPrintf(colWarn, "The following packages depend on libraries that were removed/upgraded:\n")
 			for _, pkg := range affectedList {
-				libs := affectedPackages[pkg]
-				cPrintf(colWarn, "  %s (needs: %s)\n", pkg, strings.Join(libs, ", "))
+				fmt.Println(affectedLibraryLine(pkg, affectedPackages[pkg]))
 			}
 			colArrow.Print("-> ")
-			cPrintf(colInfo, "Skipping library rebuild prompts for remote binary updates.\n")
+			colSuccess.Println("Skipping library rebuild prompts for remote binary updates.")
 		} else {
 			// --- Sequential Handling (managed=false) ---
 			// 8a. Prompt for rebuild (Hokuto is guaranteed to be run in a terminal)
 			var sb strings.Builder
-			sb.WriteString("\nWARNING: The following packages depend on libraries that were removed/upgraded:\n")
+			sb.WriteString("\n" + colArrow.Sprint("-> ") + colWarn.Sprint("The following packages depend on libraries that were removed/upgraded:") + "\n")
 			for _, pkg := range affectedList {
-				libs := affectedPackages[pkg]
-				sb.WriteString(fmt.Sprintf("  %s (needs: %s)\n", pkg, strings.Join(libs, ", ")))
+				sb.WriteString(affectedLibraryLine(pkg, affectedPackages[pkg]) + "\n")
 			}
 			// Interactive rebuild selection
 			var packagesToRebuild []string
@@ -1703,7 +1700,7 @@ func pkgInstallWithRemotePolicy(tarballPath, pkgName string, cfg *Config, execCt
 				shouldQuit := false
 				WithPrompt(func() {
 					// Print warning inside the prompt block to ensure it's not overwritten
-					cPrintf(colWarn, "%s", sb.String())
+					fmt.Print(sb.String())
 
 					for _, pkg := range affectedList {
 						if shouldQuit {
@@ -1713,7 +1710,8 @@ func pkgInstallWithRemotePolicy(tarballPath, pkgName string, cfg *Config, execCt
 						if rebuildAll {
 							// 'all' was selected, just add and continue
 							packagesToRebuild = append(packagesToRebuild, pkg)
-							cPrintf(colInfo, "Rebuilding %s (auto-selected by 'all')\n", pkg)
+							colArrow.Print("-> ")
+							fmt.Println(styledPrompt("Rebuilding ", pkg, " (all selected)"))
 							// continue // continue doesn't render well here since we are inside closure inside loop?
 							// actually we are inside closure.
 							// Wait, if we wrap the WHOLE loop in WithPrompt, then we can use continue naturally?
@@ -1722,7 +1720,7 @@ func pkgInstallWithRemotePolicy(tarballPath, pkgName string, cfg *Config, execCt
 						}
 
 						// Prompt for this specific package
-						cPrintf(colInfo, "Rebuild %s? [Y/n/a(ll)/q(uit)]: ", pkg)
+						printChoicePrompt(styledPrompt("Rebuild ", pkg, "?"), "[Y/n/a(ll)/q(uit)]")
 						os.Stdout.Sync()
 						response, err := stdinReader.ReadString('\n')
 						if err != nil {
@@ -1734,16 +1732,20 @@ func pkgInstallWithRemotePolicy(tarballPath, pkgName string, cfg *Config, execCt
 						case "y", "": // Default is Yes
 							packagesToRebuild = append(packagesToRebuild, pkg)
 						case "n": // No
-							cPrintf(colInfo, "Skipping rebuild for %s\n", pkg)
+							colArrow.Print("-> ")
+							fmt.Println(styledPrompt("Skipping rebuild for ", pkg))
 						case "a": // All
-							cPrintf(colInfo, "Rebuilding %s and all subsequent packages\n", pkg)
+							colArrow.Print("-> ")
+							fmt.Println(styledPrompt("Rebuilding ", pkg, " and all subsequent packages"))
 							rebuildAll = true
 							packagesToRebuild = append(packagesToRebuild, pkg)
 						case "q": // Quit
-							cPrintf(colInfo, "Quitting rebuild selection. No more packages will be rebuilt.\n")
+							colArrow.Print("-> ")
+							colSuccess.Println("Quitting rebuild selection. No more packages will be rebuilt.")
 							shouldQuit = true // Signal to break loop
 						default: // Invalid, treat as 'No' for safety
-							cPrintf(colInfo, "Invalid input. Skipping rebuild for %s\n", pkg)
+							colArrow.Print("-> ")
+							fmt.Println(styledPrompt("Invalid input. Skipping rebuild for ", pkg))
 						}
 					}
 				})
@@ -2009,12 +2011,12 @@ func checkStagingConflicts(pkgName, stagingDir, rootDir, stagingManifest string,
 			input = "n"
 		} else if !skipAllPrompts && !fast {
 			// Display all conflicting files
-			cPrintf(colWarn, "Conflicting file(s) detected from %s package:\n", conflictPkg)
+			colArrow.Print("-> ")
+			fmt.Println(styledPrompt("Files ", pkgName, " installs that ", conflictPkg, " already has:"))
 			for _, c := range conflicts {
-				colArrow.Print("-> ")
-				colInfo.Println(c.filePath)
+				fmt.Println("   " + colNote.Sprint(c.filePath))
 			}
-			cPrintf(colInfo, "Use [N]ew %s, keep [o]riginal %s: ", pkgName, conflictPkg)
+			printChoicePrompt(styledPrompt("Use the files of ", pkgName, " or keep those of ", conflictPkg, "?"), "[N]ew, keep [o]riginal")
 			os.Stdout.Sync()
 			response, err := stdinReader.ReadString('\n')
 			if err != nil {
@@ -2087,12 +2089,12 @@ func checkStagingConflicts(pkgName, stagingDir, rootDir, stagingManifest string,
 		} else if useNewForAll {
 			input = "n"
 		} else if !skipAllPrompts && !fast {
-			cPrintf(colWarn, "Conflicting file(s) detected (unmanaged):\n")
+			colArrow.Print("-> ")
+			fmt.Println(styledPrompt("Files ", pkgName, " installs that exist already but belong to no package:"))
 			for _, c := range unmanagedConflicts {
-				colArrow.Print("-> ")
-				colInfo.Println(c.filePath)
+				fmt.Println("   " + colNote.Sprint(c.filePath))
 			}
-			cPrintf(colInfo, "Use [N]ew %s, [k]eep original: ", pkgName)
+			printChoicePrompt(styledPrompt("Use the files of ", pkgName, " or keep the existing ones?"), "[N]ew, [k]eep original")
 			os.Stdout.Sync()
 			response, err := stdinReader.ReadString('\n')
 			if err != nil {
@@ -2333,4 +2335,32 @@ func rootOnlyReadable(path string) bool {
 		return false
 	}
 	return info.Mode().IsRegular() && info.Mode().Perm()&0o004 == 0
+}
+
+// styledPrompt is the text of a question in the standard colors: the parts
+// alternate between text (blue) and names or paths (green).
+func styledPrompt(parts ...string) string {
+	var b strings.Builder
+	for i, part := range parts {
+		if i%2 == 0 {
+			b.WriteString(colSuccess.Sprint(part))
+		} else {
+			b.WriteString(colNote.Sprint(part))
+		}
+	}
+	return b.String()
+}
+
+// printChoicePrompt prints a question and its choices, the choices in the
+// terminal's default color, as the [Y/n] prompts do.
+func printChoicePrompt(question, choices string) {
+	colArrow.Print("-> ")
+	fmt.Print(question)
+	fmt.Printf(" %s: ", choices)
+}
+
+// affectedLibraryLine is one entry of the library rebuild list: the package
+// and the libraries it needs that were removed or upgraded.
+func affectedLibraryLine(pkg string, libs []string) string {
+	return "   " + styledPrompt("", pkg, " (needs: ", strings.Join(libs, ", "), ")")
 }

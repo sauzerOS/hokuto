@@ -216,7 +216,8 @@ func pkgUninstallWithRemovalSet(pkgName string, cfg *Config, execCtx *Executor, 
 	// 5. Confirm with user unless 'yes' is set
 	if !yes {
 		fcPrintf(logger, colArrow, "-> ")
-		fcPrintf(logger, color.Danger, "About to remove package %s and %d file(s). Continue? [Y/n]: ", pkgName, fileCount)
+		fcPrintf(logger, color.Danger, "About to remove package %s and %d file(s). Continue?", pkgName, fileCount)
+		fmt.Fprint(logger, " [Y/n]: ")
 		var answer string
 		fmt.Scanln(&answer)
 		answer = strings.ToLower(strings.TrimSpace(answer))

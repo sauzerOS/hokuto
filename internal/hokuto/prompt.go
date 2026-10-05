@@ -58,10 +58,12 @@ func askForConfirmationWithDefault(p colorPrinter, defaultYes bool, format strin
 		// We print mainPrompt and the suffix separately to ensure the suffix keeps
 		// the color 'p' even if mainPrompt contains internal color resets (like colNote).
 		cPrintf(p, "%s", mainPrompt)
+		// The choices in the terminal's default color, whatever the
+		// question's.
 		if defaultYes {
-			cPrintf(p, " [Y/n]: ")
+			fmt.Print(" [Y/n]: ")
 		} else {
-			cPrintf(p, " [y/N]: ")
+			fmt.Print(" [y/N]: ")
 		}
 
 		response, err := reader.ReadString('\n')

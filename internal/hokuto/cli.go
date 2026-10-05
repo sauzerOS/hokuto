@@ -893,7 +893,7 @@ func Main() {
 			colArrow.Print("-> ")
 			// [extra dependencies/all packages in the plan]
 			colSuccess.Print("The following extra dependencies will be installed ")
-			colNote.Printf("[%d/%d]", len(extraDeps), len(installPlan))
+			fmt.Printf("[%d/%d]", len(extraDeps), len(installPlan))
 			colSuccess.Print(": [")
 			for i, dep := range extraDeps {
 				if i > 0 {

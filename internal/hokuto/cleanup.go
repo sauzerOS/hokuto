@@ -194,7 +194,7 @@ func handleKernelCleanup(cfg *Config) error {
 		if len(cand.Packages) > 0 {
 			colWarn.Printf(", %s", strings.Join(cand.Packages, ", "))
 		}
-		colWarn.Print(" [y/N]: ")
+		fmt.Print(" [y/N]: ")
 		answer, _ := reader.ReadString('\n')
 		answer = strings.ToLower(strings.TrimSpace(answer))
 		if answer != "y" && answer != "yes" {
