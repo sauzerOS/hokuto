@@ -1755,22 +1755,37 @@ func checkForUpgrades(ctx context.Context, cfg *Config, maxJobs int, yes bool) e
 	startUpdateBatch(batchOutputs)
 	defer reportBrokenUpdateBatch()
 
+	// An update that builds nothing installs as "hokuto install" does: each
+	// package quietly under one bar, the global post-install tasks once at
+	// the end. One that builds keeps the step-by-step output, since the
+	// builds report their own progress.
+	var progress *installProgress
+	if !Debug && len(sourceBuildPackages) == 0 {
+		progress = newInstallProgress(totalToUpdate)
+	}
+	fastInstall := progress != nil
+
 	for i, pkgName := range pkgNames {
 		// From here on a removed library that affects this package is its
 		// own problem again: its update is the one running now.
 		markUpdateBatchDone(getOutputPackageName(pkgName, cfg))
-		colArrow.Print("\n-> ")
-		if userRequestedMap[pkgName] {
-			colSuccess.Printf("Executing update for:")
-			colNote.Printf(" %s (%d/%d)\n", pkgName, i+1, totalToUpdate)
+		if fastInstall {
+			progress.start(getOutputPackageName(pkgName, cfg))
 		} else {
-			colSuccess.Printf("Installing dependency:")
-			colNote.Printf(" %s (%d/%d)\n", pkgName, i+1, totalToUpdate)
+			colArrow.Print("\n-> ")
+			if userRequestedMap[pkgName] {
+				colSuccess.Printf("Executing update for:")
+				colNote.Printf(" %s (%d/%d)\n", pkgName, i+1, totalToUpdate)
+			} else {
+				colSuccess.Printf("Installing dependency:")
+				colNote.Printf(" %s (%d/%d)\n", pkgName, i+1, totalToUpdate)
+			}
 		}
 
 		// 0. Check for binary package first (Local Cache or Mirror)
 		version, revision, err := getRepoVersion2(pkgName)
 		if err != nil {
+			progress.endLine()
 			color.Danger.Printf("Failed to get version/revision for %s: %v\n", pkgName, err)
 			failedPackages = append(failedPackages, pkgName)
 			continue
@@ -1785,8 +1800,10 @@ func checkForUpgrades(ctx context.Context, cfg *Config, maxJobs int, yes bool) e
 
 		foundBinary := false
 		if _, err := os.Stat(tarballPath); err == nil {
-			colArrow.Print("-> ")
-			colSuccess.Printf("Using cached binary package: %s\n", tarballName)
+			if !fastInstall {
+				colArrow.Print("-> ")
+				colSuccess.Printf("Using cached binary package: %s\n", tarballName)
+			}
 			foundBinary = true
 		} else if BinaryMirror != "" && len(remoteIndex) > 0 {
 			// Lookup checksum and verify the package exists in the index
@@ -1829,10 +1846,12 @@ func checkForUpgrades(ctx context.Context, cfg *Config, maxJobs int, yes bool) e
 			}
 
 			if foundInIndex {
-				// Sequential mode: output is fine (quiet=false)
-				if err := fetchSpecificBinaryPackage(archivePkgName, version, revision, bestEntry.Variant, cfg, false, expectedSum, false); err == nil {
+				// Sequential mode: output is fine (quiet=false), unless
+				// under the bar (the download normally happened already).
+				if err := fetchSpecificBinaryPackage(archivePkgName, version, revision, bestEntry.Variant, cfg, fastInstall, expectedSum, false); err == nil {
 					foundBinary = true
 				} else {
+					progress.endLine()
 					colArrow.Print("-> ")
 					colSuccess.Println("Binary not found on mirror, building package locally")
 				}
@@ -1849,14 +1868,21 @@ func checkForUpgrades(ctx context.Context, cfg *Config, maxJobs int, yes bool) e
 		if foundBinary {
 			isCriticalAtomic.Store(1)
 			handlePreInstallUninstall(outputPkgName, cfg, RootExec, false, nil)
-			colArrow.Print("-> ")
-			colSuccess.Printf("Installing")
-			colNote.Printf(" %s\n", outputPkgName)
-			if _, err := pkgInstallWithRemotePolicy(tarballPath, outputPkgName, cfg, RootExec, false, false, false, false, nil); err != nil {
+			if !fastInstall {
+				colArrow.Print("-> ")
+				colSuccess.Printf("Installing")
+				colNote.Printf(" %s\n", outputPkgName)
+			}
+			if _, err := pkgInstallWithRemotePolicy(tarballPath, outputPkgName, cfg, RootExec, false, fastInstall, false, false, nil); err != nil {
 				isCriticalAtomic.Store(0)
+				progress.endLine()
 				color.Danger.Printf("Binary installation failed for %s: %v. Falling back to build.\n", outputPkgName, err)
 			} else {
 				isCriticalAtomic.Store(0)
+				if fastInstall {
+					progress.advance()
+					continue
+				}
 				colArrow.Print("-> ")
 				if userRequestedMap[pkgName] {
 					colSuccess.Printf("Package")
@@ -1872,6 +1898,7 @@ func checkForUpgrades(ctx context.Context, cfg *Config, maxJobs int, yes bool) e
 		}
 
 		// A. Fallback: Directly call pkgBuild within the current process
+		progress.endLine()
 		duration, err := pkgBuild(pkgName, cfg, UserExec, BuildOptions{
 			Bootstrap:    false,
 			CurrentIndex: i + 1,
@@ -1940,7 +1967,17 @@ func checkForUpgrades(ctx context.Context, cfg *Config, maxJobs int, yes bool) e
 			colNote.Printf(" %s ", outputPkgName)
 			colSuccess.Printf("installed successfully.\n")
 		}
+		progress.advance()
+	}
 
+	progress.finish(len(failedPackages) == 0)
+	if fastInstall {
+		// Installed in fast mode, which leaves these to the end.
+		colArrow.Print("-> ")
+		colSuccess.Println("Running post-install tasks")
+		if err := PostInstallTasks(RootExec, os.Stdout); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: Global post-install tasks failed: %v\n", err)
+		}
 	}
 
 	if len(failedPackages) > 0 {

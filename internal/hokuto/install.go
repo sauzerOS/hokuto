@@ -1148,19 +1148,26 @@ func pkgInstallWithRemotePolicy(tarballPath, pkgName string, cfg *Config, execCt
 				continue
 			}
 
-			// Try to display diff, retry with root executor if permission denied
-			runDiffWithFallback(currentFile, stagingFile, true)
+			// The fast installer keeps its progress bar on the current
+			// terminal line. Move below it before the diff and the prompt, so
+			// they do not get appended to the progress bar.
+			if fast {
+				prepareDependencyProgressLogOutput()
+			}
+			// Try to display diff, retry with root executor if permission
+			// denied. A file only root may read (/etc/shadow, /etc/gshadow,
+			// sudoers) is not shown: its contents would end up on the
+			// terminal and in its scrollback.
+			if rootOnlyReadable(currentFile) {
+				cPrintf(colNote, "(%s is readable by root only; its changes are not shown)\n", file)
+			} else {
+				runDiffWithFallback(currentFile, stagingFile, true)
+			}
 			// Flush stdout to ensure diff output is visible before prompt
 			os.Stdout.Sync()
 
 			var input string
 			if (!yes && !skipAllPrompts) || fast {
-				// The fast installer keeps its progress bar on the current terminal
-				// line. Move below it before displaying an interactive prompt so the
-				// prompt does not get appended to the progress bar.
-				if fast {
-					fmt.Println()
-				}
 				cPrintf(colInfo, "File %s modified, %schoose action: [K]eep current, [u]se new, [b]ackup, [e]dit, use new for [A]ll: ", file, ownerDisplay)
 				// Flush stdout to ensure prompt is visible
 				os.Stdout.Sync()
@@ -2315,4 +2322,15 @@ func backupModifiedFile(currentFile, relPath string, execCtx *Executor, logger i
 		fmt.Fprintf(logger, "%s%s\n", colArrow.Sprint("-> "), colNote.Sprintf("Saved backup of %s to %s", currentFile, backupPath))
 	}
 	return nil
+}
+
+// rootOnlyReadable reports whether path exists and others may not read it,
+// like /etc/shadow (0600 or 0000).
+// Stat needs no read permission on the file itself.
+func rootOnlyReadable(path string) bool {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return false
+	}
+	return info.Mode().IsRegular() && info.Mode().Perm()&0o004 == 0
 }

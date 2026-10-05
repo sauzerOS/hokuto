@@ -205,64 +205,100 @@ func checkForRemoteUpgrades(_ context.Context, cfg *Config, yes bool) error {
 		}
 	}
 
-	// We'll iterate the upgrade list.
-	// For each package, we'll first ensure its dependencies are met (installing missing ones).
-	// Then we update the package itself.
-
 	// 6. Execute Updates
-	// Logic similar to checkForUpgrades loop but purely remote.
-
-	// Track duplication to avoid re-checking in same run
-	processedDeps := make(map[string]bool)
-	isCriticalAtomic.Store(1)
-	defer isCriticalAtomic.Store(0)
-
-	totalUpdated := 0
+	// The whole run is planned first: each update after the dependencies it
+	// brings that are not installed. Everything is downloaded at once, then
+	// installed in order as "hokuto install" does: each package quietly
+	// under one bar, the global post-install tasks once at the end.
+	type remoteStep struct {
+		name   string
+		target string // the update this step is for
+		isDep  bool
+	}
+	var steps []remoteStep
 	var failed []string
-	for i, pkgName := range pkgNames {
-		colArrow.Print("\n-> ")
-		colSuccess.Printf("Updating %s (%d/%d)\n", pkgName, i+1, len(pkgNames))
-
-		// 6a. Resolve and Install Missing Dependencies
-		// We can use resolveBinaryDependencies with force=false.
-		// It will add MISSING deps to 'depPlan'.
-		// We install them first.
+	planned := make(map[string]bool)
+	for _, pkgName := range pkgNames {
 		depPlan, err := remoteUpdateDependencyPlan(pkgName, cfg, remoteIndex)
 		if err != nil {
 			color.Danger.Printf("Failed to resolve dependencies for %s: %v\n", pkgName, err)
 			failed = append(failed, fmt.Sprintf("%s (dependency resolution: %v)", pkgName, err))
 			continue
 		}
-
-		// Install missing deps found
-		dependencyFailed := false
 		for _, dep := range depPlan {
-			if processedDeps[dep] {
-				continue
-			}
-			// Install dep
-			if err := installRemotePackage(dep, cfg, remoteIndex, yes); err != nil {
-				color.Danger.Printf("Failed to install dependency %s: %v\n", dep, err)
-				failed = append(failed, fmt.Sprintf("%s (dependency %s: %v)", pkgName, dep, err))
-				dependencyFailed = true
-				break
-			} else {
-				processedDeps[dep] = true
+			if !planned[dep] {
+				planned[dep] = true
+				steps = append(steps, remoteStep{name: dep, target: pkgName, isDep: true})
 			}
 		}
-		if dependencyFailed {
+		planned[pkgName] = true
+		steps = append(steps, remoteStep{name: pkgName, target: pkgName})
+	}
+
+	var entries []RepoEntry
+	for _, step := range steps {
+		if entry, err := remoteUpdateEntry(step.name, cfg, remoteIndex); err == nil {
+			entries = append(entries, entry)
+		}
+	}
+	prefetchRepoEntries(entries, cfg)
+
+	isCriticalAtomic.Store(1)
+	defer isCriticalAtomic.Store(0)
+
+	var progress *installProgress
+	if !Debug {
+		progress = newInstallProgress(len(steps))
+	}
+	fast := progress != nil
+
+	totalUpdated := 0
+	targetFailed := make(map[string]bool)
+	for i, step := range steps {
+		if targetFailed[step.target] {
+			// A dependency of this update failed: it is not installed.
+			progress.advance()
 			continue
 		}
-
-		// 6b. Install the Package Update (Target)
-		if err := installRemotePackage(pkgName, cfg, remoteIndex, yes); err != nil {
-			color.Danger.Printf("Failed to update %s: %v\n", pkgName, err)
-			failed = append(failed, fmt.Sprintf("%s: %v", pkgName, err))
+		if fast {
+			progress.start(step.name)
 		} else {
-			processedDeps[pkgName] = true
+			colArrow.Print("\n-> ")
+			if step.isDep {
+				colSuccess.Printf("Installing dependency %s for %s (%d/%d)\n", step.name, step.target, i+1, len(steps))
+			} else {
+				colSuccess.Printf("Updating %s (%d/%d)\n", step.name, i+1, len(steps))
+			}
+		}
+		if err := installRemotePackage(step.name, cfg, remoteIndex, yes, fast); err != nil {
+			progress.endLine()
+			targetFailed[step.target] = true
+			if step.isDep {
+				color.Danger.Printf("Failed to install dependency %s: %v\n", step.name, err)
+				failed = append(failed, fmt.Sprintf("%s (dependency %s: %v)", step.target, step.name, err))
+			} else {
+				color.Danger.Printf("Failed to update %s: %v\n", step.name, err)
+				failed = append(failed, fmt.Sprintf("%s: %v", step.name, err))
+			}
+			progress.advance()
+			continue
+		}
+		progress.advance()
+		if !step.isDep {
 			totalUpdated++
-			colArrow.Print("-> ")
-			colSuccess.Printf("Package %s updated successfully.\n", pkgName)
+			if !fast {
+				colArrow.Print("-> ")
+				colSuccess.Printf("Package %s updated successfully.\n", step.name)
+			}
+		}
+	}
+	progress.finish(len(failed) == 0)
+	if fast && len(steps) > 0 {
+		// Installed in fast mode, which leaves these to the end.
+		colArrow.Print("-> ")
+		colSuccess.Println("Running post-install tasks")
+		if err := PostInstallTasks(RootExec, os.Stdout); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: Global post-install tasks failed: %v\n", err)
 		}
 	}
 	if len(failed) > 0 {
@@ -280,14 +316,10 @@ func checkForRemoteUpgrades(_ context.Context, cfg *Config, yes bool) error {
 	return nil
 }
 
-// installRemotePackage fetches and installs a package from the remote index.
-// yes is the update's own -y: without it the installer asks what to do with
-// a file modified on this system, as "hokuto install" does, instead of
-// keeping it silently (a /usr/bin/hokuto copied in by hand stayed in place
-// through a hokuto update).
-func installRemotePackage(pkgName string, cfg *Config, remoteIndex []RepoEntry, yes bool) error {
-	// Find entry
-	var entry RepoEntry
+// remoteUpdateEntry is the index entry a remote update installs for
+// pkgName: the newest release of the preferred variant, or of the generic
+// one when only that exists.
+func remoteUpdateEntry(pkgName string, cfg *Config, remoteIndex []RepoEntry) (RepoEntry, error) {
 	arch := GetSystemArchForPackage(cfg, pkgName)
 	preferredVariant := GetSystemVariantForPackage(cfg, pkgName)
 	fallbackVariant := ""
@@ -312,28 +344,35 @@ func installRemotePackage(pkgName string, cfg *Config, remoteIndex []RepoEntry, 
 			}
 		}
 	}
-
 	if bestMatch == nil {
-		return fmt.Errorf("package %s not in remote index for %s (preferred: %s)", pkgName, arch, preferredVariant)
+		return RepoEntry{}, fmt.Errorf("package %s not in remote index for %s (preferred: %s)", pkgName, arch, preferredVariant)
 	}
+	return *bestMatch, nil
+}
 
-	entry = *bestMatch
-
-	version := entry.Version
-	revision := entry.Revision
-	// Note: entry.Arch and entry.Variant are the ones we FOUND
-	tarballName := StandardizeRemoteName(archivePkgName, version, revision, entry.Arch, entry.Variant)
+// installRemotePackage fetches and installs a package from the remote index.
+// yes is the update's own -y: without it the installer asks what to do with
+// a file modified on this system, as "hokuto install" does, instead of
+// keeping it silently (a /usr/bin/hokuto copied in by hand stayed in place
+// through a hokuto update). fast installs it quietly under the caller's
+// progress bar, leaving the global post-install tasks to the caller.
+func installRemotePackage(pkgName string, cfg *Config, remoteIndex []RepoEntry, yes, fast bool) error {
+	entry, err := remoteUpdateEntry(pkgName, cfg, remoteIndex)
+	if err != nil {
+		return err
+	}
+	archivePkgName := canonicalParallelPackageName(pkgName)
+	tarballName := StandardizeRemoteName(archivePkgName, entry.Version, entry.Revision, entry.Arch, entry.Variant)
 	tarballPath := filepath.Join(BinDir, tarballName)
 
 	if _, err := os.Stat(tarballPath); err != nil {
-		if err := fetchSpecificBinaryPackage(archivePkgName, version, revision, entry.Variant, cfg, false, entry.B3Sum, false); err != nil {
+		if err := fetchSpecificBinaryPackage(archivePkgName, entry.Version, entry.Revision, entry.Variant, cfg, fast, entry.B3Sum, false); err != nil {
 			return fmt.Errorf("download failed: %w", err)
 		}
 	}
 
-	// Install
 	handlePreInstallUninstall(pkgName, cfg, RootExec, false, nil)
-	if _, err := pkgInstallWithRemotePolicy(tarballPath, pkgName, cfg, RootExec, yes, false, false, false, nil); err != nil {
+	if _, err := pkgInstallWithRemotePolicy(tarballPath, pkgName, cfg, RootExec, yes, fast, false, false, nil); err != nil {
 		return err
 	}
 	return nil

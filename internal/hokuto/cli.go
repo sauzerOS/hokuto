@@ -20,7 +20,6 @@ import (
 	"time"
 
 	"github.com/gookit/color"
-	"github.com/schollz/progressbar/v3"
 	"golang.org/x/sys/unix"
 	"golang.org/x/term"
 )
@@ -943,33 +942,11 @@ func Main() {
 		allSucceeded := true
 
 		// Iterate through the calculated plan
-		var bar *progressbar.ProgressBar
-		if effectiveFast && len(installPlan) > 0 {
-			// progressbar.Default without its 65 ms throttle: with it, a
-			// label set while packages go by quickly was not drawn, and a
-			// slow post-install hook that followed sat under the name of an
-			// earlier package (shared-mime-info's 3 s update-mime-database
-			// looked like x265 hanging). The bar is redrawn once per package.
-			bar = progressbar.NewOptions64(int64(len(installPlan)),
-				progressbar.OptionSetDescription(colSuccess.Sprint("Installing Packages")),
-				progressbar.OptionSetWriter(os.Stderr),
-				progressbar.OptionSetWidth(10),
-				progressbar.OptionShowCount(),
-				progressbar.OptionShowIts(),
-				progressbar.OptionOnCompletion(func() { fmt.Fprint(os.Stderr, "\n") }),
-				progressbar.OptionSpinnerType(14),
-				progressbar.OptionFullWidth(),
-				progressbar.OptionSetRenderBlankState(true),
-			)
+		var bar *installProgress
+		if effectiveFast {
+			bar = newInstallProgress(len(installPlan))
 		}
-		installProgressLineActive := bar != nil
-		finishInstallProgressLine := func() {
-			if bar != nil && installProgressLineActive {
-				fmt.Fprintln(os.Stderr)
-				installProgressLineActive = false
-			}
-		}
-		deactivateInstallProgressLine := activateProgressLineFinisher(finishInstallProgressLine)
+		finishInstallProgressLine := bar.endLine
 
 		for _, arg := range installPlan {
 			installPlanPending.Store(arg, true)
@@ -988,9 +965,7 @@ func Main() {
 			// install, 123 of 175 packages, was placed twice).
 			if !explicitlyRequested && !strings.HasSuffix(arg, ".tar.zst") && !strings.Contains(arg, "@") && checkPackageExactMatch(arg) {
 				debugf("%s was installed earlier in this run; skipping it\n", arg)
-				if effectiveFast && bar != nil {
-					bar.Add(1)
-				}
+				bar.advance()
 				continue
 			}
 
@@ -1354,11 +1329,8 @@ func Main() {
 
 			handlePreInstallUninstall(pkgName, cfg, RootExec, effectiveYes, nil)
 
-			if effectiveFast && bar != nil {
-				bar.Describe(colSuccess.Sprint("Installing ") + colNote.Sprint(pkgName))
-				// Describe only stores the label; draw it now.
-				_ = bar.RenderBlank()
-				installProgressLineActive = true
+			if bar != nil {
+				bar.start(pkgName)
 			} else {
 				colArrow.Print("-> ")
 				colSuccess.Printf("Installing:")
@@ -1386,9 +1358,8 @@ func Main() {
 				}
 			}
 
-			if effectiveFast && bar != nil {
-				bar.Add(1)
-				installProgressLineActive = true
+			if bar != nil {
+				bar.advance()
 			} else {
 				colArrow.Print("-> ")
 				colSuccess.Printf("Package ")
@@ -1397,14 +1368,7 @@ func Main() {
 			}
 		}
 
-		if effectiveFast && bar != nil {
-			if allSucceeded {
-				bar.Finish()
-				installProgressLineActive = true
-			}
-			finishInstallProgressLine()
-		}
-		deactivateInstallProgressLine()
+		bar.finish(allSucceeded)
 		// A failed or canceled plan leaves entries behind.
 		installPlanPending.Clear()
 
