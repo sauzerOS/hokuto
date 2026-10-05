@@ -732,6 +732,15 @@ func handleUploadCommand(args []string, cfg *Config) error {
 				activeFiles[entries[0].Filename] = true
 			}
 		}
+		// And the older releases published packages depend on (glew 2.2.0
+		// for rpcs3's glew<2.3), which share a major line with a newer one.
+		var indexEntries []RepoEntry
+		for _, entry := range newIndexMap {
+			indexEntries = append(indexEntries, entry)
+		}
+		for filename := range releasesNeededByDependents(indexEntries) {
+			activeFiles[filename] = true
+		}
 
 		var deletedCount int
 		for _, obj := range remoteObjects {

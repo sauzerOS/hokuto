@@ -320,6 +320,14 @@ func checkForRemoteUpgrades(_ context.Context, cfg *Config, yes bool) error {
 // pkgName: the newest release of the preferred variant, or of the generic
 // one when only that exists.
 func remoteUpdateEntry(pkgName string, cfg *Config, remoteIndex []RepoEntry) (RepoEntry, error) {
+	// A pinned release (glew@2.2.0-1, a constrained dependency) is that one.
+	if strings.Contains(pkgName, "@") {
+		entry, err := GetRemotePackageEntry(pkgName, cfg, remoteIndex)
+		if err != nil {
+			return RepoEntry{}, err
+		}
+		return *entry, nil
+	}
 	arch := GetSystemArchForPackage(cfg, pkgName)
 	preferredVariant := GetSystemVariantForPackage(cfg, pkgName)
 	fallbackVariant := ""
@@ -362,6 +370,11 @@ func installRemotePackage(pkgName string, cfg *Config, remoteIndex []RepoEntry, 
 		return err
 	}
 	archivePkgName := canonicalParallelPackageName(pkgName)
+	if strings.Contains(pkgName, "@") {
+		// Fetched under its own name, installed under its parallel one.
+		archivePkgName = entry.Name
+		pkgName = pinnedInstallName(pkgName, cfg)
+	}
 	tarballName := StandardizeRemoteName(archivePkgName, entry.Version, entry.Revision, entry.Arch, entry.Variant)
 	tarballPath := filepath.Join(BinDir, tarballName)
 

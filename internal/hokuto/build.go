@@ -993,6 +993,14 @@ func canonicalParallelPackageName(name string) string {
 }
 
 func parallelInstallPackageName(pkgName, version string, cfg *Config) string {
+	// Already a parallel name of a package (glew-2, atkmm-2.28) whose line
+	// the version is in: installed under it.
+	if base := canonicalParallelPackageName(pkgName); base != pkgName {
+		if _, line, ok := splitVersionedPackageName(pkgName); ok && versionMatchesPackageLine(version, line) {
+			registerParallelPackageVersion(pkgName, version)
+			return pkgName
+		}
+	}
 	outputName := getOutputPackageName(pkgName, cfg)
 	major := strings.SplitN(strings.TrimSpace(version), ".", 2)[0]
 	if major == "" {

@@ -96,6 +96,10 @@ func installedDependents(pkgName string, cfg *Config, removing map[string]bool) 
 				dependencyNames = []string{dep.Name}
 				if dep.Op == "" && dep.Version == "" {
 					dependencyNames = equivalentDependencyNames(dep.Name, other)
+				} else if satisfying := findInstalledSatisfyingIn(dbRoot, dep.Name, dep.Op, dep.Version); satisfying != "" {
+					// glew<2.3 needs the package that meets it (the parallel
+					// glew-2), not the current glew 2.3.1 it names.
+					dependencyNames = []string{satisfying}
 				}
 			}
 			found := false

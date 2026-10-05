@@ -745,13 +745,16 @@ func generateDepends(pkgName, pkgDir, outputDir, rootDir string, execCtx *Execut
 					}
 
 					// Constrained dependencies may resolve to a parallel-installable
-					// ABI package (foo-1 satisfying foo<2). Store that real runtime
-					// identity so it deduplicates an auto-detected library owner and
-					// does not later request the repository's current foo release.
+					// ABI package (foo-1 satisfying foo<2). Key the line by that
+					// real runtime identity, so it deduplicates an auto-detected
+					// library owner, but keep the constraint: the parallel name only
+					// carries the major line, and glew<2.3 recorded as glew-2 let
+					// the installer pick glew 2.3.1. Installs resolve the
+					// constraint against the mirror (pinnedReleaseFor).
 					if op != "" && ver != "" && !postInstall {
 						if resolved := findInstalledSatisfyingIn(runtimeDBRoot, name, op, ver); resolved != "" && resolved != name {
+							line = formatDepLine(name, op, ver)
 							name = resolved
-							line = resolved
 						}
 					}
 

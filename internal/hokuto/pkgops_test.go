@@ -522,7 +522,7 @@ func TestGenerateDependsPreservesPostInstallAlternativeGroup(t *testing.T) {
 	}
 }
 
-func TestGenerateDependsUsesVersionedRuntimePackageForConstraint(t *testing.T) {
+func TestGenerateDependsKeepsConstraintOfVersionedRuntimePackage(t *testing.T) {
 	tmp := t.TempDir()
 	pkgDir := filepath.Join(tmp, "repo", "gst-plugins-bad")
 	outputDir := filepath.Join(tmp, "out")
@@ -559,7 +559,10 @@ func TestGenerateDependsUsesVersionedRuntimePackageForConstraint(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, want := string(data), "webrtc-audio-processing-1\n"; got != want {
+	// The constraint is kept (the parallel name only carries the major
+	// line: glew<2.3 as glew-2 let installs pick glew 2.3.1), and the library
+	// owner webrtc-audio-processing-1 adds no second line.
+	if got, want := string(data), "webrtc-audio-processing<2.0\n"; got != want {
 		t.Fatalf("unexpected generated dependencies: got %q want %q", got, want)
 	}
 }

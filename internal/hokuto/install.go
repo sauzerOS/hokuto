@@ -426,6 +426,19 @@ func installMissingPackageRuntimeDependencies(pkgName string, cfg *Config, logge
 		if findInstalledDependencySatisfying(depName, dep.Op, dep.Version) != "" {
 			continue
 		}
+		// An older release a constraint needs (glew<2.3): from the mirror,
+		// unless the plan being installed brings it.
+		if !noRemote {
+			if pinned, ok := pinnedReleaseFor(depName, dep.Op, dep.Version, cfg, nil); ok {
+				if _, planned := installPlanPending.Load(pinned); planned {
+					continue
+				}
+				if _, err := installRuntimeDependencyBinaryOnly(pinned, cfg, noRemote, nil, quiet); err != nil {
+					return fmt.Errorf("failed to install runtime dependency %s for %s: %w", pinned, pkgName, err)
+				}
+				continue
+			}
+		}
 		depName = wildcardMajorDependencyName(depName, dep.Op, dep.Version)
 
 		if binaryOnlyRuntimeDependencyInstall.Load() > 0 {

@@ -210,6 +210,8 @@ func findCachedRequestedBinaryTarball(pkgRequest string, cfg *Config) (path, ver
 	if name == "" || request == "" {
 		return "", "", "", false
 	}
+	// A parallel name (glew-2) is looked up as its package's archives.
+	name = canonicalParallelPackageName(name)
 	version = request
 	if lastDash := strings.LastIndex(request, "-"); lastDash != -1 {
 		if _, err := strconv.Atoi(request[lastDash+1:]); err == nil {
@@ -784,6 +786,16 @@ func resolveDependencyList(parentPkg string, deps []DepSpec, visited map[string]
 
 		if !force {
 			if findInstalledDependencySatisfying(depName, dep.Op, dep.Version) != "" {
+				continue
+			}
+		}
+		// A constraint the current release does not meet (glew<2.3) is met
+		// by an older release from the mirror, installed next to it.
+		if allowRemote {
+			if pinned, ok := pinnedReleaseFor(depName, dep.Op, dep.Version, cfg, remoteIndex); ok {
+				if err := resolveBinaryDependencies(pinned, visited, plan, force, yes, cfg, remoteIndex, allowRemote); err != nil {
+					return err
+				}
 				continue
 			}
 		}
@@ -2870,6 +2882,15 @@ func ensureBinaryRuntimeDependenciesInstalledWithOptions(pkgName string, cfg *Co
 		if findInstalledDependencySatisfying(depName, dep.Op, dep.Version) != "" {
 			continue
 		}
+		// An older release a constraint needs (glew<2.3): from the mirror.
+		if !noRemote {
+			if pinned, ok := pinnedReleaseFor(depName, dep.Op, dep.Version, cfg, nil); ok {
+				if _, err := installRuntimeDependencyBinaryOnly(pinned, cfg, noRemote, seen, quiet); err != nil {
+					return fmt.Errorf("failed to install runtime dependency %s for %s: %w", pinned, pkgName, err)
+				}
+				continue
+			}
+		}
 		depName = wildcardMajorDependencyName(depName, dep.Op, dep.Version)
 		if binaryOnlyRuntimeDependencyInstall.Load() > 0 {
 			installed, err := installRuntimeDependencyBinaryOnly(depName, cfg, noRemote, seen, quiet)
@@ -2930,7 +2951,9 @@ func installRuntimeDependencyBinaryOnly(pkgName string, cfg *Config, noRemote bo
 	if err != nil || !ok {
 		return false, err
 	}
-	if err := ensureBinaryRuntimeDependenciesInstalledWithOptions(installName, cfg, noRemote, seen, quiet); err != nil {
+	// A pinned release's dependencies are its own, not those of the newest
+	// release of its parallel name.
+	if err := ensureBinaryRuntimeDependenciesInstalledWithOptions(runtimeDepsLookupName(pkgName, installName), cfg, noRemote, seen, quiet); err != nil {
 		return false, err
 	}
 
@@ -3207,6 +3230,9 @@ func availableBinaryPackageTarball(pkgName string, cfg *Config, noRemote bool) (
 // locateBinaryPackageTarball is availableBinaryPackageTarball without the
 // download: the archive of the current release, cached or on the mirror.
 func locateBinaryPackageTarball(pkgName string, cfg *Config, noRemote bool) (binaryTarball, bool, error) {
+	if strings.Contains(pkgName, "@") {
+		return locatePinnedBinaryTarball(pkgName, cfg, noRemote)
+	}
 	lookupName := pkgName
 	if idx := strings.Index(pkgName, "@"); idx != -1 {
 		lookupName = pkgName[:idx]
@@ -3321,7 +3347,8 @@ func availableBuildDependencyBinaryTarball(pkgName string, cfg *Config, noRemote
 // locateBuildDependencyBinaryTarball is availableBuildDependencyBinaryTarball
 // without the download.
 func locateBuildDependencyBinaryTarball(pkgName string, cfg *Config, noRemote bool) (binaryTarball, bool, error) {
-	if b, ok, err := locateBinaryPackageTarball(pkgName, cfg, noRemote); err != nil || ok {
+	if b, ok, err := locateBinaryPackageTarball(pkgName, cfg, noRemote); err != nil || ok || strings.Contains(pkgName, "@") {
+		// A pinned release (glew@2.2.0-1) is that release or nothing.
 		return b, ok, err
 	}
 
@@ -3434,7 +3461,7 @@ func installAvailableBuildDependencyBinaryWithOptions(pkgName string, cfg *Confi
 		return false, err
 	}
 	if installRuntimeDeps {
-		if err := ensureBinaryRuntimeDependenciesInstalledWithOptions(installName, cfg, noRemote, nil, quiet); err != nil {
+		if err := ensureBinaryRuntimeDependenciesInstalledWithOptions(runtimeDepsLookupName(pkgName, installName), cfg, noRemote, nil, quiet); err != nil {
 			return false, err
 		}
 	} else {
@@ -3462,7 +3489,7 @@ func installAvailableBinaryPackageWithRuntimeDepsOption(pkgName string, cfg *Con
 	}
 
 	if installRuntimeDeps {
-		if err := ensureBinaryRuntimeDependenciesInstalledWithOptions(installName, cfg, noRemote, nil, quiet); err != nil {
+		if err := ensureBinaryRuntimeDependenciesInstalledWithOptions(runtimeDepsLookupName(pkgName, installName), cfg, noRemote, nil, quiet); err != nil {
 			return false, err
 		}
 	} else {
