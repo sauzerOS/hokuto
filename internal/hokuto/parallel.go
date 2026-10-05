@@ -15,6 +15,9 @@ import (
 
 // ParallelManager handles the execution of parallel builds
 type ParallelManager struct {
+	// startedAt is when the parallel build began, for the elapsed time
+	// on the status line.
+	startedAt time.Time
 	MaxJobs   int
 	Config    *Config
 	BuildPlan *BuildPlan
@@ -107,6 +110,7 @@ func RunParallelBuilds(plan *BuildPlan, cfg *Config, maxJobs int, userRequestedM
 	defer cancel()
 
 	pm := &ParallelManager{
+		startedAt:           time.Now(),
 		MaxJobs:             maxJobs,
 		Config:              cfg,
 		BuildPlan:           plan,
@@ -1346,7 +1350,7 @@ func (pm *ParallelManager) getStatusString() string {
 	sort.Strings(building) // Stabilize output
 
 	// Use colors consistent with prompts
-	// -> (Arrow) Building [N]: pkg1, pkg2 | Done: M Left: P
+	// -> (Arrow) Building [N]: pkg1, pkg2 | Done: M Left: P | 12 min
 
 	prefix := colArrow.Sprint("->")
 
@@ -1356,9 +1360,20 @@ func (pm *ParallelManager) getStatusString() string {
 		listStr = listStr[:57] + "..."
 	}
 
-	return fmt.Sprintf("%s %s %s | %s",
+	return fmt.Sprintf("%s %s %s | %s | %s",
 		prefix,
 		colSuccess.Sprintf("Building [%d]:", len(building)),
 		colNote.Sprint(listStr),
-		colSuccess.Sprintf("Done: %d Left: %d", len(pm.Completed), len(pm.Pending)))
+		colSuccess.Sprintf("Done: %d Left: %d", len(pm.Completed), len(pm.Pending)),
+		colSuccess.Sprint(formatBuildElapsed(pm.startedAt)))
+}
+
+// formatBuildElapsed is how long the parallel build has been running, in
+// whole minutes ("0 min" for the first one); the status line changes, and
+// so is redrawn, once a minute.
+func formatBuildElapsed(started time.Time) string {
+	if started.IsZero() {
+		return "0 min"
+	}
+	return fmt.Sprintf("%d min", int(time.Since(started).Minutes()))
 }
