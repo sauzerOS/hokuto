@@ -1592,6 +1592,8 @@ func handleAutoBumpRepository(cfg *Config, autoBuild bool, assumeYes bool, repoU
 			pkgName = "dbus-python"
 		case "python-pyqt-builder":
 			pkgName = "pyqt-builder"
+		case "pacman-package-manager":
+			pkgName = "pacman"
 		}
 
 		var newestVer string
