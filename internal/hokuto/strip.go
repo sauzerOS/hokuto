@@ -10,9 +10,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"sync"
+	"syscall"
 )
 
 // stripBinary returns the strip executable a package's output should be run
@@ -109,6 +111,15 @@ func stripPackage(outputDir string, stripStaticArchives bool, stripBin string, b
 		return nil
 	}
 
+	// One name per file: strip keeps a file's hard links by writing the
+	// result back into it through a temporary stXXXXXX file, so stripping
+	// two names of one file at once raced, and the loser left its temporary
+	// file behind (binutils: /usr/bin/aarch64-linux-gnu-ld and
+	// /usr/aarch64-linux-gnu/bin/ld). Stripped once, every name has it.
+	paths = uniqueFilesByInode(paths)
+	leftoverWatch := snapshotStripTempNames(paths)
+	defer removeStripLeftovers(leftoverWatch, buildExec)
+
 	var failedMu sync.Mutex
 	var failedFiles []string
 
@@ -204,4 +215,75 @@ func stripPackage(outputDir string, stripStaticArchives bool, stripBin string, b
 	}
 
 	return nil
+}
+
+// uniqueFilesByInode keeps the first name of each file among paths; a name
+// that cannot be stat-ed is kept.
+func uniqueFilesByInode(paths []string) []string {
+	seen := make(map[[2]uint64]bool, len(paths))
+	unique := paths[:0:0]
+	for _, p := range paths {
+		if p == "" {
+			continue
+		}
+		if info, err := os.Lstat(p); err == nil {
+			if st, ok := info.Sys().(*syscall.Stat_t); ok {
+				key := [2]uint64{uint64(st.Dev), st.Ino}
+				if seen[key] {
+					debugf("  -> Not stripping %s: a hard link of a file already stripped\n", p)
+					continue
+				}
+				seen[key] = true
+			}
+		}
+		unique = append(unique, p)
+	}
+	return unique
+}
+
+// stripTempName matches strip's temporary files: "st" and six characters.
+var stripTempName = regexp.MustCompile(`^st[A-Za-z0-9]{6}$`)
+
+// snapshotStripTempNames records, for each directory strip works in, the
+// names there that already look like strip's temporary files, so only ones
+// strip leaves behind are removed afterwards.
+func snapshotStripTempNames(paths []string) map[string]map[string]bool {
+	dirs := make(map[string]map[string]bool)
+	for _, p := range paths {
+		dir := filepath.Dir(p)
+		if _, done := dirs[dir]; done {
+			continue
+		}
+		existing := make(map[string]bool)
+		if entries, err := os.ReadDir(dir); err == nil {
+			for _, e := range entries {
+				if stripTempName.MatchString(e.Name()) {
+					existing[e.Name()] = true
+				}
+			}
+		}
+		dirs[dir] = existing
+	}
+	return dirs
+}
+
+// removeStripLeftovers removes the temporary files a failed strip left in
+// the directories it worked in.
+func removeStripLeftovers(dirs map[string]map[string]bool, buildExec *Executor) {
+	for dir, existing := range dirs {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			continue
+		}
+		for _, e := range entries {
+			if e.IsDir() || !stripTempName.MatchString(e.Name()) || existing[e.Name()] {
+				continue
+			}
+			path := filepath.Join(dir, e.Name())
+			debugf("Removing strip leftover %s\n", path)
+			if err := os.Remove(path); err != nil {
+				_ = buildExec.Run(exec.Command("rm", "-f", "--", path))
+			}
+		}
+	}
 }
