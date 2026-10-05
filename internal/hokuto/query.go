@@ -292,6 +292,7 @@ func listPackages(searchTerm string, sortBySize bool) error {
 	}
 
 	// Step 4: Collect the information for the final list of packages.
+	sizes := installedPackageSizes(pkgsToShow)
 	var output []SortablePagerLine
 	for _, p := range pkgsToShow {
 		versionFile := filepath.Join(Installed, p, "version")
@@ -303,7 +304,7 @@ func listPackages(searchTerm string, sortBySize bool) error {
 		sizeInfo := "?"
 		sizeBytes := int64(0)
 		hasSize := false
-		if total, _, _, err := installedPackageSize(p); err == nil {
+		if total, ok := sizes[p]; ok {
 			sizeInfo = humanReadableSize(total)
 			sizeBytes = total
 			hasSize = true

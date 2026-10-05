@@ -1550,7 +1550,8 @@ func pkgInstallWithRemotePolicy(tarballPath, pkgName string, cfg *Config, execCt
 		}
 	}
 
-	// 5. Place staging into root
+	// 5. Place staging into root, with the installed size for "hokuto list".
+	recordStagedInstalledSize(stagingDir, pkgName, execCtx)
 	debugf("Placing staging into root")
 	if err := placeStaging(stagingDir, rootDir, execCtx); err != nil {
 		return nil, fmt.Errorf("failed to sync staging to %s: %v", rootDir, err)

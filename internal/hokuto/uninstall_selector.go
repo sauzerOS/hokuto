@@ -55,6 +55,14 @@ func installedUninstallListEntries() ([]uninstallListEntry, error) {
 		return nil, fmt.Errorf("failed to read installed packages: %w", err)
 	}
 
+	var names []string
+	for _, entry := range entries {
+		if entry.IsDir() {
+			names = append(names, entry.Name())
+		}
+	}
+	sizes := installedPackageSizes(names)
+
 	var result []uninstallListEntry
 	for _, entry := range entries {
 		if !entry.IsDir() {
@@ -65,7 +73,7 @@ func installedUninstallListEntries() ([]uninstallListEntry, error) {
 		if data, readErr := os.ReadFile(filepath.Join(Installed, name, "version")); readErr == nil {
 			version = strings.TrimSpace(string(data))
 		}
-		size, _, _, _ := installedPackageSize(name)
+		size := sizes[name]
 		protected := name == protectedBasePackage
 		if protected {
 			version += " | protected base filesystem"
