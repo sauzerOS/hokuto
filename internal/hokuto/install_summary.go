@@ -338,3 +338,31 @@ func formatSignedSize(b int64) string {
 	}
 	return humanReadableSize(b)
 }
+
+// localTarballPackageName is the package a local archive installs: the name
+// its pkginfo records. Only an archive without one (or unreadable) falls
+// back to its file name: name-version-revision[-arch-variant].tar.zst,
+// where the variant may itself contain a dash (multi-optimized).
+func localTarballPackageName(tarballPath string) (string, error) {
+	if metadata, _, err := scanTarballMetadata(tarballPath); err == nil && metadata["name"] != "" {
+		return metadata["name"], nil
+	}
+	nameWithoutExt := strings.TrimSuffix(filepath.Base(tarballPath), ".tar.zst")
+	parts := strings.Split(nameWithoutExt, "-")
+	for _, variant := range []string{"multi-optimized", "multi-generic", "optimized", "generic", "multilib"} {
+		n := strings.Count(variant, "-") + 1
+		if len(parts) < n+4 || strings.Join(parts[len(parts)-n:], "-") != variant {
+			continue
+		}
+		if arch := parts[len(parts)-n-1]; arch == "x86_64" || arch == "aarch64" {
+			return strings.Join(parts[:len(parts)-n-3], "-"), nil
+		}
+	}
+	if len(parts) >= 3 {
+		return strings.Join(parts[:len(parts)-2], "-"), nil
+	}
+	if len(parts) == 2 {
+		return parts[0], nil
+	}
+	return "", fmt.Errorf("could not determine package name from tarball file name: %s", tarballPath)
+}

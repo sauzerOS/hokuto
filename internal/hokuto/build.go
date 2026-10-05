@@ -4225,6 +4225,13 @@ func handleBuildCommand(args []string, cfg *Config) (err error) {
 	if *parallelLong > maxJobs {
 		maxJobs = *parallelLong
 	}
+	// A bootstrap builds a basic rootfs the LFS cross-toolchain way: nearly
+	// every step needs the one before it, so it always builds one package
+	// at a time.
+	if *bootstrap && maxJobs > 1 {
+		debugf("bootstrap mode: ignoring -j %d, building sequentially\n", maxJobs)
+		maxJobs = 1
+	}
 	// Temporary build dependency installs should use the same quiet/fast path
 	// regardless of parallelism; the build output itself provides the progress.
 	quietDependencyInstalls := true

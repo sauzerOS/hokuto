@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 )
 
 // KeyringEntry represents a trusted public key in the index.
@@ -17,51 +18,42 @@ type KeyringEntry struct {
 	Pub string `json:"pub"` // Hex encoded Ed25519 public key
 }
 
-// FetchKeyring downloads and verifies the remote keyring.
-func FetchKeyring(cfg *Config) ([]KeyringEntry, error) {
-	// Try to use a cached keyring if available and not too old?
-	// For now, always fetch to ensure we have the latest trusted keys.
+// The keyring as verified during this run, per mirror, for signature checks:
+// a package signed with a key missing locally fetched it again for every
+// package.
+var (
+	verifiedKeyringMu     sync.Mutex
+	verifiedKeyringMirror string
+	verifiedKeyring       []KeyringEntry
+	verifiedKeyringErr    error
+	verifiedKeyringLoaded bool
+)
 
+// cachedVerifiedKeyring is FetchKeyring once per run (and mirror). A failure
+// is remembered too, so an unreachable mirror is not retried per package.
+func cachedVerifiedKeyring(cfg *Config) ([]KeyringEntry, error) {
+	verifiedKeyringMu.Lock()
+	defer verifiedKeyringMu.Unlock()
+	if verifiedKeyringLoaded && verifiedKeyringMirror == BinaryMirror {
+		return verifiedKeyring, verifiedKeyringErr
+	}
+	verifiedKeyring, verifiedKeyringErr = FetchKeyring(cfg)
+	verifiedKeyringMirror = BinaryMirror
+	verifiedKeyringLoaded = true
+	return verifiedKeyring, verifiedKeyringErr
+}
+
+// FetchKeyring downloads and verifies the remote keyring, always fresh
+// (keys sync needs the current one); signature checks use
+// cachedVerifiedKeyring.
+func FetchKeyring(cfg *Config) ([]KeyringEntry, error) {
 	var keyringData []byte
 	var sigData []byte
 	var fetchErr error
 
 	// 1. Try BinaryMirror First (Public URL)
 	if BinaryMirror != "" {
-		tmpDir := os.TempDir()
-		keyringPath := filepath.Join(tmpDir, "keyring.json")
-		sigPath := filepath.Join(tmpDir, "keyring.json.sig")
-
-		// Best effort cleanup
-		defer os.Remove(keyringPath)
-		defer os.Remove(sigPath)
-
-		keyringURL := fmt.Sprintf("%s/keyring.json", BinaryMirror)
-		sigURL := fmt.Sprintf("%s/keyring.json.sig", BinaryMirror)
-
-		// Download keyring
-		if err := downloadFileQuiet(keyringURL, keyringURL, keyringPath); err == nil {
-			// Download signature
-			if err := downloadFileQuiet(sigURL, sigURL, sigPath); err == nil {
-				// Both succeeded
-				keyringData, err = os.ReadFile(keyringPath)
-				if err == nil {
-					sigData, err = os.ReadFile(sigPath)
-					if err == nil {
-						// Success!
-					} else {
-						fetchErr = fmt.Errorf("failed to read downloaded signature: %w", err)
-						keyringData = nil // Invalidate
-					}
-				} else {
-					fetchErr = fmt.Errorf("failed to read downloaded keyring: %w", err)
-				}
-			} else {
-				fetchErr = fmt.Errorf("failed to fetch keyring signature from mirror: %w", err)
-			}
-		} else {
-			fetchErr = fmt.Errorf("failed to fetch keyring from mirror: %w", err)
-		}
+		keyringData, sigData, fetchErr = fetchKeyringFromMirror()
 	}
 
 	// 2. Fallback to R2 if Mirror failed
@@ -104,6 +96,36 @@ func FetchKeyring(cfg *Config) ([]KeyringEntry, error) {
 	}
 
 	return keyring, nil
+}
+
+// fetchKeyringFromMirror downloads keyring.json and its signature from the
+// binary mirror into a private temporary directory.
+func fetchKeyringFromMirror() ([]byte, []byte, error) {
+	tmpDir, cleanup, err := privateTempDir("hokuto-keyring-")
+	if err != nil {
+		return nil, nil, err
+	}
+	defer cleanup()
+	keyringPath := filepath.Join(tmpDir, "keyring.json")
+	sigPath := filepath.Join(tmpDir, "keyring.json.sig")
+	keyringURL := fmt.Sprintf("%s/keyring.json", BinaryMirror)
+	sigURL := fmt.Sprintf("%s/keyring.json.sig", BinaryMirror)
+
+	if err := downloadFileQuiet(keyringURL, keyringURL, keyringPath); err != nil {
+		return nil, nil, fmt.Errorf("failed to fetch keyring from mirror: %w", err)
+	}
+	if err := downloadFileQuiet(sigURL, sigURL, sigPath); err != nil {
+		return nil, nil, fmt.Errorf("failed to fetch keyring signature from mirror: %w", err)
+	}
+	keyringData, err := os.ReadFile(keyringPath)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to read downloaded keyring: %w", err)
+	}
+	sigData, err := os.ReadFile(sigPath)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to read downloaded signature: %w", err)
+	}
+	return keyringData, sigData, nil
 }
 
 // SyncKeyring synchronizes keys bidirectionally:

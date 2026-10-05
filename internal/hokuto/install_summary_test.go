@@ -114,3 +114,23 @@ func TestComputeRemoteUpdateSizesNetChange(t *testing.T) {
 		t.Fatalf("formatSignedSize = %q", got)
 	}
 }
+
+func TestLocalTarballPackageNameFromFileName(t *testing.T) {
+	// The files do not exist: the name comes from the file name.
+	cases := map[string]string{
+		"/x/foo-1.0-1.tar.zst":                                 "foo",
+		"/x/gtk+3-3.24.52-2-x86_64-optimized.tar.zst":          "gtk+3",
+		"/x/lib32-glibc-2.42-1-x86_64-multi-optimized.tar.zst": "lib32-glibc",
+		"/x/aarch64-binutils-2.45-1-aarch64-generic.tar.zst":   "aarch64-binutils",
+		"/x/old-1.0.tar.zst":                                   "old",
+	}
+	for path, want := range cases {
+		got, err := localTarballPackageName(path)
+		if err != nil || got != want {
+			t.Errorf("localTarballPackageName(%q) = %q, %v; want %q", path, got, err, want)
+		}
+	}
+	if _, err := localTarballPackageName("/x/broken.tar.zst"); err == nil {
+		t.Error("a file name without version should be an error")
+	}
+}

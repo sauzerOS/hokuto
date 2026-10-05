@@ -296,12 +296,7 @@ func getPublicKey(id string) (ed25519.PublicKey, error) {
 		return ed25519.PublicKey(keyData), nil
 	}
 
-	// 3. Fallback to verified keyring
-	// We need a way to pass cfg here... but getPublicKey is used in VerifyPackageSignature.
-	// We might need to fetch the keyring once and cache it globally or pass cfg around.
-	// For now, let's try to fetch it if we can.
-	// Note: this is expensive if called for every package.
-	// TODO: Cache keyring.
+	// 3. GetPublicKeyVerified falls back to the remote keyring.
 	return nil, fmt.Errorf("public key '%s' not found in local keyring (%s)", id, keyPath)
 }
 
@@ -313,7 +308,7 @@ func GetPublicKeyVerified(id string, cfg *Config) (ed25519.PublicKey, error) {
 	}
 
 	// Try remote keyring
-	keyring, err := FetchKeyring(cfg)
+	keyring, err := cachedVerifiedKeyring(cfg)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch keyring for key %s: %w", id, err)
 	}

@@ -744,6 +744,18 @@ func downloadFile(originalURL, finalURL, destFile string) error {
 	return downloadFileWithOptions(originalURL, finalURL, destFile, downloadOptions{Quiet: false, WgetNoCheckCertificate: wgetNoCheckCertificate})
 }
 
+// privateTempDir creates a directory only this process can use, for a
+// download that has no place of its own. A fixed name in the shared /tmp
+// (/tmp/keyring.json) let concurrent runs delete each other's file and
+// another local user create it first.
+func privateTempDir(pattern string) (string, func(), error) {
+	dir, err := os.MkdirTemp("", pattern)
+	if err != nil {
+		return "", func() {}, fmt.Errorf("failed to create temporary directory: %w", err)
+	}
+	return dir, func() { os.RemoveAll(dir) }, nil
+}
+
 func downloadFileQuiet(originalURL, finalURL, destFile string) error {
 	return downloadFileWithOptions(originalURL, finalURL, destFile, downloadOptions{Quiet: true, WgetNoCheckCertificate: wgetNoCheckCertificate})
 }
@@ -1889,7 +1901,12 @@ func SyncPkgDB(cfg *Config) error {
 
 	filename := filepath.Base(PkgDBPath)
 	url := fmt.Sprintf("%s/%s", BinaryMirror, filename)
-	tmpPath := filepath.Join(os.TempDir(), filename)
+	tmpDir, cleanup, err := privateTempDir("hokuto-pkgdb-")
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+	tmpPath := filepath.Join(tmpDir, filename)
 
 	colArrow.Print("-> ")
 	colNote.Printf("Checking for updated global database from mirror\n")
@@ -1898,7 +1915,6 @@ func SyncPkgDB(cfg *Config) error {
 	if err := downloadFileQuiet(url, url, tmpPath); err != nil {
 		return fmt.Errorf("failed to download database from mirror: %w", err)
 	}
-	defer os.Remove(tmpPath)
 
 	// Read remote revision
 	remoteDB, err := readPkgDB(tmpPath)

@@ -581,13 +581,19 @@ func handleUploadCommand(args []string, cfg *Config) error {
 			}
 
 			// We need a temporary file to use ReadPackageMetadata logic or just use bytes
-			tmpFile := filepath.Join(os.TempDir(), obj.Key)
+			tmpDir, cleanup, err := privateTempDir("hokuto-reindex-")
+			if err != nil {
+				debugf("Warning: %v\n", err)
+				continue
+			}
+			tmpFile := filepath.Join(tmpDir, filepath.Base(obj.Key))
 			if err := os.WriteFile(tmpFile, data, 0644); err != nil {
+				cleanup()
 				debugf("Warning: failed to write tmp file for %s: %v\n", obj.Key, err)
 				continue
 			}
 			entry, err := ReadPackageMetadata(tmpFile)
-			os.Remove(tmpFile)
+			cleanup()
 			if err != nil {
 				debugf("Warning: failed to parse metadata for %s: %v\n", obj.Key, err)
 				continue

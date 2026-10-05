@@ -334,7 +334,12 @@ func fetchRemoteIndex(cfg *Config, quiet bool) ([]RepoEntry, error) {
 			fmt.Fprintln(os.Stdout, colArrow.Sprint("->"), colSuccess.Sprint("Fetching remote index via Binary Mirror"))
 		}
 		url := fmt.Sprintf("%s/repo-index.json", BinaryMirror)
-		dest := filepath.Join(os.TempDir(), "hokuto-index.json")
+		tmpDir, cleanup, tmpErr := privateTempDir("hokuto-index-")
+		if tmpErr != nil {
+			return nil, tmpErr
+		}
+		defer cleanup()
+		dest := filepath.Join(tmpDir, "repo-index.json")
 		indexDownloadOpt := downloadOptions{Quiet: true, NativeAttempts: 2, NativeOnly: true}
 		if dlErr := downloadFileWithOptions(url, url, dest, indexDownloadOpt); dlErr == nil {
 			data, err = os.ReadFile(dest)
