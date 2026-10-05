@@ -1590,6 +1590,8 @@ func handleAutoBumpRepository(cfg *Config, autoBuild bool, assumeYes bool, repoU
 			pkgName = "libutf8proc"
 		case "python-dbus-python":
 			pkgName = "dbus-python"
+		case "python-pyqt-builder":
+			pkgName = "pyqt-builder"
 		}
 
 		var newestVer string
