@@ -847,6 +847,9 @@ func pkgInstallWithRemotePolicy(tarballPath, pkgName string, cfg *Config, execCt
 				return nil, fmt.Errorf("failed to assign parallel install identity %s to %s: %w", pkgName, archivePkgName, moveErr)
 			}
 		}
+		if err := renameManifestMetadataPaths(filepath.Join(to, "manifest"), archivePkgName, pkgName, execCtx); err != nil {
+			return nil, fmt.Errorf("failed to assign parallel install identity %s to %s: %w", pkgName, archivePkgName, err)
+		}
 	}
 
 	// Helper function to run diff with root executor fallback if permission denied
@@ -2394,4 +2397,33 @@ func printQuestion(question, coloredChoices string) {
 // and the libraries it needs that were removed or upgraded.
 func affectedLibraryLine(pkg string, libs []string) string {
 	return "   " + styledPrompt("", pkg, " (needs: ", strings.Join(libs, ", "), ")")
+}
+
+// renameManifestMetadataPaths rewrites the metadata entries of a staged
+// manifest (/var/db/hokuto/installed/atkmm/...) for the parallel name the
+// package is installed under (atkmm-2.28). They used to keep the archive's
+// name, so the installed atkmm-2.28 claimed the metadata of the current
+// atkmm, and removing it deleted that.
+func renameManifestMetadataPaths(manifestPath, from, to string, execCtx *Executor) error {
+	data, err := readFileAsRoot(manifestPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	oldPrefix := "/var/db/hokuto/installed/" + from + "/"
+	newPrefix := "/var/db/hokuto/installed/" + to + "/"
+	lines := strings.Split(string(data), "\n")
+	changed := false
+	for i, line := range lines {
+		if strings.HasPrefix(line, oldPrefix) {
+			lines[i] = newPrefix + strings.TrimPrefix(line, oldPrefix)
+			changed = true
+		}
+	}
+	if !changed {
+		return nil
+	}
+	return writeFileAsRoot(manifestPath, []byte(strings.Join(lines, "\n")), 0o644, execCtx)
 }

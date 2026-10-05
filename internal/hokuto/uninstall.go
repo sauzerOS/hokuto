@@ -275,6 +275,16 @@ func pkgUninstallWithRemovalSet(pkgName string, cfg *Config, execCtx *Executor, 
 			failed = append(failed, fmt.Sprintf("%s: refused to remove root", p))
 			continue
 		}
+		// Another package's metadata is never this package's to remove. A
+		// package installed under a parallel name (atkmm-2.28) used to keep
+		// its archive's manifest entries for installed/atkmm/: removing it
+		// deleted the metadata of the atkmm installed next to it, leaving
+		// a directory with only its signature and no manifest.
+		if strings.HasPrefix(clean, internalFilePrefix+string(filepath.Separator)) &&
+			clean != installedDir && !strings.HasPrefix(clean, installedDir+string(filepath.Separator)) {
+			debugf("Not removing %s: metadata of another package\n", clean)
+			continue
+		}
 
 		var canonical string
 		if checkAlternatives {
