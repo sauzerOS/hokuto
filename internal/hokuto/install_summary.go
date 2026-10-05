@@ -185,21 +185,15 @@ type remoteUpdateSizes struct {
 	unknown int
 	// known counts the packages net includes.
 	known int
+	// built counts packages an update builds from source, whose size is
+	// known only once they are built.
+	built int
 }
 
 // computeRemoteUpdateSizes adds up the upgrades in pkgNames, which replace
 // what is installed, and the new dependencies they bring, which add to it.
 func computeRemoteUpdateSizes(pkgNames []string, targets map[string]RepoEntry, cfg *Config, remoteIndex []RepoEntry) remoteUpdateSizes {
 	var sizes remoteUpdateSizes
-	addDownload := func(entry RepoEntry) {
-		if entry.Filename != "" {
-			if info, err := os.Stat(filepath.Join(BinDir, entry.Filename)); err == nil && info.Size() == entry.Size {
-				return
-			}
-		}
-		sizes.download += entry.Size
-	}
-
 	counted := make(map[string]bool)
 	for _, name := range pkgNames {
 		counted[name] = true
@@ -217,13 +211,7 @@ func computeRemoteUpdateSizes(pkgNames []string, targets map[string]RepoEntry, c
 					sizes.unknown++
 					continue
 				}
-				addDownload(*entry)
-				if entry.InstalledSize > 0 {
-					sizes.net += entry.InstalledSize
-					sizes.known++
-				} else {
-					sizes.unknown++
-				}
+				sizes.addNew(entry, "")
 			}
 		}
 
@@ -232,16 +220,61 @@ func computeRemoteUpdateSizes(pkgNames []string, targets map[string]RepoEntry, c
 			sizes.unknown++
 			continue
 		}
-		addDownload(entry)
-		oldSize, known := installedPackageFootprint(name)
-		if entry.InstalledSize > 0 && known {
-			sizes.net += entry.InstalledSize - oldSize
-			sizes.known++
-		} else {
-			sizes.unknown++
-		}
+		sizes.addUpgrade(name, &entry, "")
 	}
 	return sizes
+}
+
+// archiveSizes is what installing one archive downloads and takes: from
+// its index entry, or from the archive itself when it is cached and has no
+// entry (or one without an installed size).
+func archiveSizes(entry *RepoEntry, cachedPath string) (download, installed int64) {
+	if entry != nil {
+		cached := false
+		if entry.Filename != "" {
+			if info, err := os.Stat(filepath.Join(BinDir, entry.Filename)); err == nil && info.Size() == entry.Size {
+				cached = true
+				if cachedPath == "" {
+					cachedPath = filepath.Join(BinDir, entry.Filename)
+				}
+			}
+		}
+		if !cached && cachedPath == "" {
+			download = entry.Size
+		}
+		installed = entry.InstalledSize
+	}
+	if installed <= 0 && cachedPath != "" {
+		if scan, err := scanTarballFull(cachedPath); err == nil {
+			installed = scan.installedSize
+		}
+	}
+	return download, installed
+}
+
+// addUpgrade counts the archive replacing the installed package name.
+func (s *remoteUpdateSizes) addUpgrade(name string, entry *RepoEntry, cachedPath string) {
+	download, installed := archiveSizes(entry, cachedPath)
+	s.download += download
+	oldSize, known := installedPackageFootprint(name)
+	if installed > 0 && known {
+		s.net += installed - oldSize
+		s.known++
+	} else {
+		s.unknown++
+	}
+}
+
+// addNew counts an archive that installs a package not installed yet.
+func (s *remoteUpdateSizes) addNew(entry *RepoEntry, cachedPath string) {
+	download, installed := archiveSizes(entry, cachedPath)
+	s.download += download
+	if installed > 0 {
+		s.net += installed
+		s.known++
+	} else {
+		s.unknown++
+	}
 }
 
 // installedPackageFootprint is what an installed package takes, from its
@@ -283,7 +316,7 @@ func printRemoteUpdateSizes(sizes remoteUpdateSizes) {
 	colNote.Println(humanReadableSize(sizes.download))
 	colArrow.Print("-> ")
 	colSuccess.Print("Total Upgrade Size:  ")
-	if sizes.known == 0 && sizes.unknown > 0 {
+	if sizes.known == 0 && (sizes.unknown > 0 || sizes.built > 0) {
 		// Nothing to add up: "0 B" would claim the size does not change.
 		colNote.Println("unknown")
 		return
@@ -291,6 +324,9 @@ func printRemoteUpdateSizes(sizes remoteUpdateSizes) {
 	colNote.Print(formatSignedSize(sizes.net))
 	if sizes.unknown > 0 {
 		colSuccess.Printf(" (+%d package(s) of unknown size)", sizes.unknown)
+	}
+	if sizes.built > 0 {
+		colSuccess.Printf(" (+%d built from source)", sizes.built)
 	}
 	colSuccess.Println()
 }

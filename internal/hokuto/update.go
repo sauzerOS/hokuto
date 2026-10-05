@@ -176,10 +176,13 @@ func mergeSplitUpdateTargets(dst, selected map[string][]string) {
 	}
 }
 
-func currentSplitUpdateTarball(sourcePkg, splitPkg string, cfg *Config, remoteIndex []RepoEntry) (string, bool, error) {
+// locateSplitUpdateTarball finds the binary of splitPkg for the
+// repository's current release of sourcePkg, cached or in the index,
+// without downloading it.
+func locateSplitUpdateTarball(sourcePkg, splitPkg string, cfg *Config, remoteIndex []RepoEntry) (binaryTarball, bool, error) {
 	version, revision, err := getRepoVersion2(sourcePkg)
 	if err != nil {
-		return "", false, err
+		return binaryTarball{}, false, err
 	}
 	arch := GetSystemArchForPackage(cfg, sourcePkg)
 	archiveName := canonicalParallelPackageName(splitPkg)
@@ -187,52 +190,58 @@ func currentSplitUpdateTarball(sourcePkg, splitPkg string, cfg *Config, remoteIn
 	for _, variant := range variants {
 		tarballPath := filepath.Join(BinDir, StandardizeRemoteName(archiveName, version, revision, arch, variant))
 		if _, err := os.Stat(tarballPath); err == nil {
-			return tarballPath, true, nil
+			return cachedBinaryTarball(splitPkg, tarballPath), true, nil
 		}
 	}
 
 	for _, variant := range variants {
-		for _, entry := range remoteIndex {
+		for i := range remoteIndex {
+			entry := &remoteIndex[i]
 			if entry.Type == "meta" || entry.Name != archiveName || entry.Version != version ||
 				entry.Revision != revision || entry.Arch != arch || entry.Variant != variant {
 				continue
 			}
-			if err := fetchSpecificBinaryPackage(archiveName, version, revision, variant, cfg, false, entry.B3Sum, false); err != nil {
-				return "", false, fmt.Errorf("failed to fetch split update %s: %w", splitPkg, err)
-			}
-			tarballPath := filepath.Join(BinDir, StandardizeRemoteName(archiveName, version, revision, arch, variant))
-			return tarballPath, true, nil
+			return remoteBinaryTarball(splitPkg, entry, cfg), true, nil
 		}
 	}
-	return "", false, nil
+	return binaryTarball{}, false, nil
 }
 
-// installAvailableSplitUpdates updates selected split outputs directly from
-// binaries. It returns false without installing anything unless every selected
-// output is available, allowing the caller to fall back to one source build.
-func installAvailableSplitUpdates(sourcePkg string, splitPkgs []string, cfg *Config, remoteIndex []RepoEntry, quiet bool) (bool, error) {
-	paths := make(map[string]string, len(splitPkgs))
+// locateSplitUpdates finds the binaries of the selected split outputs of
+// sourcePkg. It returns false unless every one of them is available, so the
+// caller can fall back to one source build.
+func locateSplitUpdates(sourcePkg string, splitPkgs []string, cfg *Config, remoteIndex []RepoEntry) (map[string]binaryTarball, bool, error) {
+	tarballs := make(map[string]binaryTarball, len(splitPkgs))
 	for _, splitPkg := range splitPkgs {
-		path, available, err := currentSplitUpdateTarball(sourcePkg, splitPkg, cfg, remoteIndex)
+		b, available, err := locateSplitUpdateTarball(sourcePkg, splitPkg, cfg, remoteIndex)
 		if err != nil {
-			return false, err
+			return nil, false, err
 		}
 		if !available {
-			return false, nil
+			return nil, false, nil
 		}
-		paths[splitPkg] = path
+		tarballs[splitPkg] = b
 	}
+	return tarballs, true, nil
+}
 
+// installSplitUpdates installs split outputs located by locateSplitUpdates,
+// in order, once the update is confirmed.
+func installSplitUpdates(splitPkgs []string, tarballs map[string]binaryTarball, cfg *Config, quiet bool) error {
 	logger, fast := dependencyInstallLogger(quiet)
 	for _, splitPkg := range splitPkgs {
 		colArrow.Print("-> ")
 		colSuccess.Printf("Installing split package")
 		colNote.Printf(" %s\n", splitPkg)
-		if err := installSplitPackageTarballWithLogger(splitPkg, paths[splitPkg], cfg, logger, fast); err != nil {
-			return true, err
+		path, err := tarballs[splitPkg].fetch(cfg)
+		if err != nil {
+			return fmt.Errorf("failed to fetch split update %s: %w", splitPkg, err)
+		}
+		if err := installSplitPackageTarballWithLogger(splitPkg, path, cfg, logger, fast); err != nil {
+			return err
 		}
 	}
-	return true, nil
+	return nil
 }
 
 func removeUpdateTarget(targets []string, remove string) []string {
@@ -1412,99 +1421,80 @@ func checkForUpgrades(ctx context.Context, cfg *Config, maxJobs int, yes bool) e
 	// Prefer independent split binaries. A source build is needed only when at
 	// least one selected output is unavailable. This also keeps a split-only
 	// installation from pulling in or rebuilding its parent package.
-	directSplitUpdates := 0
-	for sourcePkg, splitPkgs := range selectedSplitUpdates {
-		installed, err := installAvailableSplitUpdates(sourcePkg, splitPkgs, cfg, remoteIndex, true)
+	// They are only located here; like everything else they are shown in
+	// the summary, downloaded once the update is confirmed, and installed
+	// first.
+	var splitBinaries []splitUpdateBinary
+	splitSources := make([]string, 0, len(selectedSplitUpdates))
+	for sourcePkg := range selectedSplitUpdates {
+		splitSources = append(splitSources, sourcePkg)
+	}
+	sort.Strings(splitSources)
+	for _, sourcePkg := range splitSources {
+		splitPkgs := selectedSplitUpdates[sourcePkg]
+		tarballs, available, err := locateSplitUpdates(sourcePkg, splitPkgs, cfg, remoteIndex)
 		if err != nil {
 			return fmt.Errorf("failed to update split package(s) from %s: %w", sourcePkg, err)
 		}
-		if !installed {
+		if !available {
 			continue
 		}
-		directSplitUpdates += len(splitPkgs)
+		for _, splitPkg := range splitPkgs {
+			splitBinaries = append(splitBinaries, splitUpdateBinary{name: splitPkg, tarball: tarballs[splitPkg]})
+		}
 		delete(selectedSplitUpdates, sourcePkg)
 		if !userRequestedMap[sourcePkg] {
 			pkgNames = removeUpdateTarget(pkgNames, sourcePkg)
 		}
 	}
+	installSplitBinaries := func() error {
+		if len(splitBinaries) == 0 {
+			return nil
+		}
+		names := make([]string, len(splitBinaries))
+		tarballs := make(map[string]binaryTarball, len(splitBinaries))
+		for i, sb := range splitBinaries {
+			names[i] = sb.name
+			tarballs[sb.name] = sb.tarball
+		}
+		if err := installSplitUpdates(names, tarballs, cfg, true); err != nil {
+			return fmt.Errorf("failed to update split package(s): %w", err)
+		}
+		return nil
+	}
 	if len(pkgNames) == 0 {
+		if !confirmUpdatePlan(nil, userRequestedMap, nil, nil, splitBinaries, cfg, yes) {
+			colArrow.Print("-> ")
+			colWarn.Println("Upgrade canceled.")
+			return nil
+		}
+		prefetchRepoEntries(splitUpdateEntries(splitBinaries), cfg)
+		if err := installSplitBinaries(); err != nil {
+			return err
+		}
 		if err := PostInstallTasks(RootExec, os.Stdout); err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: Global post-install tasks failed: %v\n", err)
 		}
 		colArrow.Print("-> ")
-		colSuccess.Printf("System update completed successfully (%d split package(s)).\n", directSplitUpdates)
+		colSuccess.Printf("System update completed successfully (%d split package(s)).\n", len(splitBinaries))
 		return nil
 	}
 
+	// The binaries of the selected updates, located without downloading:
+	// they are downloaded together once the update is confirmed.
+	updateBinaries := make(map[string]binaryTarball)
 	if len(pkgNames) > 0 {
 		colArrow.Print("-> ")
 		colSuccess.Printf("Checking for binary availability\n")
-		// Use fetching logic to populate binaryAvailable
 		for _, pkgName := range pkgNames {
 			// A selected split output is produced by the source build.  Do not let
 			// the source binary suppress its make dependencies or the build itself.
 			if len(selectedSplitUpdates[pkgName]) > 0 {
 				continue
 			}
-			version, revision, err := getRepoVersion2(pkgName)
-			if err != nil {
-				continue
-			}
-
-			archivePkgName := getArchivePackageName(pkgName, cfg)
-			arch := GetSystemArchForPackage(cfg, pkgName)
-			variant := GetSystemVariantForPackage(cfg, pkgName)
-			tarballName := StandardizeRemoteName(archivePkgName, version, revision, arch, variant)
-			tarballPath := filepath.Join(BinDir, tarballName)
-
-			// 1. Check local cache
-			if _, err := os.Stat(tarballPath); err == nil {
+			if b, ok := locateUpdateBinary(pkgName, cfg, remoteIndex); ok {
 				binaryAvailable[pkgName] = true
-				continue
-			}
-
-			if BinaryMirror != "" && len(remoteIndex) > 0 {
-				// Lookup checksum and verify the package exists in the index
-				var expectedSum string
-				foundInIndex := false
-				targetArch := GetSystemArchForPackage(cfg, pkgName)
-				preferredVariant := GetSystemVariantForPackage(cfg, pkgName)
-				fallbackVariant := ""
-				if !strings.Contains(preferredVariant, "generic") {
-					fallbackVariant = "generic"
-					if strings.HasPrefix(preferredVariant, "multi-") {
-						fallbackVariant = "multi-generic"
-					}
-				}
-
-				var bestEntry *RepoEntry
-				for _, entry := range remoteIndex {
-					if entry.Name == archivePkgName && entry.Version == version &&
-						entry.Revision == revision && entry.Arch == targetArch {
-						if entry.Variant == preferredVariant {
-							e := entry
-							bestEntry = &e
-							break
-						}
-						if fallbackVariant != "" && entry.Variant == fallbackVariant {
-							e := entry
-							bestEntry = &e
-						}
-					}
-				}
-
-				if bestEntry != nil {
-					expectedSum = bestEntry.B3Sum
-					foundInIndex = true
-				}
-
-				// Only attempt download if the package was found in the remote index
-				if foundInIndex {
-					// Use quiet mode for check
-					if err := fetchSpecificBinaryPackage(archivePkgName, version, revision, bestEntry.Variant, cfg, true, expectedSum, false); err == nil {
-						binaryAvailable[pkgName] = true
-					}
-				}
+				updateBinaries[pkgName] = b
 			}
 		}
 	}
@@ -1525,6 +1515,25 @@ func checkForUpgrades(ctx context.Context, cfg *Config, maxJobs int, yes bool) e
 	if err != nil {
 		return fmt.Errorf("failed to resolve upgrade plan: %w", err)
 	}
+	// As pacman does: what the update builds, installs and downloads, and
+	// how much the installed size changes, then confirm, before anything
+	// is installed or downloaded.
+	if !confirmUpdatePlan(plan, userRequestedMap, binaryAvailable, updateBinaries, splitBinaries, cfg, yes) {
+		colArrow.Print("-> ")
+		colWarn.Println("Upgrade canceled.")
+		return nil
+	}
+	updateEntries := splitUpdateEntries(splitBinaries)
+	for _, b := range updateBinaries {
+		if b.entry != nil {
+			updateEntries = append(updateEntries, *b.entry)
+		}
+	}
+	prefetchRepoEntries(updateEntries, cfg)
+	if err := installSplitBinaries(); err != nil {
+		return err
+	}
+
 	updateTargets := append([]string(nil), pkgNames...)
 	acceptedBinaryDeps := make(map[string]bool)
 	for {
