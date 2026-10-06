@@ -2394,9 +2394,14 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, opts BuildOptions)
 	buildDir := filepath.Join(pkgTmpDir, "build")
 	outputDir := filepath.Join(pkgTmpDir, "output")
 	splitRoot := filepath.Join(pkgTmpDir, "split")
+	// The build's own TMPDIR, removed with the rest of the build tree.
+	// Pointing tools at the shared TMPDIR left whatever they failed to
+	// clean up (mold's GCC LTO temporaries after every failed configure
+	// link) to pile up there.
+	buildTmpDir := filepath.Join(pkgTmpDir, "tmp")
 
 	// Create build/output dirs (non-root, inside TMPDIR).
-	for _, dir := range []string{buildDir, outputDir, logDir, splitRoot} {
+	for _, dir := range []string{buildDir, outputDir, logDir, splitRoot, buildTmpDir} {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return 0, fmt.Errorf("failed to create dir %s: %v", dir, err)
 		}
@@ -2579,7 +2584,7 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, opts BuildOptions)
 			"PATH":              filepath.Join(lfsRoot, "tools/bin") + ":/usr/bin:/bin",
 			"MAKEFLAGS":         fmt.Sprintf("-j%d", numCores),
 			"HOKUTO_ROOT":       lfsRoot,
-			"TMPDIR":            currentTmpDir,
+			"TMPDIR":            buildTmpDir,
 			"XDG_CACHE_HOME":    filepath.Join(buildDir, ".cache"), // Prevent g-ir-scanner from using ~/.cache
 			"HOKUTO_ARCH":       targetArch,
 			"HOKUTO_BUILD_DIR":  buildDir,
@@ -2772,7 +2777,7 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, opts BuildOptions)
 			"GOPATH":                     filepath.Join(buildDir, "go"),
 			"CARGO_HOME":                 filepath.Join(buildDir, "cargo"),
 			"HOKUTO_ROOT":                cfg.Values["HOKUTO_ROOT"],
-			"TMPDIR":                     currentTmpDir,
+			"TMPDIR":                     buildTmpDir,
 			"XDG_CACHE_HOME":             filepath.Join(buildDir, ".cache"), // Prevent g-ir-scanner from using ~/.cache
 			"CONFIG_SITE":                ("/usr/share/config.site"),
 			"HOKUTO_ARCH":                targetArch,
@@ -3454,6 +3459,7 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 	buildDir := filepath.Join(pkgTmpDir, "build")
 	outputDir := filepath.Join(pkgTmpDir, "output")
 	logDir := filepath.Join(pkgTmpDir, "log")
+	buildTmpDir := filepath.Join(pkgTmpDir, "tmp") // the build's own TMPDIR, as in pkgBuild
 
 	// First try to cleanup pkgTmpDir with Go's os.RemoveAll
 	if err := os.RemoveAll(pkgTmpDir); err != nil {
@@ -3464,7 +3470,7 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 		}
 	}
 
-	for _, dir := range []string{buildDir, outputDir, logDir} {
+	for _, dir := range []string{buildDir, outputDir, logDir, buildTmpDir} {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return fmt.Errorf("failed to create dir %s: %v", dir, err)
 		}
@@ -3594,7 +3600,7 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 		"GOFLAGS":                    "-trimpath -modcacherw",
 		"GOPATH":                     filepath.Join(buildDir, "go"),
 		"HOKUTO_ROOT":                rootDir,
-		"TMPDIR":                     currentTmpDir,
+		"TMPDIR":                     buildTmpDir,
 		"CONFIG_SITE":                ("/usr/share/config.site"),
 	}
 
