@@ -1594,6 +1594,10 @@ func handleAutoBumpRepository(cfg *Config, autoBuild bool, assumeYes bool, repoU
 			pkgName = "pyqt-builder"
 		case "pacman-package-manager":
 			pkgName = "pacman"
+		case "discord-linux":
+			pkgName = "discord"
+		case "zig":
+			pkgName = "zig-bin"
 		}
 
 		var newestVer string
