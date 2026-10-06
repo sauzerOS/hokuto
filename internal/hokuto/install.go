@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -272,6 +273,12 @@ func flushPackageSuggestions(logger io.Writer, cfg *Config, noRemote bool, promp
 	pending := make(map[string][]packageSuggestion)
 	for pkg := range items {
 		if !packageOrMetaInstalled(pkg) {
+			continue
+		}
+		// dracut, pulled in only to run a kernel's post-install hook, is
+		// not something the user chose; its optional extras are not worth
+		// asking about.
+		if installedOnlyForPostInstall(pkg) {
 			continue
 		}
 		for _, item := range items[pkg] {
@@ -2478,4 +2485,59 @@ func stagedPackageVersion(stagingDir, pkgName string) (string, error) {
 		return "", fmt.Errorf("empty version file for %s", pkgName)
 	}
 	return fields[0], nil
+}
+
+// installedOnlyForPostInstall reports whether pkg is installed only because
+// installed packages need it to run their post-install hooks ("dracut
+// post-install" in a kernel's depends): nothing requested it (world,
+// world_make) and no installed package depends on it otherwise.
+func installedOnlyForPostInstall(pkg string) bool {
+	for _, file := range []string{WorldFile, WorldMakeFile} {
+		if fileHasLine(file, pkg) {
+			return false
+		}
+	}
+	entries, err := os.ReadDir(Installed)
+	if err != nil {
+		return false
+	}
+	postInstallOnly := false
+	for _, entry := range entries {
+		if !entry.IsDir() || entry.Name() == pkg {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(Installed, entry.Name(), "depends"))
+		if err != nil {
+			continue
+		}
+		deps, err := parseDependsData(data)
+		if err != nil {
+			continue
+		}
+		for _, dep := range deps {
+			if dep.Suggest || (dep.Name != pkg && !slices.Contains(dep.Alternatives, pkg)) {
+				continue
+			}
+			if !dep.PostInstall {
+				return false
+			}
+			postInstallOnly = true
+		}
+	}
+	return postInstallOnly
+}
+
+// fileHasLine reports whether path has a line that is exactly line, ignoring
+// surrounding whitespace.
+func fileHasLine(path, line string) bool {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	for _, l := range strings.Split(string(data), "\n") {
+		if strings.TrimSpace(l) == line {
+			return true
+		}
+	}
+	return false
 }
