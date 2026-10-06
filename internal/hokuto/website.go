@@ -338,13 +338,20 @@ func describeWebsiteOutput(websiteRepo, arch, version string, src WebsiteOutputS
 	if info, err := os.Stat(src.Tarball); err == nil {
 		out.Size = info.Size()
 	}
-	installed, err := installedSize(src.OutputDir)
-	if err != nil {
-		return out, err
+	// The archive records the installed size. Walking the output instead
+	// fails on an asroot build, whose output holds directories only root
+	// may enter (cups: etc/cups/ssl).
+	if scan, err := scanTarballFull(src.Tarball); err == nil && scan.installedSize > 0 {
+		out.Installed = scan.installedSize
+	} else {
+		installed, err := installedSize(src.OutputDir)
+		if err != nil {
+			return out, err
+		}
+		out.Installed = installed
 	}
-	out.Installed = installed
 
-	data, err := os.ReadFile(filepath.Join(src.OutputDir, "var", "db", "hokuto", "installed", src.Name, "manifest"))
+	data, err := readFileAsRoot(filepath.Join(src.OutputDir, "var", "db", "hokuto", "installed", src.Name, "manifest"))
 	if err != nil {
 		return out, err
 	}
