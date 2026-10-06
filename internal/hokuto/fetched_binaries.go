@@ -80,6 +80,7 @@ func removeFetchedBinaries() {
 // exitHokuto is os.Exit for hokuto's command paths: it first removes the
 // packages this process downloaded, which a deferred call would miss.
 func exitHokuto(code int) {
+	flushTransactionLog()
 	removeFetchedBinaries()
 	os.Exit(code)
 }

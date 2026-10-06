@@ -94,6 +94,9 @@ func confirmUpdatePlan(plan *BuildPlan, userRequested, binaryAvailable map[strin
 		}
 	}
 	printRemoteUpdateSizes(sizes)
+	if !reportFreeSpace(sizes.download, sizes.net) {
+		return false
+	}
 
 	if yes || !term.IsTerminal(int(os.Stdin.Fd())) {
 		return true

@@ -195,7 +195,11 @@ func checkForRemoteUpgrades(_ context.Context, cfg *Config, yes bool) error {
 	// As pacman does: what the update downloads and how much the installed
 	// size grows or shrinks, then confirm. Only on a terminal, so scripts
 	// keep working; -y skips it.
-	printRemoteUpdateSizes(computeRemoteUpdateSizes(pkgNames, targets, cfg, remoteIndex))
+	sizes := computeRemoteUpdateSizes(pkgNames, targets, cfg, remoteIndex)
+	printRemoteUpdateSizes(sizes)
+	if !reportFreeSpace(sizes.download, sizes.net) {
+		return fmt.Errorf("the update does not fit on disk")
+	}
 	if !yes && term.IsTerminal(int(os.Stdin.Fd())) {
 		colArrow.Print("-> ")
 		if !askForConfirmation(colSuccess, "Proceed with installation?") {

@@ -909,7 +909,11 @@ func Main() {
 		}
 
 		if len(installPlan) > 0 {
-			printInstallPlanSizes(computeInstallPlanSizes(installPlan, cfg, remoteIndex))
+			sizes := computeInstallPlanSizes(installPlan, cfg, remoteIndex)
+			printInstallPlanSizes(sizes)
+			if !reportFreeSpace(sizes.download, sizes.installed) {
+				exitHokuto(1)
+			}
 		}
 
 		if *ask && !confirmInstallPlanWithAsk(installPlan, requestedMetas) {

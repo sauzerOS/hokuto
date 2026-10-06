@@ -661,6 +661,18 @@ func stagedArchivePackageName(stagingDir, requestedName string) (string, error) 
 // mirror. Callers that do not explicitly opt in retain pkgInstall's historical
 // local-only behavior.
 func pkgInstallWithRemotePolicy(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes, fast, managed, noRemote bool, logger io.Writer) ([]string, error) {
+	defer lockInstalledState()()
+	oldRelease, wasInstalled := installedRelease(pkgName)
+	rebuilds, err := installPackageArchive(tarballPath, pkgName, cfg, execCtx, yes, fast, managed, noRemote, logger)
+	if err == nil {
+		logPackageInstall(pkgName, oldRelease, wasInstalled)
+	}
+	return rebuilds, err
+}
+
+// installPackageArchive is pkgInstallWithRemotePolicy under the
+// installed-state lock.
+func installPackageArchive(tarballPath, pkgName string, cfg *Config, execCtx *Executor, yes, fast, managed, noRemote bool, logger io.Writer) ([]string, error) {
 	transferEquivalentWorld := false
 	transferEquivalentWorldMake := false
 	if logger == nil {
@@ -669,14 +681,30 @@ func pkgInstallWithRemotePolicy(tarballPath, pkgName string, cfg *Config, execCt
 	// "Installing" message is now handled by the caller (cli.go, update.go, build.go)
 	// to avoid duplicate output.
 
-	// Special handling for glibc: direct extraction without staging or checks
+	// glibc is not placed like other packages: replacing the C library file
+	// by file under running tools is what the staging copy cannot survive.
+	// It is still unpacked into staging first, so its signature and version
+	// hold are checked like any other package's, and then copied into the
+	// root by tar in one pass from the verified tree.
 	if pkgName == "glibc" {
-		// Check lock for glibc by parsing version from filename
-		base := filepath.Base(tarballPath)
-		nameWithoutExt := strings.TrimSuffix(base, ".tar.zst")
-		parts := strings.Split(nameWithoutExt, "-")
-		if len(parts) >= 3 {
-			version := parts[len(parts)-2]
+		stagingBase := installStagingBase(rootDir, tmpDir, cfg)
+		stagingDir := filepath.Join(stagingBase, pkgName, "staging")
+		os.RemoveAll(stagingDir)
+		if err := os.MkdirAll(stagingDir, 0o755); err != nil {
+			return nil, fmt.Errorf("failed to create staging dir: %v", err)
+		}
+		defer func() { _ = removeAllPrivilegedFallback(filepath.Join(stagingBase, pkgName), execCtx) }()
+		if err := unpackPackageToStaging(tarballPath, stagingDir, execCtx); err != nil {
+			return nil, err
+		}
+		sigLogger := logger
+		if fast {
+			sigLogger = io.Discard
+		}
+		if err := VerifyPackageSignature(stagingDir, pkgName, cfg, execCtx, sigLogger); err != nil {
+			return nil, err
+		}
+		if version, err := stagedPackageVersion(stagingDir, pkgName); err == nil {
 			if err := checkLock(pkgName, version); err != nil {
 				colArrow.Print("-> ")
 				colError.Println(err)
@@ -689,11 +717,9 @@ func pkgInstallWithRemotePolicy(tarballPath, pkgName string, cfg *Config, execCt
 		}
 
 		var extractErr error
-
 		tarSuccess := false
 		if _, err := exec.LookPath("tar"); err == nil {
-			args := []string{"xf", tarballPath, "-C", rootDir}
-			tarCmd := exec.Command("tar", args...)
+			tarCmd := exec.Command("sh", "-c", `tar -C "$1" -cf - . | tar -C "$2" -xpf -`, "sh", stagingDir, rootDir)
 			if Debug {
 				tarCmd.Stdout = os.Stdout
 				tarCmd.Stderr = os.Stderr
@@ -713,6 +739,7 @@ func pkgInstallWithRemotePolicy(tarballPath, pkgName string, cfg *Config, execCt
 		}
 
 		if !tarSuccess {
+			// Verified above; this reads the same archive again.
 			if os.Geteuid() == 0 {
 				if err := unpackTarballFallback(tarballPath, rootDir); err != nil {
 					extractErr = fmt.Errorf("native fallback failed: %v", err)
@@ -774,43 +801,8 @@ func pkgInstallWithRemotePolicy(tarballPath, pkgName string, cfg *Config, execCt
 	// 1. Unpack tarball into staging
 	debugf("Unpacking %s into %s\n", tarballPath, stagingDir)
 
-	tarSuccess := false
-	if _, err := exec.LookPath("tar"); err == nil {
-		// A package packed into several zstd frames can be decoded on all cores
-		// at once. Archives with a single frame -- everything packed by an older
-		// hokuto, and every package small enough to fit in one chunk -- fall
-		// through to the ordinary path.
-		if err := unpackMultiFrame(tarballPath, stagingDir, execCtx); err == nil {
-			tarSuccess = true
-		} else if !errors.Is(err, errSingleFrameArchive) {
-			debugf("Parallel unpack of %s failed, falling back to tar --zstd: %v\n", tarballPath, err)
-		}
-
-		if !tarSuccess {
-			untarCmd := exec.Command("tar", "--zstd", "-xf", tarballPath, "-C", stagingDir)
-			if !Debug {
-				untarCmd.Stdout = io.Discard
-				untarCmd.Stderr = io.Discard
-			}
-			if err := execCtx.Run(untarCmd); err == nil {
-				tarSuccess = true
-			} else {
-				debugf("System tar failed for %s, falling back to internal tar+zstd: %v\n", tarballPath, err)
-			}
-		}
-	}
-
-	if !tarSuccess {
-		// The internal unpacker runs in this process: only as root does it
-		// give the files their owners. Run as a normal user (installing
-		// through sudo or run0) it would stage, and so install, every file
-		// owned by that user.
-		if os.Geteuid() != 0 {
-			return nil, fmt.Errorf("cannot unpack %s: installing as a normal user needs a working tar with zstd (tar --zstd); install tar and zstd, or run hokuto as root", filepath.Base(tarballPath))
-		}
-		if err := unpackTarballFallback(tarballPath, stagingDir); err != nil {
-			return nil, fmt.Errorf("failed to unpack tarball (native): %v", err)
-		}
+	if err := unpackPackageToStaging(tarballPath, stagingDir, execCtx); err != nil {
+		return nil, err
 	}
 
 	archivePkgName, err := stagedArchivePackageName(stagingDir, pkgName)
@@ -2427,4 +2419,63 @@ func renameManifestMetadataPaths(manifestPath, from, to string, execCtx *Executo
 		return nil
 	}
 	return writeFileAsRoot(manifestPath, []byte(strings.Join(lines, "\n")), 0o644, execCtx)
+}
+
+// unpackPackageToStaging unpacks a package archive into stagingDir, where it
+// is verified before anything reaches the root.
+func unpackPackageToStaging(tarballPath, stagingDir string, execCtx *Executor) error {
+	tarSuccess := false
+	if _, err := exec.LookPath("tar"); err == nil {
+		// A package packed into several zstd frames can be decoded on all cores
+		// at once. Archives with a single frame -- everything packed by an older
+		// hokuto, and every package small enough to fit in one chunk -- fall
+		// through to the ordinary path.
+		if err := unpackMultiFrame(tarballPath, stagingDir, execCtx); err == nil {
+			tarSuccess = true
+		} else if !errors.Is(err, errSingleFrameArchive) {
+			debugf("Parallel unpack of %s failed, falling back to tar --zstd: %v\n", tarballPath, err)
+		}
+
+		if !tarSuccess {
+			untarCmd := exec.Command("tar", "--zstd", "-xf", tarballPath, "-C", stagingDir)
+			if !Debug {
+				untarCmd.Stdout = io.Discard
+				untarCmd.Stderr = io.Discard
+			}
+			if err := execCtx.Run(untarCmd); err == nil {
+				tarSuccess = true
+			} else {
+				debugf("System tar failed for %s, falling back to internal tar+zstd: %v\n", tarballPath, err)
+			}
+		}
+	}
+
+	if !tarSuccess {
+		// The internal unpacker runs in this process: only as root does it
+		// give the files their owners. Run as a normal user (installing
+		// through sudo or run0) it would stage, and so install, every file
+		// owned by that user.
+		if os.Geteuid() != 0 {
+			return fmt.Errorf("cannot unpack %s: installing as a normal user needs a working tar with zstd (tar --zstd); install tar and zstd, or run hokuto as root", filepath.Base(tarballPath))
+		}
+		if err := unpackTarballFallback(tarballPath, stagingDir); err != nil {
+			return fmt.Errorf("failed to unpack tarball (native): %v", err)
+		}
+	}
+
+	return nil
+}
+
+// stagedPackageVersion is the version (without revision) of the package
+// staged in stagingDir, read from its version file.
+func stagedPackageVersion(stagingDir, pkgName string) (string, error) {
+	data, err := readFileAsRoot(filepath.Join(stagingDir, "var", "db", "hokuto", "installed", pkgName, "version"))
+	if err != nil {
+		return "", err
+	}
+	fields := strings.Fields(string(data))
+	if len(fields) == 0 {
+		return "", fmt.Errorf("empty version file for %s", pkgName)
+	}
+	return fields[0], nil
 }

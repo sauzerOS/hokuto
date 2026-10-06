@@ -118,6 +118,7 @@ func appendLineToFile(path, line string) error {
 }
 
 func addToWorld(pkgName string) error {
+	defer lockInstalledState()()
 	// 1. Read existing world
 	content, err := os.ReadFile(WorldFile)
 	// It's okay if file doesn't exist yet
@@ -138,6 +139,7 @@ func addToWorld(pkgName string) error {
 // removeFromWorld removes a package from the world file.
 
 func removeFromWorld(pkgName string) error {
+	defer lockInstalledState()()
 	content, err := os.ReadFile(WorldFile)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -185,6 +187,7 @@ func removeFromWorld(pkgName string) error {
 // addToWorldMake adds a package to the world_make file.
 
 func addToWorldMake(pkgName string) error {
+	defer lockInstalledState()()
 	// 1. Check if already in world_make
 	content, err := os.ReadFile(WorldMakeFile)
 	if err == nil {
@@ -202,6 +205,7 @@ func addToWorldMake(pkgName string) error {
 // removeFromWorldMake removes a package from the world_make file.
 
 func removeFromWorldMake(pkgName string) error {
+	defer lockInstalledState()()
 	content, err := os.ReadFile(WorldMakeFile)
 	if err != nil {
 		return nil

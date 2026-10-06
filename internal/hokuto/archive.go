@@ -6,6 +6,7 @@ package hokuto
 import (
 	"archive/tar"
 	"bufio"
+	"cmp"
 	"compress/bzip2"
 	"fmt"
 	"io"
@@ -377,6 +378,17 @@ func unpackTarballFallback(tarballPath, dest string) error {
 	}
 	defer zr.Close()
 
+	// As GNU tar does, symlinks that point outside the archive (an absolute
+	// target, or one with "..") are created only once every other entry is
+	// written: an archive could otherwise create "a -> /etc" and then write
+	// "a/passwd" through it, outside dest. Relative package links such as
+	// "../lib/libfoo.so" end up the same, only later.
+	type deferredSymlink struct {
+		target, linkname string
+		uid, gid         int
+	}
+	var deferred []deferredSymlink
+
 	tr := tar.NewReader(zr)
 	for {
 		hdr, err := tr.Next()
@@ -403,6 +415,10 @@ func unpackTarballFallback(tarballPath, dest string) error {
 			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 				return err
 			}
+			// Replace a symlink at target instead of writing through it.
+			if fi, err := os.Lstat(target); err == nil && fi.Mode()&os.ModeSymlink != 0 {
+				_ = os.Remove(target)
+			}
 			out, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, os.FileMode(hdr.Mode))
 			if err != nil {
 				return err
@@ -418,6 +434,10 @@ func unpackTarballFallback(tarballPath, dest string) error {
 		case tar.TypeSymlink:
 			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 				return err
+			}
+			if symlinkLeavesArchive(hdr.Linkname) {
+				deferred = append(deferred, deferredSymlink{target, hdr.Linkname, hdr.Uid, hdr.Gid})
+				continue
 			}
 			_ = os.Remove(target)
 			if err := os.Symlink(hdr.Linkname, target); err != nil && !os.IsExist(err) {
@@ -446,7 +466,38 @@ func unpackTarballFallback(tarballPath, dest string) error {
 			debugf("Skipping unsupported package tar entry type %c: %s\n", hdr.Typeflag, hdr.Name)
 		}
 	}
-	return nil
+	var firstErr error
+	for _, link := range deferred {
+		if err := os.MkdirAll(filepath.Dir(link.target), 0o755); err != nil {
+			firstErr = cmp.Or(firstErr, err)
+			continue
+		}
+		if fi, err := os.Lstat(link.target); err == nil && !fi.IsDir() {
+			_ = os.Remove(link.target)
+		}
+		if err := os.Symlink(link.linkname, link.target); err != nil {
+			firstErr = cmp.Or(firstErr, fmt.Errorf("failed to create symlink %s -> %s: %w", link.target, link.linkname, err))
+			continue
+		}
+		if os.Geteuid() == 0 {
+			_ = unix.Lchown(link.target, link.uid, link.gid)
+		}
+	}
+	return firstErr
+}
+
+// symlinkLeavesArchive reports whether a symlink target can point outside
+// the tree being unpacked: an absolute path, or one climbing with "..".
+func symlinkLeavesArchive(linkname string) bool {
+	if filepath.IsAbs(linkname) {
+		return true
+	}
+	for _, part := range strings.Split(linkname, "/") {
+		if part == ".." {
+			return true
+		}
+	}
+	return false
 }
 
 // createPackageTarball creates a .tar.zst archive of outputDir into BinDir.

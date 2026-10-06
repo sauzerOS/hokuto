@@ -317,6 +317,19 @@ added to `world`.
 10. discover rebuild triggers/affected reverse dependencies;
 11. update installed metadata, suggestions, and global post-install state.
 
+Installing, uninstalling and editing the world files hold the installed-state
+lock (`lockInstalledState` in `state_lock.go`), an flock on the installed
+database directory that serializes these changes across hokuto processes.
+It is shared within one process, so nested installs do not deadlock. A new
+path that changes installed state must take it. glibc is placed by tar
+instead of staging placement, but is still unpacked into staging and verified
+first. Install and update plans are checked for free space
+(`checkFreeSpace` in `disk_space.go`) before anything is downloaded.
+Each install, upgrade, downgrade, reinstall and removal is recorded in the
+zstd-compressed transaction log `/var/log/hokuto.log.zst`
+(`transaction_log.go`); queued lines are flushed periodically and by
+`exitHokuto`, so leave hokuto through `exitHokuto`.
+
 The `managed` argument means a caller such as parallel update owns rebuild
 scheduling. In managed mode the installer returns rebuild targets rather than
 building them inline.

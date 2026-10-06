@@ -126,6 +126,20 @@ func installedDependents(pkgName string, cfg *Config, removing map[string]bool) 
 }
 
 func pkgUninstallWithRemovalSet(pkgName string, cfg *Config, execCtx *Executor, force, yes bool, logger io.Writer, removing map[string]bool) error {
+	defer lockInstalledState()()
+	oldRelease, wasInstalled := installedRelease(pkgName)
+	if err := uninstallPackageLocked(pkgName, cfg, execCtx, force, yes, logger, removing); err != nil {
+		return err
+	}
+	if wasInstalled && !isPackageInstalled(pkgName) {
+		logTransaction("removed %s (%s)", pkgName, oldRelease)
+	}
+	return nil
+}
+
+// uninstallPackageLocked is pkgUninstallWithRemovalSet under the
+// installed-state lock.
+func uninstallPackageLocked(pkgName string, cfg *Config, execCtx *Executor, force, yes bool, logger io.Writer, removing map[string]bool) error {
 	if pkgName == protectedBasePackage {
 		return fmt.Errorf("refusing to uninstall protected base filesystem package %s", pkgName)
 	}
