@@ -186,7 +186,9 @@ make dependencies for a confirmed binary target.
 - `asroot`, `interactive`, `noram`, `idle`;
 - `binary`, `nodevel`, `devel`;
 - `multilib`, `generic`;
-- `nolto`, `nostrip`, `staticlibs`, `clang`;
+- `nolto`, `nostrip`, `staticlibs`, `clang` (only sets `LTOJOBS=auto`; the
+  recipe chooses its compiler and linker), `nomold` (keep ld.bfd: builds link
+  with mold, LTO included, whenever it is installed; see `applyMoldLinker`);
 - `cross-simple`, `host-tool`, `nocrossopt`;
 - `perlxs`, `python-rebuild`: recipes whose packages must be rebuilt after a
   Perl API or Python minor upgrade (`perl_rebuild.go`, `python_rebuild.go`).

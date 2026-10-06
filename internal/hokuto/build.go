@@ -2731,20 +2731,7 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, opts BuildOptions)
 		}
 
 		// 4. Apply Linker Logic (Mold)
-		// ----------------------------
-		// "replace -fuse-ld=bfd with -fuse-ld=mold if mold is installed and LTO is disabled"
-		if !shouldLTO {
-			useMold := checkPackageExactMatch("mold")
-
-			if useMold {
-				// Upgrade BFD/Gold to Mold
-				ldflagsVal = strings.ReplaceAll(ldflagsVal, "-fuse-ld=bfd", "-fuse-ld=mold")
-				ldflagsVal = strings.ReplaceAll(ldflagsVal, "-fuse-ld=gold", "-fuse-ld=mold")
-			} else {
-				// Fallback: If config asks for Mold but it's not installed, revert to BFD
-				ldflagsVal = strings.ReplaceAll(ldflagsVal, "-fuse-ld=mold", "-fuse-ld=bfd")
-			}
-		}
+		ldflagsVal = applyMoldLinker(ldflagsVal, options)
 
 		// 5. Apply CPU Flags
 		cpuFlags := ""
@@ -3764,16 +3751,7 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 	}
 
 	// 4. Apply Linker Logic (Mold)
-	// ----------------------------
-	if !shouldLTO {
-		useMold := checkPackageExactMatch("mold")
-		if useMold {
-			ldflagsVal = strings.ReplaceAll(ldflagsVal, "-fuse-ld=bfd", "-fuse-ld=mold")
-			ldflagsVal = strings.ReplaceAll(ldflagsVal, "-fuse-ld=gold", "-fuse-ld=mold")
-		} else {
-			ldflagsVal = strings.ReplaceAll(ldflagsVal, "-fuse-ld=mold", "-fuse-ld=bfd")
-		}
-	}
+	ldflagsVal = applyMoldLinker(ldflagsVal, options)
 
 	// 5. Update defaults map
 	// ----------------------
@@ -5899,3 +5877,19 @@ func orderedBuildList(toBuild map[string]bool, requested []string) []string {
 	sort.Strings(rest)
 	return append(list, rest...)
 }
+
+// applyMoldLinker links with mold when it is installed, LTO builds included:
+// mold 3 links GCC and LLVM LTO objects through the same compiler plugins as
+// ld.bfd. A recipe whose package mold breaks opts out with the "nomold"
+// option and keeps ld.bfd, as does every build without mold installed.
+func applyMoldLinker(ldflags string, options map[string]bool) string {
+	if !options["nomold"] && moldInstalled() {
+		ldflags = strings.ReplaceAll(ldflags, "-fuse-ld=bfd", "-fuse-ld=mold")
+		return strings.ReplaceAll(ldflags, "-fuse-ld=gold", "-fuse-ld=mold")
+	}
+	return strings.ReplaceAll(ldflags, "-fuse-ld=mold", "-fuse-ld=bfd")
+}
+
+// moldInstalled reports whether the mold package is installed. A variable so
+// tests need not install it.
+var moldInstalled = func() bool { return checkPackageExactMatch("mold") }
