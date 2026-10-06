@@ -227,20 +227,29 @@ func locateSplitUpdates(sourcePkg string, splitPkgs []string, cfg *Config, remot
 }
 
 // installSplitUpdates installs split outputs located by locateSplitUpdates,
-// in order, once the update is confirmed.
-func installSplitUpdates(splitPkgs []string, tarballs map[string]binaryTarball, cfg *Config, quiet bool) error {
+// in order, once the update is confirmed. Under the update's install bar
+// (progress) they are counted and shown like the other packages; without
+// one each gets a line of its own.
+func installSplitUpdates(splitPkgs []string, tarballs map[string]binaryTarball, cfg *Config, quiet bool, progress *installProgress) error {
 	logger, fast := dependencyInstallLogger(quiet)
 	for _, splitPkg := range splitPkgs {
-		colArrow.Print("-> ")
-		colSuccess.Printf("Installing split package")
-		colNote.Printf(" %s\n", splitPkg)
+		if progress != nil {
+			progress.start(splitPkg)
+		} else {
+			colArrow.Print("-> ")
+			colSuccess.Printf("Installing split package")
+			colNote.Printf(" %s\n", splitPkg)
+		}
 		path, err := tarballs[splitPkg].fetch(cfg)
 		if err != nil {
+			progress.endLine()
 			return fmt.Errorf("failed to fetch split update %s: %w", splitPkg, err)
 		}
 		if err := installSplitPackageTarballWithLogger(splitPkg, path, cfg, logger, fast); err != nil {
+			progress.endLine()
 			return err
 		}
+		progress.advance()
 	}
 	return nil
 }
@@ -1449,17 +1458,19 @@ func checkForUpgrades(ctx context.Context, cfg *Config, maxJobs int, yes bool) e
 			pkgNames = removeUpdateTarget(pkgNames, sourcePkg)
 		}
 	}
-	installSplitBinaries := func() error {
-		if len(splitBinaries) == 0 {
+	splitBinariesInstalled := false
+	installSplitBinaries := func(progress *installProgress) error {
+		if len(splitBinaries) == 0 || splitBinariesInstalled {
 			return nil
 		}
+		splitBinariesInstalled = true
 		names := make([]string, len(splitBinaries))
 		tarballs := make(map[string]binaryTarball, len(splitBinaries))
 		for i, sb := range splitBinaries {
 			names[i] = sb.name
 			tarballs[sb.name] = sb.tarball
 		}
-		if err := installSplitUpdates(names, tarballs, cfg, true); err != nil {
+		if err := installSplitUpdates(names, tarballs, cfg, true, progress); err != nil {
 			return fmt.Errorf("failed to update split package(s): %w", err)
 		}
 		return nil
@@ -1471,7 +1482,13 @@ func checkForUpgrades(ctx context.Context, cfg *Config, maxJobs int, yes bool) e
 			return nil
 		}
 		prefetchRepoEntries(splitUpdateEntries(splitBinaries), cfg)
-		if err := installSplitBinaries(); err != nil {
+		var progress *installProgress
+		if !Debug {
+			progress = newInstallProgress(len(splitBinaries))
+		}
+		err := installSplitBinaries(progress)
+		progress.finish(err == nil)
+		if err != nil {
 			return err
 		}
 		if err := PostInstallTasks(RootExec, os.Stdout); err != nil {
@@ -1532,8 +1549,13 @@ func checkForUpgrades(ctx context.Context, cfg *Config, maxJobs int, yes bool) e
 		}
 	}
 	prefetchRepoEntries(updateEntries, cfg)
-	if err := installSplitBinaries(); err != nil {
-		return err
+	// An update that builds from source installs the split outputs first,
+	// step by step, as its builds report; one that only installs binaries
+	// counts them under its install bar with the other packages (below).
+	if Debug || updatePlanRequiresSourceBuild(plan, binaryAvailable, selectedSplitUpdates) {
+		if err := installSplitBinaries(nil); err != nil {
+			return err
+		}
 	}
 
 	updateTargets := append([]string(nil), pkgNames...)
@@ -1621,6 +1643,11 @@ func checkForUpgrades(ctx context.Context, cfg *Config, maxJobs int, yes bool) e
 
 	// --- PARALLEL EXECUTION PATH ---
 	if maxJobs > 1 {
+		// The parallel path has no install bar: split outputs that were left
+		// for it go first, step by step.
+		if err := installSplitBinaries(nil); err != nil {
+			return err
+		}
 		colArrow.Print("-> ")
 		colSuccess.Printf("Executing parallel update (jobs: %d)\n", maxJobs)
 
@@ -1763,9 +1790,19 @@ func checkForUpgrades(ctx context.Context, cfg *Config, maxJobs int, yes bool) e
 	// builds report their own progress.
 	var progress *installProgress
 	if !Debug && len(sourceBuildPackages) == 0 {
-		progress = newInstallProgress(totalToUpdate)
+		pendingSplits := 0
+		if !splitBinariesInstalled {
+			pendingSplits = len(splitBinaries)
+		}
+		progress = newInstallProgress(totalToUpdate + pendingSplits)
 	}
 	fastInstall := progress != nil
+	// Split outputs not installed yet (no source build) go first, under the
+	// same bar; without a bar, the old way.
+	if err := installSplitBinaries(progress); err != nil {
+		progress.finish(false)
+		return err
+	}
 
 	for i, pkgName := range pkgNames {
 		// From here on a removed library that affects this package is its
