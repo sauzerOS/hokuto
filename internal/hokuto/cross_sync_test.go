@@ -3,6 +3,7 @@ package hokuto
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 )
 
@@ -42,5 +43,20 @@ func TestCrossSystemSyncTargetsFollowRecipesNotInstalls(t *testing.T) {
 	}
 	if missing := missingSyncPackages(targets, index); len(missing) != 0 {
 		t.Fatalf("cached package still reported missing: %+v", missing)
+	}
+}
+
+// Native aarch64 builds are published to the website's package table;
+// -system builds (the cross toolchain and sysroot) are not.
+func TestCrossSyncBuildArgsIndexNativeBuildsOnly(t *testing.T) {
+	pkgs := []syncPackage{{Base: "harfbuzz"}, {Base: "firefox"}}
+	native := crossSyncBuildArgs(false, true, true, 5, pkgs)
+	want := []string{"--cross=arm64", "--index", "-i", "--no-install", "-j5", "harfbuzz", "firefox"}
+	if !slices.Equal(native, want) {
+		t.Errorf("native: got %v want %v", native, want)
+	}
+	system := crossSyncBuildArgs(true, false, false, 1, []syncPackage{{Base: "gcc"}})
+	if slices.Contains(system, "--index") || !slices.Equal(system, []string{"--cross=arm64,system", "gcc"}) {
+		t.Errorf("-system builds must not be indexed: %v", system)
 	}
 }

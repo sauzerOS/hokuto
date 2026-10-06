@@ -107,25 +107,7 @@ func handleCrossSyncCommand(args []string, cfg *Config) error {
 	colArrow.Print("-> ")
 	colSuccess.Printf("Starting build for %d packages\n", len(toBuild))
 
-	// Construct build arguments for handleBuildCommand
-	buildArgs := []string{"--cross=arm64"}
-	if systemMode {
-		buildArgs = []string{"--cross=arm64,system"}
-	}
-	if *idleFlag {
-		buildArgs = append(buildArgs, "-i")
-	}
-	if *noInstallFlag {
-		buildArgs = append(buildArgs, "--no-install")
-	}
-	if *parallelFlag > 1 {
-		buildArgs = append(buildArgs, "-j"+strconv.Itoa(*parallelFlag))
-	}
-
-	// Add all packages to the build command
-	for _, pkg := range toBuild {
-		buildArgs = append(buildArgs, pkg.Base)
-	}
+	buildArgs := crossSyncBuildArgs(systemMode, *idleFlag, *noInstallFlag, *parallelFlag, toBuild)
 
 	// Single call to handleBuildCommand allows it to manage parallel builds and order
 	if err := handleBuildCommand(buildArgs, cfg); err != nil {
@@ -133,6 +115,33 @@ func handleCrossSyncCommand(args []string, cfg *Config) error {
 	}
 
 	return nil
+}
+
+// crossSyncBuildArgs are the hokuto build arguments for the selected
+// packages. Native aarch64 builds publish their status to the website's
+// package table (--index), listed under aarch64 next to the x86_64 builds;
+// -system builds are the build host's cross toolchain and sysroot
+// (aarch64-*), which the table does not list.
+func crossSyncBuildArgs(systemMode, idle, noInstall bool, jobs int, pkgs []syncPackage) []string {
+	args := []string{"--cross=arm64"}
+	if systemMode {
+		args = []string{"--cross=arm64,system"}
+	} else {
+		args = append(args, "--index")
+	}
+	if idle {
+		args = append(args, "-i")
+	}
+	if noInstall {
+		args = append(args, "--no-install")
+	}
+	if jobs > 1 {
+		args = append(args, "-j"+strconv.Itoa(jobs))
+	}
+	for _, pkg := range pkgs {
+		args = append(args, pkg.Base)
+	}
+	return args
 }
 
 // nativeSyncTargets lists the recipes, at their repository version, that
