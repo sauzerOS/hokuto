@@ -4547,6 +4547,11 @@ func handleBuildCommand(args []string, cfg *Config) (err error) {
 			return fmt.Errorf("cannot build %s: %w", pkg, err)
 		}
 	}
+	// A publishing build checks what it built for dropped shared libraries
+	// and bumps the published packages linked against them.
+	if UpdateWebsiteIndex && cfg.Values["HOKUTO_CROSS_ARCH"] == "" {
+		defer checkPublishedBuildABI(packagesToProcess, cfg)
+	}
 
 	// --- SELECT DEPENDENCY STRATEGY and EXECUTE BUILD ---
 	var failedBuilds = make(map[string]error)

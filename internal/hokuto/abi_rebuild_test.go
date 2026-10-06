@@ -151,6 +151,18 @@ func TestAbiConsumers(t *testing.T) {
 	if got, _ := abiConsumers(index, "x86_64", brk32); !reflect.DeepEqual(got, map[string][]string{"lib32-user-src": {"libfoo.so.3"}}) {
 		t.Fatalf("split consumer: %v", got)
 	}
+
+	// A consumer already bumped past its published package (app 1.0-2 in
+	// the repository, 1.0-1 published) waits for its rebuild: checking the
+	// same library change again must not bump it a second time.
+	if err := os.WriteFile(filepath.Join(repo, "app", "version"), []byte("1.0 2\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = abiConsumers(index, "x86_64", brk)
+	want = map[string][]string{"tool": {"libfoo.so.3"}, "both-variants": {"libfoo.so.3"}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("pending rebuild bumped again: got %v want %v", got, want)
+	}
 }
 
 func TestReadPackageMetadataRecordsLibdeps(t *testing.T) {

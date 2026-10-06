@@ -201,6 +201,9 @@ func abiConsumers(index []RepoEntry, arch string, brk abiBreak) (consumers map[s
 		if pkgDir, err := findPackageMetadataDir(recipe); err == nil && loadBuildOptions(pkgDir)["binary"] {
 			continue
 		}
+		if rebuildPending(recipe, e) {
+			continue
+		}
 		for _, name := range hit {
 			if !slices.Contains(consumers[recipe], name) {
 				consumers[recipe] = append(consumers[recipe], name)
@@ -494,6 +497,9 @@ func privateAPIConsumers(index []RepoEntry, arch string, change privateAPIChange
 		if pkgDir, err := findPackageMetadataDir(recipe); err == nil && loadBuildOptions(pkgDir)["binary"] {
 			continue
 		}
+		if rebuildPending(recipe, e) {
+			continue
+		}
 		for _, lib := range hit {
 			if !slices.Contains(consumers[recipe], lib) {
 				consumers[recipe] = append(consumers[recipe], lib)
@@ -609,6 +615,51 @@ func handleABIRebuilds(built []string, cfg *Config, logMsg func(string, ...inter
 	libs = append(libs, privateReasons...)
 	sort.Strings(libs)
 	return libs
+}
+
+// rebuildPending reports whether recipe's release is already ahead of its
+// published package e: its rebuild is bumped and waiting, so a second check
+// of the same library change (it runs on every publishing build) must not
+// bump it again.
+func rebuildPending(recipe string, e RepoEntry) bool {
+	version, revision, err := getRepoVersion2(recipe)
+	if err != nil {
+		return false
+	}
+	return isNewer(RepoEntry{Version: version, Revision: revision}, e)
+}
+
+// abiRebuildLog receives handleABIRebuilds' log lines when the check runs at
+// the end of a publishing build; bump points it at its log.
+var abiRebuildLog = func(string, ...interface{}) {}
+
+// abiRebuildHintDeferred is set while bump builds: it prints the rebuild
+// hint itself, once, after all its builds.
+var abiRebuildHintDeferred bool
+
+// lastABIRebuildLibs collects what the publishing builds' ABI checks bumped
+// consumers for, for bump's closing hint.
+var lastABIRebuildLibs []string
+
+// checkPublishedBuildABI is the ABI check of a publishing build (hokuto build
+// --index: bump --build, hokuto-builder build): every requested recipe that
+// now has a package of its current release is compared with its previous
+// published package, and the published packages linked against a library it
+// dropped get a revision bump. Run only from bump, a library updated any
+// other way (a manual version bump, then hokuto-builder build) left its
+// consumers linked against a library that no longer exists.
+func checkPublishedBuildABI(recipes []string, cfg *Config) {
+	var built []string
+	for _, recipe := range recipes {
+		if bumpedPackageBuilt(recipe, cfg) {
+			built = append(built, recipe)
+		}
+	}
+	libs := handleABIRebuilds(built, cfg, abiRebuildLog)
+	lastABIRebuildLibs = append(lastABIRebuildLibs, libs...)
+	if !abiRebuildHintDeferred {
+		printABIRebuildHint(libs)
+	}
 }
 
 // runningInHokutoBuilder reports whether hokuto runs in a hokuto-builder

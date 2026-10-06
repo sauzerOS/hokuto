@@ -427,6 +427,13 @@ Bumping modifies `version`, expands `.sources` into `sources`, fetches sources,
 updates checksums, commits, pushes, optionally builds through the normal build
 orchestrator, refreshes the package database, and syncs uploads.
 
+A publishing build (`hokuto build --index`: `bump --build`, `hokuto-builder
+build`) ends with the ABI check (`checkPublishedBuildABI` in
+`abi_rebuild.go`): a library that dropped a shared library gets the published
+packages linked against it revision-bumped, committed and pushed. Consumers
+already ahead of their published package are skipped, so the check can run
+again safely.
+
 Treat Git push, upload, repository initialization, and metadata publication as
 external side effects. A request to diagnose or review does not authorize them.
 

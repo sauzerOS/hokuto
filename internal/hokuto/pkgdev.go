@@ -1793,7 +1793,11 @@ func handleAutoBumpRepository(cfg *Config, autoBuild bool, assumeYes bool, repoU
 		fmt.Println("------------------------------------------------")
 	}
 
-	// Then the successful bumps are built together.
+	// Then the successful bumps are built together. The build's ABI check
+	// (it publishes with --index) logs here, and the hint is printed once
+	// at the end.
+	abiRebuildLog, abiRebuildHintDeferred, lastABIRebuildLibs = logMsg, true, nil
+	defer func() { abiRebuildLog, abiRebuildHintDeferred = func(string, ...interface{}) {}, false }()
 	if autoBuild && len(toBuild) > 0 {
 		successfullyBuilt, failedBuilds = buildBumpedPackages(toBuild, cfg)
 		for _, pkgName := range successfullyBuilt {
@@ -1806,12 +1810,10 @@ func handleAutoBumpRepository(cfg *Config, autoBuild bool, assumeYes bool, repoU
 		}
 	}
 
-	// Published packages linked against a library these builds dropped get a
-	// revision bump, to be rebuilt by `hokuto update --build-missing-binaries`.
-	var abiLibs []string
-	if autoBuild {
-		abiLibs = handleABIRebuilds(successfullyBuilt, cfg, logMsg)
-	}
+	// Published packages linked against a library these builds dropped got a
+	// revision bump from the builds' ABI check, to be rebuilt by
+	// `hokuto update --build-missing-binaries`.
+	abiLibs := lastABIRebuildLibs
 
 	// If build was requested and some packages were built, run upload --sync
 	if autoBuild && len(successfullyBuilt) > 0 {
