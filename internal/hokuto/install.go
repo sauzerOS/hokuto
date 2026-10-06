@@ -1630,6 +1630,10 @@ func installPackageArchive(tarballPath, pkgName string, cfg *Config, execCtx *Ex
 			}
 
 			if shouldRebuild {
+				// The module rebuilds share their kernel's headers: keep them
+				// installed from the first rebuild to the last.
+				releaseHeaders := reserveKmodHeaders(rebuildTriggerPkgs, cfg)
+				defer releaseHeaders()
 				for _, rebuildPkg := range rebuildTriggerPkgs {
 					debugf("\n--- Rebuilding %s (triggered by %s) ---\n", rebuildPkg, pkgName)
 

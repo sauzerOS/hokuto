@@ -514,3 +514,52 @@ func TestKmodHeaderMessagesPauseTheProgressLine(t *testing.T) {
 		t.Errorf("installing message: progress line paused %d / resumed %d times, want 1 / 1", paused, resumed)
 	}
 }
+
+// Module rebuilds triggered by a kernel update run one after another: with
+// the headers reserved for all of them, they are installed once and removed
+// after the last build, not removed and reinstalled between builds.
+func TestReserveKmodHeadersKeepsThemAcrossSequentialBuilds(t *testing.T) {
+	withKmodFixture(t, kernelLinux)
+	buildDir := filepath.Join(t.TempDir(), "build")
+	installs, removals := 0, 0
+	oldInstall, oldRemove := kmodInstallHeaders, kmodRemoveHeaders
+	kmodInstallHeaders = func(name string, cfg *Config) (bool, error) {
+		installs++
+		if err := os.MkdirAll(buildDir, 0o755); err != nil {
+			return false, err
+		}
+		return true, os.WriteFile(filepath.Join(buildDir, "Makefile"), nil, 0o644)
+	}
+	kmodRemoveHeaders = func(name string, cfg *Config) {
+		removals++
+		os.RemoveAll(buildDir)
+	}
+	t.Cleanup(func() { kmodInstallHeaders, kmodRemoveHeaders = oldInstall, oldRemove })
+
+	release := reserveKmodHeaders([]string{"nvidia-open~linux", "zlib", "nvidia-open~linux"}, nil)
+	for _, name := range []string{"nvidia-open~linux", "vhba-module~linux"} {
+		target := &kmodTarget{Instance: name, KernelPackage: "linux", Release: kernelLinux.Release, BuildDir: buildDir}
+		done, err := target.acquireHeaders(nil)
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		done()
+		if removals != 0 {
+			t.Fatalf("headers removed after %s although more module builds are planned", name)
+		}
+	}
+	if installs != 1 {
+		t.Fatalf("headers installed %d times, want once", installs)
+	}
+	release()
+	release() // releasing twice is harmless
+	if removals != 1 {
+		t.Fatalf("headers removed %d times after the reservation ended, want once", removals)
+	}
+
+	// Nothing reserved for a list without module builds.
+	reserveKmodHeaders([]string{"zlib"}, nil)()
+	if removals != 1 {
+		t.Fatal("a list without module builds must not touch the headers")
+	}
+}

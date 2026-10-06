@@ -848,6 +848,7 @@ func generateDepends(pkgName, pkgDir, outputDir, rootDir string, execCtx *Execut
 type postInstallOutputWriter struct {
 	destination     io.Writer
 	startOnNewLine  bool
+	beforeOutput    func() // called once, before the first output
 	mu              sync.Mutex
 	started         bool
 	wroteOutput     bool
@@ -862,7 +863,9 @@ func (w *postInstallOutputWriter) Write(p []byte) (int, error) {
 	}
 	if !w.started {
 		w.started = true
-		if w.startOnNewLine && p[0] != '\n' {
+		if w.beforeOutput != nil {
+			w.beforeOutput()
+		} else if w.startOnNewLine && p[0] != '\n' {
 			if _, err := io.WriteString(w.destination, "\n"); err != nil {
 				return 0, err
 			}
@@ -928,6 +931,17 @@ func executePostInstall(pkgName, rootDir string, execCtx *Executor, cfg *Config,
 	hookOutput := &postInstallOutputWriter{destination: logger, startOnNewLine: fast}
 	cmd.Stdout = hookOutput
 	cmd.Stderr = hookOutput
+	// Under the install bar, the hook's output replaces the bar's line
+	// instead of following a half-drawn bar; the bar is drawn again at its
+	// next update, below this output and any message after it.
+	if bar := currentInstallProgress(); fast && bar != nil {
+		hookOutput.beforeOutput = bar.suspend
+		defer func() {
+			if hookOutput.wroteOutput && !hookOutput.endsWithNewline {
+				fmt.Fprintln(logger)
+			}
+		}()
+	}
 
 	if execCtx.Interactive {
 		cmd.Stdin = os.Stdin

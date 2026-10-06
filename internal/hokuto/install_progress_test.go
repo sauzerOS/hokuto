@@ -1,6 +1,7 @@
 package hokuto
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"testing"
@@ -35,5 +36,40 @@ func TestInstallProgressNilIsNoOp(t *testing.T) {
 	p.finish(true)
 	if newInstallProgress(0) != nil {
 		t.Fatal("no bar for an empty plan")
+	}
+}
+
+// A kernel's post-install hook (depmod, initramfs, boot entry) printed under
+// the install bar and left it half drawn. The hook's output now takes the
+// bar's line: the bar is suspended once, before the first output.
+func TestPostInstallOutputSuspendsInstallBar(t *testing.T) {
+	bar := newInstallProgress(2)
+	if currentInstallProgress() != bar {
+		t.Fatal("an active install bar must be registered")
+	}
+	suspends := 0
+	var out bytes.Buffer
+	w := &postInstallOutputWriter{destination: &out, startOnNewLine: true, beforeOutput: func() {
+		suspends++
+		bar.suspend()
+	}}
+	w.Write([]byte("Running depmod -a 7.2.9-sauzerOS\n"))
+	w.Write([]byte("Generating initramfs for 7.2.9-sauzerOS\n"))
+	if suspends != 1 {
+		t.Fatalf("bar suspended %d times, want once", suspends)
+	}
+	if bar.lineActive {
+		t.Fatal("the bar's line must be free after the hook's output")
+	}
+	if out.String() != "Running depmod -a 7.2.9-sauzerOS\nGenerating initramfs for 7.2.9-sauzerOS\n" {
+		t.Fatalf("hook output changed: %q", out.String())
+	}
+	bar.advance()
+	if !bar.lineActive {
+		t.Fatal("the next update must draw the bar again")
+	}
+	bar.finish(true)
+	if currentInstallProgress() != nil {
+		t.Fatal("a finished bar must be unregistered")
 	}
 }

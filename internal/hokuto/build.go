@@ -4547,6 +4547,10 @@ func handleBuildCommand(args []string, cfg *Config) (err error) {
 			return fmt.Errorf("cannot build %s: %w", pkg, err)
 		}
 	}
+	// Module builds of the same kernel keep its headers installed until the
+	// last of them is done, even when they run one after another.
+	defer reserveKmodHeaders(packagesToProcess, cfg)()
+
 	// A publishing build checks what it built for dropped shared libraries
 	// and bumps the published packages linked against them.
 	if UpdateWebsiteIndex && cfg.Values["HOKUTO_CROSS_ARCH"] == "" {

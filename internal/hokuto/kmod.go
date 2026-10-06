@@ -244,6 +244,50 @@ func kmodNotify(format string, a ...any) {
 	})
 }
 
+// reserveKmodHeaders counts the module builds among pkgNames as users of
+// their kernels' headers before any of them starts. Builds that run one after
+// another (rebuilds triggered by a kernel update, a build plan) each took and
+// released the headers, so they were removed after every build and installed
+// again for the next. The returned release ends the reservation; the headers
+// are then removed if a module build installed them and none uses them.
+func reserveKmodHeaders(pkgNames []string, cfg *Config) func() {
+	seen := make(map[string]bool)
+	var headers []string
+	for _, name := range pkgNames {
+		t, err := kmodBuildTarget(name)
+		if err != nil || t == nil || seen[t.headersPackage()] {
+			continue
+		}
+		seen[t.headersPackage()] = true
+		headers = append(headers, t.headersPackage())
+	}
+	if len(headers) == 0 {
+		return func() {}
+	}
+	kmodHeaders.Lock()
+	for _, h := range headers {
+		kmodHeaders.users[h]++
+	}
+	kmodHeaders.Unlock()
+
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			kmodHeaders.Lock()
+			defer kmodHeaders.Unlock()
+			for _, h := range headers {
+				kmodHeaders.users[h]--
+				if kmodHeaders.users[h] > 0 || !kmodHeaders.installed[h] {
+					continue
+				}
+				delete(kmodHeaders.users, h)
+				delete(kmodHeaders.installed, h)
+				removeKmodHeaders(h, cfg)
+			}
+		})
+	}
+}
+
 func (t *kmodTarget) headersPackage() string {
 	return t.KernelPackage + kmodHeadersSufix
 }

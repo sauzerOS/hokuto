@@ -15,6 +15,10 @@ import (
 
 // ParallelManager handles the execution of parallel builds
 type ParallelManager struct {
+	// kmodHeaderReleases end the kernel-headers reservations of the module
+	// builds this run planned or queued (reserveKmodHeaders).
+	kmodHeaderReleases   []func()
+	kmodHeaderReleasesMu sync.Mutex
 	// startedAt is when the parallel build began, for the elapsed time
 	// on the status line.
 	startedAt time.Time
@@ -137,6 +141,13 @@ func RunParallelBuilds(plan *BuildPlan, cfg *Config, maxJobs int, userRequestedM
 		AutoInstall:         autoInstall,
 		AddRequestedToWorld: addRequestedToWorld,
 	}
+	// Module builds of one kernel share its headers: keep them installed from
+	// the first planned module build to the last, also when they run one
+	// after another.
+	if plan != nil {
+		pm.reserveKmodHeaders(plan.Order)
+	}
+	defer pm.releaseKmodHeaders()
 
 	if customBuilder != nil {
 		pm.Builder = customBuilder
@@ -882,6 +893,7 @@ func (pm *ParallelManager) prepareRebuildDependencies(pkgNames []string) error {
 	if pm.TemporaryInstalls == nil {
 		pm.TemporaryInstalls = make(map[string]bool)
 	}
+	pm.reserveKmodHeaders(pkgNames)
 	installed, err := installRebuildDependenciesWithOptions(pkgNames, pm.Config, false, true)
 	for _, pkgName := range installed {
 		pm.TemporaryInstalls[pkgName] = true
@@ -1378,4 +1390,24 @@ func formatBuildElapsed(started time.Time) string {
 		return "0 min"
 	}
 	return fmt.Sprintf("%d min", int(time.Since(started).Minutes()))
+}
+
+// reserveKmodHeaders keeps the kernel headers the module builds among
+// pkgNames need installed until the run ends.
+func (pm *ParallelManager) reserveKmodHeaders(pkgNames []string) {
+	release := reserveKmodHeaders(pkgNames, pm.Config)
+	pm.kmodHeaderReleasesMu.Lock()
+	pm.kmodHeaderReleases = append(pm.kmodHeaderReleases, release)
+	pm.kmodHeaderReleasesMu.Unlock()
+}
+
+// releaseKmodHeaders ends this run's kernel-headers reservations.
+func (pm *ParallelManager) releaseKmodHeaders() {
+	pm.kmodHeaderReleasesMu.Lock()
+	releases := pm.kmodHeaderReleases
+	pm.kmodHeaderReleases = nil
+	pm.kmodHeaderReleasesMu.Unlock()
+	for _, release := range releases {
+		release()
+	}
 }

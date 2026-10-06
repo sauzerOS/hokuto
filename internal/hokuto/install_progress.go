@@ -3,6 +3,7 @@ package hokuto
 import (
 	"fmt"
 	"os"
+	"sync"
 
 	"github.com/schollz/progressbar/v3"
 )
@@ -51,8 +52,50 @@ func newPackageProgress(total int, verb string) *installProgress {
 	)
 	p.lineActive = true
 	// Output from nested operations starts on a fresh line.
-	p.deactivate = activateProgressLineFinisher(p.endLine)
+	finisherOff := activateProgressLineFinisher(p.endLine)
+	activeInstallProgresses.Lock()
+	activeInstallProgresses.stack = append(activeInstallProgresses.stack, p)
+	activeInstallProgresses.Unlock()
+	p.deactivate = func() {
+		finisherOff()
+		activeInstallProgresses.Lock()
+		if n := len(activeInstallProgresses.stack); n > 0 && activeInstallProgresses.stack[n-1] == p {
+			activeInstallProgresses.stack = activeInstallProgresses.stack[:n-1]
+		}
+		activeInstallProgresses.Unlock()
+	}
 	return p
+}
+
+// activeInstallProgresses are the bars being shown, innermost last, so a
+// post-install hook can print above the current one.
+var activeInstallProgresses struct {
+	sync.Mutex
+	stack []*installProgress
+}
+
+// currentInstallProgress is the bar being shown, or nil.
+func currentInstallProgress() *installProgress {
+	activeInstallProgresses.Lock()
+	defer activeInstallProgresses.Unlock()
+	if n := len(activeInstallProgresses.stack); n > 0 {
+		return activeInstallProgresses.stack[n-1]
+	}
+	return nil
+}
+
+// suspend clears the bar's line, so output (a kernel's post-install hook:
+// depmod, initramfs, boot entry) takes its place instead of following a
+// half-drawn bar. The next start or advance draws the bar again, on the line
+// below that output.
+func (p *installProgress) suspend() {
+	if p == nil {
+		return
+	}
+	if p.lineActive {
+		_ = p.bar.Clear()
+	}
+	p.lineActive = false
 }
 
 // endLine moves below the bar, so a message or prompt does not end up
