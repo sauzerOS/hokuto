@@ -405,6 +405,16 @@ func fetchRemoteIndex(cfg *Config, quiet bool) ([]RepoEntry, error) {
 	return ParseRepoIndex(data)
 }
 
+// setLoadedRemoteIndex makes index the process-wide remote index, for a
+// command that fetched it itself (install --remote).
+func setLoadedRemoteIndex(index []RepoEntry) {
+	GlobalRemoteIndexMu.Lock()
+	defer GlobalRemoteIndexMu.Unlock()
+	GlobalRemoteIndex = index
+	GlobalRemoteIndexErr = nil
+	GlobalRemoteIndexLoaded = true
+}
+
 // GetCachedRemoteIndex returns the global remote index, fetching it if necessary.
 func GetCachedRemoteIndex(cfg *Config) ([]RepoEntry, error) {
 	return getCachedRemoteIndex(cfg, false)

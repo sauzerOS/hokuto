@@ -324,3 +324,64 @@ func TestMissingDepsRecordedBinaryDependencyFollowsEquivalentChoice(t *testing.T
 		t.Fatalf("missing deps must use the sonic choice only: %s", got)
 	}
 }
+
+// A package's equivalents metadata is published in its index entry.
+func TestIndexEntryRecordsEquivalents(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sonic-frameworks-core-addons-6.1-1-x86_64-optimized.tar.zst")
+	writeTestArchive(t, path, map[string]string{
+		"var/db/hokuto/installed/sonic-frameworks-core-addons/pkginfo":     "name=sonic-frameworks-core-addons\nversion=6.1\nrevision=1\narch=x86_64\ngeneric=0\nmultilib=0\n",
+		"var/db/hokuto/installed/sonic-frameworks-core-addons/equivalents": "kcoreaddons sonic-frameworks-core-addons\n",
+	}, nil)
+	entry, err := ReadPackageMetadata(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if entry.Equivalents != "kcoreaddons sonic-frameworks-core-addons" {
+		t.Fatalf("equivalents not indexed: %q", entry.Equivalents)
+	}
+}
+
+// A binary-only system (no recipe repositories) learns the pairs from the
+// remote index: installing sonic-desktop asked to choose kcoreaddons or
+// sonic-frameworks-core-addons for every KDE framework it pulled in.
+func TestRemoteIndexEquivalentsAvoidPromptsAndPreferReplacement(t *testing.T) {
+	cfg, _ := withTempDependencyRepo(t) // repositories without an equivalents file
+	cfg.Values["HOKUTO_ARCH"] = "x86_64"
+	variant := GetSystemVariantForPackage(cfg, "kcoreaddons")
+	oldIndex, oldLoaded := GlobalRemoteIndex, GlobalRemoteIndexLoaded
+	t.Cleanup(func() {
+		GlobalRemoteIndexMu.Lock()
+		GlobalRemoteIndex, GlobalRemoteIndexLoaded = oldIndex, oldLoaded
+		GlobalRemoteIndexMu.Unlock()
+		preferEquivalentReplacements.Store(false)
+		alternativeDepCache = make(map[string]string)
+		invalidatePackageEquivalentCache()
+	})
+	alternativeDepCache = make(map[string]string)
+	invalidatePackageEquivalentCache()
+	pair := "kcoreaddons sonic-frameworks-core-addons"
+	setLoadedRemoteIndex([]RepoEntry{
+		{Name: "kcoreaddons", Version: "6.1", Revision: "1", Arch: "x86_64", Variant: variant, MetadataVersion: repoEntryMetadataVersion, Equivalents: pair},
+		{Name: "sonic-frameworks-core-addons", Version: "6.1", Revision: "1", Arch: "x86_64", Variant: variant, MetadataVersion: repoEntryMetadataVersion, Equivalents: pair},
+		{Name: "sonic-workspace", Version: "6.7", Revision: "1", Arch: "x86_64", Variant: variant, MetadataVersion: repoEntryMetadataVersion},
+	})
+
+	// As a published KDE package records it: KDE side first.
+	dep := DepSpec{Name: "kcoreaddons", Alternatives: []string{"kcoreaddons", "sonic-frameworks-core-addons"}}
+	if !isPackageEquivalentAlternative(dep) {
+		t.Fatal("the pair published in the index must be known")
+	}
+	// yes=false: an unknown pair would prompt here and fail the test.
+	if got, err := resolveAlternativeDep(dep, false, cfg, "kcmutils"); err != nil || got != "kcoreaddons" {
+		t.Fatalf("without a sonic install: got %q, %v", got, err)
+	}
+
+	alternativeDepCache = make(map[string]string)
+	preferEquivalentReplacementsFor([]string{"sonic-desktop", "sonic-frameworks-core-addons"})
+	if !preferEquivalentReplacements.Load() {
+		t.Fatal("requesting a replacement-side package must prefer replacements")
+	}
+	if got, err := resolveAlternativeDep(dep, false, cfg, "kcmutils"); err != nil || got != "sonic-frameworks-core-addons" {
+		t.Fatalf("installing sonic: got %q, %v", got, err)
+	}
+}

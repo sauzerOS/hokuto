@@ -740,6 +740,7 @@ func Main() {
 				fmt.Fprintf(os.Stderr, "Error fetching remote index: %v\n", err)
 				exitHokuto(1)
 			}
+			setLoadedRemoteIndex(remoteIndex)
 		} else if !*noRemote && BinaryMirror != "" {
 			// A normal install may still obtain packages from the binary mirror. Use
 			// the mirror's dependency metadata when constructing that install plan;
@@ -805,6 +806,24 @@ func Main() {
 		// so we only add those to the World file later.
 		userRequestedMap := make(map[string]bool)
 		requestedMetas := make(map[string]MetaPackage)
+
+		// Installing a sonic desktop: every equivalence pair prefers its
+		// replacement side, so the KDE frameworks it pulls in get sonic's
+		// equivalents too, without asking for each.
+		var requestedNames []string
+		for _, arg := range packagesToInstall {
+			if strings.HasSuffix(arg, ".tar.zst") {
+				continue
+			}
+			requestedNames = append(requestedNames, arg)
+			if meta, ok := findInstallMetaPackage(arg, cfg, remoteIndex, !*noRemote); ok {
+				for _, dep := range meta.Depends {
+					requestedNames = append(requestedNames, dep.Name)
+					requestedNames = append(requestedNames, dep.Alternatives...)
+				}
+			}
+		}
+		preferEquivalentReplacementsFor(requestedNames)
 
 		for _, arg := range packagesToInstall {
 			// If argument is a tarball file (ends in .tar.zst), we just add it to the plan directly.

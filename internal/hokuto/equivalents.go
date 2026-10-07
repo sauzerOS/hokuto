@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 )
 
 const equivalentsFile = "equivalents"
@@ -88,18 +89,77 @@ func packageEquivalentSources() []string {
 }
 
 func loadPackageEquivalentPairs() ([]packageEquivalentPair, error) {
-	key := repoPaths + "\x00" + Installed
+	index := loadedRemoteIndex()
+	key := repoPaths + "\x00" + Installed + "\x00" + remoteIndexIdentity(index)
 	packageEquivalentCache.Lock()
 	defer packageEquivalentCache.Unlock()
 	if packageEquivalentCache.valid && packageEquivalentCache.key == key {
 		return append([]packageEquivalentPair(nil), packageEquivalentCache.pairs...), packageEquivalentCache.err
 	}
 	pairs, err := loadPackageEquivalentPairsUncached()
+	if err == nil {
+		pairs = appendIndexEquivalentPairs(pairs, index)
+	}
 	packageEquivalentCache.key = key
 	packageEquivalentCache.valid = true
 	packageEquivalentCache.pairs = append([]packageEquivalentPair(nil), pairs...)
 	packageEquivalentCache.err = err
 	return pairs, err
+}
+
+// loadedRemoteIndex is the remote index this process has loaded, or nil. It
+// never fetches: the pairs it adds are for runs that use the index anyway.
+func loadedRemoteIndex() []RepoEntry {
+	GlobalRemoteIndexMu.Lock()
+	defer GlobalRemoteIndexMu.Unlock()
+	if !GlobalRemoteIndexLoaded && GlobalRemoteIndex == nil {
+		return nil
+	}
+	return GlobalRemoteIndex
+}
+
+// remoteIndexIdentity tells loaded indexes apart for the pair cache.
+func remoteIndexIdentity(index []RepoEntry) string {
+	if len(index) == 0 {
+		return ""
+	}
+	return fmt.Sprintf("%p:%d", &index[0], len(index))
+}
+
+// appendIndexEquivalentPairs adds the pairs published in the remote index.
+// A system that installs binaries without the recipe repositories (a fresh
+// sonic-desktop install) otherwise does not know kcmutils' kcoreaddons
+// dependency and sonic-frameworks-core-addons are equivalent, and asked to
+// choose for every such dependency. Pairs from the repositories and
+// installed packages take precedence; a published pair that names a package
+// already in one is skipped.
+func appendIndexEquivalentPairs(pairs []packageEquivalentPair, index []RepoEntry) []packageEquivalentPair {
+	if len(index) == 0 {
+		return pairs
+	}
+	member := make(map[string]bool, 2*len(pairs))
+	for _, pair := range pairs {
+		member[pair.Base] = true
+		member[pair.Replacement] = true
+	}
+	for i := range index {
+		if index[i].Equivalents == "" {
+			continue
+		}
+		parsed, err := parsePackageEquivalentPairs([]byte(index[i].Equivalents), "remote index")
+		if err != nil {
+			continue
+		}
+		for _, pair := range parsed {
+			if member[pair.Base] || member[pair.Replacement] {
+				continue
+			}
+			member[pair.Base] = true
+			member[pair.Replacement] = true
+			pairs = append(pairs, pair)
+		}
+	}
+	return pairs
 }
 
 func loadPackageEquivalentPairsUncached() ([]packageEquivalentPair, error) {
@@ -165,10 +225,31 @@ func packageUsesReplacementSide(pkgName string) bool {
 	return false
 }
 
+// preferEquivalentReplacements is set for an install whose requested
+// packages include the replacement side of a pair (installing sonic-desktop):
+// its pairs then prefer the replacement for every consumer, so kcmutils gets
+// sonic-frameworks-core-addons too instead of KDE's kcoreaddons. An installed
+// side still wins (resolveAlternativeDep).
+var preferEquivalentReplacements atomic.Bool
+
+// preferEquivalentReplacementsFor sets preferEquivalentReplacements when one
+// of names is a replacement-side package.
+func preferEquivalentReplacementsFor(names []string) {
+	for _, name := range names {
+		if packageUsesReplacementSide(name) {
+			preferEquivalentReplacements.Store(true)
+			return
+		}
+	}
+}
+
 func equivalentDependencyNames(name, consumer string) []string {
 	pair, ok := packageEquivalentPairFor(name)
 	if !ok {
 		return []string{name}
+	}
+	if preferEquivalentReplacements.Load() {
+		return []string{pair.Replacement, pair.Base}
 	}
 	if packageUsesReplacementSide(consumer) {
 		return []string{pair.Replacement, pair.Base}

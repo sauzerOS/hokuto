@@ -1392,8 +1392,16 @@ func resolveAlternativeDep(dep DepSpec, yes bool, cfg *Config, requestingPkg ...
 	// need an interactive provider choice. The installed-provider preference
 	// above still wins when either equivalent is already present.
 	if isPackageEquivalentAlternative(dep) {
-		alternativeDepCache[cacheKey] = available[0]
-		return available[0], nil
+		choice := available[0]
+		// An install of the replacement side (sonic-desktop) prefers it for
+		// every consumer, whatever order a published package recorded.
+		if preferEquivalentReplacements.Load() {
+			if pair, ok := packageEquivalentPairFor(dep.Alternatives[0]); ok && slices.Contains(available, pair.Replacement) {
+				choice = pair.Replacement
+			}
+		}
+		alternativeDepCache[cacheKey] = choice
+		return choice, nil
 	}
 
 	// If only one is available (and not installed), use it automatically and cache it

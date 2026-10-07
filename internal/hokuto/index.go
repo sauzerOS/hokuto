@@ -187,6 +187,11 @@ type RepoEntry struct {
 	Suggests        []string `json:"suggests,omitempty"`
 	Description     string   `json:"description,omitempty"`
 	MetadataVersion int      `json:"metadata_version,omitempty"`
+	// Equivalents is the equivalence pair the package belongs to, from its
+	// equivalents metadata ("kcoreaddons sonic-frameworks-core-addons"), so
+	// a system without the recipe repositories knows the pair before
+	// installing either side. Optional; absent on older entries.
+	Equivalents string `json:"equivalents,omitempty"`
 }
 
 // ReadPackageMetadata extracts pkginfo and computes checksum for a local tarball.
@@ -218,6 +223,7 @@ func ReadPackageMetadata(tarballPath string) (RepoEntry, error) {
 	fillRepoEntryMetadata(&entry, r.metadata, r.deps, r.libdeps, r.privatedeps)
 	entry.PostInstallDepends = r.postInstallDeps
 	entry.InstalledSize = r.installedSize
+	entry.Equivalents = r.equivalents
 	return entry, nil
 }
 
@@ -271,6 +277,9 @@ func repoEntryFromPackageOutput(tarballPath, outputDir, pkgName string) (RepoEnt
 	}
 	fillRepoEntryMetadata(&entry, ParsePkgInfo(pkginfo), deps, libdeps, privatedeps)
 	entry.PostInstallDepends = postInstallDeps
+	if data, err := os.ReadFile(filepath.Join(metaDir, equivalentsFile)); err == nil {
+		entry.Equivalents = equivalentsForIndex(data)
+	}
 	if entry.InstalledSize, err = installedSize(outputDir); err != nil {
 		return entry, fmt.Errorf("failed to measure %s: %w", outputDir, err)
 	}
@@ -289,6 +298,16 @@ func libdepsForIndex(data []byte) []string {
 		}
 	}
 	return libdeps
+}
+
+// equivalentsForIndex returns a package's equivalents metadata as the index
+// stores it: its one pair, "base replacement", or "" when it has none.
+func equivalentsForIndex(data []byte) string {
+	pairs, err := parsePackageEquivalentPairs(data, equivalentsFile)
+	if err != nil || len(pairs) == 0 {
+		return ""
+	}
+	return pairs[0].Base + " " + pairs[0].Replacement
 }
 
 // privateDepsForIndex returns a privatedeps file's sonames.
@@ -395,6 +414,7 @@ type tarballMetadataResult struct {
 	deps, libdeps, privatedeps []string
 	postInstallDeps            []string
 	installedSize              int64
+	equivalents                string
 }
 
 var (
@@ -443,6 +463,15 @@ func scanTarballMetadataUncached(tarballPath string) (tarballMetadataResult, err
 		// stored as TypeLink with no data, count once).
 		if header.Typeflag == tar.TypeReg {
 			r.installedSize += header.Size
+		}
+
+		if strings.HasSuffix(header.Name, "/equivalents") && strings.Contains(header.Name, "var/db/hokuto/installed/") {
+			data, err := io.ReadAll(tr)
+			if err != nil {
+				return r, fmt.Errorf("failed to read equivalents from %s: %w", tarballPath, err)
+			}
+			r.equivalents = equivalentsForIndex(data)
+			continue
 		}
 
 		if strings.HasSuffix(header.Name, "/privatedeps") && strings.Contains(header.Name, "var/db/hokuto/installed/") {
