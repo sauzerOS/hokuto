@@ -165,6 +165,20 @@ func TestAbiConsumers(t *testing.T) {
 	}
 }
 
+func TestAbiLibraryRecipesSkipsBinaryRecipes(t *testing.T) {
+	_, repo := withTempDependencyRepo(t)
+	for _, name := range []string{"dav1d", "proton"} {
+		writeTestPackage(t, repo, name, "")
+	}
+	// proton bundles its own libdav1d.so.7; dropping it breaks nothing.
+	if err := os.WriteFile(filepath.Join(repo, "proton", "options"), []byte("binary multilib\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := abiLibraryRecipes([]string{"proton", "dav1d"}); !reflect.DeepEqual(got, []string{"dav1d"}) {
+		t.Fatalf("got %v, want only dav1d", got)
+	}
+}
+
 func TestReadPackageMetadataRecordsLibdeps(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "app-1.0-1-x86_64-optimized.tar.zst")
 	writeTestArchive(t, path, map[string]string{

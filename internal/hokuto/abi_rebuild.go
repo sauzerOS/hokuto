@@ -531,6 +531,7 @@ func handleABIRebuilds(built []string, cfg *Config, logMsg func(string, ...inter
 	for _, pkgName := range built {
 		builtHere[resolveBumpSourcePackage(pkgName)] = true
 	}
+	built = abiLibraryRecipes(built)
 	addConsumers := func(found map[string][]string) {
 		for recipe, libs := range found {
 			// Built in this same run, so already against the new library.
@@ -615,6 +616,21 @@ func handleABIRebuilds(built []string, cfg *Config, logMsg func(string, ...inter
 	libs = append(libs, privateReasons...)
 	sort.Strings(libs)
 	return libs
+}
+
+// abiLibraryRecipes leaves out the built recipes with the binary option: they
+// ship prebuilt or bundled copies of libraries (proton's libdav1d.so.7) that
+// nothing links against, so a library they drop is no ABI change.
+func abiLibraryRecipes(built []string) []string {
+	var kept []string
+	for _, pkgName := range built {
+		if pkgDir, err := findPackageMetadataDir(resolveBumpSourcePackage(pkgName)); err == nil && loadBuildOptions(pkgDir)["binary"] {
+			debugf("ABI check: skipping %s, a binary recipe\n", pkgName)
+			continue
+		}
+		kept = append(kept, pkgName)
+	}
+	return kept
 }
 
 // rebuildPending reports whether recipe's release is already ahead of its
