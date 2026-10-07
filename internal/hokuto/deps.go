@@ -465,6 +465,29 @@ func repoEntryHasDependencyMetadata(entry RepoEntry) bool {
 }
 
 func resolveBinaryDependenciesFromArchive(pkgName string, cfg *Config, remoteIndex []RepoEntry, allowRemote bool) ([]DepSpec, bool, error) {
+	deps, found, err := archiveDependencySpecs(pkgName, cfg, remoteIndex, allowRemote)
+	return expandArchiveEquivalentDependencies(deps, pkgName), found, err
+}
+
+// expandArchiveEquivalentDependencies gives a binary package's dependencies
+// the same equivalence alternatives a recipe's get. Without them binary
+// kcmutils asked for plain kcoreaddons while the sonic packages of the same
+// run had chosen sonic-frameworks-core-addons, and the two conflicted on
+// install. deps may come from a cache that must not change, so a copy is
+// expanded.
+func expandArchiveEquivalentDependencies(deps []DepSpec, consumer string) []DepSpec {
+	if len(deps) == 0 {
+		return deps
+	}
+	if at := strings.Index(consumer, "@"); at != -1 {
+		consumer = consumer[:at]
+	}
+	return expandPackageEquivalentDependencies(append([]DepSpec(nil), deps...), consumer)
+}
+
+// archiveDependencySpecs reads a binary package's dependencies from a cached
+// archive or the remote index, without equivalence expansion.
+func archiveDependencySpecs(pkgName string, cfg *Config, remoteIndex []RepoEntry, allowRemote bool) ([]DepSpec, bool, error) {
 	lookupName := pkgName
 	if idx := strings.Index(pkgName, "@"); idx != -1 {
 		lookupName = pkgName[:idx]
@@ -771,6 +794,18 @@ func recordedBinaryDependencySpecs(pkgName string, cfg *Config, noRemote bool) [
 }
 
 func resolveDependencyList(parentPkg string, deps []DepSpec, visited map[string]bool, plan *[]string, force bool, yes bool, cfg *Config, remoteIndex []RepoEntry, allowRemote bool) error {
+	// A package's own choices between equivalents (kcoreaddons or
+	// sonic-frameworks-core-addons) are made before its dependencies are
+	// explored: the run shares one choice per pair, and otherwise the first
+	// dependency to reach the pair (a KDE framework preferring kcoreaddons)
+	// would decide it for the sonic package that pulled it in.
+	for _, dep := range deps {
+		if isPackageEquivalentAlternative(dep) {
+			if _, err := resolveAlternativeDep(dep, yes, cfg, parentPkg); err != nil {
+				return err
+			}
+		}
+	}
 	for _, dep := range deps {
 		if dep.Make || dep.Optional || dep.Rebuild || dep.PostInstall || dep.Suggest {
 			continue

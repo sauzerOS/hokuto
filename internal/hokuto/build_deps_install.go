@@ -93,6 +93,8 @@ func missingRuntimeDepsOfBinary(d buildDepInstall, visited map[string]bool, remo
 		return nil
 	}
 
+	deps = expandArchiveEquivalentDependencies(deps, d.tarball.name)
+
 	var plan []string
 	if err := resolveDependencyList(d.tarball.name, deps, visited, &plan, false, true, d.cfg, remoteIndex, !noRemote && len(remoteIndex) > 0); err != nil {
 		debugf("Could not plan the runtime dependencies of %s: %v\n", d.tarball.name, err)

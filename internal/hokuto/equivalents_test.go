@@ -215,3 +215,79 @@ func TestEquivalentReplacementRemovesOldPackageAndTransfersRoots(t *testing.T) {
 		t.Fatal("old equivalent remained in a world file")
 	}
 }
+
+func withTempDependencyEquivalents(t *testing.T, repo, content string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(repo, equivalentsFile), []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	invalidatePackageEquivalentCache()
+	alternativeDepCache = make(map[string]string)
+	t.Cleanup(func() {
+		invalidatePackageEquivalentCache()
+		alternativeDepCache = make(map[string]string)
+	})
+}
+
+// Binary kcmutils (from the mirror index) asked for plain kcoreaddons while
+// the sonic packages of the same run had chosen sonic-frameworks-core-addons:
+// both were installed and conflicted. Archive dependencies now get the same
+// equivalence alternatives as recipe dependencies.
+func TestBinaryDependenciesExpandEquivalents(t *testing.T) {
+	cfg, repo := withTempDependencyRepo(t)
+	cfg.Values["HOKUTO_ARCH"] = "x86_64"
+	withTempDependencyEquivalents(t, repo, "kcoreaddons sonic-frameworks-core-addons\n")
+	writeTestPackage(t, repo, "kcoreaddons", "")
+	writeTestPackage(t, repo, "sonic-frameworks-core-addons", "")
+	index := []RepoEntry{{Name: "kcmutils", Version: "6.1", Revision: "1", Arch: "x86_64",
+		Variant: GetSystemVariantForPackage(cfg, "kcmutils"), MetadataVersion: repoEntryMetadataVersion,
+		Depends: []string{"kcoreaddons", "glibc"}}}
+
+	deps, found, err := resolveBinaryDependenciesFromArchive("kcmutils", cfg, index, true)
+	if err != nil || !found {
+		t.Fatalf("deps: found=%v err=%v", found, err)
+	}
+	if want := []string{"kcoreaddons", "sonic-frameworks-core-addons"}; !reflect.DeepEqual(deps[0].Alternatives, want) {
+		t.Fatalf("binary dependency not expanded: %+v", deps[0])
+	}
+	if !reflect.DeepEqual(index[0].Depends, []string{"kcoreaddons", "glibc"}) {
+		t.Fatalf("index entry changed: %v", index[0].Depends)
+	}
+	// A choice made earlier in the run (by a sonic package) holds.
+	alternativeDepCache[alternativeDepCacheKey(deps[0])] = "sonic-frameworks-core-addons"
+	if got, err := resolveAlternativeDep(deps[0], true, cfg, "kcmutils"); err != nil || got != "sonic-frameworks-core-addons" {
+		t.Fatalf("resolved %q, %v", got, err)
+	}
+}
+
+// A sonic package that pulls in a KDE framework (kcmutils) before naming its
+// own core-addons dependency keeps its choice: its equivalences are settled
+// before its dependencies are explored.
+func TestDependencyListSettlesOwnEquivalentsFirst(t *testing.T) {
+	cfg, repo := withTempDependencyRepo(t)
+	withTempDependencyEquivalents(t, repo, "kcoreaddons sonic-frameworks-core-addons\nplasma-pa sonic-audio-applet-pulse\n")
+	writeTestPackage(t, repo, "kcoreaddons", "")
+	writeTestPackage(t, repo, "sonic-frameworks-core-addons", "")
+	writeTestPackage(t, repo, "kcmutils", "kcoreaddons\n")
+	writeTestPackage(t, repo, "sonic-audio-applet-pulse", "kcmutils\nkcoreaddons\n")
+
+	deps, err := parsePackageDependsFile(filepath.Join(repo, "sonic-audio-applet-pulse"), "sonic-audio-applet-pulse")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var plan []string
+	if err := resolveDependencyList("sonic-audio-applet-pulse", deps, map[string]bool{}, &plan, false, true, cfg, nil, false); err != nil {
+		t.Fatal(err)
+	}
+	has := func(name string) bool {
+		for _, p := range plan {
+			if p == name {
+				return true
+			}
+		}
+		return false
+	}
+	if !has("sonic-frameworks-core-addons") || has("kcoreaddons") {
+		t.Fatalf("plan must use the sonic choice only: %v", plan)
+	}
+}
