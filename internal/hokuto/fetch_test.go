@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -346,5 +347,61 @@ func TestSharedDownloadLocksWaitForExclusiveDownloader(t *testing.T) {
 	}
 	if err := <-sharedDone; err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestShallowGitCheckoutAtCommit(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	dir := t.TempDir()
+	upstream := filepath.Join(dir, "upstream")
+	git := func(args ...string) string {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Env = append(os.Environ(), "GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@t", "GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@t")
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	git("init", "--quiet", upstream)
+	commit := func(content string) string {
+		if err := os.WriteFile(filepath.Join(upstream, "file"), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		git("-C", upstream, "add", "file")
+		git("-C", upstream, "commit", "--quiet", "-m", content)
+		return git("-C", upstream, "rev-parse", "HEAD")
+	}
+	first := commit("one")
+	second := commit("two")
+	commit("three")
+
+	url := "file://" + upstream
+	checkout := filepath.Join(dir, "checkout")
+	for _, c := range []struct{ ref, want, content string }{
+		{first, first, "one"},
+		{"commit=" + second, second, "two"},
+		{second, second, "two"}, // already there
+	} {
+		if err := ensureShallowGitCheckout(url, c.ref, 1, checkout, true); err != nil {
+			t.Fatalf("checkout %s: %v", c.ref, err)
+		}
+		if head := git("-C", checkout, "rev-parse", "HEAD"); head != c.want {
+			t.Fatalf("checkout %s: HEAD %s, want %s", c.ref, head, c.want)
+		}
+		if got := git("-C", checkout, "rev-list", "--count", "HEAD"); got != "1" {
+			t.Fatalf("checkout %s: %s commits, want a depth-1 history", c.ref, got)
+		}
+		data, err := os.ReadFile(filepath.Join(checkout, "file"))
+		if err != nil || string(data) != c.content {
+			t.Fatalf("checkout %s: file %q (%v), want %q", c.ref, data, err, c.content)
+		}
+	}
+
+	if err := ensureShallowGitCheckout(url, first[:12], 1, filepath.Join(dir, "short"), true); err == nil {
+		t.Fatal("abbreviated hash should be rejected for a shallow source")
 	}
 }

@@ -175,8 +175,11 @@ func ensureShallowGitCheckout(gitURL, ref string, depth int, sharedPath string, 
 	}
 
 	kind, cleanRef := normalizeGitSourceRef(ref)
+	if isShallowCommitRef(kind, cleanRef) {
+		return ensureShallowGitCommit(gitURL, cleanRef, depth, sharedPath, quiet)
+	}
 	if cleanRef != "" && kind != "branch" && kind != "tag" {
-		return fmt.Errorf("shallow git sources require an explicit branch= or tag= selector, got %q", ref)
+		return fmt.Errorf("shallow git sources require a branch=, tag= or full commit hash selector, got %q", ref)
 	}
 
 	if _, err := os.Stat(sharedPath); os.IsNotExist(err) {
@@ -219,6 +222,51 @@ func ensureShallowGitCheckout(gitURL, ref string, depth int, sharedPath string, 
 	default:
 		if err := runSystemGit(quiet, "-C", sharedPath, "pull", "--ff-only", "--depth", depthArg); err != nil {
 			return fmt.Errorf("failed to update shallow default branch for %s: %w", gitURL, err)
+		}
+	}
+	return nil
+}
+
+// isShallowCommitRef reports whether a shallow source is pinned to a commit:
+// a full hash, bare or as commit=/rev=/revision=. Abbreviated hashes cannot
+// be fetched from a remote, so they stay errors.
+func isShallowCommitRef(kind, ref string) bool {
+	switch kind {
+	case "", "commit", "rev", "revision":
+	default:
+		return false
+	}
+	if len(ref) != 40 && len(ref) != 64 {
+		return false
+	}
+	for _, c := range ref {
+		if !strings.ContainsRune("0123456789abcdef", c) {
+			return false
+		}
+	}
+	return true
+}
+
+// ensureShallowGitCommit checks out a pinned commit with a depth-limited
+// fetch of that commit alone. A commit never moves, so an existing checkout
+// at it is left alone.
+func ensureShallowGitCommit(gitURL, commit string, depth int, sharedPath string, quiet bool) error {
+	if out, err := gitCommand("-C", sharedPath, "rev-parse", "HEAD").Output(); err == nil && strings.TrimSpace(string(out)) == commit {
+		return nil
+	}
+	if err := os.RemoveAll(sharedPath); err != nil {
+		return fmt.Errorf("failed to replace shallow checkout %s: %w", sharedPath, err)
+	}
+	steps := [][]string{
+		{"init", "--quiet", sharedPath},
+		{"-C", sharedPath, "remote", "add", "origin", gitURL},
+		{"-C", sharedPath, "fetch", "--depth", strconv.Itoa(depth), "origin", commit},
+		{"-C", sharedPath, "checkout", "--quiet", "--detach", "FETCH_HEAD"},
+	}
+	for _, args := range steps {
+		if err := runSystemGit(quiet, args...); err != nil {
+			os.RemoveAll(sharedPath)
+			return fmt.Errorf("failed to shallow fetch %s at %s: %w", gitURL, commit, err)
 		}
 	}
 	return nil
