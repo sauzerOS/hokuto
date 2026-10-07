@@ -793,18 +793,30 @@ func recordedBinaryDependencySpecs(pkgName string, cfg *Config, noRemote bool) [
 	return depSpecsFromNames(entry.Depends)
 }
 
-func resolveDependencyList(parentPkg string, deps []DepSpec, visited map[string]bool, plan *[]string, force bool, yes bool, cfg *Config, remoteIndex []RepoEntry, allowRemote bool) error {
-	// A package's own choices between equivalents (kcoreaddons or
-	// sonic-frameworks-core-addons) are made before its dependencies are
-	// explored: the run shares one choice per pair, and otherwise the first
-	// dependency to reach the pair (a KDE framework preferring kcoreaddons)
-	// would decide it for the sonic package that pulled it in.
+// settleEquivalentChoices makes parentPkg's choices between equivalent
+// packages before its dependencies are explored. The run shares one choice
+// per pair (alternativeDepCache), so otherwise the first dependency to reach
+// the pair (a KDE framework preferring kcoreaddons) would decide it for the
+// sonic package that pulled it in.
+func settleEquivalentChoices(deps []DepSpec, yes bool, cfg *Config, parentPkg string) error {
 	for _, dep := range deps {
 		if isPackageEquivalentAlternative(dep) {
 			if _, err := resolveAlternativeDep(dep, yes, cfg, parentPkg); err != nil {
 				return err
 			}
 		}
+	}
+	return nil
+}
+
+func resolveDependencyList(parentPkg string, deps []DepSpec, visited map[string]bool, plan *[]string, force bool, yes bool, cfg *Config, remoteIndex []RepoEntry, allowRemote bool) error {
+	// A package's own choices between equivalents (kcoreaddons or
+	// sonic-frameworks-core-addons) are made before its dependencies are
+	// explored: the run shares one choice per pair, and otherwise the first
+	// dependency to reach the pair (a KDE framework preferring kcoreaddons)
+	// would decide it for the sonic package that pulled it in.
+	if err := settleEquivalentChoices(deps, yes, cfg, parentPkg); err != nil {
+		return err
 	}
 	for _, dep := range deps {
 		if dep.Make || dep.Optional || dep.Rebuild || dep.PostInstall || dep.Suggest {
@@ -1049,12 +1061,19 @@ func resolveMissingDeps(pkgName string, processed map[string]bool, missing *[]st
 			return fmt.Errorf("failed to parse dependencies for %s: %w", pkgName, err)
 		}
 		if binaryAvailableForPkg && !isPackageInstalled(pkgName) {
-			dependencies = append(dependencies, recordedBinaryDependencySpecs(pkgName, pkgCfg, noRemote)...)
+			// The binary's recorded dependencies get the recipe's equivalence
+			// alternatives too: plain kcoreaddons from binary kcmutils was
+			// planned next to the sonic-frameworks-core-addons the run chose.
+			dependencies = append(dependencies, expandArchiveEquivalentDependencies(recordedBinaryDependencySpecs(pkgName, pkgCfg, noRemote), pkgName)...)
 		}
 	}
 
 	// A host tool and its cross runtime used together must match.
 	noteCrossToolchainPairs(dependencies, cfg)
+
+	// This package's own choices between equivalents come before its
+	// dependencies are explored, as in resolveDependencyList.
+	settleEquivalentChoices(dependencies, false, cfg, pkgName)
 
 	// --- 5. Recursively check all dependencies ---
 	for _, dep := range dependencies {
@@ -1286,6 +1305,8 @@ func resolveRemoteDependencies(pkgName string, visited map[string]bool, plan *[]
 
 		deps = append(depSpecsFromNames(scan.deps), depSpecsFromNames(scan.postInstallDeps)...)
 	}
+
+	deps = expandArchiveEquivalentDependencies(deps, pkgName)
 
 	// 7. Recurse
 	if err := resolveDependencyList(pkgName, deps, visited, plan, force, yes, cfg, remoteIndex, true); err != nil {

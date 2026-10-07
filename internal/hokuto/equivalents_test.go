@@ -5,6 +5,8 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
+	"sync"
 	"testing"
 )
 
@@ -289,5 +291,36 @@ func TestDependencyListSettlesOwnEquivalentsFirst(t *testing.T) {
 	}
 	if !has("sonic-frameworks-core-addons") || has("kcoreaddons") {
 		t.Fatalf("plan must use the sonic choice only: %v", plan)
+	}
+}
+
+// hokuto-builder rebuild of the sonic packages: binary kcmutils records a
+// plain kcoreaddons dependency, which resolveMissingDeps used to plan as is,
+// next to the sonic-frameworks-core-addons the sonic package chose.
+func TestMissingDepsRecordedBinaryDependencyFollowsEquivalentChoice(t *testing.T) {
+	cfg, repo := withTempDependencyRepo(t)
+	cfg.Values["HOKUTO_ARCH"] = "x86_64"
+	withTempDependencyEquivalents(t, repo, "kcoreaddons sonic-frameworks-core-addons\nplasma-pa sonic-audio-applet-pulse\n")
+	tarballDependencyCache = sync.Map{}
+	t.Cleanup(func() { tarballDependencyCache = sync.Map{} })
+
+	writeTestPackage(t, repo, "kcoreaddons", "")
+	writeTestPackage(t, repo, "sonic-frameworks-core-addons", "")
+	writeTestPackage(t, repo, "kcmutils", "") // the recipe leaves it to libdeps
+	writeTestPackage(t, repo, "sonic-audio-applet-pulse", "kcmutils\nkcoreaddons\n")
+	variant := GetSystemVariantForPackage(cfg, "kcmutils")
+	writeTestBinaryTarballWithDepends(t, filepath.Join(BinDir, StandardizeRemoteName("kcmutils", "1.0", "1", "x86_64", variant)),
+		"kcmutils", "1.0", "1", "kcoreaddons\n")
+	writeCachedTestBinary(t, cfg, "kcoreaddons")
+	writeCachedTestBinary(t, cfg, "sonic-frameworks-core-addons")
+
+	var missing []string
+	if err := resolveMissingDeps("sonic-audio-applet-pulse", map[string]bool{}, &missing,
+		map[string]bool{"sonic-audio-applet-pulse": true}, cfg, true); err != nil {
+		t.Fatal(err)
+	}
+	got := strings.Join(missing, ",")
+	if !strings.Contains(got, "sonic-frameworks-core-addons") || strings.Contains(got, "kcoreaddons,") || strings.HasSuffix(got, "kcoreaddons") {
+		t.Fatalf("missing deps must use the sonic choice only: %s", got)
 	}
 }
