@@ -48,6 +48,7 @@ type PkgDBEntry struct {
 	Name          string          `json:"name"`
 	Type          string          `json:"type,omitempty"`
 	Version       string          `json:"version"`
+	Revision      string          `json:"revision,omitempty"`
 	SourcePackage string          `json:"source_package,omitempty"`
 	Metadata      PackageMetadata `json:"metadata"`
 }
@@ -720,6 +721,10 @@ func generatePkgDB(cfg *Config, quiet bool) error {
 				continue
 			}
 			version := fields[0]
+			revision := "1"
+			if len(fields) > 1 {
+				revision = fields[1]
+			}
 
 			// Try to read metadata
 			var meta PackageMetadata
@@ -738,6 +743,7 @@ func generatePkgDB(cfg *Config, quiet bool) error {
 			db.Packages = append(db.Packages, PkgDBEntry{
 				Name:     pkgName,
 				Version:  version,
+				Revision: revision,
 				Metadata: parentDBMeta,
 			})
 			seen[pkgName] = true
@@ -751,6 +757,7 @@ func generatePkgDB(cfg *Config, quiet bool) error {
 				db.Packages = append(db.Packages, PkgDBEntry{
 					Name:          splitName,
 					Version:       version,
+					Revision:      revision,
 					SourcePackage: pkgName,
 					Metadata:      splitMeta,
 				})
@@ -914,9 +921,14 @@ func SearchPkgDB(args []string, cfg *Config) error {
 
 	colNote.Printf("\nSearch results for '%s' (%d matches):\n", query, len(results))
 	fmt.Printf("--------------------------------------------------------------------------------\n")
+	nameWidth, versionWidth := 20, 10
 	for _, r := range results {
-		colSuccess.Printf("%-20s ", r.Name)
-		fmt.Printf("%-10s ", r.Version)
+		nameWidth = max(nameWidth, len(r.Name))
+		versionWidth = max(versionWidth, len(searchResultVersion(r)))
+	}
+	for _, r := range results {
+		colSuccess.Printf("%-*s ", nameWidth, r.Name)
+		fmt.Printf("%-*s ", versionWidth, searchResultVersion(r))
 		if r.Type == "meta" {
 			color.Magenta.Print("(meta) ")
 		}
@@ -934,6 +946,16 @@ func SearchPkgDB(args []string, cfg *Config) error {
 	fmt.Println()
 
 	return nil
+}
+
+// searchResultVersion is the version a search result shows: version-revision
+// (1.99.0-2), or the bare version from a database written before revisions
+// were recorded.
+func searchResultVersion(r PkgDBEntry) string {
+	if r.Revision == "" || r.Type == "meta" {
+		return r.Version
+	}
+	return r.Version + "-" + r.Revision
 }
 
 func packageDBEntryMatchesSearch(pkg PkgDBEntry, query, queryLower string, tagMode, strictMode bool) bool {
@@ -987,9 +1009,10 @@ func searchRemotePackageIndex(query, queryLower string, strictMode bool, cfg *Co
 			}
 		}
 		results = append(results, PkgDBEntry{
-			Name:    selected.Name,
-			Type:    selected.Type,
-			Version: selected.Version,
+			Name:     selected.Name,
+			Type:     selected.Type,
+			Version:  selected.Version,
+			Revision: selected.Revision,
 			Metadata: PackageMetadata{
 				Description: selected.Description,
 			},

@@ -81,7 +81,7 @@ func TestGeneratePkgDBAppliesSplitMetadataOverrides(t *testing.T) {
 	repoPaths = repo
 	PkgDBPath = filepath.Join(tmp, "pkg-db.json.zst")
 
-	if err := os.WriteFile(filepath.Join(pkgDir, "version"), []byte("3.0.23\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(pkgDir, "version"), []byte("3.0.23 4\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(pkgDir, "split", "libvlc", "depends"), nil, 0o644); err != nil {
@@ -146,6 +146,27 @@ func TestGeneratePkgDBAppliesSplitMetadataOverrides(t *testing.T) {
 	}
 	if split.Metadata.URL != parent.Metadata.URL {
 		t.Fatalf("expected split URL to inherit parent URL, got %q", split.Metadata.URL)
+	}
+	if got := searchResultVersion(*parent); got != "3.0.23-4" {
+		t.Fatalf("parent search version: got %q", got)
+	}
+	if got := searchResultVersion(*split); got != "3.0.23-4" {
+		t.Fatalf("split search version: got %q", got)
+	}
+}
+
+func TestSearchResultVersion(t *testing.T) {
+	for _, c := range []struct {
+		entry PkgDBEntry
+		want  string
+	}{
+		{PkgDBEntry{Version: "1.99.0", Revision: "2"}, "1.99.0-2"},
+		{PkgDBEntry{Version: "1.99.0"}, "1.99.0"}, // database from an older hokuto
+		{PkgDBEntry{Type: "meta", Version: "meta", Revision: "1"}, "meta"},
+	} {
+		if got := searchResultVersion(c.entry); got != c.want {
+			t.Fatalf("%+v: got %q want %q", c.entry, got, c.want)
+		}
 	}
 }
 
