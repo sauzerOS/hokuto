@@ -233,6 +233,9 @@ func locateSplitUpdates(sourcePkg string, splitPkgs []string, cfg *Config, remot
 func installSplitUpdates(splitPkgs []string, tarballs map[string]binaryTarball, cfg *Config, quiet bool, progress *installProgress) error {
 	logger, fast := dependencyInstallLogger(quiet)
 	for _, splitPkg := range splitPkgs {
+		// From here on a removed library that affects this split output is
+		// its own update's problem, as for the other packages of the run.
+		markUpdateBatchDone(splitPkg)
 		if progress != nil {
 			progress.start(splitPkg)
 		} else {
@@ -1777,9 +1780,17 @@ func checkForUpgrades(ctx context.Context, cfg *Config, maxJobs int, yes bool) e
 
 	// A library removed by one update can affect a package this run updates
 	// later; the installer leaves those for the check after the loop.
-	batchOutputs := make([]string, 0, len(pkgNames))
+	batchOutputs := make([]string, 0, len(pkgNames)+len(splitBinaries))
 	for _, pkgName := range pkgNames {
 		batchOutputs = append(batchOutputs, getOutputPackageName(pkgName, cfg))
+	}
+	// Split outputs this run installs from their own binaries are replaced
+	// too: lib32-llvm-libs dropping libLLVM.so.22.1 must not offer to
+	// rebuild the old lib32-mesa its new binary is about to replace.
+	if !splitBinariesInstalled {
+		for _, sb := range splitBinaries {
+			batchOutputs = append(batchOutputs, sb.name)
+		}
 	}
 	startUpdateBatch(batchOutputs)
 	defer reportBrokenUpdateBatch()
