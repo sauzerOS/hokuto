@@ -310,6 +310,7 @@ func bumpABIConsumers(consumers map[string][]string, msg string) (abiRebuildResu
 	sort.Strings(names)
 
 	byRepo := make(map[string][]string)
+	linesByRepo := make(map[string][]string)
 	var repoOrder []string
 	for _, name := range names {
 		pkgDir, err := findPackageMetadataDir(name)
@@ -339,13 +340,12 @@ func bumpABIConsumers(consumers map[string][]string, msg string) (abiRebuildResu
 			repoOrder = append(repoOrder, root)
 		}
 		byRepo[root] = append(byRepo[root], versionPath)
+		linesByRepo[root] = append(linesByRepo[root], revisionBumpLine(name, bumped, "links "+strings.Join(consumers[name], ", ")))
 	}
 
 	for _, root := range repoOrder {
-		// Commit only these paths so unrelated staged changes stay out.
-		args := append([]string{"-C", root, "commit", "-m", msg, "--"}, byRepo[root]...)
-		if out, err := exec.Command("git", args...).CombinedOutput(); err != nil {
-			return result, fmt.Errorf("git commit in %s failed: %v: %s", root, err, strings.TrimSpace(string(out)))
+		if err := commitRevisionBumps(root, msg, linesByRepo[root], byRepo[root]); err != nil {
+			return result, err
 		}
 		if err := pushGitRepo(root); err != nil {
 			return result, fmt.Errorf("git push of %s failed: %w", root, err)

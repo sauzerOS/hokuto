@@ -6,7 +6,6 @@ import (
 	"io"
 	"io/fs"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -188,6 +187,7 @@ func bumpRecipesWithOption(option, reason, msg string) error {
 	colArrow.Print("-> ")
 	colSuccess.Printf("Bumping %d recipe(s) for %s\n", len(names), reason)
 	byRepo := make(map[string][]string)
+	linesByRepo := make(map[string][]string)
 	var repoOrder []string
 	for _, name := range names {
 		pkgDir := recipes[name]
@@ -205,13 +205,12 @@ func bumpRecipesWithOption(option, reason, msg string) error {
 			repoOrder = append(repoOrder, root)
 		}
 		byRepo[root] = append(byRepo[root], filepath.Join(pkgDir, "version"))
+		linesByRepo[root] = append(linesByRepo[root], revisionBumpLine(name, bumped, ""))
 	}
 
 	for _, root := range repoOrder {
-		// Commit only these paths so unrelated staged changes stay out.
-		args := append([]string{"-C", root, "commit", "-m", msg, "--"}, byRepo[root]...)
-		if out, err := exec.Command("git", args...).CombinedOutput(); err != nil {
-			return fmt.Errorf("git commit in %s failed: %v: %s", root, err, strings.TrimSpace(string(out)))
+		if err := commitRevisionBumps(root, msg, linesByRepo[root], byRepo[root]); err != nil {
+			return err
 		}
 	}
 	return nil

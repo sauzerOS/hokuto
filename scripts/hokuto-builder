@@ -687,7 +687,7 @@ cycle_step() {
     info "Cycle: $label"
     start=$(date +%s)
     HOKUTO_BUILDER_USER=$BUILD_USER HOKUTO_BUILDER_RESULTS=$results \
-        "$(readlink -f "$0")" "$@" </dev/null || rc=$?
+        "$(readlink -f "$0")" "$@" </dev/null 8>&- || rc=$?
     elapsed=$(($(date +%s) - start))
     status=ok
     [ "$rc" = 0 ] || status="FAILED (exit $rc)"
@@ -758,8 +758,17 @@ clean_tmpdirs() {
 publish_round() {
     printf 'round\t%s\t%s\n' "$1" $(($(date +%s) - $1)) >>"$ROUND_FILE"
     chown "$BUILD_UID:$BUILD_GID" "$ROUND_FILE"
-    runuser -u "$BUILD_USER" -- env HOME="$BUILD_HOME" hokuto website-round "$ROUND_FILE" ||
+    runuser -u "$BUILD_USER" -- env HOME="$BUILD_HOME" hokuto website-round "$ROUND_FILE" 8>&- ||
         info "Could not publish the round to the website"
+}
+
+CYCLE_LOCK=/run/lock/hokuto-builder-cycle.lock
+
+# remove_round_files: a round's temporary files in the run log directory
+# (summary, round record, package results), which only the round that holds
+# CYCLE_LOCK can own.
+remove_round_files() {
+    find "$RUN_LOG_DIR" -maxdepth 1 -type f \( -name 'cycle.*' -o -name 'round.*' -o -name 'results.*' \) -delete
 }
 
 # generic_rootfs: the generic container's location, as the --generic
@@ -800,6 +809,14 @@ check_cycle_setup() {
 cmd_cycle() {
     check_cycle_setup
     install -d -m 0755 "$RUN_LOG_DIR"
+    # One round at a time, so the temporary files of the run log directory
+    # left here are a killed round's, never a running one's.
+    exec 8>"$CYCLE_LOCK"
+    flock -n 8 || die "another hokuto-builder cycle is running"
+    remove_round_files
+    trap remove_round_files EXIT
+    # systemctl stop sends TERM; exit so the EXIT trap runs.
+    trap 'exit 143' TERM INT
     local summary start
     summary=$(mktemp "$RUN_LOG_DIR/cycle.XXXXXX")
     ROUND_FILE=$(mktemp "$RUN_LOG_DIR/round.XXXXXX")
@@ -841,7 +858,6 @@ cmd_cycle() {
         } | tee -a "$RUN_LOG"
         publish_round "$start"
     fi
-    rm -f "$summary" "$ROUND_FILE"
 }
 
 cmd_destroy() {
