@@ -249,6 +249,7 @@ func initConfig(cfg *Config) {
 	WorldMakeFile = filepath.Join(rootDir, "/var/db/hokuto/world_make")
 	LockFile = filepath.Join(rootDir, "/etc/hokuto/hokuto.lock")
 	PkgsetFile = filepath.Join(rootDir, "/etc/hokuto/hokuto.pkgset")
+	PreferFile = filepath.Join(rootDir, "/etc/hokuto/hokuto.prefer")
 	PkgDBPath = filepath.Join(rootDir, "/var/db/hokuto/pkg-db.json.zst")
 	BumpLogFile = filepath.Join(rootDir, "/var/log/hokuto-bump.log")
 	BumpIgnoreFile = filepath.Join(rootDir, "/var/db/hokuto/bump-ignore.json")

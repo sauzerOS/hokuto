@@ -51,13 +51,15 @@
 #   /var/cache/hokuto            binary cache (and the sources mount below it)
 #   /var/tmp/hokuto              TMPDIR, on the host's zram disk
 #   /var/tmpdir/hokuto           TMPDIR2, disk-backed, for "noram" builds
-#   /etc/hokuto/hokuto.conf, hokuto.lock, keys/, mirror-auth   config, mirror
-#                                credentials and login, version locks and the
+#   /etc/hokuto/hokuto.conf, hokuto.lock, hokuto.prefer, keys/, mirror-auth
+#                                config, mirror credentials and login, version
+#                                locks, alternative dependency choices and the
 #                                signing key
 #   /usr/local/bin/hokuto        the host's hokuto, so both run the same version;
 #                                it comes first in PATH. The container's own
 #                                hokuto package (/usr/bin/hokuto, hokuto.update,
-#                                .rebuild, .pkgset) stays updatable.
+#                                .rebuild, .pkgset) stays updatable; hokuto.conf
+#                                and hokuto.prefer are copied in on every run.
 #   ~/.gitconfig, ~/.git-credentials   git identity and push credentials
 #   /var/db/hokuto/bump-ignore.json, build-ignore.json   the bump and rebuild
 #                                blacklists
@@ -419,13 +421,16 @@ nspawn_run() {
     for file in hokuto.lock keys mirror-auth; do
         [ -e "/etc/hokuto/$file" ] && args+=(--bind-ro="/etc/hokuto/$file")
     done
-    # sauzeros-base ships hokuto.conf, and an install renames its new copy
-    # over the file, which a bind mount refuses (EBUSY). Copied instead, on
-    # every run, so the host's settings win over whatever an update put there.
-    if [ -f /etc/hokuto/hokuto.conf ]; then
-        install -d "$ROOTFS/etc/hokuto"
-        cp --preserve=mode,ownership /etc/hokuto/hokuto.conf "$ROOTFS/etc/hokuto/hokuto.conf"
-    fi
+    # sauzeros-base ships hokuto.conf and hokuto hokuto.prefer, and an install
+    # renames its new copy over the file, which a bind mount refuses (EBUSY).
+    # Copied instead, on every run, so the host's settings win over whatever
+    # an update put there.
+    for file in hokuto.conf hokuto.prefer; do
+        if [ -f "/etc/hokuto/$file" ]; then
+            install -d "$ROOTFS/etc/hokuto"
+            cp --preserve=mode,ownership "/etc/hokuto/$file" "$ROOTFS/etc/hokuto/$file"
+        fi
+    done
     # hokuto stages installs on the root's own filesystem so it can hard link
     # them into place; /var/cache/hokuto is the host's here, so it uses this
     # one, which the build user must own (hokuto creates entries as that user).

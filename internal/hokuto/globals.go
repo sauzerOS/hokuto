@@ -62,6 +62,7 @@ var (
 	WorldMakeFile    = "/var/db/hokuto/world_make"
 	LockFile         = "/etc/hokuto/hokuto.lock"
 	PkgsetFile       = "/etc/hokuto/hokuto.pkgset"
+	PreferFile       = "/etc/hokuto/hokuto.prefer"
 	versionedPkgDirs = make(map[string]string) // pkgName@version -> tmpDir
 	// versionedPkgBaseNames maps an internal pkg-MAJOR build/install identity
 	// back to the canonical package name used in archives and the remote index.

@@ -1388,6 +1388,12 @@ func resolveAlternativeDep(dep DepSpec, yes bool, cfg *Config, requestingPkg ...
 		return installed[0], nil
 	}
 
+	// Otherwise the choice hokuto.prefer makes for every such dependency.
+	if preferred := preferredAlternative(available); preferred != "" {
+		alternativeDepCache[cacheKey] = preferred
+		return preferred, nil
+	}
+
 	// Repository equivalence pairs have a declared preference order and do not
 	// need an interactive provider choice. The installed-provider preference
 	// above still wins when either equivalent is already present.
@@ -1424,7 +1430,7 @@ func resolveAlternativeDep(dep DepSpec, yes bool, cfg *Config, requestingPkg ...
 	}
 
 	// Multiple alternatives available (none installed) - prompt user
-	if yes {
+	if yes || GlobalAssumeYes {
 		// In --yes mode, use the first available alternative and cache it
 		alternativeDepCache[cacheKey] = available[0]
 		return available[0], nil

@@ -169,7 +169,8 @@ Common forms:
 - `pkg rebuild`: post-build rebuild action when `--rebuilds` is enabled;
 - `pkg suggest "text"`: user-facing suggestion;
 - `pkg cross make` and cross-native variants;
-- `a | b`: alternatives;
+- `a | b`: alternatives; an installed one wins, then the first listed in
+  `/etc/hokuto/hokuto.prefer` (`dependency_prefer.go`), before any prompt;
 - `pkg==1.*`, `pkg<=2.0`, etc.: constraints, potentially resolved from Git
   history.
 
