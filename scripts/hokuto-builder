@@ -26,10 +26,10 @@
 #                                  --no-upload skips the upload
 #   hokuto-builder cycle           one unattended round: bump -y, rebuild -y,
 #                                  --generic rebuild -y with CYCLE_GENERIC=1,
-#                                  cross-sync -system -y, cross-sync -y, then
-#                                  remove what failed builds left in the build
-#                                  tmpdirs; results go to
-#                                  /var/log/hokuto-builder/runs.log
+#                                  cross-sync -system -y, cross-sync -y; before
+#                                  each and at the end it removes what failed
+#                                  builds left in the build tmpdirs; results go
+#                                  to /var/log/hokuto-builder/runs.log
 #                                  hokuto-builder.timer runs it unattended,
 #                                  15 minutes after the previous round ends:
 #                                  systemctl enable --now hokuto-builder.timer
@@ -69,13 +69,19 @@
 # The container location is asked for by 'create' and saved in
 # /etc/hokuto-builder.conf for the other commands.
 #
-# Builds use every core: the container's cgroup runs at idle CPU weight, so
-# it only gets the CPU time the host's own work leaves, and its memory is
-# throttled above 75% of RAM. /etc/hokuto-builder.conf can change both:
+# The container's cgroup runs at idle CPU weight, so builds only get the CPU
+# time the host's own work leaves. Idle weight alone still slowed the host
+# (builds share its cores' hyperthreads and lower their boost clocks), so
+# builds are also capped at 80% of the threads, and their memory is
+# throttled above half the RAM, before the host's own memory is swapped out.
+# /etc/hokuto-builder.conf can change these:
 #
 #   CPU_WEIGHT=idle              systemd CPUWeight= (1-10000 or idle); an
 #                                empty value removes the limit
-#   MEMORY_HIGH=75%              systemd MemoryHigh= (bytes, K/M/G or a
+#   CPU_QUOTA=                   systemd CPUQuota=, 100% per thread (1600%
+#                                is 16 threads); unset, 80% of the threads;
+#                                empty removes the cap
+#   MEMORY_HIGH=50%              systemd MemoryHigh= (bytes, K/M/G or a
 #                                percentage of RAM); empty removes the limit
 #   CYCLE_JOBS=4                 packages cycle builds at once
 #   CYCLE_GENERIC=0              1: cycle also runs --generic rebuild -y, in
@@ -209,7 +215,10 @@ conf_value() {
     fi
 }
 CPU_WEIGHT=$(conf_value CPU_WEIGHT idle)
-MEMORY_HIGH=$(conf_value MEMORY_HIGH 75%)
+CPU_QUOTA=$(conf_value CPU_QUOTA "$(($(nproc) * 80))%")
+MEMORY_HIGH=$(conf_value MEMORY_HIGH 50%)
+[ -z "$CPU_QUOTA" ] || [[ "$CPU_QUOTA" =~ ^[1-9][0-9]*%$ ]] ||
+    die "CPU_QUOTA in $CONFIG_FILE must be a percentage such as 1600% (100% per thread), not '$CPU_QUOTA'"
 CYCLE_JOBS=$(conf_value CYCLE_JOBS 4)
 CYCLE_GENERIC=$(conf_value CYCLE_GENERIC 0)
 RUN_LOG_DIR=/var/log/hokuto-builder
@@ -424,6 +433,7 @@ nspawn_run() {
     [ -t 0 ] || args+=(--console=pipe)
     # Limits on the container's scope unit, which holds every process in it.
     [ -n "$CPU_WEIGHT" ] && args+=(--property="CPUWeight=$CPU_WEIGHT")
+    [ -n "$CPU_QUOTA" ] && args+=(--property="CPUQuota=$CPU_QUOTA")
     [ -n "$MEMORY_HIGH" ] && args+=(--property="MemoryHigh=$MEMORY_HIGH")
     # A cycle step: hokuto records each package's build result here.
     if [ -n "${HOKUTO_BUILDER_RESULTS:-}" ]; then
@@ -701,15 +711,32 @@ cycle_step() {
             printf '      nothing built\n'
         fi
     } >>"$summary"
+    # Before the next step: what this one's failed builds left.
+    clean_tmpdirs
+    # A skip is noted but alone does not make the round worth reporting.
+    case "$CLEANED" in
+        "removed 0 "*) ;;
+        skipped*) printf '      tmpdir cleanup: %s\n' "$CLEANED" >>"$summary" ;;
+        *)
+            printf '      tmpdir cleanup: %s\n' "$CLEANED" >>"$summary"
+            CYCLE_ACTIVE=1
+            ;;
+    esac
     rm -f "$results"
 }
 
 # clean_tmpdirs: remove what failed builds left in the build tmpdirs (a
-# successful build removes its own tree). Skipped while any hokuto runs, on
-# the host or in a container: the tmpdirs are shared.
+# successful build removes its own tree), so they cannot fill them for the
+# steps after. Skipped while any hokuto runs, on the host or in a container:
+# the tmpdirs are shared. Sets CLEANED to what it did, and adds to the round's
+# CLEANED_TOTAL and CLEAN_SKIPPED.
+CLEANED=""
+CLEANED_TOTAL=0
+CLEAN_SKIPPED=0
 clean_tmpdirs() {
     if pgrep -x 'hokuto|hk' >/dev/null; then
-        echo "skipped, hokuto is running"
+        CLEANED="skipped, hokuto is running"
+        CLEAN_SKIPPED=$((CLEAN_SKIPPED + 1))
         return 0
     fi
     local dir entry n=0
@@ -721,7 +748,8 @@ clean_tmpdirs() {
             n=$((n + 1))
         done
     done
-    echo "removed $n leftover item(s)"
+    CLEANED_TOTAL=$((CLEANED_TOTAL + n))
+    CLEANED="removed $n leftover item(s)"
 }
 
 # publish_round <start>: the round on the website's rounds.html, committed and
@@ -734,13 +762,6 @@ publish_round() {
         info "Could not publish the round to the website"
 }
 
-# One unattended round, for hokuto-builder.service: auto-bump and build, the
-# rebuilds bump left, then the cross-system and native aarch64 packages the
-# mirror lacks, then the
-# tmpdir cleanup. Package status and logs also go to the website
-# (packages.html) as with the interactive commands; the run log keeps the
-# rounds, and those that did something also go to the website's rounds.html.
-# Failed packages do not fail the round.
 # generic_rootfs: the generic container's location, as the --generic
 # commands find it.
 generic_rootfs() {
@@ -769,6 +790,13 @@ check_cycle_setup() {
         die "CYCLE_JOBS in $CONFIG_FILE must be a positive number, not '$CYCLE_JOBS'"
 }
 
+# One unattended round, for hokuto-builder.service: auto-bump and build, the
+# rebuilds bump left, then the cross-system and native aarch64 packages the
+# mirror lacks, cleaning the build tmpdirs before each step and at the end.
+# Package status and logs also go to the website (packages.html) as with the
+# interactive commands; the run log keeps the rounds, and those that did
+# something also go to the website's rounds.html. Failed packages do not fail
+# the round.
 cmd_cycle() {
     check_cycle_setup
     install -d -m 0755 "$RUN_LOG_DIR"
@@ -776,6 +804,16 @@ cmd_cycle() {
     summary=$(mktemp "$RUN_LOG_DIR/cycle.XXXXXX")
     ROUND_FILE=$(mktemp "$RUN_LOG_DIR/round.XXXXXX")
     start=$(date +%s)
+    # What an interrupted round left.
+    clean_tmpdirs
+    case "$CLEANED" in
+        "removed 0 "*) ;;
+        skipped*) printf '  %-20s %s\n' "tmpdir cleanup" "$CLEANED" >>"$summary" ;;
+        *)
+            printf '  %-20s %s\n' "tmpdir cleanup" "$CLEANED" >>"$summary"
+            CYCLE_ACTIVE=1
+            ;;
+    esac
     cycle_step "$summary" bump bump -y "-j$CYCLE_JOBS"
     # What bump's ABI check revision-bumped, and earlier failures whose
     # recipe has changed since (blacklisted ones stay skipped). -y builds
@@ -787,11 +825,9 @@ cmd_cycle() {
     fi
     cycle_step "$summary" "cross-sync -system" cross-sync -system -y "-j$CYCLE_JOBS"
     cycle_step "$summary" cross-sync cross-sync -y "-j$CYCLE_JOBS"
-    local cleaned
-    cleaned=$(clean_tmpdirs)
-    printf '  %-20s %s\n' "tmpdir cleanup" "$cleaned" >>"$summary"
+    local cleaned="removed $CLEANED_TOTAL leftover item(s)"
+    [ "$CLEAN_SKIPPED" = 0 ] || cleaned+=", skipped $CLEAN_SKIPPED time(s) while hokuto was running"
     printf 'cleanup\t%s\n' "$cleaned" >>"$ROUND_FILE"
-    case "$cleaned" in "removed 0 "*) ;; *) CYCLE_ACTIVE=1 ;; esac
     local header
     header="$(date -d "@$start" '+%Y-%m-%d %H:%M'), $(fmt_duration $(($(date +%s) - start)))"
     # A round runs every 15 minutes: one with nothing to report takes a line.
