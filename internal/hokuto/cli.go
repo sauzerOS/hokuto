@@ -1790,7 +1790,9 @@ func Main() {
 		var msgLong = bumpCmd.String("message", "", "Commit message")
 		var jobs = bumpCmd.Int("j", autoBumpBuildJobs, "With --auto --build: packages built at once")
 		var jobsLong = bumpCmd.Int("parallel", 0, "With --auto --build: packages built at once")
-		if err := bumpCmd.Parse(os.Args[2:]); err != nil {
+		// -j4 as well as -j 4, as build and update take it (hokuto-builder
+		// passes -jN).
+		if err := bumpCmd.Parse(PreprocessBuildArgs(os.Args[2:])); err != nil {
 			fmt.Fprintf(os.Stderr, "Error parsing bump flags: %v\n", err)
 			exitHokuto(1)
 		}

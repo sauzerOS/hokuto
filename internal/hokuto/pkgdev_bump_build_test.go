@@ -1,6 +1,7 @@
 package hokuto
 
 import (
+	"flag"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -40,5 +41,20 @@ func TestBumpBuildFlagsIdleOutsideHokutoBuilder(t *testing.T) {
 	t.Setenv("HOKUTO_BUILDER", "1")
 	if got, want := bumpBuildFlags(), []string{"--no-install", "--index"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("bumpBuildFlags() in hokuto-builder = %v, want %v", got, want)
+	}
+}
+
+// hokuto-builder's service runs "bump --auto --build -y -j4".
+func TestBumpFlagsAcceptAttachedJobs(t *testing.T) {
+	bumpCmd := flag.NewFlagSet("bump", flag.ContinueOnError)
+	bumpCmd.Bool("auto", false, "")
+	bumpCmd.Bool("build", false, "")
+	bumpCmd.Bool("y", false, "")
+	jobs := bumpCmd.Int("j", autoBumpBuildJobs, "")
+	if err := bumpCmd.Parse(PreprocessBuildArgs([]string{"--auto", "--build", "-y", "-j6"})); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if *jobs != 6 {
+		t.Fatalf("-j6 parsed as %d jobs", *jobs)
 	}
 }
