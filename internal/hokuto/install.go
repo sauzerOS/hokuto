@@ -19,6 +19,7 @@ import (
 	"sync"
 
 	"github.com/gookit/color"
+	"golang.org/x/term"
 )
 
 type packageSuggestion struct {
@@ -1182,7 +1183,13 @@ func installPackageArchive(tarballPath, pkgName string, cfg *Config, execCtx *Ex
 			os.Stdout.Sync()
 
 			var input string
-			if (!yes && !skipAllPrompts) || fast {
+			// Asked even with -y in a fast (update) install, as the user's own
+			// edits are at stake; without a terminal to answer (hokuto-builder's
+			// service), the default keeps them.
+			if ((!yes && !skipAllPrompts) || fast) && !term.IsTerminal(int(os.Stdin.Fd())) {
+				colArrow.Print("-> ")
+				fmt.Println(styledPrompt("Kept the modified ", file, ": no terminal to ask about it."))
+			} else if (!yes && !skipAllPrompts) || fast {
 				printKeyChoicePrompt(styledPrompt("File ", file, " was modified here (owner: ", ownerPkg, "). Choose:"), "[K]eep current, [u]se new, [b]ackup, [e]dit, use new for [A]ll")
 				// Flush stdout to ensure prompt is visible
 				os.Stdout.Sync()

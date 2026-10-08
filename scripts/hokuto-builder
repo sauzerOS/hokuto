@@ -417,6 +417,11 @@ nspawn_run() {
         --restrict-address-families="AF_INET AF_INET6 AF_UNIX AF_NETLINK"
         --bind-ro=/usr/bin/hokuto:/usr/local/bin/hokuto
     )
+    # Without a terminal (the service), nspawn's default console gives the
+    # container a terminal nothing ever types into, and a question hokuto
+    # asks waits forever. Passing stdin through instead lets it read end of
+    # input and take its default.
+    [ -t 0 ] || args+=(--console=pipe)
     # Limits on the container's scope unit, which holds every process in it.
     [ -n "$CPU_WEIGHT" ] && args+=(--property="CPUWeight=$CPU_WEIGHT")
     [ -n "$MEMORY_HIGH" ] && args+=(--property="MemoryHigh=$MEMORY_HIGH")
