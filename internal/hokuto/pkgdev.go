@@ -772,8 +772,8 @@ func buildBumpedPackages(pkgNames []string, cfg *Config) (built, failed []string
 		return nil, nil
 	}
 	jobs := max(autoBumpBuildJobs, 1)
-	colNote.Printf(">> [BUILDING] %s (idle mode, %d jobs)\n", strings.Join(pkgNames, " "), jobs)
-	args := []string{"-i", "--no-install", "--index", "--parallel", strconv.Itoa(jobs)}
+	colNote.Printf(">> [BUILDING] %s (%s, %d jobs)\n", strings.Join(pkgNames, " "), bumpBuildMode(), jobs)
+	args := append(bumpBuildFlags(), "--parallel", strconv.Itoa(jobs))
 	if err := handleBuildCommand(append(args, pkgNames...), cfg); err != nil {
 		debugf("Build of the bumped packages: %v\n", err)
 	}
@@ -799,8 +799,26 @@ func bumpedPackageBuilt(pkgName string, cfg *Config) bool {
 }
 
 func buildBumpedPackage(pkgName string, cfg *Config) error {
-	colNote.Printf(">> [BUILDING] %s (idle mode)\n", pkgName)
-	return handleBuildCommand([]string{"-i", "--no-install", "--index", pkgName}, cfg)
+	colNote.Printf(">> [BUILDING] %s (%s)\n", pkgName, bumpBuildMode())
+	return handleBuildCommand(append(bumpBuildFlags(), pkgName), cfg)
+}
+
+// bumpBuildFlags are the build flags of "bump --build": idle, not
+// installed, published to the index. In a hokuto-builder container the build
+// uses every core instead; the container's cgroup runs at idle CPU weight, so
+// it still yields to the host's own work.
+func bumpBuildFlags() []string {
+	if runningInHokutoBuilder() {
+		return []string{"--no-install", "--index"}
+	}
+	return []string{"-i", "--no-install", "--index"}
+}
+
+func bumpBuildMode() string {
+	if runningInHokutoBuilder() {
+		return "hokuto-builder"
+	}
+	return "idle mode"
 }
 
 // resolveBumpSourcePackage maps a split output back to the recipe that owns it.

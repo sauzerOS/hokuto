@@ -55,6 +55,15 @@
 # The container location is asked for by 'create' and saved in
 # /etc/hokuto-builder.conf for the other commands.
 #
+# Builds use every core: the container's cgroup runs at idle CPU weight, so
+# it only gets the CPU time the host's own work leaves, and its memory is
+# throttled above 75% of RAM. /etc/hokuto-builder.conf can change both:
+#
+#   CPU_WEIGHT=idle              systemd CPUWeight= (1-10000 or idle); an
+#                                empty value removes the limit
+#   MEMORY_HIGH=75%              systemd MemoryHigh= (bytes, K/M/G or a
+#                                percentage of RAM); empty removes the limit
+#
 # The generic container shares the same directories, except that it keeps its
 # own rebuild blacklist (build-ignore-generic.json) and does not publish build
 # status to the website, whose table has one entry per package. Both share the
@@ -164,6 +173,18 @@ saved_rootfs() {
 }
 ROOTFS=${ROOTFS_OVERRIDE:-$(saved_rootfs)}
 ROOTFS=${ROOTFS:-$DEFAULT_ROOTFS}
+
+# conf_value <key> <default>: a setting from the config file, the default when
+# the file does not set it. An empty value is kept: it removes a limit.
+conf_value() {
+    if [ -f "$CONFIG_FILE" ] && grep -q "^$1=" "$CONFIG_FILE"; then
+        sed -n "s/^$1=//p" "$CONFIG_FILE" | tail -n 1
+    else
+        printf '%s\n' "$2"
+    fi
+}
+CPU_WEIGHT=$(conf_value CPU_WEIGHT idle)
+MEMORY_HIGH=$(conf_value MEMORY_HIGH 75%)
 
 # save_rootfs records this container's location, keeping the other one's.
 save_rootfs() {
@@ -350,6 +371,9 @@ nspawn_run() {
         --restrict-address-families="AF_INET AF_INET6 AF_UNIX AF_NETLINK"
         --bind-ro=/usr/bin/hokuto:/usr/local/bin/hokuto
     )
+    # Limits on the container's scope unit, which holds every process in it.
+    [ -n "$CPU_WEIGHT" ] && args+=(--property="CPUWeight=$CPU_WEIGHT")
+    [ -n "$MEMORY_HIGH" ] && args+=(--property="MemoryHigh=$MEMORY_HIGH")
     # Overrides the shared hokuto.conf: generic flags for every build, and the
     # generic variant for every package hokuto installs in this container.
     [ "$VARIANT" = generic ] && args+=(--setenv=HOKUTO_GENERIC=1)
@@ -460,7 +484,7 @@ remove_leftovers() {
 '
 
 # The build step of `hokuto bump --build` for packages that are already
-# bumped (e.g. after a failed build): idle, not installed, status and log
+# bumped (e.g. after a failed build): not installed, status and log
 # published to the website, then the mirror synced if the build succeeded.
 cmd_build() {
     local upload=1 arg
@@ -474,7 +498,7 @@ cmd_build() {
     done
     [ ${#args[@]} -gt 0 ] || die "usage: hokuto-builder${VARIANT_FLAG} build <pkg>... [--no-upload]"
     # Build status goes to the website from the optimized container only.
-    local build_flags=(-i --no-install)
+    local build_flags=(--no-install)
     [ "$VARIANT" = optimized ] && build_flags+=(--index)
     # One container session; the arguments reach hokuto as "$@", unquoted
     # nowhere.
@@ -523,7 +547,7 @@ cmd_rebuild() {
         # After the update: what it installed stays in the container.
         snapshot_installed
         status=0
-        /usr/local/bin/hokuto update --build-missing-binaries -i "$@" || status=$?
+        /usr/local/bin/hokuto update --build-missing-binaries "$@" || status=$?
         # A failed package must not keep the others off the mirror: upload
         # whatever was built, then report the build status.
         if [ "$upload" = 1 ]; then
@@ -537,12 +561,11 @@ cmd_rebuild() {
 # hokuto cross-sync: build the native aarch64 packages, or with -system the
 # aarch64-* cross-system packages, that the mirror lacks at their recipe
 # version. Both are found from the mirror index and the recipes, so nothing
-# needs to be installed first. Idle, like the other builds, and the mirror
-# synced afterwards. Like build, it never installs what it builds: the
+# needs to be installed first. The mirror is synced afterwards. Like build, it never installs what it builds: the
 # packages are for the mirror, not this container.
 cmd_cross_sync() {
     local upload=1 arg
-    local args=(-i -no-install)
+    local args=(-no-install)
     for arg in "$@"; do
         if [ "$arg" = --no-upload ]; then
             upload=0

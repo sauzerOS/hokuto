@@ -3,6 +3,7 @@ package hokuto
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 )
 
@@ -27,5 +28,17 @@ func TestBumpedPackageBuiltLooksForTheNewRelease(t *testing.T) {
 	}
 	if !bumpedPackageBuilt("geeqie", cfg) {
 		t.Fatal("the package of the bumped release is there")
+	}
+}
+
+func TestBumpBuildFlagsIdleOutsideHokutoBuilder(t *testing.T) {
+	t.Setenv("HOKUTO_BUILDER", "")
+	if got, want := bumpBuildFlags(), []string{"-i", "--no-install", "--index"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("bumpBuildFlags() = %v, want %v", got, want)
+	}
+	// The container's cgroup yields the CPU instead, so builds use every core.
+	t.Setenv("HOKUTO_BUILDER", "1")
+	if got, want := bumpBuildFlags(), []string{"--no-install", "--index"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("bumpBuildFlags() in hokuto-builder = %v, want %v", got, want)
 	}
 }
