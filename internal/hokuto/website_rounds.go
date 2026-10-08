@@ -130,6 +130,12 @@ func parseWebsiteRound(data string) (WebsiteRound, error) {
 	return round, nil
 }
 
+// isGenericRoundStep reports whether a step ran in hokuto-builder's generic
+// container (hokuto-builder cycle names it "generic rebuild").
+func isGenericRoundStep(name string) bool {
+	return strings.HasPrefix(name, "generic ")
+}
+
 // roundCounts returns how many package builds of the round succeeded and
 // failed.
 func roundCounts(round WebsiteRound) (built, failed int) {
@@ -152,6 +158,11 @@ func publishWebsiteRound(websiteRepo string, round WebsiteRound) error {
 		return fmt.Errorf("website repository %s not found", websiteRepo)
 	}
 	for i := range round.Steps {
+		// Generic builds publish no log: one of the same name and version
+		// is the optimized build's.
+		if isGenericRoundStep(round.Steps[i].Name) {
+			continue
+		}
 		for j := range round.Steps[i].Packages {
 			pkg := &round.Steps[i].Packages[j]
 			rel := "logs/" + websiteLogName(pkg.Name, pkg.Version, pkg.Arch)

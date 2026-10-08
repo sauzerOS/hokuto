@@ -12,6 +12,8 @@ const testRoundFile = "round\t1791460800\t6060\n" +
 	"step\tbump\t0\t4320\n" +
 	"pkg\t2026-10-08T15:00:00Z\tsuccess\ttmux\t3.8-1\tx86_64\t190\t\n" +
 	"pkg\t2026-10-08T15:01:00Z\tfailed\tbaz\t2.0-1\tx86_64\t62\tbuild script exited with code 2\n" +
+	"step\tgeneric rebuild\t0\t300\n" +
+	"pkg\t2026-10-08T15:05:00Z\tsuccess\ttmux\t3.8-1\tx86_64\t200\t\n" +
 	"step\tcross-sync\t1\t1510\n" +
 	"cleanup\tremoved 3 leftover item(s)\n"
 
@@ -23,18 +25,18 @@ func TestParseWebsiteRound(t *testing.T) {
 	if round.Started != "2026-10-08T12:00:00Z" || round.Duration != 6060 || round.Cleanup != "removed 3 leftover item(s)" {
 		t.Fatalf("round = %+v", round)
 	}
-	if len(round.Steps) != 2 {
-		t.Fatalf("got %d steps, want 2", len(round.Steps))
+	if len(round.Steps) != 3 {
+		t.Fatalf("got %d steps, want 3", len(round.Steps))
 	}
-	bump, cross := round.Steps[0], round.Steps[1]
+	bump, cross := round.Steps[0], round.Steps[2]
 	if bump.Status != "ok" || len(bump.Packages) != 2 || bump.Packages[1].Reason != "build script exited with code 2" {
 		t.Fatalf("bump step = %+v", bump)
 	}
 	if cross.Status != "failed" || cross.Exit != 1 || len(cross.Packages) != 0 {
 		t.Fatalf("cross-sync step = %+v", cross)
 	}
-	if built, failed := roundCounts(round); built != 1 || failed != 1 {
-		t.Fatalf("roundCounts = %d, %d; want 1, 1", built, failed)
+	if built, failed := roundCounts(round); built != 2 || failed != 1 {
+		t.Fatalf("roundCounts = %d, %d; want 2, 1", built, failed)
 	}
 }
 
@@ -99,6 +101,10 @@ func TestPublishWebsiteRoundCommitsAndLinksLogs(t *testing.T) {
 	pkgs := rounds[0].Steps[0].Packages
 	if pkgs[0].Log != "logs/tmux-3.8-1.txt.gz" || pkgs[1].Log != "" {
 		t.Fatalf("logs = %q, %q", pkgs[0].Log, pkgs[1].Log)
+	}
+	// The generic tmux build does not get the optimized build's log.
+	if generic := rounds[0].Steps[1].Packages[0]; generic.Log != "" {
+		t.Fatalf("generic build linked to %q", generic.Log)
 	}
 	out, err := exec.Command("git", "-C", remote, "log", "--format=%s", "-1").Output()
 	if err != nil {

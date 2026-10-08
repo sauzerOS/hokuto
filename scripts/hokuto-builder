@@ -25,6 +25,7 @@
 #                                  -y builds every missing package;
 #                                  --no-upload skips the upload
 #   hokuto-builder cycle           one unattended round: bump -y, rebuild -y,
+#                                  --generic rebuild -y with CYCLE_GENERIC=1,
 #                                  cross-sync -system -y, cross-sync -y, then
 #                                  remove what failed builds left in the build
 #                                  tmpdirs; results go to
@@ -77,6 +78,8 @@
 #   MEMORY_HIGH=75%              systemd MemoryHigh= (bytes, K/M/G or a
 #                                percentage of RAM); empty removes the limit
 #   CYCLE_JOBS=4                 packages cycle builds at once
+#   CYCLE_GENERIC=0              1: cycle also runs --generic rebuild -y, in
+#                                the generic container, which must exist
 #
 # The generic container shares the same directories, except that it keeps its
 # own rebuild blacklist (build-ignore-generic.json) and does not publish build
@@ -117,7 +120,15 @@ BUILD_IGNORE=/var/db/hokuto/build-ignore.json
 # in hokuto.conf, same default as hokuto).
 DEFAULT_WEBSITE_REPO=/home/dbz/Documents/sauzerOS.github.io
 
-die() { printf '\033[0;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
+die() {
+    # Plain under systemd: the journal shows escape codes as they are.
+    if [ -t 2 ]; then
+        printf '\033[0;31merror:\033[0m %s\n' "$*" >&2
+    else
+        printf 'error: %s\n' "$*" >&2
+    fi
+    exit 1
+}
 # hokuto's colors: a #FFEB3B arrow and #1976D2 text, on a terminal only.
 info() {
     if [ -t 1 ]; then
@@ -200,6 +211,7 @@ conf_value() {
 CPU_WEIGHT=$(conf_value CPU_WEIGHT idle)
 MEMORY_HIGH=$(conf_value MEMORY_HIGH 75%)
 CYCLE_JOBS=$(conf_value CYCLE_JOBS 4)
+CYCLE_GENERIC=$(conf_value CYCLE_GENERIC 0)
 RUN_LOG_DIR=/var/log/hokuto-builder
 RUN_LOG=$RUN_LOG_DIR/runs.log
 
@@ -724,8 +736,36 @@ publish_round() {
 # (packages.html) as with the interactive commands; the run log keeps the
 # rounds, and those that did something also go to the website's rounds.html.
 # Failed packages do not fail the round.
+# generic_rootfs: the generic container's location, as the --generic
+# commands find it.
+generic_rootfs() {
+    local root=${HOKUTO_BUILDER_GENERIC_ROOT:-}
+    [ -n "$root" ] || root=$(conf_value GENERIC_ROOTFS "")
+    printf '%s\n' "${root:-/var/lib/hokuto-builder-generic}"
+}
+
+# check_cycle_setup fails the round, and so the service, when a container it
+# needs is missing: a round of steps that all fail at once would only bury
+# the cause in the log.
+check_cycle_setup() {
+    container_exists ||
+        die "missing container at $ROOTFS: set it up first with 'hokuto-builder create' (or mount its drive)"
+    case "$CYCLE_GENERIC" in
+        0) ;;
+        1)
+            local generic
+            generic=$(generic_rootfs)
+            [ -d "$generic/var/db/hokuto/installed" ] ||
+                die "missing generic container at $generic: set it up first with 'hokuto-builder --generic create', or set CYCLE_GENERIC=0 in $CONFIG_FILE"
+            ;;
+        *) die "CYCLE_GENERIC in $CONFIG_FILE must be 0 or 1, not '$CYCLE_GENERIC'" ;;
+    esac
+    [[ "$CYCLE_JOBS" =~ ^[1-9][0-9]*$ ]] ||
+        die "CYCLE_JOBS in $CONFIG_FILE must be a positive number, not '$CYCLE_JOBS'"
+}
+
 cmd_cycle() {
-    container_exists || die "no container at $ROOTFS; run 'hokuto-builder create' first"
+    check_cycle_setup
     install -d -m 0755 "$RUN_LOG_DIR"
     local summary start
     summary=$(mktemp "$RUN_LOG_DIR/cycle.XXXXXX")
@@ -736,6 +776,10 @@ cmd_cycle() {
     # recipe has changed since (blacklisted ones stay skipped). -y builds
     # only packages that have been published before.
     cycle_step "$summary" rebuild rebuild -y "-j$CYCLE_JOBS"
+    # The same for the generic packages, bumped ones included.
+    if [ "$CYCLE_GENERIC" = 1 ]; then
+        cycle_step "$summary" "generic rebuild" --generic rebuild -y "-j$CYCLE_JOBS"
+    fi
     cycle_step "$summary" "cross-sync -system" cross-sync -system -y "-j$CYCLE_JOBS"
     cycle_step "$summary" cross-sync cross-sync -y "-j$CYCLE_JOBS"
     local cleaned
