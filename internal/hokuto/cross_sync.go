@@ -32,6 +32,7 @@ func handleCrossSyncCommand(args []string, cfg *Config) error {
 	idleFlag := syncCmd.Bool("i", false, "Use idle build priority")
 	noInstallFlag := syncCmd.Bool("no-install", false, "Do not offer to install the built -system packages on this host")
 	parallelFlag := syncCmd.Int("j", 1, "Number of parallel build jobs")
+	yesFlag := syncCmd.Bool("y", false, "Build every missing package and answer yes to every question")
 
 	if err := syncCmd.Parse(args); err != nil {
 		return err
@@ -86,17 +87,23 @@ func handleCrossSyncCommand(args []string, cfg *Config) error {
 	}
 	fmt.Println()
 
-	// User Interaction
-	promptMsg := "Build (a)ll, (q)uit, or pick packages to build (numbers or -numbers):"
-	indices, ok := AskForSelection(promptMsg, len(missing))
-	if !ok {
-		colNote.Println("Operation canceled.")
-		return nil
-	}
-
 	var toBuild []syncPackage
-	for _, idx := range indices {
-		toBuild = append(toBuild, missing[idx])
+	if *yesFlag {
+		toBuild = missing
+		// The build's own questions too: it runs unattended.
+		oldAssumeYes := GlobalAssumeYes
+		GlobalAssumeYes = true
+		defer func() { GlobalAssumeYes = oldAssumeYes }()
+	} else {
+		promptMsg := "Build (a)ll, (q)uit, or pick packages to build (numbers or -numbers):"
+		indices, ok := AskForSelection(promptMsg, len(missing))
+		if !ok {
+			colNote.Println("Operation canceled.")
+			return nil
+		}
+		for _, idx := range indices {
+			toBuild = append(toBuild, missing[idx])
+		}
 	}
 
 	// Execute Build

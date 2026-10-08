@@ -71,7 +71,7 @@ func printHelp() {
 		{
 			{"bootstrap", "<dir>", "Build a bootstrap rootfs in target directory"},
 			{"chroot", "<dir> [cmd]", "Enter chroot and run command (default: /bin/bash)"},
-			{"cross-sync", "[-system] [-no-install] [-jN] [-i]", "Build missing native aarch64 packages (or, with -system, outdated aarch64-* cross-system packages)"},
+			{"cross-sync", "[-system] [-no-install] [-jN] [-i] [-y]", "Build missing native aarch64 packages (or, with -system, outdated aarch64-* cross-system packages)"},
 			{"init-repos", "", "Initialize repositories"},
 			{"perl-rebuild", "", "Bump the revision of Perl modules and packages that depend on perl"},
 			{"python-rebuild", "[build [build flags] | list | bump <msg>]", "Test-build the recipes marked python-rebuild against the installed python and report failures; bump their revisions"},

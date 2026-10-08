@@ -13,14 +13,25 @@
 #   hokuto-builder build <pkg...>  build as bump --build does, then upload --sync;
 #                                  --no-upload skips the upload, other options
 #                                  go to hokuto build
-#   hokuto-builder rebuild [-jN]   build and upload recipes whose version or
+#   hokuto-builder rebuild [-y] [-jN]
+#                                  build and upload recipes whose version or
 #                                  revision is ahead of the mirror (after an
 #                                  ABI change bump bumped them); the container
 #                                  is first updated from the mirror so they
-#                                  link against the new libraries
-#   hokuto-builder cross-sync [-system] [-jN]
+#                                  link against the new libraries; -y builds,
+#                                  without asking, those published before
+#   hokuto-builder cross-sync [-system] [-y] [-jN]
 #                                  hokuto cross-sync, then upload --sync;
+#                                  -y builds every missing package;
 #                                  --no-upload skips the upload
+#   hokuto-builder cycle           one unattended round: bump -y, rebuild -y,
+#                                  cross-sync -system -y, cross-sync -y, then
+#                                  remove what failed builds left in the build
+#                                  tmpdirs; results go to
+#                                  /var/log/hokuto-builder/runs.log
+#                                  hokuto-builder.timer runs it unattended,
+#                                  15 minutes after the previous round ends:
+#                                  systemctl enable --now hokuto-builder.timer
 #   hokuto-builder run <cmd...>    run any command in the container
 #   hokuto-builder shell           interactive shell in the container
 #   hokuto-builder update          update the container's own packages
@@ -63,6 +74,7 @@
 #                                empty value removes the limit
 #   MEMORY_HIGH=75%              systemd MemoryHigh= (bytes, K/M/G or a
 #                                percentage of RAM); empty removes the limit
+#   CYCLE_JOBS=4                 packages cycle builds at once
 #
 # The generic container shares the same directories, except that it keeps its
 # own rebuild blacklist (build-ignore-generic.json) and does not publish build
@@ -75,6 +87,10 @@
 #   HOKUTO_BUILDER_GENERIC_ROOT  the same for the generic container
 #   HOKUTO_BUILDER_NAME          machine name (default hokuto-builder; the
 #                                generic container adds -generic)
+#   HOKUTO_BUILDER_USER          the build user when started as root without
+#                                sudo (the service); otherwise BUILD_USER in
+#                                /etc/hokuto-builder.conf, saved by 'create',
+#                                or the owner of the container's state
 
 set -euo pipefail
 
@@ -85,8 +101,10 @@ MACHINE=${HOKUTO_BUILDER_NAME:-hokuto-builder}
 # sauzeros and base-devel are metapackages (/repo/sauzeros/.hokuto).
 BASE_PACKAGES=(sauzeros base-devel git git-lfs sudo ca-certificates curl wget rsync less)
 
+# The build tmpdirs (TMPDIR and TMPDIR2 in hokuto.conf).
+TMP_DIRS=(/var/tmp/hokuto /var/tmpdir/hokuto)
 # Directories shared read-write with the host.
-SHARED_DIRS=(/repo /var/cache/hokuto /var/tmp/hokuto /var/tmpdir/hokuto)
+SHARED_DIRS=(/repo /var/cache/hokuto "${TMP_DIRS[@]}")
 SOURCES_MOUNT=/var/cache/hokuto/sources
 SOURCES_UNIT=var-cache-hokuto-sources.mount
 # The auto-bump blacklist is state, not configuration: keep one copy.
@@ -108,7 +126,9 @@ info() {
 }
 
 usage() {
-    sed -n '3,31p' "$(readlink -f "$0")" | sed 's/^# \{0,1\}//'
+    # The command list: the header up to the paragraph after it.
+    awk 'NR >= 3 && /^# Commands run as/ { exit } NR >= 3' "$(readlink -f "$0")" |
+        sed '$d' | sed 's/^# \{0,1\}//'
     exit "${1:-0}"
 }
 
@@ -120,7 +140,7 @@ if [ "${1:-}" = --generic ]; then
 fi
 
 case "${1:-}" in
-    create | bump | build | rebuild | cross-sync | run | shell | update | destroy) ;;
+    create | bump | build | rebuild | cross-sync | cycle | run | shell | update | destroy) ;;
     -h | --help | help) usage ;;
     *) usage 1 ;;
 esac
@@ -129,6 +149,7 @@ if [ "$VARIANT" = generic ]; then
     case "$1" in
         bump) die "bump runs in the optimized container; build the generic packages afterwards with 'hokuto-builder --generic rebuild'" ;;
         cross-sync) die "cross-sync runs in the optimized container" ;;
+        cycle) die "cycle runs in the optimized container" ;;
     esac
 fi
 
@@ -136,15 +157,6 @@ if [ "$EUID" -ne 0 ]; then
     exec sudo --preserve-env=HOKUTO_BUILDER_ROOT,HOKUTO_BUILDER_GENERIC_ROOT,HOKUTO_BUILDER_NAME \
         "$(readlink -f "$0")" "${ORIG_ARGS[@]}"
 fi
-
-BUILD_USER=${SUDO_USER:-}
-if [ -z "$BUILD_USER" ] || [ "$BUILD_USER" = root ]; then
-    die "run hokuto-builder as your normal user; it uses sudo itself"
-fi
-BUILD_UID=$(id -u "$BUILD_USER")
-BUILD_GID=$(id -g "$BUILD_USER")
-BUILD_GROUP=$(id -gn "$BUILD_USER")
-BUILD_HOME=$(getent passwd "$BUILD_USER" | cut -d: -f6)
 
 # Where the rebuild blacklist lives inside the container, whichever host file
 # backs it.
@@ -185,15 +197,33 @@ conf_value() {
 }
 CPU_WEIGHT=$(conf_value CPU_WEIGHT idle)
 MEMORY_HIGH=$(conf_value MEMORY_HIGH 75%)
+CYCLE_JOBS=$(conf_value CYCLE_JOBS 4)
+RUN_LOG_DIR=/var/log/hokuto-builder
+RUN_LOG=$RUN_LOG_DIR/runs.log
 
-# save_rootfs records this container's location, keeping the other one's.
-save_rootfs() {
+# The build user: the one who ran sudo; started as root (the service), the
+# user saved by 'create', else the one the container's state belongs to.
+BUILD_USER=${SUDO_USER:-${HOKUTO_BUILDER_USER:-$(conf_value BUILD_USER "")}}
+if [ -z "$BUILD_USER" ] && [ -z "${SUDO_USER:-}" ] && [ -d "$ROOTFS/var/lib/hokuto" ]; then
+    BUILD_USER=$(stat -c %U "$ROOTFS/var/lib/hokuto")
+fi
+if [ -z "$BUILD_USER" ] || [ "$BUILD_USER" = root ] || [ "$BUILD_USER" = UNKNOWN ]; then
+    die "run hokuto-builder as your normal user; it uses sudo itself (as root, set HOKUTO_BUILDER_USER or BUILD_USER= in $CONFIG_FILE)"
+fi
+BUILD_UID=$(id -u "$BUILD_USER")
+BUILD_GID=$(id -g "$BUILD_USER")
+BUILD_GROUP=$(id -gn "$BUILD_USER")
+BUILD_HOME=$(getent passwd "$BUILD_USER" | cut -d: -f6)
+
+# save_conf <key> <value> sets one setting, keeping the others (such as the
+# other container's location).
+save_conf() {
     local tmp
     tmp=$(mktemp "$CONFIG_FILE.XXXXXX")
     if [ -f "$CONFIG_FILE" ]; then
-        grep -v "^$ROOTFS_KEY=" "$CONFIG_FILE" >"$tmp" || true
+        grep -v "^$1=" "$CONFIG_FILE" >"$tmp" || true
     fi
-    printf '%s=%s\n' "$ROOTFS_KEY" "$ROOTFS" >>"$tmp"
+    printf '%s=%s\n' "$1" "$2" >>"$tmp"
     chmod 644 "$tmp"
     mv -f "$tmp" "$CONFIG_FILE"
 }
@@ -249,7 +279,9 @@ cmd_create() {
     fi
     check_location "$ROOTFS"
     mkdir -p "$ROOTFS"
-    save_rootfs
+    save_conf "$ROOTFS_KEY" "$ROOTFS"
+    # The service runs as root and builds as this user.
+    save_conf BUILD_USER "$BUILD_USER"
     info "Saved the location in $CONFIG_FILE"
 
     info "Installing ${BASE_PACKAGES[*]} ($VARIANT) into $ROOTFS"
@@ -374,6 +406,10 @@ nspawn_run() {
     # Limits on the container's scope unit, which holds every process in it.
     [ -n "$CPU_WEIGHT" ] && args+=(--property="CPUWeight=$CPU_WEIGHT")
     [ -n "$MEMORY_HIGH" ] && args+=(--property="MemoryHigh=$MEMORY_HIGH")
+    # A cycle step: hokuto records each package's build result here.
+    if [ -n "${HOKUTO_BUILDER_RESULTS:-}" ]; then
+        args+=(--bind="$RUN_LOG_DIR" --setenv=HOKUTO_BUILD_RESULTS="$HOKUTO_BUILDER_RESULTS")
+    fi
     # Overrides the shared hokuto.conf: generic flags for every build, and the
     # generic variant for every package hokuto installs in this container.
     [ "$VARIANT" = generic ] && args+=(--setenv=HOKUTO_GENERIC=1)
@@ -590,6 +626,114 @@ cmd_cross_sync() {
     ' hokuto-builder-cross-sync "$upload" "${args[@]}"
 }
 
+# fmt_duration <seconds>
+fmt_duration() {
+    local s=$1
+    if [ "$s" -ge 3600 ]; then
+        printf '%dh%02dm' $((s / 3600)) $((s % 3600 / 60))
+    elif [ "$s" -ge 60 ]; then
+        printf '%dm%02ds' $((s / 60)) $((s % 60))
+    else
+        printf '%ds' "$s"
+    fi
+}
+
+# cycle_step <summary> <label> <hokuto-builder arguments...>: one step of a
+# cycle, in its own hokuto-builder process so a failure does not end the
+# cycle. Its status and the packages it built go to the summary file, and
+# CYCLE_ACTIVE is set when it built something or failed.
+CYCLE_ACTIVE=0
+cycle_step() {
+    local summary=$1 label=$2
+    shift 2
+    local results start rc=0 elapsed status
+    results=$(mktemp "$RUN_LOG_DIR/results.XXXXXX")
+    # Written by hokuto in the container, as the build user.
+    chown "$BUILD_UID:$BUILD_GID" "$results"
+    info "Cycle: $label"
+    start=$(date +%s)
+    HOKUTO_BUILDER_USER=$BUILD_USER HOKUTO_BUILDER_RESULTS=$results \
+        "$(readlink -f "$0")" "$@" </dev/null || rc=$?
+    elapsed=$(($(date +%s) - start))
+    status=ok
+    [ "$rc" = 0 ] || status="FAILED (exit $rc)"
+    { [ "$rc" = 0 ] && [ ! -s "$results" ]; } || CYCLE_ACTIVE=1
+    {
+        printf '  %-20s %-18s %s\n' "$label" "$status" "$(fmt_duration "$elapsed")"
+        if [ -s "$results" ]; then
+            local when result pkg version arch secs reason
+            while IFS=$'\t' read -r when result pkg version arch secs reason; do
+                if [ "$result" = success ]; then
+                    printf '      built   %s %s (%s, %s)\n' "$pkg" "$version" "$arch" "$(fmt_duration "$secs")"
+                else
+                    printf '      FAILED  %s %s (%s, %s): %s\n' "$pkg" "$version" "$arch" "$(fmt_duration "$secs")" "$reason"
+                fi
+            done <"$results"
+        else
+            printf '      nothing built\n'
+        fi
+    } >>"$summary"
+    rm -f "$results"
+}
+
+# clean_tmpdirs: remove what failed builds left in the build tmpdirs (a
+# successful build removes its own tree). Skipped while any hokuto runs, on
+# the host or in a container: the tmpdirs are shared.
+clean_tmpdirs() {
+    if pgrep -x 'hokuto|hk' >/dev/null; then
+        echo "skipped, hokuto is running"
+        return 0
+    fi
+    local dir entry n=0
+    for dir in "${TMP_DIRS[@]}"; do
+        [ -d "$dir" ] || continue
+        for entry in "$dir"/* "$dir"/.[!.]* "$dir"/..?*; do
+            [ -e "$entry" ] || [ -L "$entry" ] || continue
+            rm -rf --one-file-system -- "$entry"
+            n=$((n + 1))
+        done
+    done
+    echo "removed $n leftover item(s)"
+}
+
+# One unattended round, for hokuto-builder.service: auto-bump and build, the
+# rebuilds bump left, then the cross-system and native aarch64 packages the
+# mirror lacks, then the
+# tmpdir cleanup. Package status and logs also go to the website
+# (packages.html) as with the interactive commands; the run log keeps the
+# rounds. Failed packages do not fail the round.
+cmd_cycle() {
+    container_exists || die "no container at $ROOTFS; run 'hokuto-builder create' first"
+    install -d -m 0755 "$RUN_LOG_DIR"
+    local summary start
+    summary=$(mktemp "$RUN_LOG_DIR/cycle.XXXXXX")
+    start=$(date +%s)
+    cycle_step "$summary" bump bump -y "-j$CYCLE_JOBS"
+    # What bump's ABI check revision-bumped, and earlier failures whose
+    # recipe has changed since (blacklisted ones stay skipped). -y builds
+    # only packages that have been published before.
+    cycle_step "$summary" rebuild rebuild -y "-j$CYCLE_JOBS"
+    cycle_step "$summary" "cross-sync -system" cross-sync -system -y "-j$CYCLE_JOBS"
+    cycle_step "$summary" cross-sync cross-sync -y "-j$CYCLE_JOBS"
+    local cleaned
+    cleaned=$(clean_tmpdirs)
+    printf '  %-20s %s\n' "tmpdir cleanup" "$cleaned" >>"$summary"
+    case "$cleaned" in "removed 0 "*) ;; *) CYCLE_ACTIVE=1 ;; esac
+    local header
+    header="$(date -d "@$start" '+%Y-%m-%d %H:%M'), $(fmt_duration $(($(date +%s) - start)))"
+    # A round runs every 15 minutes: one with nothing to report takes a line.
+    if [ "$CYCLE_ACTIVE" = 0 ]; then
+        printf '== %s: nothing to do ==\n' "$header" | tee -a "$RUN_LOG"
+    else
+        {
+            printf '== %s ==\n' "$header"
+            cat "$summary"
+            echo
+        } | tee -a "$RUN_LOG"
+    fi
+    rm -f "$summary"
+}
+
 cmd_destroy() {
     [ "$ROOTFS" != / ] || die "refusing to delete /"
     container_exists || [ -d "$ROOTFS" ] || die "no container at $ROOTFS"
@@ -620,6 +764,7 @@ case "$1" in
     build) shift; cmd_build "$@" ;;
     rebuild) shift; cmd_rebuild "$@" ;;
     cross-sync) shift; cmd_cross_sync "$@" ;;
+    cycle) cmd_cycle ;;
     run) shift; [ $# -gt 0 ] || usage 1; nspawn_run "$BUILD_USER" "$@" ;;
     shell) EXCLUSIVE=0 nspawn_run "$BUILD_USER" /bin/bash -l ;;
     update) nspawn_run "$BUILD_USER" /usr/local/bin/hokuto update -y ;;

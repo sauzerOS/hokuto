@@ -2221,7 +2221,16 @@ func finalizeBuiltPackage(in builtPackageFinalization) error {
 	return nil
 }
 
+// pkgBuild builds one package (see runPkgBuild) and records its result for
+// HOKUTO_BUILD_RESULTS.
 func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, opts BuildOptions) (time.Duration, error) {
+	start := time.Now()
+	elapsed, err := runPkgBuild(pkgName, cfg, execCtx, opts)
+	recordBuildResult(pkgName, cfg, err, time.Since(start))
+	return elapsed, err
+}
+
+func runPkgBuild(pkgName string, cfg *Config, execCtx *Executor, opts BuildOptions) (time.Duration, error) {
 	if opts.Quiet && opts.LogWriter == nil {
 		opts.LogWriter = io.Discard
 	}
@@ -5308,6 +5317,7 @@ func handleBuildCommand(args []string, cfg *Config) (err error) {
 	}
 
 BuildSummary:
+	recordUnbuiltFailures(failedBuilds, cfg)
 
 	// --- Final Report ---
 	if len(failedBuilds) == 0 {
