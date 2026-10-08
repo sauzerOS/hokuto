@@ -645,9 +645,11 @@ fmt_duration() {
 
 # cycle_step <summary> <label> <hokuto-builder arguments...>: one step of a
 # cycle, in its own hokuto-builder process so a failure does not end the
-# cycle. Its status and the packages it built go to the summary file, and
-# CYCLE_ACTIVE is set when it built something or failed.
+# cycle. Its status and the packages it built go to the summary file and, for
+# the website, to ROUND_FILE (see hokuto website-round); CYCLE_ACTIVE is set
+# when it built something or failed.
 CYCLE_ACTIVE=0
+ROUND_FILE=""
 cycle_step() {
     local summary=$1 label=$2
     shift 2
@@ -663,6 +665,10 @@ cycle_step() {
     status=ok
     [ "$rc" = 0 ] || status="FAILED (exit $rc)"
     { [ "$rc" = 0 ] && [ ! -s "$results" ]; } || CYCLE_ACTIVE=1
+    {
+        printf 'step\t%s\t%s\t%s\n' "$label" "$rc" "$elapsed"
+        sed 's/^/pkg\t/' "$results"
+    } >>"$ROUND_FILE"
     {
         printf '  %-20s %-18s %s\n' "$label" "$status" "$(fmt_duration "$elapsed")"
         if [ -s "$results" ]; then
@@ -701,17 +707,29 @@ clean_tmpdirs() {
     echo "removed $n leftover item(s)"
 }
 
+# publish_round <start>: the round on the website's rounds.html, committed and
+# pushed by the host's hokuto as the build user, who owns the website checkout
+# and the git credentials. A failure only costs the round its entry.
+publish_round() {
+    printf 'round\t%s\t%s\n' "$1" $(($(date +%s) - $1)) >>"$ROUND_FILE"
+    chown "$BUILD_UID:$BUILD_GID" "$ROUND_FILE"
+    runuser -u "$BUILD_USER" -- env HOME="$BUILD_HOME" hokuto website-round "$ROUND_FILE" ||
+        info "Could not publish the round to the website"
+}
+
 # One unattended round, for hokuto-builder.service: auto-bump and build, the
 # rebuilds bump left, then the cross-system and native aarch64 packages the
 # mirror lacks, then the
 # tmpdir cleanup. Package status and logs also go to the website
 # (packages.html) as with the interactive commands; the run log keeps the
-# rounds. Failed packages do not fail the round.
+# rounds, and those that did something also go to the website's rounds.html.
+# Failed packages do not fail the round.
 cmd_cycle() {
     container_exists || die "no container at $ROOTFS; run 'hokuto-builder create' first"
     install -d -m 0755 "$RUN_LOG_DIR"
     local summary start
     summary=$(mktemp "$RUN_LOG_DIR/cycle.XXXXXX")
+    ROUND_FILE=$(mktemp "$RUN_LOG_DIR/round.XXXXXX")
     start=$(date +%s)
     cycle_step "$summary" bump bump -y "-j$CYCLE_JOBS"
     # What bump's ABI check revision-bumped, and earlier failures whose
@@ -723,6 +741,7 @@ cmd_cycle() {
     local cleaned
     cleaned=$(clean_tmpdirs)
     printf '  %-20s %s\n' "tmpdir cleanup" "$cleaned" >>"$summary"
+    printf 'cleanup\t%s\n' "$cleaned" >>"$ROUND_FILE"
     case "$cleaned" in "removed 0 "*) ;; *) CYCLE_ACTIVE=1 ;; esac
     local header
     header="$(date -d "@$start" '+%Y-%m-%d %H:%M'), $(fmt_duration $(($(date +%s) - start)))"
@@ -735,8 +754,9 @@ cmd_cycle() {
             cat "$summary"
             echo
         } | tee -a "$RUN_LOG"
+        publish_round "$start"
     fi
-    rm -f "$summary"
+    rm -f "$summary" "$ROUND_FILE"
 }
 
 cmd_destroy() {

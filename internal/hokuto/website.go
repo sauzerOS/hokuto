@@ -313,8 +313,13 @@ func UpdateWebsiteStatus(r WebsiteBuildResult) error {
 		debugf("Note: git commit skipped or failed: %v\n", err)
 	}
 
-	// The site's package-index workflow commits repo.json on its own, so
-	// rebase onto it before pushing; retry if one lands in between.
+	return pushWebsiteRepo(websiteRepo)
+}
+
+// pushWebsiteRepo pushes the website checkout's new commits. The site's
+// package-index workflow commits repo.json on its own, so it rebases onto it
+// before pushing, and retries if one lands in between.
+func pushWebsiteRepo(websiteRepo string) error {
 	var pushErr error
 	for attempt := 1; attempt <= 3; attempt++ {
 		pullCmd := exec.Command("git", "-C", websiteRepo, "pull", "--rebase", "--autostash", "--quiet")

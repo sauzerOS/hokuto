@@ -493,6 +493,13 @@ func Main() {
 			exitHokuto(1)
 		}
 
+	case "website-round":
+		// Used by hokuto-builder cycle; not listed in the help.
+		if err := handleWebsiteRoundCommand(os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "website-round failed: %v\n", err)
+			exitHokuto(1)
+		}
+
 	case "sign-file":
 		if len(os.Args) < 3 {
 			fmt.Println("Usage: hokuto sign-file <path>")
