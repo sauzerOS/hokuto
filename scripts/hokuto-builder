@@ -722,10 +722,10 @@ cycle_step() {
     } >>"$summary"
     # Before the next step: what this one's failed builds left.
     clean_tmpdirs
-    # A skip is noted but alone does not make the round worth reporting.
+    # Entries kept for a running build alone do not make the round worth
+    # reporting.
     case "$CLEANED" in
         "removed 0 "*) ;;
-        skipped*) printf '      tmpdir cleanup: %s\n' "$CLEANED" >>"$summary" ;;
         *)
             printf '      tmpdir cleanup: %s\n' "$CLEANED" >>"$summary"
             CYCLE_ACTIVE=1
@@ -734,31 +734,46 @@ cycle_step() {
     rm -f "$results"
 }
 
+# in_use <path>: whether a process works inside path (its current
+# directory), as every process of a running build does, on the host or in a
+# container (the tmpdirs are bound at the same path).
+in_use() {
+    local link cwd
+    for link in /proc/[0-9]*/cwd; do
+        cwd=$(readlink "$link" 2>/dev/null) || continue
+        case "$cwd" in
+            "$1" | "$1"/*) return 0 ;;
+        esac
+    done
+    return 1
+}
+
 # clean_tmpdirs: remove what failed builds left in the build tmpdirs (a
 # successful build removes its own tree), so they cannot fill them for the
-# steps after. Skipped while any hokuto runs, on the host or in a container:
-# the tmpdirs are shared. Sets CLEANED to what it did, and adds to the round's
-# CLEANED_TOTAL and CLEAN_SKIPPED.
+# steps after. An entry a running build works in, on the host or in a
+# container, is kept: the tmpdirs are shared. Sets CLEANED to what it did,
+# and adds to the round's CLEANED_TOTAL and CLEAN_KEPT.
 CLEANED=""
 CLEANED_TOTAL=0
-CLEAN_SKIPPED=0
+CLEAN_KEPT=0
 clean_tmpdirs() {
-    if pgrep -x 'hokuto|hk' >/dev/null; then
-        CLEANED="skipped, hokuto is running"
-        CLEAN_SKIPPED=$((CLEAN_SKIPPED + 1))
-        return 0
-    fi
-    local dir entry n=0
+    local dir entry n=0 kept=0
     for dir in "${TMP_DIRS[@]}"; do
         [ -d "$dir" ] || continue
         for entry in "$dir"/* "$dir"/.[!.]* "$dir"/..?*; do
             [ -e "$entry" ] || [ -L "$entry" ] || continue
+            if in_use "$entry"; then
+                kept=$((kept + 1))
+                continue
+            fi
             rm -rf --one-file-system -- "$entry"
             n=$((n + 1))
         done
     done
     CLEANED_TOTAL=$((CLEANED_TOTAL + n))
+    CLEAN_KEPT=$((CLEAN_KEPT + kept))
     CLEANED="removed $n leftover item(s)"
+    [ "$kept" = 0 ] || CLEANED+=", kept $kept in use by a running build"
 }
 
 # publish_round <start>: the round on the website's rounds.html, committed and
@@ -834,7 +849,6 @@ cmd_cycle() {
     clean_tmpdirs
     case "$CLEANED" in
         "removed 0 "*) ;;
-        skipped*) printf '  %-20s %s\n' "tmpdir cleanup" "$CLEANED" >>"$summary" ;;
         *)
             printf '  %-20s %s\n' "tmpdir cleanup" "$CLEANED" >>"$summary"
             CYCLE_ACTIVE=1
@@ -852,7 +866,7 @@ cmd_cycle() {
     cycle_step "$summary" "cross-sync -system" cross-sync -system -y "-j$CYCLE_JOBS"
     cycle_step "$summary" cross-sync cross-sync -y "-j$CYCLE_JOBS"
     local cleaned="removed $CLEANED_TOTAL leftover item(s)"
-    [ "$CLEAN_SKIPPED" = 0 ] || cleaned+=", skipped $CLEAN_SKIPPED time(s) while hokuto was running"
+    [ "$CLEAN_KEPT" = 0 ] || cleaned+=", kept $CLEAN_KEPT in use by a running build"
     printf 'cleanup\t%s\n' "$cleaned" >>"$ROUND_FILE"
     local header
     header="$(date -d "@$start" '+%Y-%m-%d %H:%M'), $(fmt_duration $(($(date +%s) - start)))"

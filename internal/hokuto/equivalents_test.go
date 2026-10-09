@@ -410,3 +410,34 @@ func TestEquivalentsReadFromRepositoryRootAboveHokutoPath(t *testing.T) {
 		t.Fatalf("metadata for xorg-server = %q, want the pair from the repository root", data)
 	}
 }
+
+// A cross-system package carries its pair with the arch prefix: installing
+// aarch64-xorg-server failed when it carried "xorg-server xlibre".
+func TestCrossSystemPackageEquivalentMetadataIsPrefixed(t *testing.T) {
+	_, installed := withTempEquivalents(t, "xorg-server xlibre\n")
+	data, err := packageEquivalentMetadata("aarch64-xorg-server")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "aarch64-xorg-server aarch64-xlibre\n" {
+		t.Fatalf("metadata = %q", data)
+	}
+	if data, _ := packageEquivalentMetadata("xorg-server"); string(data) != "xorg-server xlibre\n" {
+		t.Fatalf("native metadata = %q", data)
+	}
+
+	if err := os.MkdirAll(filepath.Join(installed, "aarch64-xlibre"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	staged := t.TempDir()
+	if err := os.WriteFile(filepath.Join(staged, equivalentsFile), []byte("aarch64-xorg-server aarch64-xlibre\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	conflicts, err := stagedPackageEquivalentConflicts(staged, "aarch64-xorg-server")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(conflicts, []string{"aarch64-xlibre"}) {
+		t.Fatalf("conflicts = %v, want [aarch64-xlibre]", conflicts)
+	}
+}

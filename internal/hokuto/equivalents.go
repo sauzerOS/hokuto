@@ -344,6 +344,18 @@ func packageEquivalentMetadata(pkgName string) ([]byte, error) {
 			return []byte(pair.Base + " " + pair.Replacement + "\n"), nil
 		}
 	}
+	// A cross-system package (aarch64-xorg-server) is exclusive with the
+	// other side's cross-system package in the same sysroot; the pair must
+	// name it, or installing it fails ("equivalence metadata xorg-server/xlibre
+	// does not contain package aarch64-xorg-server").
+	if prefix := archPrefixOf(pkgName); prefix != "" {
+		base := strings.TrimPrefix(pkgName, prefix)
+		for _, pair := range pairs {
+			if pair.Base == base || pair.Replacement == base {
+				return []byte(prefix + pair.Base + " " + prefix + pair.Replacement + "\n"), nil
+			}
+		}
+	}
 	return nil, nil
 }
 

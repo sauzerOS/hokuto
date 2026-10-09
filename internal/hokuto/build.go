@@ -1918,7 +1918,7 @@ func packageSplitOutputs(parentPkgName, pkgDir, splitRoot, version, revision, ta
 		if err := copyEffectivePackageMetadata(pkgDir, splitName, parentPkgName, installedDir, buildExec); err != nil {
 			return fmt.Errorf("failed to copy package metadata for split package %s: %w", outputSplitName, err)
 		}
-		if err := writePackageEquivalentMetadata(splitName, installedDir, buildExec); err != nil {
+		if err := writePackageEquivalentMetadata(outputSplitName, installedDir, buildExec); err != nil {
 			return fmt.Errorf("failed to write equivalence metadata for split package %s: %w", outputSplitName, err)
 		}
 		// A split-specific hook takes precedence. Recipes may explicitly opt all
@@ -2149,7 +2149,7 @@ func finalizeBuiltPackage(in builtPackageFinalization) error {
 	if err := copyEffectivePackageMetadata(in.pkgDir, in.sourcePkgName, in.sourcePkgName, installedDir, in.buildExec); err != nil {
 		return fmt.Errorf("failed to copy package metadata: %w", err)
 	}
-	if err := writePackageEquivalentMetadata(in.sourcePkgName, installedDir, in.buildExec); err != nil {
+	if err := writePackageEquivalentMetadata(in.outputPkgName, installedDir, in.buildExec); err != nil {
 		return fmt.Errorf("failed to write package equivalence metadata: %w", err)
 	}
 	if err := copyOptionalMetadataFile(filepath.Join(in.pkgDir, "post-install"), filepath.Join(installedDir, "post-install"), in.buildExec); err != nil {
