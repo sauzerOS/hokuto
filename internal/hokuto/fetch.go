@@ -1623,6 +1623,13 @@ func fetchSourcesWithOptions(pkgName, pkgDir string, processGit bool, quiet bool
 					if err != nil {
 						return err
 					}
+				} else {
+					// No ref: the default branch, as the updated cache has it.
+					out, err := exec.Command("git", "-C", cacheRepoPath, "rev-parse", "--verify", "HEAD^{commit}").Output()
+					if err != nil {
+						return fmt.Errorf("failed to resolve the default branch of %s: %w", gitURL, err)
+					}
+					resolvedCommit = strings.TrimSpace(string(out))
 				}
 				return nil
 			}()
@@ -1648,8 +1655,13 @@ func fetchSourcesWithOptions(pkgName, pkgDir string, processGit bool, quiet bool
 					if !quiet {
 						cPrintf(colInfo, "Creating shared git checkout for %s@%s\n", gitURL, ref)
 					}
-					// Use --shared to save space (links to cache objects)
-					cmd := exec.Command("git", "clone", "--shared", cacheRepoPath, sharedPath)
+					// Use --shared to save space (links to cache objects).
+					// --no-checkout: checking out here would need the default
+					// branch's Git LFS files while origin is still the local
+					// cache, which has none; the clone then failed half done
+					// (cosmic-edit, cosmic-wallpapers). The checkout below
+					// fetches them from the real origin.
+					cmd := exec.Command("git", "clone", "--shared", "--no-checkout", cacheRepoPath, sharedPath)
 					if quiet && !Debug {
 						cmd.Stdout = io.Discard
 						cmd.Stderr = io.Discard
@@ -1660,26 +1672,27 @@ func fetchSourcesWithOptions(pkgName, pkgDir string, processGit bool, quiet bool
 					if err := cmd.Run(); err != nil {
 						return fmt.Errorf("failed to create shared checkout from cache: %v", err)
 					}
-					// Reset the origin URL to the real one
-					if err := exec.Command("git", "-C", sharedPath, "remote", "set-url", "origin", gitURL).Run(); err != nil {
-						return fmt.Errorf("failed to set origin URL for shared checkout: %w", err)
-					}
+				}
+				// The real origin, for Git LFS downloads; also for a checkout
+				// whose clone failed before this was set.
+				if err := exec.Command("git", "-C", sharedPath, "remote", "set-url", "origin", gitURL).Run(); err != nil {
+					return fmt.Errorf("failed to set origin URL for shared checkout: %w", err)
 				}
 
 				// Finalize checkout state (ref and updates)
 				if err := exec.Command("git", "-C", sharedPath, "config", "advice.detachedHead", "false").Run(); err != nil {
 					return fmt.Errorf("failed to configure shared checkout: %w", err)
 				}
-				if ref != "" {
-					if err := exec.Command("git", "-C", sharedPath, "checkout", "--detach", resolvedCommit).Run(); err != nil {
-						return fmt.Errorf("failed to checkout git revision %s (%s): %w", ref, resolvedCommit, err)
+				// --force: builds copy the shared checkout and never change it,
+				// so anything differing is a failed checkout's leftovers, which
+				// would otherwise block every later one.
+				out, err := exec.Command("git", "-C", sharedPath, "checkout", "--force", "--detach", resolvedCommit).CombinedOutput()
+				if err != nil {
+					what := ref
+					if what == "" {
+						what = "default branch"
 					}
-				} else {
-					// If no ref, we try to update the default branch
-					debugf("Updating shared default branch for %s from cache\n", gitURL)
-					if err := exec.Command("git", "-C", sharedPath, "pull").Run(); err != nil {
-						return fmt.Errorf("failed to update shared default branch for %s: %w", gitURL, err)
-					}
+					return fmt.Errorf("failed to checkout git revision %s (%s): %w: %s", what, resolvedCommit, err, strings.TrimSpace(string(out)))
 				}
 				return nil
 			}()
