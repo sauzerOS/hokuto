@@ -441,3 +441,49 @@ func TestCrossSystemPackageEquivalentMetadataIsPrefixed(t *testing.T) {
 		t.Fatalf("conflicts = %v, want [aarch64-xlibre]", conflicts)
 	}
 }
+
+// Installing xorg-server over xlibre also replaces the xlibre input driver,
+// which depends on xlibre and has its own pair, and what depends on that.
+func TestEquivalentCompanionsFollowReplacedDependents(t *testing.T) {
+	_, installed := withTempEquivalents(t, "xorg-server xlibre\nxf86-input-libinput xlibre-xf86-input-libinput\nxinput-tool xlibre-xinput-tool\n")
+	for pkg, depends := range map[string]string{
+		"xlibre":                     "glibc\n",
+		"xlibre-xf86-input-libinput": "glibc\nlibinput\nxlibre\nxorgproto make\n",
+		"xlibre-xinput-tool":         "xlibre-xf86-input-libinput\n",
+		"xterm":                      "xlibre\n", // no pair: stays
+		"glibc":                      "",
+	} {
+		dir := filepath.Join(installed, pkg)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "depends"), []byte(depends), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "version"), []byte("1 1\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	planned := map[string]bool{"xorg-server": true}
+	got := equivalentCompanions([]string{"xorg-server"}, planned)
+	want := []equivalentCompanion{
+		{Name: "xf86-input-libinput", Replaces: "xlibre-xf86-input-libinput", DependsOn: "xlibre", ReplacedBy: "xorg-server"},
+		{Name: "xinput-tool", Replaces: "xlibre-xinput-tool", DependsOn: "xlibre-xf86-input-libinput", ReplacedBy: "xf86-input-libinput"},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("companions = %+v\nwant %+v", got, want)
+	}
+
+	// Already planned: not added twice.
+	if got := equivalentCompanions([]string{"xorg-server", "xf86-input-libinput"}, map[string]bool{"xorg-server": true, "xf86-input-libinput": true}); len(got) != 1 || got[0].Name != "xinput-tool" {
+		t.Fatalf("companions with the driver planned = %+v", got)
+	}
+	// Nothing to replace: a fresh xorg-server install brings nothing along.
+	if err := os.RemoveAll(filepath.Join(installed, "xlibre")); err != nil {
+		t.Fatal(err)
+	}
+	if got := equivalentCompanions([]string{"xorg-server"}, map[string]bool{"xorg-server": true}); len(got) != 0 {
+		t.Fatalf("companions without xlibre installed = %+v", got)
+	}
+}

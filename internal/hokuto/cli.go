@@ -902,6 +902,9 @@ func Main() {
 				}
 			}
 		}
+		if !*noDeps {
+			installPlan = addEquivalentCompanions(installPlan, visited, effectiveYes, cfg, remoteIndex, !*noRemote)
+		}
 		installPlan = MovePackageToFront(installPlan, "sauzeros-base")
 
 		if len(installPlan) == 0 && len(requestedMetas) == 0 && !*force {

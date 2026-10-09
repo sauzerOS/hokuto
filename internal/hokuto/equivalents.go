@@ -417,7 +417,12 @@ func removeInstalledEquivalentConflicts(stagingMetadataDir, pkgName string, cfg 
 		return false, false, err
 	}
 	for _, conflict := range conflicts {
-		if !yes && !askForConfirmation(colWarn, "-> %s replaces installed equivalent package %s. Replace it?", pkgName, conflict) {
+		if !yes {
+			// The question goes below the install bar, not onto its line.
+			prepareDependencyProgressLogOutput()
+			colArrow.Print("-> ")
+		}
+		if !yes && !askForConfirmation(colSuccess, "%s replaces installed equivalent package %s. Replace it?", colNote.Sprint(pkgName), colNote.Sprint(conflict)) {
 			return transferWorld, transferWorldMake, fmt.Errorf("cannot install %s alongside equivalent package %s", pkgName, conflict)
 		}
 		transferWorld = transferWorld || packageListedInWorld(WorldFile, conflict)
@@ -433,4 +438,137 @@ func removeInstalledEquivalentConflicts(stagingMetadataDir, pkgName string, cfg 
 		}
 	}
 	return transferWorld, transferWorldMake, nil
+}
+
+// equivalentCompanion is a package an install adds because the package it
+// replaces was built for the side being replaced (see equivalentCompanions).
+type equivalentCompanion struct {
+	Name       string // the companion to install
+	Replaces   string // the installed equivalent it replaces
+	DependsOn  string // the package being replaced that Replaces depends on
+	ReplacedBy string // the package replacing DependsOn
+}
+
+// otherSide returns the other package of the pair.
+func (pair packageEquivalentPair) otherSide(name string) string {
+	if name == pair.Base {
+		return pair.Replacement
+	}
+	return pair.Base
+}
+
+// equivalentCompanions returns what replacing equivalents brings along.
+// The pairs are independent, and a dependency on one side is satisfied by
+// the other, so installing xorg-server over xlibre left
+// xlibre-xf86-input-libinput installed: built against xlibre's module ABI,
+// while nothing reported it. An installed package that depends on a replaced
+// side and is one side of a pair itself is replaced by its counterpart too,
+// and so on for what that replaces. planned holds the packages of the plan
+// and gets the companions added.
+func equivalentCompanions(names []string, planned map[string]bool) []equivalentCompanion {
+	dependents := installedRuntimeDependents()
+	var companions []equivalentCompanion
+	queue := append([]string(nil), names...)
+	for len(queue) > 0 {
+		name := queue[0]
+		queue = queue[1:]
+		pair, ok := packageEquivalentPairFor(name)
+		if !ok {
+			continue
+		}
+		replaced := pair.otherSide(name)
+		if !isPackageInstalled(replaced) {
+			continue
+		}
+		for _, dependent := range dependents[replaced] {
+			depPair, ok := packageEquivalentPairFor(dependent)
+			if !ok {
+				continue
+			}
+			companion := depPair.otherSide(dependent)
+			if planned[companion] || isPackageInstalled(companion) {
+				continue
+			}
+			planned[companion] = true
+			companions = append(companions, equivalentCompanion{Name: companion, Replaces: dependent, DependsOn: replaced, ReplacedBy: name})
+			queue = append(queue, companion)
+		}
+	}
+	return companions
+}
+
+// installedRuntimeDependents maps each package name the installed packages
+// depend on at run time (any alternative counts) to those packages, sorted.
+func installedRuntimeDependents() map[string][]string {
+	dependents := make(map[string][]string)
+	entries, _ := os.ReadDir(Installed)
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(Installed, entry.Name(), "depends"))
+		if err != nil {
+			continue
+		}
+		deps, err := parseDependsData(data)
+		if err != nil {
+			continue
+		}
+		seen := make(map[string]bool)
+		for _, dep := range deps {
+			if dep.Make || dep.Optional || dep.Rebuild || dep.PostInstall || dep.Suggest {
+				continue
+			}
+			for _, name := range append([]string{dep.Name}, dep.Alternatives...) {
+				if name != "" && name != entry.Name() && !seen[name] {
+					seen[name] = true
+					dependents[name] = append(dependents[name], entry.Name())
+				}
+			}
+		}
+	}
+	for name := range dependents {
+		sort.Strings(dependents[name])
+	}
+	return dependents
+}
+
+// addEquivalentCompanions adds the equivalentCompanions of an install plan,
+// with their dependencies, to it. A companion that cannot be resolved is
+// left out with a warning; the install goes on without it.
+func addEquivalentCompanions(plan []string, visited map[string]bool, yes bool, cfg *Config, remoteIndex []RepoEntry, allowRemote bool) []string {
+	planned := make(map[string]bool, len(plan))
+	var names []string
+	for _, entry := range plan {
+		name := entry
+		if strings.HasSuffix(entry, ".tar.zst") {
+			pkgName, err := localTarballPackageName(entry)
+			if err != nil {
+				continue
+			}
+			name = pkgName
+		}
+		planned[name] = true
+		names = append(names, name)
+	}
+	for _, c := range equivalentCompanions(names, planned) {
+		before := len(plan)
+		if err := resolveBinaryDependencies(c.Name, visited, &plan, false, yes, cfg, remoteIndex, allowRemote); err != nil {
+			plan = plan[:before]
+			colArrow.Print("-> ")
+			colWarn.Printf("%s depends on %s, which %s replaces, but its equivalent %s cannot be installed: %v\n", c.Replaces, c.DependsOn, c.ReplacedBy, c.Name, err)
+			continue
+		}
+		colArrow.Print("-> ")
+		colSuccess.Print("Also replacing ")
+		colNote.Print(c.Replaces)
+		colSuccess.Print(" with ")
+		colNote.Print(c.Name)
+		colSuccess.Print(": it depends on ")
+		colNote.Print(c.DependsOn)
+		colSuccess.Print(", which ")
+		colNote.Print(c.ReplacedBy)
+		colSuccess.Println(" replaces")
+	}
+	return plan
 }
