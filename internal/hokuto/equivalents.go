@@ -68,10 +68,18 @@ func packageEquivalentSources() []string {
 		if repoPath == "" {
 			continue
 		}
-		path := filepath.Join(repoPath, equivalentsFile)
-		if !seen[path] {
-			seen[path] = true
-			paths = append(paths, path)
+		candidates := []string{filepath.Join(repoPath, equivalentsFile)}
+		// The file lives at the repository root, which for a repository
+		// split into HOKUTO_PATH entries (sauzeros/core, sauzeros/extra) is
+		// above them.
+		if root := equivalentsRepoRoot(repoPath); root != "" && root != repoPath {
+			candidates = append(candidates, filepath.Join(root, equivalentsFile))
+		}
+		for _, path := range candidates {
+			if !seen[path] {
+				seen[path] = true
+				paths = append(paths, path)
+			}
 		}
 	}
 	entries, _ := os.ReadDir(Installed)
@@ -86,6 +94,23 @@ func packageEquivalentSources() []string {
 		}
 	}
 	return paths
+}
+
+// equivalentsRepoRoot returns the git repository root at or above a
+// HOKUTO_PATH entry, looking two levels up at most, or "".
+func equivalentsRepoRoot(repoPath string) string {
+	dir := filepath.Clean(repoPath)
+	for i := 0; i < 3; i++ {
+		if _, err := os.Stat(filepath.Join(dir, ".git")); err == nil {
+			return dir
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			break
+		}
+		dir = parent
+	}
+	return ""
 }
 
 func loadPackageEquivalentPairs() ([]packageEquivalentPair, error) {

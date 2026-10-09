@@ -385,3 +385,28 @@ func TestRemoteIndexEquivalentsAvoidPromptsAndPreferReplacement(t *testing.T) {
 		t.Fatalf("installing sonic: got %q, %v", got, err)
 	}
 }
+
+// sauzeros is one git repository split into HOKUTO_PATH entries
+// (sauzeros/core, sauzeros/extra); its equivalents file is at the root.
+func TestEquivalentsReadFromRepositoryRootAboveHokutoPath(t *testing.T) {
+	_, _ = withTempEquivalents(t, "")
+	root := t.TempDir()
+	for _, dir := range []string{".git", "core", "extra"} {
+		if err := os.MkdirAll(filepath.Join(root, dir), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(root, equivalentsFile), []byte("xorg-server xlibre\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	repoPaths = filepath.Join(root, "core") + ":" + filepath.Join(root, "extra")
+	invalidatePackageEquivalentCache()
+
+	data, err := packageEquivalentMetadata("xorg-server")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "xorg-server xlibre\n" {
+		t.Fatalf("metadata for xorg-server = %q, want the pair from the repository root", data)
+	}
+}
