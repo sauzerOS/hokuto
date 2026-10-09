@@ -160,6 +160,7 @@ func publishWebsiteRound(websiteRepo string, round WebsiteRound) error {
 	if _, err := os.Stat(filepath.Join(websiteRepo, ".git")); err != nil {
 		return fmt.Errorf("website repository %s not found", websiteRepo)
 	}
+	defer lockWebsiteRepo(websiteRepo)()
 	for i := range round.Steps {
 		// Generic builds publish no log: one of the same name and version
 		// is the optimized build's.

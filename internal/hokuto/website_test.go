@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -368,5 +369,58 @@ func TestWebsiteBuildArch(t *testing.T) {
 		if got := websiteBuildArch(tc.name, tc.arch, tc.cfg); got != tc.want {
 			t.Errorf("websiteBuildArch(%s, %s, generic=%v) = %q, want %q", tc.name, tc.arch, tc.cfg == generic, got, tc.want)
 		}
+	}
+}
+
+// Parallel builds finishing together publish their statuses at once. One
+// committing while another rebased used to leave the checkout on a detached
+// HEAD that could no longer push.
+func TestUpdateWebsiteStatusConcurrent(t *testing.T) {
+	site := withWebsiteCheckout(t)
+	pkgs := []string{"xorg-server", "xlibre", "mesa", "libdrm", "pixman", "libinput"}
+	errs := make(chan error, len(pkgs))
+	var wg sync.WaitGroup
+	for _, pkg := range pkgs {
+		wg.Add(1)
+		go func(pkg string) {
+			defer wg.Done()
+			errs <- UpdateWebsiteStatus(WebsiteBuildResult{PkgName: pkg, Arch: "x86_64", Version: "1.0-1", Status: "success"})
+		}(pkg)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if branch := strings.TrimSpace(gitIn(t, site, "rev-parse", "--abbrev-ref", "HEAD")); branch != "master" {
+		t.Fatalf("checkout left on %q", branch)
+	}
+	if ahead := strings.TrimSpace(gitIn(t, site, "rev-list", "--count", "origin/master..master")); ahead != "0" {
+		t.Fatalf("%s commits not pushed", ahead)
+	}
+	if status := readWebsiteStatus(t, site); len(status) != len(pkgs) {
+		t.Fatalf("packages.json has %d of %d packages: %+v", len(status), len(pkgs), status)
+	}
+}
+
+// A rebase left behind (a hokuto that died while pulling) is aborted before
+// the next update, which then pushes the stranded commit too.
+func TestUpdateWebsiteStatusAbortsLeftoverRebase(t *testing.T) {
+	site := withWebsiteCheckout(t)
+	if err := UpdateWebsiteStatus(WebsiteBuildResult{PkgName: "foo", Arch: "x86_64", Version: "1-1", Status: "success"}); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, site, "commit", "-q", "--allow-empty", "-m", "stranded")
+	gitIn(t, site, "-c", "sequence.editor=sed -i s/^pick/edit/", "rebase", "-q", "-i", "HEAD~1")
+	if err := UpdateWebsiteStatus(WebsiteBuildResult{PkgName: "bar", Arch: "x86_64", Version: "1-1", Status: "success"}); err != nil {
+		t.Fatal(err)
+	}
+	if branch := strings.TrimSpace(gitIn(t, site, "rev-parse", "--abbrev-ref", "HEAD")); branch != "master" {
+		t.Fatalf("checkout left on %q", branch)
+	}
+	if subjects := gitIn(t, site, "log", "--format=%s", "origin/master"); !strings.Contains(subjects, "stranded") || !strings.Contains(subjects, "Update status for bar") {
+		t.Fatalf("remote history:\n%s", subjects)
 	}
 }

@@ -212,6 +212,7 @@ func UpdateWebsiteStatus(r WebsiteBuildResult) error {
 		colWarn.Printf("Warning: website repository %s not found; build status for %s not published\n", websiteRepo, r.PkgName)
 		return nil
 	}
+	defer lockWebsiteRepo(websiteRepo)()
 	jsonPath := filepath.Join(websiteRepo, "packages.json")
 	logsDir := filepath.Join(websiteRepo, "logs")
 
@@ -319,12 +320,14 @@ func UpdateWebsiteStatus(r WebsiteBuildResult) error {
 // pushWebsiteRepo pushes the website checkout's new commits. The site's
 // package-index workflow commits repo.json on its own, so it rebases onto it
 // before pushing, and retries if one lands in between.
+// The caller holds lockWebsiteRepo.
 func pushWebsiteRepo(websiteRepo string) error {
 	var pushErr error
 	for attempt := 1; attempt <= 3; attempt++ {
 		pullCmd := exec.Command("git", "-C", websiteRepo, "pull", "--rebase", "--autostash", "--quiet")
 		if out, err := pullCmd.CombinedOutput(); err != nil {
 			debugf("Warning: git pull --rebase failed in website repo: %v: %s\n", err, strings.TrimSpace(string(out)))
+			abortWebsiteRebase(websiteRepo)
 		}
 		out, err := exec.Command("git", "-C", websiteRepo, "push", "--quiet").CombinedOutput()
 		if err == nil {
@@ -333,6 +336,59 @@ func pushWebsiteRepo(websiteRepo string) error {
 		pushErr = fmt.Errorf("%v: %s", err, strings.TrimSpace(string(out)))
 	}
 	return fmt.Errorf("failed to push to website repo: %v", pushErr)
+}
+
+// lockWebsiteRepo serializes the changes to the website checkout: parallel
+// builds finishing together (and hokuto-builder publishing a round) each
+// commit, rebase and push there, and one committing while another rebases
+// leaves the checkout on a detached HEAD that can no longer push. It takes an
+// exclusive flock on the checkout's .git, which also separates goroutines of
+// one process since each call opens its own descriptor, and returns the
+// unlock. Without the lock it carries on unserialized.
+func lockWebsiteRepo(websiteRepo string) func() {
+	f, err := os.Open(filepath.Join(websiteRepo, ".git"))
+	if err != nil {
+		debugf("website lock: %v\n", err)
+		return func() {}
+	}
+	for {
+		err = syscall.Flock(int(f.Fd()), syscall.LOCK_EX)
+		if err != syscall.EINTR {
+			break
+		}
+	}
+	if err != nil {
+		debugf("website lock: %v\n", err)
+		f.Close()
+		return func() {}
+	}
+	abortWebsiteRebase(websiteRepo)
+	return func() {
+		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+		f.Close()
+	}
+}
+
+// abortWebsiteRebase ends a rebase that a failed pull, or a hokuto that died
+// while pulling, left in the website checkout, returning to its branch with
+// the local commits.
+func abortWebsiteRebase(websiteRepo string) {
+	out, err := exec.Command("git", "-C", websiteRepo, "rev-parse", "--git-path", "rebase-merge", "--git-path", "rebase-apply").Output()
+	if err != nil {
+		return
+	}
+	for _, dir := range strings.Fields(string(out)) {
+		if !filepath.IsAbs(dir) {
+			dir = filepath.Join(websiteRepo, dir)
+		}
+		if _, err := os.Stat(dir); err != nil {
+			continue
+		}
+		if out, err := exec.Command("git", "-C", websiteRepo, "rebase", "--abort").CombinedOutput(); err != nil {
+			colWarn.Printf("Warning: website repository %s is mid-rebase and git rebase --abort failed: %v: %s\n", websiteRepo, err, strings.TrimSpace(string(out)))
+		}
+		return
+	}
 }
 
 // describeWebsiteOutput measures a built package and stores its file list as
