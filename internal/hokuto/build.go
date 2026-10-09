@@ -1465,7 +1465,12 @@ set(CMAKE_CXX_COMPILER %sg++)
 set(CMAKE_AR           %sar)
 set(CMAKE_RANLIB       %sranlib)
 set(CMAKE_STRIP        %sstrip)
-set(PKG_CONFIG_EXECUTABLE %spkg-config)
+# A cache variable: as a normal one, the first find_package(PkgConfig) left an
+# empty PKG_CONFIG_EXECUTABLE in the cache, and in a project requiring CMake
+# < 3.21 (CMP0125 OLD) every later find_program() took that over the normal
+# variable, so pkg-config went "not found" after any built-in module
+# (FindFontconfig) had used it, and every pkg-config hint came back empty.
+set(PKG_CONFIG_EXECUTABLE %spkg-config CACHE FILEPATH "pkg-config for the target")
 
 # CMAKE_SYSROOT keeps the host's headers off the cross compiler's include path.
 # Without it glibc's bits/wordsize.h keys off __x86_64__, reports __WORDSIZE=32
