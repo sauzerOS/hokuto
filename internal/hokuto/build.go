@@ -2232,6 +2232,9 @@ func pkgBuild(pkgName string, cfg *Config, execCtx *Executor, opts BuildOptions)
 	start := time.Now()
 	elapsed, err := runPkgBuild(pkgName, cfg, execCtx, opts)
 	recordBuildResult(pkgName, cfg, err, time.Since(start))
+	if err != nil {
+		noteOwnBuildFailure(pkgName)
+	}
 	return elapsed, err
 }
 

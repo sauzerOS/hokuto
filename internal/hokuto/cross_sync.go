@@ -23,6 +23,10 @@ type syncPackage struct {
 // -cross=arm64,system builds.
 const crossSyncPrefix = "aarch64-"
 
+// crossSyncArch is the architecture cross-sync builds for, as the build
+// blacklist records it.
+const crossSyncArch = "aarch64"
+
 func handleCrossSyncCommand(args []string, cfg *Config) error {
 	// use build-style arg preprocessing for -jN support
 	args = PreprocessBuildArgs(args)
@@ -62,6 +66,24 @@ func handleCrossSyncCommand(args []string, cfg *Config) error {
 	}
 
 	missing := missingSyncPackages(targetPkgs, remoteIndex)
+	// A package whose aarch64 build failed in an unattended run waits for its
+	// next version or revision (hokuto blacklist remove retries it sooner).
+	if ignores, err := loadBuildIgnoreList(); err == nil && len(ignores) > 0 {
+		var kept []syncPackage
+		hidden := 0
+		for _, pkg := range missing {
+			if buildIgnoredArch(ignores, pkg.Full, crossSyncArch, pkg.Version+"-"+pkg.Revision) {
+				hidden++
+				continue
+			}
+			kept = append(kept, pkg)
+		}
+		if hidden > 0 {
+			colArrow.Print("-> ")
+			colNote.Printf("%d blacklisted package(s) skipped until their version or revision changes (hokuto blacklist)\n", hidden)
+		}
+		missing = kept
+	}
 	if len(missing) == 0 {
 		colArrow.Print("-> ")
 		if systemMode {
@@ -117,8 +139,23 @@ func handleCrossSyncCommand(args []string, cfg *Config) error {
 	buildArgs := crossSyncBuildArgs(systemMode, *idleFlag, *noInstallFlag, *parallelFlag, toBuild)
 
 	// Single call to handleBuildCommand allows it to manage parallel builds and order
-	if err := handleBuildCommand(buildArgs, cfg); err != nil {
-		return fmt.Errorf("build failed: %w", err)
+	buildErr := handleBuildCommand(buildArgs, cfg)
+	// Unattended: a failed package is not tried again every run.
+	if *yesFlag {
+		releases := make(map[string]string, len(toBuild))
+		bases := make(map[string]string, len(toBuild))
+		names := make([]string, 0, len(toBuild))
+		for _, pkg := range toBuild {
+			releases[pkg.Full] = pkg.Version + "-" + pkg.Revision
+			bases[pkg.Full] = pkg.Base
+			names = append(names, pkg.Full)
+		}
+		blacklistFailedBuilds(names, crossSyncArch,
+			func(name string) string { return releases[name] },
+			func(name string) bool { return ownBuildFailed(name) || ownBuildFailed(bases[name]) })
+	}
+	if buildErr != nil {
+		return fmt.Errorf("build failed: %w", buildErr)
 	}
 
 	return nil

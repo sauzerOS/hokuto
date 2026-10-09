@@ -1101,6 +1101,20 @@ func prioritizeAutoBumpRepository(path, currentPaths string) string {
 	return strings.Join(paths, string(os.PathListSeparator))
 }
 
+// autoBumpRecipeMissing reports whether pkgName names no recipe and no package
+// set, the case of a Repology project whose name maps to nothing here.
+func autoBumpRecipeMissing(pkgName string, sets map[string][]string, repositoryPath string) bool {
+	if pkgs, ok := sets[pkgName]; ok && len(pkgs) > 0 {
+		return false
+	}
+	if repositoryPath != "" {
+		_, err := os.Stat(filepath.Join(repositoryPath, pkgName))
+		return os.IsNotExist(err)
+	}
+	_, err := findPackageMetadataDir(pkgName)
+	return err != nil
+}
+
 func autoBumpLocalVersion(pkgName string, sets map[string][]string, repositoryPath string) (string, bool, error) {
 	lookupName := pkgName
 	isPkgSet := false
@@ -1200,6 +1214,12 @@ func writeStateFile(path string, data []byte) error {
 			return err
 		}
 		return os.WriteFile(path, data, 0o644)
+	}
+	// A location the user may write to needs no privileges.
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err == nil {
+		if err := os.WriteFile(path, data, 0o644); err == nil {
+			return nil
+		}
 	}
 
 	tmp, err := os.CreateTemp("", "hokuto-state-*.json")
@@ -1488,6 +1508,9 @@ func handleAutoBumpRepository(cfg *Config, autoBuild bool, assumeYes bool, repoU
 	}
 	ignoreListChanged := false
 	var candidates []AutoBumpCandidate
+	// Repology projects with no recipe or package set of the mapped name:
+	// project -> "name tried\tRepology version".
+	unmatched := make(map[string]string)
 
 	// Sort project names to scan deterministically
 	var projectNames []string
@@ -1658,7 +1681,12 @@ func handleAutoBumpRepository(cfg *Config, autoBuild bool, assumeYes bool, repoU
 		// Double check actual local version
 		curVer, isPkgSet, err := autoBumpLocalVersion(pkgName, sets, repositoryPath)
 		if err != nil {
-			colWarn.Printf("Skipping %s: could not determine local version: %v\n", pkgName, err)
+			if autoBumpRecipeMissing(pkgName, sets, repositoryPath) {
+				colWarn.Printf(">> [NO MATCH] Repology project %s maps to %s, which is no recipe here: add a case to the auto-bump name switch\n", project, pkgName)
+				unmatched[project] = pkgName + "\t" + newVer
+			} else {
+				colWarn.Printf("Skipping %s: could not determine local version: %v\n", pkgName, err)
+			}
 			continue
 		}
 
@@ -1685,6 +1713,17 @@ func handleAutoBumpRepository(cfg *Config, autoBuild bool, assumeYes bool, repoU
 			RepologyCurrent: repologyCurrent,
 			IsPkgSet:        isPkgSet,
 		})
+	}
+
+	if len(unmatched) > 0 {
+		names := make([]string, 0, len(unmatched))
+		for project := range unmatched {
+			names = append(names, project)
+		}
+		sort.Strings(names)
+		colArrow.Print("-> ")
+		colWarn.Printf("%d Repology project(s) match no recipe here and were not bumped: %s\n", len(names), strings.Join(names, ", "))
+		reportNewNoMatches(currentRepo, unmatched)
 	}
 
 	if len(candidates) == 0 {
@@ -1822,6 +1861,10 @@ func handleAutoBumpRepository(cfg *Config, autoBuild bool, assumeYes bool, repoU
 	defer func() { abiRebuildLog, abiRebuildHintDeferred = func(string, ...interface{}) {}, false }()
 	if autoBuild && len(toBuild) > 0 {
 		successfullyBuilt, failedBuilds = buildBumpedPackages(toBuild, cfg)
+		// Unattended: rebuild would otherwise try them again every round.
+		if assumeYes {
+			blacklistFailedBuilds(failedBuilds, "", recipeRelease, ownBuildFailed)
+		}
 		for _, pkgName := range successfullyBuilt {
 			colSuccess.Printf(">> [SUCCESS] %s built.\n", pkgName)
 			logMsg("BUILD_SUCCESS: %s\n", pkgName)

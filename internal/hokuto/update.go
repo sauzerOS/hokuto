@@ -612,6 +612,11 @@ func buildMissingRepositoryBinaries(cfg *Config, buildArgs []string, yes bool) e
 
 	buildArgs = append(buildArgs, targets...)
 	buildErr := handleBuildCommand(buildArgs, cfg)
+	// Unattended (-y, hokuto-builder's rounds): a package that failed is not
+	// tried again every run until its recipe changes.
+	if yes {
+		blacklistFailedBuilds(selected, "", recipeRelease, ownBuildFailed)
+	}
 	if len(skipped) > 0 {
 		colArrow.Print("-> ")
 		colWarn.Printf("Skipped: %s\n", strings.Join(skipped, ", "))

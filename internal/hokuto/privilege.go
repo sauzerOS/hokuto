@@ -79,6 +79,14 @@ func needsRootPrivileges(args []string) bool {
 		}
 	}
 
+	// Changing the build blacklist writes /var/db/hokuto.
+	if cmd == "blacklist" && len(args) > 1 {
+		switch args[1] {
+		case "remove", "rm", "del", "clear":
+			return true
+		}
+	}
+
 	// Check if bump command has auto flag
 	if cmd == "bump" {
 		for _, arg := range args[1:] {

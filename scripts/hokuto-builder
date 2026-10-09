@@ -33,6 +33,10 @@
 #                                  hokuto-builder.timer runs it unattended,
 #                                  15 minutes after the previous round ends:
 #                                  systemctl enable --now hokuto-builder.timer
+#   hokuto-builder blacklist [list | remove [-arch <arch>] <pkg>... | clear]
+#                                  the packages unattended builds skip after
+#                                  their build failed, until their version or
+#                                  revision changes; remove retries them
 #   hokuto-builder run <cmd...>    run any command in the container
 #   hokuto-builder shell           interactive shell in the container
 #   hokuto-builder update          update the container's own packages
@@ -159,7 +163,7 @@ if [ "${1:-}" = --generic ]; then
 fi
 
 case "${1:-}" in
-    create | bump | build | rebuild | cross-sync | cycle | run | shell | update | destroy) ;;
+    create | bump | build | rebuild | cross-sync | cycle | blacklist | run | shell | update | destroy) ;;
     -h | --help | help) usage ;;
     *) usage 1 ;;
 esac
@@ -701,11 +705,16 @@ cycle_step() {
         if [ -s "$results" ]; then
             local when result pkg version arch secs reason
             while IFS=$'\t' read -r when result pkg version arch secs reason; do
-                if [ "$result" = success ]; then
-                    printf '      built   %s %s (%s, %s)\n' "$pkg" "$version" "$arch" "$(fmt_duration "$secs")"
-                else
-                    printf '      FAILED  %s %s (%s, %s): %s\n' "$pkg" "$version" "$arch" "$(fmt_duration "$secs")" "$reason"
-                fi
+                case "$result" in
+                    success)
+                        printf '      built        %s %s (%s, %s)\n' "$pkg" "$version" "$arch" "$(fmt_duration "$secs")" ;;
+                    blacklisted)
+                        printf '      BLACKLISTED  %s %s (%s): %s\n' "$pkg" "$version" "$arch" "$reason" ;;
+                    nomatch)
+                        printf '      NO MATCH     %s %s: %s\n' "$pkg" "$version" "$reason" ;;
+                    *)
+                        printf '      FAILED       %s %s (%s, %s): %s\n' "$pkg" "$version" "$arch" "$(fmt_duration "$secs")" "$reason" ;;
+                esac
             done <"$results"
         else
             printf '      nothing built\n'
@@ -891,6 +900,9 @@ case "$1" in
     rebuild) shift; cmd_rebuild "$@" ;;
     cross-sync) shift; cmd_cross_sync "$@" ;;
     cycle) cmd_cycle ;;
+    # Each container keeps its own blacklist; this one does not wait for a
+    # running round.
+    blacklist) shift; EXCLUSIVE=0 nspawn_run "$BUILD_USER" /usr/local/bin/hokuto blacklist "$@" ;;
     run) shift; [ $# -gt 0 ] || usage 1; nspawn_run "$BUILD_USER" "$@" ;;
     shell) EXCLUSIVE=0 nspawn_run "$BUILD_USER" /bin/bash -l ;;
     update) nspawn_run "$BUILD_USER" /usr/local/bin/hokuto update -y ;;

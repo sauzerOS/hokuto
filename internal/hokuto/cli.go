@@ -73,6 +73,7 @@ func printHelp() {
 			{"chroot", "<dir> [cmd]", "Enter chroot and run command (default: /bin/bash)"},
 			{"cross-sync", "[-system] [-no-install] [-jN] [-i] [-y]", "Build missing native aarch64 packages (or, with -system, outdated aarch64-* cross-system packages)"},
 			{"init-repos", "", "Initialize repositories"},
+			{"blacklist", "[list | remove [-arch <arch>] <pkg>... | clear]", "Show or edit the packages unattended builds skip after a failed build"},
 			{"perl-rebuild", "", "Bump the revision of Perl modules and packages that depend on perl"},
 			{"python-rebuild", "[build [build flags] | list | bump <msg>]", "Test-build the recipes marked python-rebuild against the installed python and report failures; bump their revisions"},
 			{"settings", "", "Manage hokuto configuration interactively"},
@@ -490,6 +491,12 @@ func Main() {
 	case "keys":
 		if err := handleKeysCommand(os.Args[2:], cfg); err != nil {
 			fmt.Fprintf(os.Stderr, "Keys command failed: %v\n", err)
+			exitHokuto(1)
+		}
+
+	case "blacklist":
+		if err := handleBlacklistCommand(os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "blacklist: %v\n", err)
 			exitHokuto(1)
 		}
 

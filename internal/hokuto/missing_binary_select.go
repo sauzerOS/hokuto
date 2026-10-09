@@ -19,7 +19,10 @@ import (
 
 // buildIgnoreEntry blacklists one recipe at one version-revision.
 type buildIgnoreEntry struct {
-	Package string    `json:"package"`
+	Package string `json:"package"`
+	// Arch is the target architecture of a cross build (aarch64); empty for
+	// the native builds, the only kind before it was recorded.
+	Arch    string    `json:"arch,omitempty"`
 	Version string    `json:"version"` // version-revision, e.g. 4.1.0-8
 	AddedAt time.Time `json:"added_at"`
 }
@@ -42,7 +45,7 @@ func loadBuildIgnoreList() (map[string]buildIgnoreEntry, error) {
 	}
 	for _, entry := range entries {
 		if entry.Package != "" && entry.Version != "" {
-			ignores[entry.Package] = entry
+			ignores[buildIgnoreKey(entry.Package, entry.Arch)] = entry
 		}
 	}
 	return ignores, nil
@@ -53,7 +56,12 @@ func saveBuildIgnoreList(ignores map[string]buildIgnoreEntry) error {
 	for _, entry := range ignores {
 		entries = append(entries, entry)
 	}
-	sort.Slice(entries, func(i, j int) bool { return entries[i].Package < entries[j].Package })
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].Package != entries[j].Package {
+			return entries[i].Package < entries[j].Package
+		}
+		return entries[i].Arch < entries[j].Arch
+	})
 	data, err := json.MarshalIndent(entries, "", "  ")
 	if err != nil {
 		return err
@@ -81,9 +89,9 @@ func buildIgnored(ignores map[string]buildIgnoreEntry, pkgName string) bool {
 // reports whether anything changed.
 func pruneBuildIgnores(ignores map[string]buildIgnoreEntry) bool {
 	changed := false
-	for name := range ignores {
-		if !buildIgnored(ignores, name) {
-			delete(ignores, name)
+	for key, entry := range ignores {
+		if entry.Version != buildIgnoreRelease(entry.Package) {
+			delete(ignores, key)
 			changed = true
 		}
 	}

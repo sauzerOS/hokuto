@@ -35,10 +35,12 @@ type WebsiteRoundStep struct {
 
 // WebsiteRoundPackage is a package build of a step, from HOKUTO_BUILD_RESULTS.
 type WebsiteRoundPackage struct {
-	Name      string `json:"name"`
-	Version   string `json:"version"`
-	Arch      string `json:"arch"`
-	Status    string `json:"status"` // "success" or "failed"
+	Name    string `json:"name"`
+	Version string `json:"version"`
+	Arch    string `json:"arch"`
+	// Status is "success" or "failed" for a build; "blacklisted" when a failed
+	// package was blacklisted, "nomatch" for a Repology project with no recipe.
+	Status    string `json:"status"`
 	BuildTime int64  `json:"buildtime"`
 	Reason    string `json:"reason,omitempty"`
 	// Log is the build's log on the site, for the builds packages.html lists.
@@ -137,13 +139,14 @@ func isGenericRoundStep(name string) bool {
 }
 
 // roundCounts returns how many package builds of the round succeeded and
-// failed.
+// failed; blacklistings and unmatched projects are neither.
 func roundCounts(round WebsiteRound) (built, failed int) {
 	for _, step := range round.Steps {
 		for _, pkg := range step.Packages {
-			if pkg.Status == "success" {
+			switch pkg.Status {
+			case "success":
 				built++
-			} else {
+			case "failed":
 				failed++
 			}
 		}
@@ -165,6 +168,9 @@ func publishWebsiteRound(websiteRepo string, round WebsiteRound) error {
 		}
 		for j := range round.Steps[i].Packages {
 			pkg := &round.Steps[i].Packages[j]
+			if pkg.Status != "success" && pkg.Status != "failed" {
+				continue
+			}
 			rel := "logs/" + websiteLogName(pkg.Name, pkg.Version, pkg.Arch)
 			if _, err := os.Stat(filepath.Join(websiteRepo, rel)); err == nil {
 				pkg.Log = rel
