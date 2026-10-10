@@ -3326,6 +3326,10 @@ func runPkgBuild(pkgName string, cfg *Config, execCtx *Executor, opts BuildOptio
 	// Determine output package name (rename if cross-system is enabled)
 	outputPkgName := getArchivePackageName(pkgName, cfg)
 
+	// A cross build cannot generate introspection data; take the native
+	// package's before the outputs are packaged.
+	addCrossIntrospectionData(pkgDir, outputPkgName, outputDir, splitRoot, version, revision, cfg, opts.LogWriter)
+
 	debugf("%s built successfully, output in %s\n", pkgName, outputDir)
 
 	elapsed = time.Since(startTime)
