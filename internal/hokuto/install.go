@@ -1956,6 +1956,7 @@ func checkStagingConflicts(pkgName, stagingDir, rootDir, stagingManifest string,
 	conflictsByPkg := make(map[string][]conflictInfo)
 	unmanagedConflicts := []conflictInfo{}
 	var siblingConflicts []conflictInfo
+	var unmanagedDebris []string
 
 	// First pass: collect all conflicts
 	scanner := bufio.NewScanner(strings.NewReader(string(stagingData)))
@@ -2013,6 +2014,9 @@ func checkStagingConflicts(pkgName, stagingDir, rootDir, stagingManifest string,
 				stagingFile: stagingFile,
 				conflictPkg: ownerPkg,
 			})
+		} else if ownerPkg == "" && unmanagedFileIsDebris(targetFile, stagingFile) {
+			// Empty, or the same as the incoming file: nothing to keep.
+			unmanagedDebris = append(unmanagedDebris, filePath)
 		} else if ownerPkg == "" {
 			// File exists but is not owned by any package
 			unmanagedConflicts = append(unmanagedConflicts, conflictInfo{
@@ -2025,6 +2029,17 @@ func checkStagingConflicts(pkgName, stagingDir, rootDir, stagingManifest string,
 
 	if err := scanner.Err(); err != nil {
 		return fmt.Errorf("error reading staging manifest: %v", err)
+	}
+
+	// Files no package owned that are empty or identical to the incoming ones
+	// are taken over like the package's own; an "unmanaged" alternative an
+	// earlier install recorded for them would keep uninstall from removing
+	// them.
+	if len(unmanagedDebris) > 0 {
+		debugf("%s takes over %d empty or identical files that belonged to no package\n", pkgName, len(unmanagedDebris))
+		if err := forgetUnmanagedAlternatives(rootDir, unmanagedDebris, execCtx); err != nil {
+			return fmt.Errorf("failed to update the alternatives of files taken over: %w", err)
+		}
 	}
 
 	// All registrations go into one batch so the alternatives DB is loaded,
