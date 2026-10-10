@@ -4490,6 +4490,8 @@ func handleBuildCommand(args []string, cfg *Config) (err error) {
 		return err
 	}
 
+	requestedPackages = normalizeCrossSystemTargets(requestedPackages, cfg)
+
 	// Record the literal CLI targets as the packages -cross=<arch> is meant
 	// to apply to, before any dependency discovery runs. See
 	// Config.CrossOutputPackages: it lets a plain, non-cross build-time
@@ -5926,3 +5928,34 @@ func applyMoldLinker(ldflags string, options map[string]bool) string {
 // moldInstalled reports whether the mold package is installed. A variable so
 // tests need not install it.
 var moldInstalled = func() bool { return checkPackageExactMatch("mold") }
+
+// normalizeCrossSystemTargets names the recipes requested for a
+// -cross=<arch>,system build by the package they produce: libxv builds
+// aarch64-libxv, which is also how its cross dependents name it
+// ("aarch64-libxv cross"). Planned under both names, the one package was
+// built twice at once into the same archive, and a -j4 run uploaded a
+// corrupt aarch64-libxv. Names that are not recipe directories (split
+// outputs, kernel module requests, metapackages) are left as they are.
+func normalizeCrossSystemTargets(pkgs []string, cfg *Config) []string {
+	if cfg == nil || cfg.Values["HOKUTO_CROSS_SYSTEM"] != "1" {
+		return pkgs
+	}
+	arch := cfg.Values["HOKUTO_CROSS_ARCH"]
+	if arch == "arm64" {
+		arch = "aarch64"
+	}
+	if arch == "" {
+		return pkgs
+	}
+	out := make([]string, len(pkgs))
+	for i, pkg := range pkgs {
+		out[i] = pkg
+		if archPrefixOf(pkg) != "" || strings.ContainsAny(pkg, "@~") {
+			continue
+		}
+		if dir, err := findPackageMetadataDir(pkg); err == nil && filepath.Base(dir) == pkg {
+			out[i] = arch + "-" + pkg
+		}
+	}
+	return out
+}

@@ -5,6 +5,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -58,5 +59,35 @@ func TestPlannedPackageRequiresSourceBuildForSplitOutput(t *testing.T) {
 	}
 	if !plannedPackageRequiresSourceBuild("gstreamer", plan, nil, map[string][]string{"gstreamer": {"gst-plugins-bad"}}) {
 		t.Fatal("source package required to produce a split output must build from source")
+	}
+}
+
+// A recipe requested for a cross-system build is planned under the name of
+// the package it produces, the one its cross dependents use, so it is built
+// once (two builds of aarch64-libxv at once corrupted its archive).
+func TestNormalizeCrossSystemTargets(t *testing.T) {
+	repo := t.TempDir()
+	for _, name := range []string{"libxv", "gstreamer"} {
+		if err := os.MkdirAll(filepath.Join(repo, name), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(repo, name, "version"), []byte("1 1\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	oldRepoPaths := repoPaths
+	repoPaths = repo
+	t.Cleanup(func() { repoPaths = oldRepoPaths })
+
+	in := []string{"libxv", "aarch64-gstreamer", "libcups", "nvidia~linux"}
+	system := &Config{Values: map[string]string{"HOKUTO_CROSS_ARCH": "arm64", "HOKUTO_CROSS_SYSTEM": "1"}}
+	got := normalizeCrossSystemTargets(in, system)
+	want := []string{"aarch64-libxv", "aarch64-gstreamer", "libcups", "nvidia~linux"}
+	if strings.Join(got, " ") != strings.Join(want, " ") {
+		t.Fatalf("system targets = %v, want %v", got, want)
+	}
+	plain := &Config{Values: map[string]string{"HOKUTO_CROSS_ARCH": "arm64"}}
+	if got := normalizeCrossSystemTargets(in, plain); strings.Join(got, " ") != strings.Join(in, " ") {
+		t.Fatalf("plain cross targets changed: %v", got)
 	}
 }
