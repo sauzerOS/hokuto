@@ -2848,7 +2848,7 @@ func ensureSplitPackageInstalled(sourcePkg, splitPkg string, cfg *Config, noRemo
 	// Must match how the split was actually finalized, or the expected
 	// tarball name won't exist and the owner gets needlessly rebuilt from
 	// source (arm64/cross builds finalize as "generic").
-	isGeneric := isGenericBuildVariant(arch, cfg, options)
+	isGeneric := splitPackageIsGeneric(splitPkg, arch, cfg, options)
 	variant := IdentifyVariant(splitPkg, isGeneric, isMultilibPackage(splitPkg))
 	archiveSplitName := canonicalParallelPackageName(splitPkg)
 	tarballName := StandardizeRemoteName(archiveSplitName, version, revision, arch, variant)
@@ -3914,4 +3914,13 @@ func uninstallBuildDependenciesWithOptions(packages []string, cfg *Config, quiet
 		colSuccess.Printf("Removed %d temporary build dependencies\n", removedCount)
 	}
 	return removedCount
+}
+
+// splitPackageIsGeneric reports whether the split package splitName was
+// finalized as the generic variant. A cross-system split (aarch64-libelf) is
+// a sysroot package, always generic, also when a plain -cross=arm64 build,
+// whose own packages are optimized, needs it; looking it up as optimized
+// missed the published binary and rebuilt its source in the wrong mode.
+func splitPackageIsGeneric(splitName, arch string, cfg *Config, options map[string]bool) bool {
+	return archPrefixOf(splitName) != "" || isGenericBuildVariant(arch, cfg, options)
 }

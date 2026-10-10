@@ -91,3 +91,16 @@ func TestNormalizeCrossSystemTargets(t *testing.T) {
 		t.Fatalf("plain cross targets changed: %v", got)
 	}
 }
+
+// A plain -cross=arm64 build needing a sysroot split (aarch64-libelf) must
+// look for its generic archive, as it was published; its own native arm64
+// packages stay optimized.
+func TestSplitPackageIsGenericForSysrootSplits(t *testing.T) {
+	plainCross := &Config{Values: map[string]string{"HOKUTO_CROSS_ARCH": "arm64", "CFLAGS_ARM64": "-mcpu=cortex-a72"}}
+	if !splitPackageIsGeneric("aarch64-libelf", "aarch64", plainCross, map[string]bool{}) {
+		t.Fatal("aarch64-libelf looked up as optimized")
+	}
+	if splitPackageIsGeneric("libelf", "aarch64", plainCross, map[string]bool{}) {
+		t.Fatal("native arm64 libelf looked up as generic")
+	}
+}

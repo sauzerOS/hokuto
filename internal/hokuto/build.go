@@ -606,7 +606,7 @@ func installBuiltSplitPackageWithLogger(sourcePkg, splitPkg string, cfg *Config,
 	}
 	options := loadBuildOptions(pkgDir)
 	arch := GetSystemArchForPackage(cfg, sourcePkg)
-	isGeneric := isGenericBuildVariant(arch, cfg, options)
+	isGeneric := splitPackageIsGeneric(outputSplitPkg, arch, cfg, options)
 	variant := IdentifyVariant(outputSplitPkg, isGeneric, isMultilibPackage(splitPkg))
 	archiveSplitName := canonicalParallelPackageName(outputSplitPkg)
 	tarballPath := filepath.Join(BinDir, StandardizeRemoteName(archiveSplitName, version, revision, arch, variant))
