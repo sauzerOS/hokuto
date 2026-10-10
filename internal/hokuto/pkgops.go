@@ -1627,8 +1627,9 @@ func nativeCrossTargetPrefix(outputDir string) string {
 
 // nativeNameForSysrootOwner names the native package that provides, on the
 // target, a library the sysroot package owner (aarch64-cups) ships: the
-// recipe's split output named after the library (libcups for libcups.so.2)
-// when there is one, else the recipe's own package.
+// recipe's split output the library is named after, the longest split name
+// that starts the soname (libcups for libcups.so.2, libpulse for
+// libpulsecommon-17.0.so), when there is one, else the recipe's own package.
 func nativeNameForSysrootOwner(owner, prefix, libKey string) string {
 	base := strings.TrimPrefix(owner, prefix)
 	lib := libKey
@@ -1639,12 +1640,16 @@ func nativeNameForSysrootOwner(owner, prefix, libKey string) string {
 	if i := strings.Index(stem, ".so"); i > 0 {
 		stem = stem[:i]
 	}
+	best := ""
 	if pkgDir, err := findPackageMetadataDir(base); err == nil {
 		for _, split := range splitPackageNamesFromDir(pkgDir) {
-			if split == stem {
-				return split
+			if strings.HasPrefix(stem, split) && len(split) > len(best) {
+				best = split
 			}
 		}
+	}
+	if best != "" {
+		return best
 	}
 	return base
 }

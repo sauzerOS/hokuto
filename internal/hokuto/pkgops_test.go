@@ -650,18 +650,20 @@ func TestGenerateDependsNativeCrossPackageMapsSysrootOwners(t *testing.T) {
 	outputDir := filepath.Join(tmp, "out")
 	dbRoot := filepath.Join(outputDir, "var", "db", "hokuto", "installed")
 	targetDir := filepath.Join(dbRoot, "libdecor")
-	for _, d := range []string{pkgDir, filepath.Join(repo, "cups"), filepath.Join(repo, "gtk+3"), filepath.Join(repo, "gcc"), targetDir} {
+	for _, d := range []string{pkgDir, filepath.Join(repo, "cups"), filepath.Join(repo, "gtk+3"), filepath.Join(repo, "gcc"), filepath.Join(repo, "pulseaudio"), targetDir} {
 		if err := os.MkdirAll(d, 0o755); err != nil {
 			t.Fatal(err)
 		}
 	}
-	for _, f := range []string{"cups/version", "gtk+3/version", "gcc/version"} {
+	for _, f := range []string{"cups/version", "gtk+3/version", "gcc/version", "pulseaudio/version"} {
 		if err := os.WriteFile(filepath.Join(repo, f), []byte("1 1\n"), 0o644); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if err := os.WriteFile(filepath.Join(repo, "cups", "depends.libcups"), []byte("glibc\n"), 0o644); err != nil {
-		t.Fatal(err)
+	for _, f := range []string{"cups/depends.libcups", "pulseaudio/depends.libpulse"} {
+		if err := os.WriteFile(filepath.Join(repo, f), []byte("glibc\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
 	}
 	oldRepoPaths := repoPaths
 	repoPaths = repo
@@ -670,8 +672,11 @@ func TestGenerateDependsNativeCrossPackageMapsSysrootOwners(t *testing.T) {
 	owners := map[string]string{
 		"aarch64-gtk+3": "/usr/aarch64-linux-gnu/lib/libgtk-3.so.0",
 		"aarch64-cups":  "/usr/aarch64-linux-gnu/lib/libcups.so.2",
-		"aarch64-gcc":   "/usr/aarch64-linux-gnu/lib64/libgcc_s.so.1",
-		"libgcc":        "/usr/lib/libgcc_s.so.1",
+		// The sysroot keeps pulseaudio whole; natively the library is in
+		// the libpulse split.
+		"aarch64-pulseaudio": "/usr/aarch64-linux-gnu/lib/pulseaudio/libpulsecommon-17.0.so",
+		"aarch64-gcc":        "/usr/aarch64-linux-gnu/lib64/libgcc_s.so.1",
+		"libgcc":             "/usr/lib/libgcc_s.so.1",
 	}
 	for owner, path := range owners {
 		if err := os.MkdirAll(filepath.Join(dbRoot, owner), 0o755); err != nil {
@@ -681,7 +686,7 @@ func TestGenerateDependsNativeCrossPackageMapsSysrootOwners(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := os.WriteFile(filepath.Join(targetDir, "libdeps"), []byte("elf64:libgtk-3.so.0\nelf64:libcups.so.2\nelf64:libgcc_s.so.1\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(targetDir, "libdeps"), []byte("elf64:libgtk-3.so.0\nelf64:libcups.so.2\nelf64:libgcc_s.so.1\nelf64:libpulsecommon-17.0.so\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	oldScan := libDepsByMachine
@@ -707,7 +712,42 @@ func TestGenerateDependsNativeCrossPackageMapsSysrootOwners(t *testing.T) {
 	}
 	got := strings.Fields(string(data))
 	sort.Strings(got)
-	if want := []string{"gtk+3", "libcups", "libgcc"}; strings.Join(got, " ") != strings.Join(want, " ") {
+	if want := []string{"gtk+3", "libcups", "libgcc", "libpulse"}; strings.Join(got, " ") != strings.Join(want, " ") {
 		t.Fatalf("depends = %v, want %v", got, want)
+	}
+}
+
+// An asroot build's output can hold directories only root may enter
+// (cups: etc/cups/ssl). The scan skips them instead of failing, which lost
+// every library of the package.
+func TestLibDepsByMachineSkipsUnreadableDirectories(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root can enter any directory")
+	}
+	out := t.TempDir()
+	self, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(self)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(out, "usr", "bin"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(out, "usr", "bin", "tool"), data, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	locked := filepath.Join(out, "etc", "ssl")
+	if err := os.MkdirAll(locked, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(locked, 0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(locked, 0o700) })
+	if _, err := libDepsByMachine(out, elf.EM_AARCH64); err != nil {
+		t.Fatalf("scan failed on an unreadable directory: %v", err)
 	}
 }

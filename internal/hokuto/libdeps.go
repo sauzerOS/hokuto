@@ -488,6 +488,15 @@ var libDepsByMachine = func(outputDir string, target elf.Machine) (map[string]li
 	uses := make(map[string]libDepMachineUse)
 	err := filepath.WalkDir(outputDir, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
+			// An asroot build's output holds directories only root may
+			// enter (cups: etc/cups/ssl); they hold no ELF files to
+			// classify, and stopping there lost every library.
+			if errors.Is(err, fs.ErrPermission) {
+				if d != nil && d.IsDir() {
+					return fs.SkipDir
+				}
+				return nil
+			}
 			return err
 		}
 		if !d.Type().IsRegular() {
