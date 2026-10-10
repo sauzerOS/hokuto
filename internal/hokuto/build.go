@@ -1471,6 +1471,13 @@ set(CMAKE_STRIP        %sstrip)
 # variable, so pkg-config went "not found" after any built-in module
 # (FindFontconfig) had used it, and every pkg-config hint came back empty.
 set(PKG_CONFIG_EXECUTABLE %spkg-config CACHE FILEPATH "pkg-config for the target")
+# FindPkgConfig adds <prefix>/lib/pkgconfig of every CMAKE_PREFIX_PATH entry to
+# PKG_CONFIG_PATH without rooting it in the sysroot. vulkan-icd-loader puts /usr
+# there, so pkg_check_modules() took the build machine's x11.pc, compiled the
+# target against -I/usr/include, and the x86 bits/wordsize.h moved st_size in
+# struct stat: the loader then failed to read any manifest. The sysroot's .pc
+# directories are on PKG_CONFIG_LIBDIR already.
+set(PKG_CONFIG_USE_CMAKE_PREFIX_PATH FALSE)
 
 # CMAKE_SYSROOT keeps the host's headers off the cross compiler's include path.
 # Without it glibc's bits/wordsize.h keys off __x86_64__, reports __WORDSIZE=32

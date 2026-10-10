@@ -33,6 +33,8 @@ func TestWriteCMakeToolchainFile(t *testing.T) {
 		"set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)",
 		// A cache variable, or pkg-config goes missing after its first use.
 		`set(PKG_CONFIG_EXECUTABLE aarch64-linux-gnu-pkg-config CACHE FILEPATH "pkg-config for the target")`,
+		// Or a CMAKE_PREFIX_PATH of /usr hands pkg-config the host's .pc files.
+		"set(PKG_CONFIG_USE_CMAKE_PREFIX_PATH FALSE)",
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("toolchain file missing %q", want)
