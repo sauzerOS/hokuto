@@ -40,3 +40,17 @@ func TestReplaceSymlinkAtomicConcurrent(t *testing.T) {
 		t.Fatalf("leftover temporary links: %d entries in %s", len(entries), dir)
 	}
 }
+
+func TestRemoveStaleGitLocks(t *testing.T) {
+	checkout := t.TempDir()
+	for _, name := range []string{"index.lock", "HEAD.lock", "HEAD"} {
+		writeTree(t, checkout, map[string]string{filepath.Join(".git", name): ""})
+	}
+	removeStaleGitLocks(checkout)
+	for name, want := range map[string]bool{"index.lock": false, "HEAD.lock": false, "HEAD": true} {
+		_, err := os.Stat(filepath.Join(checkout, ".git", name))
+		if exists := err == nil; exists != want {
+			t.Errorf("%s exists = %v, want %v", name, exists, want)
+		}
+	}
+}

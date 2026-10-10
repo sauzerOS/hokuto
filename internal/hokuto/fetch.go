@@ -1523,6 +1523,7 @@ func fetchSourcesWithOptions(pkgName, pkgDir string, processGit bool, quiet bool
 						return fmt.Errorf("failed to lock go-git checkout: %v", err)
 					}
 					defer unix.Flock(int(lFile.Fd()), unix.LOCK_UN)
+					removeStaleGitLocks(sharedPath)
 
 					if !quiet {
 						cPrintf(colInfo, "git not found; using go-git for %s@%s\n", gitURL, ref)
@@ -1557,6 +1558,7 @@ func fetchSourcesWithOptions(pkgName, pkgDir string, processGit bool, quiet bool
 						return fmt.Errorf("failed to lock shallow git checkout: %v", err)
 					}
 					defer unix.Flock(int(lFile.Fd()), unix.LOCK_UN)
+					removeStaleGitLocks(sharedPath)
 
 					return ensureShallowGitCheckout(gitURL, ref, depth, sharedPath, quiet)
 				}()
@@ -1655,6 +1657,7 @@ func fetchSourcesWithOptions(pkgName, pkgDir string, processGit bool, quiet bool
 					return fmt.Errorf("failed to lock shared checkout: %v", err)
 				}
 				defer unix.Flock(int(lFile.Fd()), unix.LOCK_UN)
+				removeStaleGitLocks(sharedPath)
 
 				if _, err := os.Stat(sharedPath); os.IsNotExist(err) {
 					if !quiet {
@@ -1754,6 +1757,7 @@ func fetchSourcesWithOptions(pkgName, pkgDir string, processGit bool, quiet bool
 					return fmt.Errorf("failed to lock SVN cache: %v", err)
 				}
 				defer unix.Flock(int(lFile.Fd()), unix.LOCK_UN)
+				removeStaleGitLocks(sharedPath)
 
 				// If the shared checkout already exists, check if revision matches
 				if _, err := os.Stat(sharedPath); err == nil {
@@ -1857,6 +1861,7 @@ func fetchSourcesWithOptions(pkgName, pkgDir string, processGit bool, quiet bool
 					return fmt.Errorf("failed to lock HG cache: %v", err)
 				}
 				defer unix.Flock(int(lFile.Fd()), unix.LOCK_UN)
+				removeStaleGitLocks(sharedPath)
 
 				if !quiet {
 					revStr := ""
@@ -2119,4 +2124,17 @@ func readPkgDB(path string) (*PkgDB, error) {
 	}
 
 	return &db, nil
+}
+
+// removeStaleGitLocks deletes the lock files a killed git process left in a
+// shared checkout (.git/index.lock: "Another git process seems to be running
+// in this repository"), which failed every later checkout of it. The caller
+// holds the checkout's own flock, so no other hokuto runs git there.
+func removeStaleGitLocks(checkout string) {
+	for _, name := range []string{"index.lock", "HEAD.lock", "config.lock", "shallow.lock"} {
+		path := filepath.Join(checkout, ".git", name)
+		if err := os.Remove(path); err == nil {
+			debugf("Removed stale git lock %s\n", path)
+		}
+	}
 }
