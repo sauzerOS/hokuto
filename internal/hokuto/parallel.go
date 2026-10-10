@@ -402,6 +402,12 @@ func collectAvailableBinaryDependenciesForPlan(plan *BuildPlan, cfg *Config, noR
 				if seen[cand] || (inPlan[cand] && !dep.MakeOpt) || isPackageInstalled(cand) {
 					continue
 				}
+				// A split of a recipe the plan builds comes from that build:
+				// the published one may be stale (a python-rebuild check got
+				// the python 3.14 python-uv-build while rebuilding uv).
+				if source, ok := findSplitDependencySource(cand); ok && source != cand && inPlan[source] && !dep.MakeOpt {
+					continue
+				}
 				if !dependencyBinaryAvailable(cand, cfg, noRemote) {
 					if _, fallbackOK, _ := locateBuildDependencyBinaryTarball(cand, cfg, noRemote); !fallbackOK {
 						continue

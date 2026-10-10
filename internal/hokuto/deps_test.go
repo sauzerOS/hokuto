@@ -2277,6 +2277,29 @@ func TestBuildDependencyFallsBackToNewestOlderBinary(t *testing.T) {
 	}
 }
 
+func TestParallelPlanSkipsSplitDependencyOfPlannedSource(t *testing.T) {
+	cfg, repo := withTempDependencyRepo(t)
+	writeTestPackage(t, repo, "uv", "")
+	if err := os.WriteFile(filepath.Join(repo, "uv", "depends.python-uv-build"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	writeTestPackage(t, repo, "python-dnspython", "python-uv-build make\n")
+
+	tarball := filepath.Join(BinDir, StandardizeRemoteName("python-uv-build", "1.0", "1", "x86_64", "optimized"))
+	writeTestBinaryTarball(t, tarball, "python-uv-build", "1.0", "1")
+
+	plan := &BuildPlan{Order: []string{"uv", "python-dnspython"}}
+	if deps := collectAvailableBinaryDependenciesForPlan(plan, cfg, true); len(deps) != 0 {
+		t.Fatalf("the split of a planned source must come from its build, got %+v", deps)
+	}
+
+	plan = &BuildPlan{Order: []string{"python-dnspython"}}
+	deps := collectAvailableBinaryDependenciesForPlan(plan, cfg, true)
+	if len(deps) != 1 || deps[0].Name != "python-uv-build" {
+		t.Fatalf("expected the python-uv-build binary when uv is not built, got %+v", deps)
+	}
+}
+
 func TestMakeOptSelfDependencyUsesOlderBinaryWithoutEnteringBuildPlan(t *testing.T) {
 	cfg, repo := withTempDependencyRepo(t)
 	writeTestPackage(t, repo, "cmake", "cmake makeopt\n")
