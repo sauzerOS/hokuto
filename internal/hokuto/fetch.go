@@ -776,8 +776,13 @@ func (r *throughputTimeoutReader) start() {
 	}()
 }
 
+// symlinkTmpSeq keeps the temporary names of replaceSymlinkAtomic unique
+// within the process: the background prefetch and a build's own fetch link
+// the same source concurrently, and the pid and clock alone collided.
+var symlinkTmpSeq atomic.Uint64
+
 func replaceSymlinkAtomic(target, linkPath string) error {
-	tmpLinkPath := fmt.Sprintf("%s.tmp.%d.%d", linkPath, os.Getpid(), time.Now().UnixNano())
+	tmpLinkPath := fmt.Sprintf("%s.tmp.%d.%d.%d", linkPath, os.Getpid(), time.Now().UnixNano(), symlinkTmpSeq.Add(1))
 	if err := os.Symlink(target, tmpLinkPath); err != nil {
 		return err
 	}
