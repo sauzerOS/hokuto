@@ -79,6 +79,11 @@ func needsRootPrivileges(args []string) bool {
 		}
 	}
 
+	// Their help needs nothing.
+	if (cmd == "nobuild" || cmd == "python-rebuild") && wantsCommandHelp(args[1:]) {
+		return false
+	}
+
 	// A python upgrade check builds and installs; confirm and cancel write
 	// its state.
 	if cmd == "python-rebuild" && len(args) > 1 {

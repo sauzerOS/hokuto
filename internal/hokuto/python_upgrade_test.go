@@ -226,3 +226,19 @@ func TestCurrentPythonUpgradeFrom(t *testing.T) {
 		t.Fatalf("not saved: %+v", loaded)
 	}
 }
+
+func TestCommandHelpNeedsNoRoot(t *testing.T) {
+	for _, args := range [][]string{
+		{"nobuild", "help"},
+		{"nobuild", "add", "--help"},
+		{"python-rebuild", "check", "-h"},
+		{"python-rebuild", "--help"},
+	} {
+		if needsRootPrivileges(args) {
+			t.Errorf("%v asks for root", args)
+		}
+	}
+	if !needsRootPrivileges([]string{"python-rebuild", "check"}) || !needsRootPrivileges([]string{"nobuild", "add", "foo"}) {
+		t.Error("the commands themselves still need root")
+	}
+}

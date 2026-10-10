@@ -115,6 +115,38 @@ func filterNoBuild(pkgs []string, cross bool) []string {
 	return kept
 }
 
+// noBuildHelp is what hokuto nobuild --help prints.
+const noBuildHelp = `Usage: hokuto nobuild [command] [-cross | -native] [package...]
+
+The no-build list: packages the build server never builds until they are
+removed from it. Native entries are bumped by bump --build but not built,
+and skipped by update --build-missing-binaries (hokuto-builder rebuild);
+-cross entries are skipped by cross-sync and cross-sync -system.
+
+Commands:
+  list                    show the list (the default without packages)
+  add <package>...        add packages (the default with packages)
+  remove <package>...     remove packages
+  clear                   empty the list
+
+Options:
+  -cross                  cross-build entries: add them, or limit list,
+                          remove and clear to them
+  -native                 limit list, remove and clear to native entries
+  -h, --help              show this help
+`
+
+// wantsCommandHelp reports whether a command's arguments ask for its help.
+func wantsCommandHelp(args []string) bool {
+	for _, arg := range args {
+		switch arg {
+		case "-h", "-help", "--help", "help":
+			return true
+		}
+	}
+	return false
+}
+
 // handleNoBuildCommand lists or edits the no-build list:
 //
 //	hokuto nobuild [list]
@@ -122,6 +154,10 @@ func filterNoBuild(pkgs []string, cross bool) []string {
 //	hokuto nobuild remove [-cross|-native] <pkg>...
 //	hokuto nobuild clear [-cross|-native]
 func handleNoBuildCommand(args []string) error {
+	if wantsCommandHelp(args) {
+		fmt.Print(noBuildHelp)
+		return nil
+	}
 	cmd := ""
 	scope := "" // "", "cross" or "native"
 	var pkgs []string

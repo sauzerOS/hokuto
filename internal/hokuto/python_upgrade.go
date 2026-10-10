@@ -236,7 +236,39 @@ func currentPythonUpgrade(cfg *Config, index []RepoEntry, from string) (*pythonU
 	return state, savePythonUpgrade(state)
 }
 
+// pythonRebuildHelp is what hokuto python-rebuild --help prints.
+const pythonRebuildHelp = `Usage: hokuto python-rebuild [command] [options]
+
+A new Python minor release (3.14 -> 3.15) needs every package with Python
+modules or linked against libpython rebuilt. A publishing build of such a
+python holds the upgrade: nothing is bumped, the new python is not uploaded,
+rebuild and cross-sync leave python alone, and the website shows a notice.
+Maintenance releases (3.15.0 -> 3.15.1) are not held.
+
+Commands:
+  status                  show the held upgrade and its last check (default)
+  list                    list the packages the upgrade rebuilds
+  check [build flags]     build and install the new python, then build every
+                          package that needs the rebuild against it, without
+                          publishing anything, and report which fail
+                          (hokuto-builder python-rebuild --check runs it in a
+                          throwaway overlay of the build container)
+  confirm [--force]       once every package built: bump their revisions,
+                          commit and push, and release python for the next
+                          rebuild; --force confirms without a passed check
+  cancel                  drop the hold (after reverting the python bump)
+
+Options:
+  --from X.Y              start an upgrade from this minor release when none
+                          is held, e.g. after the new python was published
+  -h, --help              show this help
+`
+
 func handlePythonRebuildCommand(args []string, cfg *Config) error {
+	if wantsCommandHelp(args) {
+		fmt.Print(pythonRebuildHelp)
+		return nil
+	}
 	sub := "status"
 	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
 		sub, args = args[0], args[1:]
