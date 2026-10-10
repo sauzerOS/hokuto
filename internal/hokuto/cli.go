@@ -75,7 +75,7 @@ func printHelp() {
 			{"init-repos", "", "Initialize repositories"},
 			{"blacklist", "[list | remove [-arch <arch>] <pkg>... | clear]", "Show or edit the packages unattended builds skip after a failed build"},
 			{"perl-rebuild", "", "Bump the revision of Perl modules and packages that depend on perl"},
-			{"python-rebuild", "[build [build flags] | list | bump <msg>]", "Test-build the recipes marked python-rebuild against the installed python and report failures; bump their revisions"},
+			{"python-rebuild", "[status | list | check [build flags] | confirm [--force] | cancel]", "A held python minor upgrade: test-build the packages that need the rebuild, then bump them"},
 			{"settings", "", "Manage hokuto configuration interactively"},
 			{"version, --version", "", "Version information"},
 		},

@@ -79,6 +79,15 @@ func needsRootPrivileges(args []string) bool {
 		}
 	}
 
+	// A python upgrade check builds and installs; confirm and cancel write
+	// its state.
+	if cmd == "python-rebuild" && len(args) > 1 {
+		switch args[1] {
+		case "check", "confirm", "cancel":
+			return true
+		}
+	}
+
 	// Changing the build blacklist writes /var/db/hokuto.
 	if cmd == "blacklist" && len(args) > 1 {
 		switch args[1] {

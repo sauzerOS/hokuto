@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -66,6 +67,11 @@ func handleCrossSyncCommand(args []string, cfg *Config) error {
 	}
 
 	missing := missingSyncPackages(targetPkgs, remoteIndex)
+	if held := slices.IndexFunc(missing, func(pkg syncPackage) bool { return pythonUpgradeHeld(pkg.Base) }); held >= 0 {
+		missing = slices.DeleteFunc(missing, func(pkg syncPackage) bool { return pythonUpgradeHeld(pkg.Base) })
+		colArrow.Print("-> ")
+		colNote.Printf("Not built: %s\n", heldPythonNote())
+	}
 	if noBuild, err := loadNoBuildList(); err != nil {
 		colWarn.Printf("Warning: failed to read the no-build list: %v\n", err)
 	} else if len(noBuild) > 0 {

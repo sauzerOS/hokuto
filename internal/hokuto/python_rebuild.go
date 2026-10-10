@@ -8,24 +8,35 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
-	"slices"
 	"sort"
 	"strings"
 )
 
 // A Python minor upgrade (3.14 -> 3.15) moves site-packages to a new
 // directory and changes the extension ABI, so every package that installs
-// Python modules or links libpython has to be rebuilt. The upgrade is done by
-// hand in the build container:
+// Python modules or links libpython has to be rebuilt, and how many of them
+// build against the new release is only known by trying. The build server
+// therefore holds the upgrade back until they have been tried:
 //
-//	install the new python
-//	hokuto python-rebuild               build every marked recipe, report failures
-//	(fix recipes, repeat)
-//	hokuto python-rebuild bump "msg"    bump their revisions, commit (no push)
+//	a publishing build of python with a new minor version records the
+//	upgrade (python-upgrade.json in HOKUTO_CACHE_DIR) instead of bumping
+//	the libpython consumers, keeps its new package off the mirror, and
+//	posts a notice on the website; rebuild and cross-sync leave python
+//	alone while the upgrade waits
 //
-// The test builds are thrown away: they still carry the old revision, and
-// publishing them would hand the new-Python packages to systems that run the
-// old Python. The bump makes the real rebuild an ordinary update.
+//	hokuto python-rebuild check     in a throwaway copy of the build
+//	                                container (hokuto-builder python-rebuild
+//	                                --check): build and install the new
+//	                                python, build every package that needs
+//	                                the rebuild against it, report the result
+//	hokuto python-rebuild confirm   once all of them built: bump their
+//	                                revisions, commit and push, and release
+//	                                python; the next rebuild round publishes
+//	                                python together with the rebuilt packages
+//
+// The test builds are thrown away: they keep the published revision, and
+// publishing them would hand new-Python packages to systems that run the old
+// Python.
 
 // pythonRebuildOption marks a recipe whose packages install files under a
 // versioned lib/python3.X directory or link libpython3.X.
@@ -73,6 +84,9 @@ func findPythonVersionedFile(outputDir, libdepsFile string) string {
 			}
 		}
 	}
+	if found := findCPythonExtension(outputDir); found != "" {
+		return found
+	}
 	if data, err := os.ReadFile(libdepsFile); err == nil {
 		for _, line := range strings.Split(string(data), "\n") {
 			if strings.Contains(line, "libpython3") {
@@ -83,11 +97,40 @@ func findPythonVersionedFile(outputDir, libdepsFile string) string {
 	return ""
 }
 
+// cpythonExtension matches an extension module built for one CPython
+// release: _giscanner.cpython-314-x86_64-linux-gnu.so.
+var cpythonExtension = regexp.MustCompile(`\.cpython-3\d+-[^/]*\.so$`)
+
+// findCPythonExtension returns the first extension module of a staged
+// package tied to a CPython release outside the versioned directories
+// (gobject-introspection's giscanner lives in /usr/lib/gobject-introspection).
+func findCPythonExtension(outputDir string) string {
+	found := ""
+	_ = filepath.WalkDir(outputDir, func(path string, d os.DirEntry, err error) error {
+		if err != nil || found != "" {
+			return filepath.SkipAll
+		}
+		if d.IsDir() {
+			if d.Name() == "hokuto" && strings.HasSuffix(filepath.Dir(path), filepath.Join("var", "db")) {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if cpythonExtension.MatchString(d.Name()) {
+			found = "/" + strings.TrimPrefix(filepath.ToSlash(strings.TrimPrefix(path, outputDir)), "/")
+			return filepath.SkipAll
+		}
+		return nil
+	})
+	return found
+}
+
 // warnMissingPythonRebuildOption points at recipes that install Python
 // modules without python-rebuild, which a Python upgrade would miss.
 // sourcePkgName is the recipe; the interpreter itself is the upgrade.
 func warnMissingPythonRebuildOption(sourcePkgName, pkgName, outputDir string, options map[string]bool, logger io.Writer) {
-	if options[pythonRebuildOption] || sourcePkgName == "python" {
+	// A binary recipe bundles its own Python (sublime-text) and is not rebuilt.
+	if options[pythonRebuildOption] || options["binary"] || sourcePkgName == "python" {
 		return
 	}
 	libdeps := filepath.Join(outputDir, "var", "db", "hokuto", "installed", pkgName, "libdeps")
@@ -228,159 +271,10 @@ func builtRecipePackage(dir, name, pkgDir string) bool {
 	return len(matches) > 0
 }
 
-func handlePythonRebuildCommand(args []string, cfg *Config) error {
-	sub := "build"
-	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
-		sub, args = args[0], args[1:]
-	}
-	switch sub {
-	case "list":
-		names := sortedKeys(keysOf(recipesWithOption(pythonRebuildOption)))
-		for _, name := range names {
-			fmt.Println(name)
-		}
-		return nil
-	case "bump":
-		minor, _ := currentPythonMinor()
-		msg := strings.TrimSpace(strings.Join(args, " "))
-		if msg == "" {
-			if minor == "" {
-				return fmt.Errorf("usage: hokuto python-rebuild bump <commit message>")
-			}
-			msg = fmt.Sprintf("python %s: rebuild dependent packages", minor)
-		}
-		reason := "a Python rebuild"
-		if minor != "" {
-			reason = "python " + minor
-		}
-		return bumpRecipesWithOption(pythonRebuildOption, reason, msg)
-	case "build":
-		return pythonRebuildBuild(args, cfg)
-	}
-	return fmt.Errorf("unknown python-rebuild command %q (build, list or bump)", sub)
-}
-
 func keysOf(m map[string]string) map[string]bool {
 	set := make(map[string]bool, len(m))
 	for k := range m {
 		set[k] = true
 	}
 	return set
-}
-
-// pythonRebuildBuild builds every recipe marked python-rebuild against the
-// installed Python, without publishing anything, and reports the failures.
-// buildArgs are passed on to hokuto build (-jN, -i, ...).
-func pythonRebuildBuild(buildArgs []string, cfg *Config) error {
-	marked := recipesWithOption(pythonRebuildOption)
-	delete(marked, "python")
-	if len(marked) == 0 {
-		colArrow.Print("-> ")
-		colSuccess.Printf("No recipes are marked %s.\n", pythonRebuildOption)
-		return nil
-	}
-	current, err := currentPythonMinor()
-	if err != nil {
-		return err
-	}
-
-	// Test builds go to a directory of their own and are deleted afterwards:
-	// they keep the published revision and must never be uploaded.
-	scratch, err := os.MkdirTemp(CacheDir, "python-rebuild-")
-	if err != nil {
-		return fmt.Errorf("failed to create a scratch binary directory: %w", err)
-	}
-	oldBinDir := BinDir
-	BinDir = scratch
-	defer func() {
-		BinDir = oldBinDir
-		os.RemoveAll(scratch)
-	}()
-
-	bootstrap := pythonBootstrapSet(marked)
-	var rest []string
-	for _, name := range sortedKeys(keysOf(marked)) {
-		if !slices.Contains(bootstrap, name) {
-			rest = append(rest, name)
-		}
-	}
-	colArrow.Print("-> ")
-	colSuccess.Printf("Rebuilding %d recipe(s) marked %s against python %s\n", len(marked), pythonRebuildOption, current)
-
-	// Stage 1: the build tools, installed, so the rest can use them.
-	if len(bootstrap) > 0 {
-		var installed []string
-		for _, name := range bootstrap {
-			if isPackageInstalled(name) {
-				installed = append(installed, name)
-			}
-		}
-		path, err := pythonBootstrapPath(installed, current)
-		if err != nil {
-			return fmt.Errorf("failed to prepare the old build tools: %w", err)
-		}
-		colArrow.Print("-> ")
-		if path != "" {
-			colSuccess.Printf("Building the Python build tools first, with their old copies on PYTHONPATH: %s\n", strings.Join(bootstrap, " "))
-			oldPath, hadPath := os.LookupEnv("PYTHONPATH")
-			os.Setenv("PYTHONPATH", path)
-			defer func() {
-				if hadPath {
-					os.Setenv("PYTHONPATH", oldPath)
-				} else {
-					os.Unsetenv("PYTHONPATH")
-				}
-				os.RemoveAll(path)
-			}()
-		} else {
-			colSuccess.Printf("Building the Python build tools first: %s\n", strings.Join(bootstrap, " "))
-		}
-		args := append(append(append([]string{}, buildArgs...), "-a"), bootstrap...)
-		if err := handleBuildCommand(args, cfg); err != nil {
-			debugf("python-rebuild: bootstrap build: %v\n", err)
-		}
-		if path != "" {
-			os.Unsetenv("PYTHONPATH")
-		}
-	}
-
-	// Stage 2: everything else. What one of them needs from another is
-	// built and installed on the way; the rest is not installed.
-	if len(rest) > 0 {
-		colArrow.Print("-> ")
-		colSuccess.Printf("Building the remaining %d recipe(s)\n", len(rest))
-		args := append(append(append([]string{}, buildArgs...), "--no-install"), rest...)
-		if err := handleBuildCommand(args, cfg); err != nil {
-			debugf("python-rebuild: build: %v\n", err)
-		}
-	}
-
-	var failed []string
-	for _, name := range sortedKeys(keysOf(marked)) {
-		if !builtRecipePackage(scratch, name, marked[name]) {
-			failed = append(failed, name)
-		}
-	}
-	return reportPythonRebuild(len(marked), failed, current)
-}
-
-// reportPythonRebuild prints the result and keeps the failures in
-// $HOKUTO_CACHE_DIR/python-rebuild-failed.txt for the next attempt.
-func reportPythonRebuild(total int, failed []string, current string) error {
-	reportPath := filepath.Join(CacheDir, "python-rebuild-failed.txt")
-	colArrow.Print("-> ")
-	if len(failed) == 0 {
-		colSuccess.Printf("All %d recipe(s) build against python %s. Bump them with: hokuto python-rebuild bump \"<message>\"\n", total, current)
-		os.Remove(reportPath)
-		return nil
-	}
-	colWarn.Printf("%d of %d recipe(s) failed or were blocked by a failed dependency against python %s:\n", len(failed), total, current)
-	for _, name := range failed {
-		fmt.Printf("   %s\n", name)
-	}
-	if err := os.WriteFile(reportPath, []byte(strings.Join(failed, "\n")+"\n"), 0o644); err == nil {
-		colArrow.Print("-> ")
-		colSuccess.Printf("List saved to %s\n", reportPath)
-	}
-	return fmt.Errorf("%d recipe(s) failed", len(failed))
 }

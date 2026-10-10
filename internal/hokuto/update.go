@@ -520,9 +520,14 @@ func buildMissingRepositoryBinaries(cfg *Config, buildArgs []string, yes bool) e
 	}
 	packages := make([]string, 0, len(statuses))
 	hidden, notBuilt := 0, 0
+	heldPython := false
 	for pkgName, status := range statuses {
 		if noBuildListed(noBuild, pkgName, false) {
 			notBuilt++
+			continue
+		}
+		if pythonUpgradeHeld(pkgName) {
+			heldPython = true
 			continue
 		}
 		if !includeNeverBuilt && status.PreviousVersion == "" {
@@ -535,6 +540,10 @@ func buildMissingRepositoryBinaries(cfg *Config, buildArgs []string, yes bool) e
 		packages = append(packages, pkgName)
 	}
 	sort.Strings(packages)
+	if heldPython {
+		colArrow.Print("-> ")
+		colNote.Printf("Not built: %s\n", heldPythonNote())
+	}
 	if hidden > 0 {
 		colArrow.Print("-> ")
 		colNote.Printf("%d blacklisted package(s) hidden until their version or revision changes (%s)\n", hidden, BuildIgnoreFile)

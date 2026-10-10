@@ -43,6 +43,18 @@
 #                                  bump bumps but does not build them and
 #                                  rebuild skips them; -cross entries are
 #                                  skipped by cross-sync (-system)
+#   hokuto-builder python-rebuild [--status | --list | --check [-jN] |
+#                                  --confirm [--force] | --cancel]
+#                                  a new python minor release (3.14 -> 3.15)
+#                                  is held: a build of it bumps nothing and
+#                                  uploads nothing, and the website shows a
+#                                  notice; --check builds the new python and
+#                                  every package that needs the rebuild against
+#                                  it, in a throwaway overlay of the container,
+#                                  and reports which fail; --confirm, once all
+#                                  of them built, bumps them and releases
+#                                  python for the next rebuild; --cancel drops
+#                                  the hold (after reverting the python bump)
 #   hokuto-builder run <cmd...>    run any command in the container
 #   hokuto-builder shell           interactive shell in the container
 #   hokuto-builder update          update the container's own packages
@@ -172,7 +184,7 @@ if [ "${1:-}" = --generic ]; then
 fi
 
 case "${1:-}" in
-    create | bump | build | rebuild | cross-sync | cycle | blacklist | nobuild | run | shell | update | destroy) ;;
+    create | bump | build | rebuild | cross-sync | cycle | blacklist | nobuild | python-rebuild | run | shell | update | destroy) ;;
     -h | --help | help) usage ;;
     *) usage 1 ;;
 esac
@@ -182,6 +194,7 @@ if [ "$VARIANT" = generic ]; then
         bump) die "bump runs in the optimized container; build the generic packages afterwards with 'hokuto-builder --generic rebuild'" ;;
         cross-sync) die "cross-sync runs in the optimized container" ;;
         cycle) die "cycle runs in the optimized container" ;;
+        python-rebuild) die "python-rebuild runs in the optimized container" ;;
     esac
 fi
 
@@ -677,6 +690,62 @@ cmd_cross_sync() {
     ' hokuto-builder-cross-sync "$upload" "${args[@]}"
 }
 
+# A held python minor upgrade (hokuto python-rebuild). --check runs in an
+# overlay of the container: the new python and the build tools it installs
+# land in a scratch upper layer, removed afterwards, so a check that fails
+# leaves the container as it was. The other options run in the container.
+cmd_python_rebuild() {
+    local sub=status arg
+    local args=()
+    for arg in "$@"; do
+        case "$arg" in
+            --check) sub=check ;;
+            --confirm) sub=confirm ;;
+            --status) sub=status ;;
+            --list) sub=list ;;
+            --cancel) sub=cancel ;;
+            *) args+=("$arg") ;;
+        esac
+    done
+    case "$sub" in
+        check) python_rebuild_check "${args[@]}" ;;
+        status | list)
+            EXCLUSIVE=0 nspawn_run "$BUILD_USER" /usr/local/bin/hokuto python-rebuild "$sub" "${args[@]}"
+            ;;
+        *) nspawn_run "$BUILD_USER" /usr/local/bin/hokuto python-rebuild "$sub" "${args[@]}" ;;
+    esac
+}
+
+PYTHON_CHECK_DIR=""
+python_check_cleanup() {
+    [ -n "$PYTHON_CHECK_DIR" ] || return 0
+    if mountpoint -q "$PYTHON_CHECK_DIR/merged"; then
+        umount "$PYTHON_CHECK_DIR/merged" || umount -l "$PYTHON_CHECK_DIR/merged" || true
+    fi
+    rm -rf "$PYTHON_CHECK_DIR"
+}
+
+python_rebuild_check() {
+    container_exists || die "no container at $ROOTFS; run 'hokuto-builder create' first"
+    PYTHON_CHECK_DIR="$ROOTFS.python-rebuild"
+    # Left by a check that was killed.
+    python_check_cleanup
+    PYTHON_CHECK_DIR="$ROOTFS.python-rebuild"
+    trap python_check_cleanup EXIT
+    install -d "$PYTHON_CHECK_DIR/upper" "$PYTHON_CHECK_DIR/work" "$PYTHON_CHECK_DIR/merged"
+    mount -t overlay overlay \
+        -o "lowerdir=$ROOTFS,upperdir=$PYTHON_CHECK_DIR/upper,workdir=$PYTHON_CHECK_DIR/work" \
+        "$PYTHON_CHECK_DIR/merged" || die "failed to mount the overlay for the check"
+    info "Checking in a throwaway overlay of the container; nothing it installs stays"
+    local rootfs=$ROOTFS status=0
+    ROOTFS="$PYTHON_CHECK_DIR/merged"
+    nspawn_run "$BUILD_USER" /usr/local/bin/hokuto python-rebuild check "$@" || status=$?
+    ROOTFS=$rootfs
+    python_check_cleanup
+    trap - EXIT
+    return "$status"
+}
+
 # fmt_duration <seconds>
 fmt_duration() {
     local s=$1
@@ -935,6 +1004,7 @@ case "$1" in
     # The list is a host file, bound into both containers: the host's hokuto
     # edits it directly, so this needs no container and works during a round.
     nobuild) shift; exec /usr/bin/hokuto nobuild "$@" ;;
+    python-rebuild) shift; cmd_python_rebuild "$@" ;;
     run) shift; [ $# -gt 0 ] || usage 1; nspawn_run "$BUILD_USER" "$@" ;;
     shell) EXCLUSIVE=0 nspawn_run "$BUILD_USER" /bin/bash -l ;;
     update) nspawn_run "$BUILD_USER" /usr/local/bin/hokuto update -y ;;

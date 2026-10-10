@@ -3,7 +3,6 @@ package hokuto
 import (
 	"bytes"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -156,46 +155,5 @@ func TestBuiltRecipePackage(t *testing.T) {
 	writeTree(t, dir, map[string]string{"python-foo-2.0-3-x86_64-optimized.tar.zst": ""})
 	if !builtRecipePackage(dir, "python-foo", recipe) {
 		t.Fatal("the current revision was not found")
-	}
-}
-
-func TestPythonRebuildBumpCommitsWithMessage(t *testing.T) {
-	repo := t.TempDir()
-	oldRepoPaths := repoPaths
-	repoPaths = repo
-	t.Cleanup(func() { repoPaths = oldRepoPaths })
-	runGit := func(args ...string) string {
-		t.Helper()
-		out, err := exec.Command("git", append([]string{"-C", repo}, args...)...).CombinedOutput()
-		if err != nil {
-			t.Fatalf("git %v failed: %v: %s", args, err, out)
-		}
-		return strings.TrimSpace(string(out))
-	}
-	runGit("init", "-q")
-	runGit("config", "user.name", "Hokuto Test")
-	runGit("config", "user.email", "test@sauzeros.invalid")
-	writeTree(t, repo, map[string]string{
-		"python-foo/version": "1.0 1\n", "python-foo/options": "python-rebuild\n",
-		"gdb/version": "17.1 2\n", "gdb/options": "nolto python-rebuild\n",
-		"zlib/version": "1.3 1\n",
-	})
-	runGit("add", ".")
-	runGit("commit", "-q", "-m", "initial")
-
-	if err := handlePythonRebuildCommand([]string{"bump", "rebuild", "for", "python", "3.15"}, nil); err != nil {
-		t.Fatal(err)
-	}
-	for name, want := range map[string]string{"python-foo": "1.0 2", "gdb": "17.1 3", "zlib": "1.3 1"} {
-		data, _ := os.ReadFile(filepath.Join(repo, name, "version"))
-		if got := strings.TrimSpace(string(data)); got != want {
-			t.Errorf("%s: %q, want %q", name, got, want)
-		}
-	}
-	if msg := runGit("log", "-1", "--format=%s"); msg != "rebuild for python 3.15" {
-		t.Fatalf("commit message %q", msg)
-	}
-	if files := runGit("show", "--name-only", "--format=", "HEAD"); files != "gdb/version\npython-foo/version" {
-		t.Fatalf("committed %q", files)
 	}
 }

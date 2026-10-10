@@ -193,6 +193,9 @@ make dependencies for a confirmed binary target.
 - `cross-simple`, `host-tool`, `nocrossopt`;
 - `perlxs`, `python-rebuild`: recipes whose packages must be rebuilt after a
   Perl API or Python minor upgrade (`perl_rebuild.go`, `python_rebuild.go`).
+  A Python minor upgrade is held, not bumped, by the publishing build's ABI
+  check until `hokuto python-rebuild check` and `confirm`
+  (`python_upgrade.go`; `hokuto-builder python-rebuild`).
 
 Base-devel policy is centralized by `packageNeedsDevelPackages`:
 

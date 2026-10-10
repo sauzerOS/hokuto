@@ -90,6 +90,7 @@ func noBuildListed(entries map[string]noBuildEntry, pkgName string, cross bool) 
 // filterNoBuild drops from pkgs those on the no-build list for the given
 // builds and reports them. A list that cannot be read keeps every package.
 func filterNoBuild(pkgs []string, cross bool) []string {
+	pkgs = filterHeldPython(pkgs)
 	entries, err := loadNoBuildList()
 	if err != nil {
 		colWarn.Printf("Warning: failed to read the no-build list: %v\n", err)
@@ -275,4 +276,18 @@ func removeNoBuildEntries(entries map[string]noBuildEntry, pkgs []string, scope 
 	}
 	sort.Strings(removed)
 	return removed
+}
+
+// filterHeldPython drops python from pkgs while its upgrade is held.
+func filterHeldPython(pkgs []string) []string {
+	kept := pkgs[:0:0]
+	for _, pkgName := range pkgs {
+		if pythonUpgradeHeld(pkgName) {
+			colArrow.Print("-> ")
+			colNote.Printf("Not built: %s\n", heldPythonNote())
+			continue
+		}
+		kept = append(kept, pkgName)
+	}
+	return kept
 }

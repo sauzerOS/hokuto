@@ -297,22 +297,27 @@ type abiRebuildResult struct {
 	Skipped []string // recipes left alone, with the reason
 }
 
-// bumpABIConsumers bumps the revision of each consumer recipe and commits the
-// version files, one commit per git repository, then pushes like a version
-// bump. A version file with uncommitted changes is not touched, so none of
-// your own edits end up in the commit.
+// bumpABIConsumers bumps the revision of each consumer recipe for the
+// libraries it links (see bumpRebuildRecipes).
 func bumpABIConsumers(consumers map[string][]string, msg string) (abiRebuildResult, error) {
-	var result abiRebuildResult
-	names := make([]string, 0, len(consumers))
-	for name := range consumers {
-		names = append(names, name)
+	notes := make(map[string]string, len(consumers))
+	for name, libs := range consumers {
+		notes[name] = "links " + strings.Join(libs, ", ")
 	}
-	sort.Strings(names)
+	return bumpRebuildRecipes(notes, msg)
+}
 
+// bumpRebuildRecipes bumps the revision of each recipe of notes, which say
+// why ("links libfoo.so.3", "python 3.15"), and commits the version files,
+// one commit per git repository, then pushes like a version bump. A version
+// file with uncommitted changes is not touched, so none of your own edits end
+// up in the commit.
+func bumpRebuildRecipes(notes map[string]string, msg string) (abiRebuildResult, error) {
+	var result abiRebuildResult
 	byRepo := make(map[string][]string)
 	linesByRepo := make(map[string][]string)
 	var repoOrder []string
-	for _, name := range names {
+	for _, name := range sortedNotes(notes) {
 		pkgDir, err := findPackageMetadataDir(name)
 		if err != nil {
 			result.Skipped = append(result.Skipped, name+": recipe not found")
@@ -334,13 +339,13 @@ func bumpABIConsumers(consumers map[string][]string, msg string) (abiRebuildResu
 			continue
 		}
 		colArrow.Print("-> ")
-		colSuccess.Printf("%s: %s (links %s)\n", name, bumped, strings.Join(consumers[name], ", "))
+		colSuccess.Printf("%s: %s (%s)\n", name, bumped, notes[name])
 		result.Bumped = append(result.Bumped, name)
 		if _, ok := byRepo[root]; !ok {
 			repoOrder = append(repoOrder, root)
 		}
 		byRepo[root] = append(byRepo[root], versionPath)
-		linesByRepo[root] = append(linesByRepo[root], revisionBumpLine(name, bumped, "links "+strings.Join(consumers[name], ", ")))
+		linesByRepo[root] = append(linesByRepo[root], revisionBumpLine(name, bumped, notes[name]))
 	}
 
 	for _, root := range repoOrder {
@@ -522,6 +527,13 @@ func handleABIRebuilds(built []string, cfg *Config, logMsg func(string, ...inter
 		return nil
 	}
 	arch := GetSystemArch(cfg)
+
+	// A new python minor release waits for its rebuild to be checked:
+	// its libpython consumers are bumped by python-rebuild confirm.
+	built = holdPythonUpgrade(built, cfg, index)
+	if len(built) == 0 {
+		return nil
+	}
 
 	consumers := make(map[string][]string) // recipe -> libraries
 	reasons := make(map[string][]string)   // library recipe -> removed sonames
