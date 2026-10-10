@@ -281,3 +281,26 @@ func TestPythonBootstrapOrder(t *testing.T) {
 		}
 	}
 }
+
+func TestPythonRecheckRecipes(t *testing.T) {
+	_, repo := withPythonUpgradeEnv(t, "3.15.0 1")
+	all := map[string]string{}
+	for name, depends := range map[string]string{
+		"python-pyqt6":      "python\npyqt-builder make\nqt6-base\n",
+		"pyqt-builder":      "python\npython-sip\n",
+		"python-sip":        "python\npython-setuptools make\n",
+		"python-setuptools": "python\n",
+		"python-wheel":      "python\n",
+		"python-pygame":     "python\nsdl2\n",
+		"gdb":               "python\n",
+	} {
+		writePythonUpgradeRecipe(t, repo, name, "1.0 1", "")
+		writeTree(t, filepath.Join(repo, name), map[string]string{"depends": depends})
+		all[name] = filepath.Join(repo, name)
+	}
+	got := sortedKeys(keysOf(pythonRecheckRecipes(all, []string{"python-pyqt6"})))
+	want := []string{"pyqt-builder", "python-pyqt6", "python-setuptools", "python-sip", "python-wheel"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("recheck set = %v, want %v (the failed one, its rebuilt dependencies, the build tools)", got, want)
+	}
+}

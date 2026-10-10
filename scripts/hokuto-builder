@@ -43,7 +43,7 @@
 #                                  bump bumps but does not build them and
 #                                  rebuild skips them; -cross entries are
 #                                  skipped by cross-sync (-system)
-#   hokuto-builder python-rebuild [--status | --list | --check [-jN] |
+#   hokuto-builder python-rebuild [--status | --list | --check [--failed] [-jN] |
 #                                  --confirm [--force] | --cancel]
 #                                  a new python minor release (3.14 -> 3.15)
 #                                  is held: a build of it bumps nothing and
@@ -208,7 +208,7 @@ wants_help() {
 }
 python_rebuild_help() {
     cat <<'USAGE'
-Usage: hokuto-builder python-rebuild [--status | --list | --check [-jN] |
+Usage: hokuto-builder python-rebuild [--status | --list | --check [--failed] [-jN] |
                                       --confirm [--force] | --cancel] [--from X.Y]
 
 A new Python minor release (3.14 -> 3.15) needs every package with Python
@@ -222,6 +222,8 @@ Maintenance releases (3.15.0 -> 3.15.1) are not held.
   --check [-jN]   build the new python and every package that needs the
                   rebuild against it, in a throwaway overlay of the
                   container, without uploading anything; report which fail
+  --failed        with --check: check only the packages the last check
+                  failed (with the build tools and their dependencies)
   --confirm       once every package built: bump them, commit and push, and
                   release python for the next rebuild
   --force         with --confirm: confirm without a passed check

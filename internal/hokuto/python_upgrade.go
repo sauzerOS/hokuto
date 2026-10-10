@@ -253,6 +253,9 @@ Commands:
                           publishing anything, and report which fail
                           (hokuto-builder python-rebuild --check runs it in a
                           throwaway overlay of the build container)
+  check --failed          check only the packages the last check failed,
+                          with the build tools and the dependencies of theirs
+                          that the upgrade rebuilds
   confirm [--force]       once every package built: bump their revisions,
                           commit and push, and release python for the next
                           rebuild; --force confirms without a passed check
@@ -275,7 +278,8 @@ func handlePythonRebuildCommand(args []string, cfg *Config) error {
 	}
 	// --from 3.14 starts an upgrade from that minor release when none is
 	// held, e.g. after the new python was published before this existed.
-	from, force := "", false
+	// check --failed checks only the packages the last check failed.
+	from, force, onlyFailed := "", false, false
 	var rest []string
 	for i := 0; i < len(args); i++ {
 		switch arg := args[i]; {
@@ -289,6 +293,8 @@ func handlePythonRebuildCommand(args []string, cfg *Config) error {
 			from = strings.TrimPrefix(arg, "--from=")
 		case sub == "confirm" && (arg == "-force" || arg == "--force"):
 			force = true
+		case sub == "check" && (arg == "-failed" || arg == "--failed"):
+			onlyFailed = true
 		default:
 			rest = append(rest, arg)
 		}
@@ -299,7 +305,7 @@ func handlePythonRebuildCommand(args []string, cfg *Config) error {
 	case "list":
 		return pythonUpgradeList(from, cfg)
 	case "check":
-		return pythonUpgradeCheck(from, rest, cfg)
+		return pythonUpgradeCheck(from, onlyFailed, rest, cfg)
 	case "confirm":
 		if len(rest) > 0 {
 			return fmt.Errorf("usage: hokuto python-rebuild confirm [--force] [--from X.Y]")
@@ -359,7 +365,7 @@ func pythonUpgradeList(from string, cfg *Config) error {
 // package that needs the rebuild against it, without publishing anything,
 // and records the result. hokuto-builder runs it in a throwaway copy of the
 // build container. buildArgs are passed on to hokuto build (-jN, -i, ...).
-func pythonUpgradeCheck(from string, buildArgs []string, cfg *Config) error {
+func pythonUpgradeCheck(from string, onlyFailed bool, buildArgs []string, cfg *Config) error {
 	index, err := GetCachedRemoteIndex(cfg)
 	if err != nil {
 		return fmt.Errorf("remote index unavailable: %w", err)
@@ -375,6 +381,16 @@ func pythonUpgradeCheck(from string, buildArgs []string, cfg *Config) error {
 		return fmt.Errorf("the python %s upgrade is already confirmed", state.To)
 	}
 	marked := pythonRebuildRecipes(index, GetSystemArch(cfg), state.From)
+	all := marked
+	if onlyFailed {
+		if len(state.Failed) == 0 {
+			return fmt.Errorf("the last check of python %s had no failures to check again", state.To)
+		}
+		marked = pythonRecheckRecipes(marked, state.Failed)
+		colArrow.Print("-> ")
+		colSuccess.Printf("Checking again the %d package(s) that failed, with %d build tool(s) and dependencies they need\n",
+			len(state.Failed), len(marked)-len(state.Failed))
+	}
 
 	// Test builds go to a directory of their own and are deleted afterwards:
 	// they keep the published revision and must never be uploaded.
@@ -402,7 +418,9 @@ func pythonUpgradeCheck(from string, buildArgs []string, cfg *Config) error {
 	if current != state.To {
 		state.Status = pythonUpgradeFailed
 		state.Checked = time.Now().UTC().Format(time.RFC3339)
-		state.Packages = []string{pythonRecipe}
+		if len(state.Packages) == 0 {
+			state.Packages = []string{pythonRecipe}
+		}
 		state.Failed = []string{pythonRecipe}
 		_ = savePythonUpgrade(state)
 		postPythonUpgradeNotice(state, cfg)
@@ -418,7 +436,8 @@ func pythonUpgradeCheck(from string, buildArgs []string, cfg *Config) error {
 		}
 	}
 	state.Checked = time.Now().UTC().Format(time.RFC3339)
-	state.Packages = sortedKeys(keysOf(marked))
+	// A check of the failed ones only leaves the others' last result.
+	state.Packages = sortedKeys(keysOf(all))
 	state.Failed = failed
 	state.Status = pythonUpgradePassed
 	if len(failed) > 0 {
@@ -431,7 +450,11 @@ func pythonUpgradeCheck(from string, buildArgs []string, cfg *Config) error {
 
 	colArrow.Print("-> ")
 	if len(failed) == 0 {
-		colSuccess.Printf("All %d package(s) build against python %s. Bump them with: hokuto-builder python-rebuild --confirm\n", len(marked), state.To)
+		if onlyFailed {
+			colSuccess.Printf("The %d package(s) checked again build against python %s; with the last check, all %d do. Bump them with: hokuto-builder python-rebuild --confirm\n", len(marked), state.To, len(all))
+		} else {
+			colSuccess.Printf("All %d package(s) build against python %s. Bump them with: hokuto-builder python-rebuild --confirm\n", len(marked), state.To)
+		}
 		return nil
 	}
 	colWarn.Printf("%d of %d package(s) failed or were blocked by a failed dependency against python %s:\n", len(failed), len(marked), state.To)
@@ -441,6 +464,51 @@ func pythonUpgradeCheck(from string, buildArgs []string, cfg *Config) error {
 	colArrow.Print("-> ")
 	colNote.Println("Fix them and check again, or bump anyway with: hokuto-builder python-rebuild --confirm --force")
 	return fmt.Errorf("%d package(s) failed", len(failed))
+}
+
+// pythonRecheckRecipes returns, of the recipes all an upgrade rebuilds, the
+// ones a check of failed builds: those, the Python build tools, which every
+// check rebuilds first, and what those need of all, as the published
+// packages are built for the old python.
+func pythonRecheckRecipes(all map[string]string, failed []string) map[string]string {
+	subset := make(map[string]string)
+	var visit func(name string)
+	visit = func(name string) {
+		pkgDir, ok := all[name]
+		if !ok {
+			if source, found := findSplitDependencySource(name); found {
+				name = source
+				pkgDir, ok = all[name]
+			}
+		}
+		if !ok || subset[name] != "" {
+			return
+		}
+		subset[name] = pkgDir
+		deps, err := parseDependsFile(pkgDir)
+		if err != nil {
+			return
+		}
+		for _, dep := range deps {
+			if dep.Cross || dep.CrossNative || dep.Suggest || dep.Optional {
+				continue
+			}
+			names := dep.Alternatives
+			if len(names) == 0 {
+				names = []string{dep.Name}
+			}
+			for _, n := range names {
+				visit(n)
+			}
+		}
+	}
+	for _, name := range failed {
+		visit(name)
+	}
+	for _, name := range pythonBootstrapSet(all) {
+		visit(name)
+	}
+	return subset
 }
 
 // pythonRebuildBuildAll builds the recipes of marked against the installed
