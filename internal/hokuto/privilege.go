@@ -87,6 +87,16 @@ func needsRootPrivileges(args []string) bool {
 		}
 	}
 
+	// So does changing the no-build list: everything but listing it.
+	if cmd == "nobuild" && len(args) > 1 {
+		for _, arg := range args[1:] {
+			if strings.HasPrefix(arg, "-") {
+				continue
+			}
+			return arg != "list" && arg != "ls"
+		}
+	}
+
 	// Check if bump command has auto flag
 	if cmd == "bump" {
 		for _, arg := range args[1:] {

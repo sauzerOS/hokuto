@@ -768,6 +768,7 @@ var autoBumpBuildJobs = 4
 // (python-sip before python-pyqt6-sip), and one failed build does not stop
 // the rest.
 func buildBumpedPackages(pkgNames []string, cfg *Config) (built, failed []string) {
+	pkgNames = filterNoBuild(pkgNames, false)
 	if len(pkgNames) == 0 {
 		return nil, nil
 	}
@@ -799,6 +800,9 @@ func bumpedPackageBuilt(pkgName string, cfg *Config) bool {
 }
 
 func buildBumpedPackage(pkgName string, cfg *Config) error {
+	if len(filterNoBuild([]string{pkgName}, false)) == 0 {
+		return nil
+	}
 	colNote.Printf(">> [BUILDING] %s (%s)\n", pkgName, bumpBuildMode())
 	return handleBuildCommand(append(bumpBuildFlags(), pkgName), cfg)
 }

@@ -514,9 +514,17 @@ func buildMissingRepositoryBinaries(cfg *Config, buildArgs []string, yes bool) e
 		ignores = make(map[string]buildIgnoreEntry)
 	}
 
+	noBuild, err := loadNoBuildList()
+	if err != nil {
+		colWarn.Printf("Warning: failed to read the no-build list: %v\n", err)
+	}
 	packages := make([]string, 0, len(statuses))
-	hidden := 0
+	hidden, notBuilt := 0, 0
 	for pkgName, status := range statuses {
+		if noBuildListed(noBuild, pkgName, false) {
+			notBuilt++
+			continue
+		}
 		if !includeNeverBuilt && status.PreviousVersion == "" {
 			continue
 		}
@@ -530,6 +538,10 @@ func buildMissingRepositoryBinaries(cfg *Config, buildArgs []string, yes bool) e
 	if hidden > 0 {
 		colArrow.Print("-> ")
 		colNote.Printf("%d blacklisted package(s) hidden until their version or revision changes (%s)\n", hidden, BuildIgnoreFile)
+	}
+	if notBuilt > 0 {
+		colArrow.Print("-> ")
+		colNote.Printf("%d package(s) on the no-build list skipped (hokuto nobuild)\n", notBuilt)
 	}
 	if len(packages) == 0 {
 		colArrow.Print("-> ")

@@ -37,6 +37,12 @@
 #                                  the packages unattended builds skip after
 #                                  their build failed, until their version or
 #                                  revision changes; remove retries them
+#   hokuto-builder nobuild [list | [add] [-cross] <pkg>... |
+#                           remove [-cross|-native] <pkg>... | clear [-cross|-native]]
+#                                  packages never built here until removed:
+#                                  bump bumps but does not build them and
+#                                  rebuild skips them; -cross entries are
+#                                  skipped by cross-sync (-system)
 #   hokuto-builder run <cmd...>    run any command in the container
 #   hokuto-builder shell           interactive shell in the container
 #   hokuto-builder update          update the container's own packages
@@ -68,6 +74,7 @@
 #   ~/.gitconfig, ~/.git-credentials   git identity and push credentials
 #   /var/db/hokuto/bump-ignore.json, build-ignore.json   the bump and rebuild
 #                                blacklists
+#   /var/db/hokuto/nobuild.json  the no-build list, shared by both containers
 #   the sauzerOS.github.io checkout    build status and logs (bump --build)
 #
 # The container location is asked for by 'create' and saved in
@@ -126,6 +133,8 @@ SOURCES_UNIT=var-cache-hokuto-sources.mount
 BUMP_IGNORE=/var/db/hokuto/bump-ignore.json
 # Likewise the blacklist of update --build-missing-binaries (rebuild).
 BUILD_IGNORE=/var/db/hokuto/build-ignore.json
+# The no-build list is policy: one copy for both containers and the host.
+NO_BUILD=/var/db/hokuto/nobuild.json
 # hokuto publishes build status and logs to this checkout (HOKUTO_WEBSITE_REPO
 # in hokuto.conf, same default as hokuto).
 DEFAULT_WEBSITE_REPO=/home/dbz/Documents/sauzerOS.github.io
@@ -163,7 +172,7 @@ if [ "${1:-}" = --generic ]; then
 fi
 
 case "${1:-}" in
-    create | bump | build | rebuild | cross-sync | cycle | blacklist | run | shell | update | destroy) ;;
+    create | bump | build | rebuild | cross-sync | cycle | blacklist | nobuild | run | shell | update | destroy) ;;
     -h | --help | help) usage ;;
     *) usage 1 ;;
 esac
@@ -490,6 +499,12 @@ nspawn_run() {
         chmod 644 "$BUILD_IGNORE"
     fi
     args+=(--bind="$BUILD_IGNORE:$CONTAINER_BUILD_IGNORE")
+    if [ ! -e "$NO_BUILD" ]; then
+        install -d /var/db/hokuto
+        printf '[]\n' >"$NO_BUILD"
+        chmod 644 "$NO_BUILD"
+    fi
+    args+=(--bind="$NO_BUILD")
     # The website's status table has one row per package; generic builds
     # would overwrite the optimized ones' status and logs.
     if [ "$VARIANT" = optimized ]; then
@@ -917,6 +932,9 @@ case "$1" in
     # Each container keeps its own blacklist; this one does not wait for a
     # running round.
     blacklist) shift; EXCLUSIVE=0 nspawn_run "$BUILD_USER" /usr/local/bin/hokuto blacklist "$@" ;;
+    # The list is a host file, bound into both containers: the host's hokuto
+    # edits it directly, so this needs no container and works during a round.
+    nobuild) shift; exec /usr/bin/hokuto nobuild "$@" ;;
     run) shift; [ $# -gt 0 ] || usage 1; nspawn_run "$BUILD_USER" "$@" ;;
     shell) EXCLUSIVE=0 nspawn_run "$BUILD_USER" /bin/bash -l ;;
     update) nspawn_run "$BUILD_USER" /usr/local/bin/hokuto update -y ;;

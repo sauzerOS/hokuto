@@ -66,6 +66,24 @@ func handleCrossSyncCommand(args []string, cfg *Config) error {
 	}
 
 	missing := missingSyncPackages(targetPkgs, remoteIndex)
+	if noBuild, err := loadNoBuildList(); err != nil {
+		colWarn.Printf("Warning: failed to read the no-build list: %v\n", err)
+	} else if len(noBuild) > 0 {
+		var kept []syncPackage
+		var skipped []string
+		for _, pkg := range missing {
+			if noBuildListed(noBuild, pkg.Base, true) {
+				skipped = append(skipped, pkg.Full)
+				continue
+			}
+			kept = append(kept, pkg)
+		}
+		if len(skipped) > 0 {
+			colArrow.Print("-> ")
+			colNote.Printf("Not built, on the no-build list for cross builds (hokuto nobuild -cross): %s\n", strings.Join(skipped, ", "))
+		}
+		missing = kept
+	}
 	// A package whose aarch64 build failed in an unattended run waits for its
 	// next version or revision (hokuto blacklist remove retries it sooner).
 	if ignores, err := loadBuildIgnoreList(); err == nil && len(ignores) > 0 {

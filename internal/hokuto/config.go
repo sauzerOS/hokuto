@@ -254,6 +254,7 @@ func initConfig(cfg *Config) {
 	BumpLogFile = filepath.Join(rootDir, "/var/log/hokuto-bump.log")
 	BumpIgnoreFile = filepath.Join(rootDir, "/var/db/hokuto/bump-ignore.json")
 	BuildIgnoreFile = filepath.Join(rootDir, "/var/db/hokuto/build-ignore.json")
+	NoBuildFile = filepath.Join(rootDir, "/var/db/hokuto/nobuild.json")
 	OptionalRebuildFile = filepath.Join(rootDir, "/var/db/hokuto/optional-rebuilds.json")
 	SaveDir = filepath.Join(rootDir, "/var/db/hokuto/save")
 	if customSave := cfg.Values["HOKUTO_SAVE_DIR"]; customSave != "" {
