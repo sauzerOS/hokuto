@@ -2920,7 +2920,7 @@ func installAvailableSplitDependencyBinary(sourcePkg, splitPkg string, cfg *Conf
 	// Must match how the split was actually finalized, or the expected
 	// tarball name won't exist and the owner gets needlessly rebuilt from
 	// source (arm64/cross builds finalize as "generic").
-	isGeneric := isGenericBuildVariant(arch, cfg, options)
+	isGeneric := splitPackageIsGeneric(splitPkg, arch, cfg, options)
 	variant := IdentifyVariant(splitPkg, isGeneric, isMultilibPackage(splitPkg))
 	archiveSplitName := canonicalParallelPackageName(splitPkg)
 	tarballPath := filepath.Join(BinDir, StandardizeRemoteName(archiveSplitName, version, revision, arch, variant))
@@ -3413,9 +3413,9 @@ func locateBinaryPackageTarball(pkgName string, cfg *Config, noRemote bool) (bin
 
 			options := loadBuildOptions(sourceDir)
 			arch := GetSystemArchForPackage(cfg, lookupName)
-			isGeneric := options["generic"]
+			isGeneric := options["generic"] || archPrefixOf(lookupName) != ""
 			if cfg != nil {
-				isGeneric = isGenericBuildVariant(arch, cfg, options)
+				isGeneric = splitPackageIsGeneric(lookupName, arch, cfg, options)
 			}
 			variant := IdentifyVariant(lookupName, isGeneric, isMultilibPackage(lookupName))
 			tarballName := StandardizeRemoteName(lookupName, version, revision, arch, variant)
