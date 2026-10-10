@@ -1,6 +1,7 @@
 package hokuto
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -229,5 +230,35 @@ func TestMajorVersionSearchCandidateUsesNaturalVersionOrdering(t *testing.T) {
 	addMajorVersionSearchCandidate(&best, "17.0.20+7", "2", true, false)
 	if best.revision != "2" || !best.remote || best.git {
 		t.Fatalf("expected newer revision to win: %#v", best)
+	}
+}
+
+// A binary-only system has no recipe repositories. Generating the package
+// database there wrote an empty one over the copy synced from the mirror,
+// with a newer revision that kept 'hokuto sync' from restoring it.
+func TestGeneratePkgDBRefusesWithoutRepositories(t *testing.T) {
+	oldRepoPaths, oldDB := repoPaths, PkgDBPath
+	t.Cleanup(func() { repoPaths, PkgDBPath = oldRepoPaths, oldDB })
+	PkgDBPath = filepath.Join(t.TempDir(), "pkg-db.json.zst")
+	if err := os.WriteFile(PkgDBPath, []byte("synced from the mirror"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, paths := range []string{"", filepath.Join(t.TempDir(), "missing")} {
+		repoPaths = paths
+		if err := generatePkgDBQuiet(&Config{Values: map[string]string{}}); !errors.Is(err, errNoLocalRepositories) {
+			t.Fatalf("HOKUTO_PATH=%q: err = %v, want errNoLocalRepositories", paths, err)
+		}
+	}
+	if data, _ := os.ReadFile(PkgDBPath); string(data) != "synced from the mirror" {
+		t.Fatalf("the existing database was replaced: %q", data)
+	}
+}
+
+func TestPkgDBHasPackagesIgnoresMetapackages(t *testing.T) {
+	if pkgDBHasPackages(PkgDB{Revision: 2000000000, Packages: []PkgDBEntry{{Name: "xfce-desktop", Type: "meta"}}}) {
+		t.Fatal("a database of metapackages only counts as having packages")
+	}
+	if !pkgDBHasPackages(PkgDB{Packages: []PkgDBEntry{{Name: "exo"}}}) {
+		t.Fatal("a database with a package counts as empty")
 	}
 }

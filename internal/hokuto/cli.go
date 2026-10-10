@@ -374,7 +374,13 @@ func Main() {
 			// worker is running.
 			RootExec = nil
 		}
-		_ = generatePkgDBQuiet(cfg)
+		// Without recipe repositories there is nothing to generate the
+		// database from: fetch the mirror's instead.
+		if hasLocalRepositories() {
+			_ = generatePkgDBQuiet(cfg)
+		} else {
+			_ = SyncPkgDB(cfg)
+		}
 
 	case "__zstd-frames":
 		// Internal filter used through tar's --use-compress-program: packs

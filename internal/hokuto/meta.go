@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -676,7 +677,43 @@ func generatePkgDBQuiet(cfg *Config) error {
 	return generatePkgDB(cfg, true)
 }
 
+// errNoLocalRepositories is returned when the package database would be
+// generated from no recipe repositories at all, as on a binary-only system.
+var errNoLocalRepositories = errors.New("no local recipe repositories in HOKUTO_PATH; use 'hokuto sync' to fetch the mirror's package database")
+
+// hasLocalRepositories reports whether any HOKUTO_PATH entry is a directory
+// that recipes could live in.
+func hasLocalRepositories() bool {
+	for _, base := range filepath.SplitList(repoPaths) {
+		if base == "" {
+			continue
+		}
+		if info, err := os.Stat(base); err == nil && info.IsDir() {
+			return true
+		}
+	}
+	return false
+}
+
+// pkgDBHasPackages reports whether db describes any package beyond the
+// metapackages, which hokuto adds even without a recipe repository.
+func pkgDBHasPackages(db PkgDB) bool {
+	for _, pkg := range db.Packages {
+		if pkg.Type != "meta" {
+			return true
+		}
+	}
+	return false
+}
+
 func generatePkgDB(cfg *Config, quiet bool) error {
+	// A binary-only system (the Pi: empty HOKUTO_PATH) has nothing to
+	// generate from. Writing the result anyway replaced the database synced
+	// from the mirror with an empty one, whose newer revision then kept
+	// 'hokuto sync' from restoring it: search found only bare index names.
+	if !hasLocalRepositories() {
+		return errNoLocalRepositories
+	}
 	unlock, err := lockPkgDBGeneration()
 	if err != nil {
 		return err

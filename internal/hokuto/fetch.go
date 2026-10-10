@@ -1983,9 +1983,11 @@ func SyncPkgDB(cfg *Config) error {
 		return fmt.Errorf("failed to read remote database: %w", err)
 	}
 
-	// Read local revision
+	// Read local revision. A database without packages (one an older hokuto
+	// generated on a binary-only system) counts as none, whatever its
+	// revision says.
 	var localRevision int64
-	if localDB, err := readPkgDB(PkgDBPath); err == nil {
+	if localDB, err := readPkgDB(PkgDBPath); err == nil && pkgDBHasPackages(*localDB) {
 		localRevision = localDB.Revision
 	}
 
