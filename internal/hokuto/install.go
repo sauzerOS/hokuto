@@ -272,6 +272,9 @@ func flushPackageSuggestions(logger io.Writer, cfg *Config, noRemote bool, promp
 
 	var packages []string
 	pending := make(map[string][]packageSuggestion)
+	// On an architecture served by cross builds, a suggestion whose recipe
+	// was never prepared for them has no package to install.
+	installableOnArch := make(map[string]bool)
 	for pkg := range items {
 		if !packageOrMetaInstalled(pkg) {
 			continue
@@ -283,9 +286,16 @@ func flushPackageSuggestions(logger io.Writer, cfg *Config, noRemote bool, promp
 			continue
 		}
 		for _, item := range items[pkg] {
-			if !suggestionAlternativesInstalled(item) {
-				pending[pkg] = append(pending[pkg], item)
+			if suggestionAlternativesInstalled(item) {
+				continue
 			}
+			if cfg != nil {
+				var ok bool
+				if item, ok = filterSuggestionForArch(item, cfg, noRemote, installableOnArch); !ok {
+					continue
+				}
+			}
+			pending[pkg] = append(pending[pkg], item)
 		}
 		if len(pending[pkg]) > 0 {
 			packages = append(packages, pkg)
