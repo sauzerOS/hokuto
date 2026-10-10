@@ -306,6 +306,19 @@ func flushPackageSuggestions(logger io.Writer, cfg *Config, noRemote bool, promp
 		fmt.Fprintln(logger, colSuccess.Sprint("Suggested optional runtime dependencies:"))
 	}
 	var installPrompts []packageSuggestion
+	// Suggestions are installed like dependencies, which leave the global
+	// post-install tasks (ldconfig, the GSettings schemas, icon and desktop
+	// caches) to the command; it ran them before asking. Run them again once
+	// anything was installed here: pwvucontrol, accepted as a suggestion of
+	// xfce4-pulseaudio-plugin, aborted on its uncompiled schema.
+	installedSuggestion := false
+	defer func() {
+		if installedSuggestion {
+			if err := PostInstallTasks(RootExec, logger); err != nil {
+				fmt.Fprintf(logger, "%s%s\n", colArrow.Sprint("-> "), colWarn.Sprintf("Warning: post-install tasks failed: %v", err))
+			}
+		}
+	}()
 	for _, pkg := range packages {
 		if !asking {
 			fmt.Fprint(logger, colArrow.Sprint("-> "))
@@ -366,6 +379,7 @@ func flushPackageSuggestions(logger io.Writer, cfg *Config, noRemote bool, promp
 				fmt.Fprintf(logger, "%s%s\n", colArrow.Sprint("-> "), colWarn.Sprintf("Warning: failed to install suggested dependency %s: %v", altName, err))
 				continue
 			}
+			installedSuggestion = true
 			if err := recordAcceptedSuggestion(item.Package, altName); err != nil {
 				fmt.Fprintf(logger, "%s%s\n", colArrow.Sprint("-> "), colWarn.Sprintf("Warning: failed to record %s as a suggested dependency of %s: %v", altName, item.Package, err))
 			}
