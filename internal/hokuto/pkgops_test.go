@@ -636,3 +636,78 @@ func TestGenerateDependsNativePackageIgnoresSysrootOwners(t *testing.T) {
 		t.Fatalf("depends = %v, want %v", got, want)
 	}
 }
+
+// A native package cross built for aarch64 (libdecor with -cross=arm64)
+// links libraries that only the sysroot's aarch64-* packages provide. They
+// are dependencies on the target's packages of those recipes: gtk+3 for
+// libgtk-3, the libcups split of cups for libcups. A library a host package
+// also owns keeps the host package's name (libgcc for aarch64-gcc's
+// libgcc_s), as before.
+func TestGenerateDependsNativeCrossPackageMapsSysrootOwners(t *testing.T) {
+	tmp := t.TempDir()
+	repo := filepath.Join(tmp, "repo")
+	pkgDir := filepath.Join(repo, "libdecor")
+	outputDir := filepath.Join(tmp, "out")
+	dbRoot := filepath.Join(outputDir, "var", "db", "hokuto", "installed")
+	targetDir := filepath.Join(dbRoot, "libdecor")
+	for _, d := range []string{pkgDir, filepath.Join(repo, "cups"), filepath.Join(repo, "gtk+3"), filepath.Join(repo, "gcc"), targetDir} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, f := range []string{"cups/version", "gtk+3/version", "gcc/version"} {
+		if err := os.WriteFile(filepath.Join(repo, f), []byte("1 1\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(repo, "cups", "depends.libcups"), []byte("glibc\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	oldRepoPaths := repoPaths
+	repoPaths = repo
+	t.Cleanup(func() { repoPaths = oldRepoPaths })
+
+	owners := map[string]string{
+		"aarch64-gtk+3": "/usr/aarch64-linux-gnu/lib/libgtk-3.so.0",
+		"aarch64-cups":  "/usr/aarch64-linux-gnu/lib/libcups.so.2",
+		"aarch64-gcc":   "/usr/aarch64-linux-gnu/lib64/libgcc_s.so.1",
+		"libgcc":        "/usr/lib/libgcc_s.so.1",
+	}
+	for owner, path := range owners {
+		if err := os.MkdirAll(filepath.Join(dbRoot, owner), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dbRoot, owner, "manifest"), []byte(path+" -\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(targetDir, "libdeps"), []byte("elf64:libgtk-3.so.0\nelf64:libcups.so.2\nelf64:libgcc_s.so.1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	oldScan := libDepsByMachine
+	libDepsByMachine = func(_ string, machine elf.Machine) (map[string]libDepMachineUse, error) {
+		if machine != elf.EM_AARCH64 {
+			return nil, nil
+		}
+		return map[string]libDepMachineUse{
+			"elf64:libgtk-3.so.0": {target: true},
+			"elf64:libcups.so.2":  {target: true},
+			"elf64:libgcc_s.so.1": {target: true},
+		}, nil
+	}
+	t.Cleanup(func() { libDepsByMachine = oldScan })
+
+	execCtx := &Executor{Context: context.Background()}
+	if err := generateDepends("libdecor", pkgDir, outputDir, outputDir, execCtx, false); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(targetDir, "depends"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := strings.Fields(string(data))
+	sort.Strings(got)
+	if want := []string{"gtk+3", "libcups", "libgcc"}; strings.Join(got, " ") != strings.Join(want, " ") {
+		t.Fatalf("depends = %v, want %v", got, want)
+	}
+}

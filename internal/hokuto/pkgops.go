@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -587,6 +588,22 @@ func generateDepends(pkgName, pkgDir, outputDir, rootDir string, execCtx *Execut
 				machineUses = uses
 			}
 		}
+		// A native package cross built for another architecture (libdecor
+		// for aarch64 with -cross=arm64) is unprefixed, but its files are for
+		// that architecture, and the libraries they link live in the
+		// sysroot's aarch64-* packages. foreignPrefix names those.
+		foreignPrefix := ""
+		if targetPrefix == "" && len(libdeps) > 0 {
+			foreignPrefix = nativeCrossTargetPrefix(outputDir)
+		}
+		libKey := func(lib libDepRef) string {
+			if lib.ABI != "" {
+				return lib.ABI + ":" + lib.Name
+			}
+			return lib.Name
+		}
+		hostServed := make(map[string]bool)
+		sysrootOwners := make(map[string][]string)
 		ownerServesLib := func(owner string, lib libDepRef) bool {
 			if targetPrefix == "" {
 				return true
@@ -656,12 +673,35 @@ func generateDepends(pkgName, pkgDir, outputDir, rootDir string, execCtx *Execut
 							if libDepIgnores.ignoresPackage(otherPkg) {
 								break
 							}
+							if foreignPrefix != "" {
+								if strings.HasPrefix(otherPkg, foreignPrefix) {
+									sysrootOwners[libKey(lib)] = append(sysrootOwners[libKey(lib)], otherPkg)
+									break
+								}
+								hostServed[libKey(lib)] = true
+							}
 							names := equivalentDependencyNames(otherPkg, pkgName)
 							libDepSet[otherPkg] = strings.Join(names, " | ")
 							break // Found the owner, move to the next library
 						}
 					}
 				}
+			}
+
+			// A library of a native cross package that only the sysroot
+			// provides is a dependency on the target package of the same
+			// recipe. A host package owning the same soname already names it
+			// (libgcc for libgcc_s, which aarch64-gcc ships in the sysroot).
+			for key, owners := range sysrootOwners {
+				if hostServed[key] {
+					continue
+				}
+				sort.Strings(owners)
+				name := nativeNameForSysrootOwner(owners[0], foreignPrefix, key)
+				if name == "" || name == pkgName || libDepIgnores.ignoresPackage(name) {
+					continue
+				}
+				libDepSet[name] = strings.Join(equivalentDependencyNames(name, pkgName), " | ")
 			}
 		}
 	}
@@ -1557,4 +1597,54 @@ func smudgeLFSFile(filePath, gitRoot string) error {
 	}
 
 	return nil
+}
+
+// nativeCrossTargetPrefix returns the arch prefix of the machine an
+// unprefixed package's ELF files were built for when that is not the build
+// host's ("aarch64-" for a -cross=arm64 package built on x86_64), else "".
+func nativeCrossTargetPrefix(outputDir string) string {
+	host := "x86_64-"
+	if runtime.GOARCH == "arm64" {
+		host = "aarch64-"
+	}
+	for _, prefix := range []string{"aarch64-", "x86_64-"} {
+		if prefix == host {
+			continue
+		}
+		machine, _ := elfMachineForArchPrefix(prefix)
+		uses, err := libDepsByMachine(outputDir, machine)
+		if err != nil {
+			continue
+		}
+		for _, use := range uses {
+			if use.target {
+				return prefix
+			}
+		}
+	}
+	return ""
+}
+
+// nativeNameForSysrootOwner names the native package that provides, on the
+// target, a library the sysroot package owner (aarch64-cups) ships: the
+// recipe's split output named after the library (libcups for libcups.so.2)
+// when there is one, else the recipe's own package.
+func nativeNameForSysrootOwner(owner, prefix, libKey string) string {
+	base := strings.TrimPrefix(owner, prefix)
+	lib := libKey
+	if i := strings.LastIndex(lib, ":"); i >= 0 {
+		lib = lib[i+1:]
+	}
+	stem := lib
+	if i := strings.Index(stem, ".so"); i > 0 {
+		stem = stem[:i]
+	}
+	if pkgDir, err := findPackageMetadataDir(base); err == nil {
+		for _, split := range splitPackageNamesFromDir(pkgDir) {
+			if split == stem {
+				return split
+			}
+		}
+	}
+	return base
 }
