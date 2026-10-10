@@ -4939,7 +4939,11 @@ func handleBuildCommand(args []string, cfg *Config) (err error) {
 							return
 						}
 						if sourcePkg, ok := findSplitDependencySource(depPkg); ok {
-							if !binaryDeclined[depPkg] && dependencyBinaryAvailable(depPkg, depCfg, *noRemote) {
+							// The run builds its source anyway: the split comes
+							// from that build, as a recipe's own package does,
+							// not from the mirror (a python-rebuild check got
+							// the old python-uv-build while rebuilding uv).
+							if !packagesThatMustBeBuilt[sourcePkg] && !binaryDeclined[depPkg] && dependencyBinaryAvailable(depPkg, depCfg, *noRemote) {
 								if useAvailableBuildDependencyBinary(*promptBinaryDeps, "Dependency '%s' is missing. Use available binary package?", depPkg) {
 									depInstalls = append(depInstalls, buildDepInstall{name: depPkg, cfg: depCfg, splitSource: sourcePkg})
 									return
