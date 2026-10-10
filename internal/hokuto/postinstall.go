@@ -5,10 +5,13 @@ package hokuto
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
@@ -51,7 +54,12 @@ func PostInstallTasks(execCtx *Executor, logger io.Writer) error {
 		//{"update-mime-database", []string{"/usr/share/mime"}},
 		{"update-desktop-database", []string{"/usr/share/applications"}},
 		{"fc-cache", nil},
-		{"gtk-update-icon-cache", []string{"-q", "-t", "-f", "/usr/share/icons/hicolor"}},
+	}
+	for _, themeDir := range staleIconThemeCaches(iconThemesDir) {
+		tasks = append(tasks, struct {
+			name string
+			args []string
+		}{"gtk-update-icon-cache", []string{"-q", "-t", "-f", themeDir}})
 	}
 
 	// Run systemctl, systemd-sysusers, and systemd-tmpfiles sequentially first.
@@ -174,4 +182,58 @@ func PostInstallTasks(execCtx *Executor, logger io.Writer) error {
 	}
 
 	return nil
+}
+
+// iconThemesDir holds the icon themes whose caches PostInstallTasks keeps
+// current.
+var iconThemesDir = "/usr/share/icons"
+
+// staleIconThemeCaches returns the icon themes under iconsDir whose
+// icon-theme.cache is missing or older than one of the theme's directories,
+// which is how GTK itself decides to ignore a cache. A theme directory left
+// with nothing but its cache, by uninstalling the theme, loses the cache and
+// the directory.
+func staleIconThemeCaches(iconsDir string) []string {
+	entries, err := os.ReadDir(iconsDir)
+	if err != nil {
+		return nil
+	}
+	var stale []string
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		themeDir := filepath.Join(iconsDir, entry.Name())
+		cachePath := filepath.Join(themeDir, "icon-theme.cache")
+		if _, err := os.Stat(filepath.Join(themeDir, "index.theme")); err != nil {
+			// gtk-update-icon-cache refuses a directory without an index.
+			if contents, err := os.ReadDir(themeDir); err == nil &&
+				len(contents) == 1 && contents[0].Name() == "icon-theme.cache" {
+				if err := os.Remove(cachePath); err == nil {
+					_ = os.Remove(themeDir)
+				}
+			}
+			continue
+		}
+		cacheInfo, err := os.Stat(cachePath)
+		if err != nil {
+			stale = append(stale, themeDir)
+			continue
+		}
+		cacheTime := cacheInfo.ModTime()
+		newer := errors.New("directory newer than the icon cache")
+		walkErr := filepath.WalkDir(themeDir, func(path string, d fs.DirEntry, err error) error {
+			if err != nil || !d.IsDir() {
+				return nil
+			}
+			if info, err := d.Info(); err == nil && info.ModTime().After(cacheTime) {
+				return newer
+			}
+			return nil
+		})
+		if walkErr == newer {
+			stale = append(stale, themeDir)
+		}
+	}
+	return stale
 }
