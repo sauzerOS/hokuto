@@ -457,44 +457,59 @@ func pythonRebuildBuildAll(marked map[string]string, current string, buildArgs [
 	colArrow.Print("-> ")
 	colSuccess.Printf("Rebuilding %d package(s) against python %s\n", len(marked), current)
 
+	oldPath, hadPath := os.LookupEnv("PYTHONPATH")
+	restorePath := func() {
+		if hadPath {
+			os.Setenv("PYTHONPATH", oldPath)
+		} else {
+			os.Unsetenv("PYTHONPATH")
+		}
+	}
+	defer restorePath()
+
 	if len(bootstrap) > 0 {
-		var installed []string
+		// The new python sees none of the build tools: their packages are
+		// built for the old one, and a build container has them installed
+		// only while a build needs them. Install the published ones, so their
+		// pure-Python code runs on the new python from PYTHONPATH (see
+		// pythonBootstrapPath) while they are rebuilt.
 		for _, name := range bootstrap {
-			if isPackageInstalled(name) {
-				installed = append(installed, name)
+			if !isPackageInstalled(name) {
+				if _, err := ensurePackageInstalled(name, cfg, false); err != nil {
+					colWarn.Printf("Warning: failed to install the published %s: %v\n", name, err)
+				}
 			}
 		}
-		path, err := pythonBootstrapPath(installed, current)
-		if err != nil {
-			colWarn.Printf("Warning: failed to prepare the old build tools: %v\n", err)
-		}
+		order := pythonBootstrapOrder(bootstrap, marked)
 		colArrow.Print("-> ")
-		colSuccess.Printf("Building the Python build tools first: %s\n", strings.Join(bootstrap, " "))
-		if path != "" {
-			oldPath, hadPath := os.LookupEnv("PYTHONPATH")
-			os.Setenv("PYTHONPATH", path)
-			defer func() {
-				if hadPath {
-					os.Setenv("PYTHONPATH", oldPath)
-				} else {
-					os.Unsetenv("PYTHONPATH")
-				}
-				os.RemoveAll(path)
-			}()
+		colSuccess.Printf("Building the Python build tools first: %s\n", strings.Join(order, " "))
+		// One at a time, each installed before the next, with PYTHONPATH made
+		// afresh from the old copies still installed: a tool once rebuilt
+		// replaced its old copy, and a link left to it would shadow the new
+		// one (a dangling setuptools .dist-info hid its entry points).
+		for _, name := range order {
+			cleanup := setPythonBootstrapPath(bootstrap, current)
+			args := append(append(append([]string{}, buildArgs...), "--no-install"), name)
+			if err := handleBuildCommand(args, cfg); err != nil {
+				debugf("python-rebuild: bootstrap build of %s: %v\n", name, err)
+			}
+			installBuiltRecipes([]string{name}, cfg)
+			cleanup()
 		}
-		args := append(append(append([]string{}, buildArgs...), "--no-install"), bootstrap...)
-		if err := handleBuildCommand(args, cfg); err != nil {
-			debugf("python-rebuild: bootstrap build: %v\n", err)
-		}
-		installBuiltRecipes(bootstrap, cfg)
-		if path != "" {
-			os.Unsetenv("PYTHONPATH")
+		for _, name := range bootstrap {
+			if !builtRecipePackage(BinDir, name, marked[name]) {
+				colWarn.Printf("Warning: %s did not rebuild; the rest uses its old copy\n", name)
+			}
 		}
 	}
 
 	// What one of the rest needs from another is built and installed on the
-	// way; the rest is not installed.
+	// way; the rest is not installed. A build tool that did not rebuild keeps
+	// its old copy on PYTHONPATH, so its failure is reported once rather than
+	// failing every package that uses it.
 	if len(rest) > 0 {
+		cleanup := setPythonBootstrapPath(bootstrap, current)
+		defer cleanup()
 		colArrow.Print("-> ")
 		colSuccess.Printf("Building the remaining %d package(s)\n", len(rest))
 		args := append(append(append([]string{}, buildArgs...), "--no-install"), rest...)
@@ -502,6 +517,105 @@ func pythonRebuildBuildAll(marked map[string]string, current string, buildArgs [
 			debugf("python-rebuild: build: %v\n", err)
 		}
 	}
+}
+
+// setPythonBootstrapPath points PYTHONPATH at the old-Python copies of the
+// tools among pkgs still installed, or unsets it when there are none. The
+// returned function removes the link directory.
+func setPythonBootstrapPath(pkgs []string, current string) func() {
+	path, err := pythonBootstrapPath(pkgs, current)
+	if err != nil {
+		colWarn.Printf("Warning: failed to prepare the old build tools: %v\n", err)
+	}
+	if path == "" {
+		os.Unsetenv("PYTHONPATH")
+		return func() {}
+	}
+	os.Setenv("PYTHONPATH", path)
+	return func() { os.RemoveAll(path) }
+}
+
+// pythonBootstrapOrder sorts the build tools so each comes after the tools
+// among them it depends on (build-time dependencies included); ties, and
+// tools caught in a cycle, go in name order.
+func pythonBootstrapOrder(tools []string, marked map[string]string) []string {
+	inSet := make(map[string]bool, len(tools))
+	for _, name := range tools {
+		inSet[name] = true
+	}
+	needs := make(map[string]map[string]bool, len(tools))
+	for _, name := range tools {
+		needs[name] = make(map[string]bool)
+		deps, err := parseDependsFile(marked[name])
+		if err != nil {
+			continue
+		}
+		for _, dep := range deps {
+			if dep.Cross || dep.CrossNative || dep.Suggest || dep.Optional {
+				continue
+			}
+			names := dep.Alternatives
+			if len(names) == 0 {
+				names = []string{dep.Name}
+			}
+			for _, n := range names {
+				if inSet[n] && n != name {
+					needs[name][n] = true
+				}
+			}
+		}
+	}
+	var order []string
+	done := make(map[string]bool, len(tools))
+	for len(order) < len(tools) {
+		progressed := false
+		for _, name := range sortedKeys(inSet) {
+			if done[name] {
+				continue
+			}
+			ready := true
+			for dep := range needs[name] {
+				if !done[dep] {
+					ready = false
+					break
+				}
+			}
+			if ready {
+				order = append(order, name)
+				done[name] = true
+				progressed = true
+			}
+		}
+		if !progressed {
+			// A cycle (flit-core and installer build each other): break it
+			// with the tool that waits for the fewest others, its old copy
+			// standing in for the rest.
+			// Ties go to the tool more of the others wait for.
+			pick, fewest, mostWaiting := "", -1, -1
+			for _, name := range sortedKeys(inSet) {
+				if done[name] {
+					continue
+				}
+				unmet, waiting := 0, 0
+				for dep := range needs[name] {
+					if !done[dep] {
+						unmet++
+					}
+				}
+				for other := range inSet {
+					if !done[other] && needs[other][name] {
+						waiting++
+					}
+				}
+				if fewest < 0 || unmet < fewest || (unmet == fewest && waiting > mostWaiting) {
+					pick, fewest, mostWaiting = name, unmet, waiting
+				}
+			}
+			order = append(order, pick)
+			done[pick] = true
+		}
+	}
+	return order
 }
 
 // installBuiltRecipes installs the packages just built of recipes, from

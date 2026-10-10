@@ -242,3 +242,42 @@ func TestCommandHelpNeedsNoRoot(t *testing.T) {
 		t.Error("the commands themselves still need root")
 	}
 }
+
+func TestPythonBootstrapOrder(t *testing.T) {
+	dir := t.TempDir()
+	marked := map[string]string{}
+	for name, depends := range map[string]string{
+		"python-installer":       "python\npython-flit-core make\n",
+		"python-flit-core":       "python\npython-build make\npython-installer make\n",
+		"python-packaging":       "python\npython-flit-core make\n",
+		"python-build":           "python\npython-packaging\npython-pyproject-hooks\n",
+		"python-setuptools":      "python\npython-build make\npython-wheel make\n",
+		"python-wheel":           "python\npython-packaging\n",
+		"meson":                  "python\npython-setuptools make\n",
+		"python-pyproject-hooks": "python\npython-flit-core make\n",
+	} {
+		marked[name] = filepath.Join(dir, name)
+		writeTree(t, marked[name], map[string]string{"depends": depends})
+	}
+	got := pythonBootstrapOrder(sortedKeys(keysOf(marked)), marked)
+	pos := map[string]int{}
+	for i, name := range got {
+		pos[name] = i
+	}
+	if len(got) != len(marked) {
+		t.Fatalf("order %v lost tools", got)
+	}
+	// Edges outside the cycles (flit-core, installer, build and
+	// pyproject-hooks build each other); inside one any order works, the
+	// old copies standing in.
+	for _, edge := range [][2]string{
+		{"python-packaging", "python-wheel"},
+		{"python-wheel", "python-setuptools"},
+		{"python-setuptools", "meson"},
+		{"python-build", "python-setuptools"},
+	} {
+		if pos[edge[0]] > pos[edge[1]] {
+			t.Errorf("%s comes after %s in %v", edge[0], edge[1], got)
+		}
+	}
+}
