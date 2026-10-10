@@ -400,6 +400,25 @@ func pythonUpgradeCheck(from string, onlyFailed bool, buildArgs []string, cfg *C
 	}
 	oldBinDir := BinDir
 	BinDir = scratch
+
+	// The whole log of each failed build, for fixing it: the terminal shows
+	// only the last lines. The previous check's logs go.
+	logDir := filepath.Join(CacheDir, "python-rebuild-logs")
+	if !onlyFailed {
+		os.RemoveAll(logDir)
+	}
+	for _, name := range sortedKeys(keysOf(marked)) {
+		os.Remove(filepath.Join(logDir, name+".log"))
+	}
+	oldLogDir, hadLogDir := os.LookupEnv(failedBuildLogDirEnv)
+	os.Setenv(failedBuildLogDirEnv, logDir)
+	defer func() {
+		if hadLogDir {
+			os.Setenv(failedBuildLogDirEnv, oldLogDir)
+		} else {
+			os.Unsetenv(failedBuildLogDirEnv)
+		}
+	}()
 	defer func() {
 		BinDir = oldBinDir
 		os.RemoveAll(scratch)
@@ -462,7 +481,9 @@ func pythonUpgradeCheck(from string, onlyFailed bool, buildArgs []string, cfg *C
 		fmt.Printf("   %s\n", name)
 	}
 	colArrow.Print("-> ")
-	colNote.Println("Fix them and check again, or bump anyway with: hokuto-builder python-rebuild --confirm --force")
+	colNote.Printf("Build logs of the failures: %s\n", logDir)
+	colArrow.Print("-> ")
+	colNote.Println("Fix them and check again (--check --failed), or bump anyway with: hokuto-builder python-rebuild --confirm --force")
 	return fmt.Errorf("%d package(s) failed", len(failed))
 }
 

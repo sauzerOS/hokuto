@@ -3281,6 +3281,7 @@ func runPkgBuild(pkgName string, cfg *Config, execCtx *Executor, opts BuildOptio
 
 		// Path to the build log (script creates and writes to this file)
 		logPath := filepath.Join(logDir, "build-log.txt")
+		keepFailedBuildLog(logPath, pkgName)
 
 		if opts.UpdateWebsite {
 			UpdateWebsiteStatus(WebsiteBuildResult{
@@ -5973,4 +5974,28 @@ func normalizeCrossSystemTargets(pkgs []string, cfg *Config) []string {
 		}
 	}
 	return out
+}
+
+// failedBuildLogDirEnv names a directory that keeps the whole log of every
+// failed build (the terminal shows its last lines only, and the build tree
+// is removed): hokuto python-rebuild check sets it.
+const failedBuildLogDirEnv = "HOKUTO_FAILED_LOG_DIR"
+
+// keepFailedBuildLog copies a failed build's log to HOKUTO_FAILED_LOG_DIR as
+// <pkgName>.log, when that is set.
+func keepFailedBuildLog(logPath, pkgName string) {
+	dir := os.Getenv(failedBuildLogDirEnv)
+	if dir == "" {
+		return
+	}
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		return
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return
+	}
+	if err := os.WriteFile(filepath.Join(dir, pkgName+".log"), data, 0o644); err != nil {
+		debugf("Warning: failed to keep the build log of %s: %v\n", pkgName, err)
+	}
 }
