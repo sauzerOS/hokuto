@@ -2016,6 +2016,9 @@ func SyncPkgDB(cfg *Config) error {
 			tempFile, _ := os.CreateTemp("", "pkg-db-sync-*.zst")
 			_ = os.WriteFile(tempFile.Name(), data, 0644)
 			tempFile.Close()
+			// CreateTemp makes the file 0600, which WriteFile keeps: the
+			// database moved into place would be readable by its owner only.
+			_ = os.Chmod(tempFile.Name(), 0644)
 			mvCmd := exec.Command("mv", tempFile.Name(), PkgDBPath)
 			err = RootExec.Run(mvCmd)
 		}
