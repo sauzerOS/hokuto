@@ -2202,6 +2202,25 @@ func prepareVersionedPlanSources(packages []string) error {
 	return nil
 }
 
+// completeVersionedPlanSources extracts in full, before parallel workers
+// start, the historical recipes the plan builds from source: planning
+// extracted only what it reads (completeVersionedPackageDir).
+func completeVersionedPlanSources(plan *BuildPlan) error {
+	for _, pkgName := range plan.Order {
+		if plan.BinaryPackages[pkgName] {
+			continue
+		}
+		pkgDir, ok := versionedPkgDirs[pkgName]
+		if !ok {
+			continue
+		}
+		if err := completeVersionedPackageDir(pkgDir, false); err != nil {
+			return fmt.Errorf("failed to extract the historical source of %s: %w", pkgName, err)
+		}
+	}
+	return nil
+}
+
 // compareVersions compares two version strings split by dots. Numeric segments are compared numerically; non-numeric fall back to lexicographic.
 // Returns -1 if a<b, 0 if equal, 1 if a>b.
 

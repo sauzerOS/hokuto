@@ -3628,3 +3628,90 @@ func TestResolveMakeAlternativePrefersBinaryWithoutPrompt(t *testing.T) {
 		})
 	}
 }
+
+func TestVersionedPackageExtractsRecipeFilesOnlyForABuild(t *testing.T) {
+	_, repo := withTempDependencyRepo(t)
+	oldTmpDir := HokutoTmpDir
+	HokutoTmpDir = t.TempDir()
+	t.Cleanup(func() { HokutoTmpDir = oldTmpDir })
+
+	pkgDir := filepath.Join(repo, "glibmm")
+	git := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = repo
+		if output, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v failed: %v\n%s", args, err, output)
+		}
+	}
+	write := func(name, data string) {
+		t.Helper()
+		path := filepath.Join(pkgDir, name)
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(data), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	git("init", "-q")
+	git("config", "user.name", "Hokuto Test")
+	git("config", "user.email", "hokuto@example.invalid")
+	write("version", "2.66.10 1\n")
+	write("depends", "libsigc++<3\n")
+	write("build", "#!/bin/sh\n")
+	write("sources", "https://example.invalid/glibmm-2.66.10.tar.xz\n")
+	write("checksums", "abc  glibmm-2.66.10.tar.xz\n")
+	write("files/fix.patch", "--- a\n+++ b\n")
+	write("split/glibmm-doc/depends", "glibmm\n")
+	git("add", "glibmm")
+	git("commit", "-q", "-m", "glibmm 2.66")
+	write("version", "2.88.0 1\n")
+	git("add", "glibmm/version")
+	git("commit", "-q", "-m", "glibmm 2.88")
+
+	resolved, err := prepareVersionedPackage("glibmm@==2.66*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { delete(versionedPkgDirs, resolved) })
+	if resolved != "glibmm-2.66" {
+		t.Fatalf("unexpected resolved name: %s", resolved)
+	}
+	dir := versionedPkgDirs[resolved]
+	exists := func(name string) bool {
+		_, err := os.Stat(filepath.Join(dir, name))
+		return err == nil
+	}
+	for _, name := range []string{"version", "depends", "build", "sources", "split/glibmm-doc/depends"} {
+		if !exists(name) {
+			t.Fatalf("planning needs %s extracted", name)
+		}
+	}
+	for _, name := range []string{"checksums", "files/fix.patch"} {
+		if exists(name) {
+			t.Fatalf("%s must wait until the release is built", name)
+		}
+	}
+	if version, _, err := getRepoVersion2(resolved); err != nil || version != "2.66.10" {
+		t.Fatalf("expected the historical version, got %q (%v)", version, err)
+	}
+
+	if err := completeVersionedPackageDir(dir, true); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"checksums", "files/fix.patch"} {
+		if !exists(name) {
+			t.Fatalf("a build needs %s extracted", name)
+		}
+	}
+	if exists(versionedPartialMarker) {
+		t.Fatal("a complete recipe must not stay marked partial")
+	}
+	if err := completeVersionedPackageDir(dir, true); err != nil {
+		t.Fatalf("completing again must do nothing: %v", err)
+	}
+	if err := completeVersionedPackageDir(pkgDir, true); err != nil {
+		t.Fatalf("a repository recipe must be left alone: %v", err)
+	}
+}

@@ -1401,6 +1401,9 @@ func fetchSourcesQuiet(pkgName, pkgDir string, processGit bool) error {
 }
 
 func fetchSourcesWithOptions(pkgName, pkgDir string, processGit bool, quiet bool) error {
+	if err := completeVersionedPackageDir(pkgDir, quiet); err != nil {
+		return fmt.Errorf("failed to extract the historical source of %s: %w", pkgName, err)
+	}
 	data, err := os.ReadFile(filepath.Join(pkgDir, "sources"))
 	if err != nil {
 		return fmt.Errorf("could not read sources file: %v", err)

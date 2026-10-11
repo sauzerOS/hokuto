@@ -6,6 +6,8 @@ package hokuto
 import (
 	"bufio"
 	"bytes"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -1360,30 +1362,126 @@ func prepareVersionedPackage(arg string) (string, error) {
 		}
 	}
 
-	// 4. Extract the package files from the commit
+	// 4. Extract the package files from the commit: only what planning reads
+	// now, the rest once a build needs it (completeVersionedPackageDir). A
+	// release whose binary is installed is never built.
 	tmpBase := filepath.Join(HokutoTmpDir, "tmprepo")
 	os.MkdirAll(tmpBase, 0o755)
 
 	finalTmpDir := filepath.Join(tmpBase, fmt.Sprintf("%s-%s-%s", pkgName, ver, foundCommit[:8]))
-	// If already extracted, we can reuse it
-	if _, err := os.Stat(finalTmpDir); err == nil {
+	register := func() {
 		versionedPkgDirs[renamedPkgName] = finalTmpDir
 		registerParallelPackageName(renamedPkgName, pkgName)
 		registerParallelPackageVersion(renamedPkgName, foundVersion)
+	}
+	// If already extracted, we can reuse it
+	if _, err := os.Stat(finalTmpDir); err == nil {
+		register()
 		return renamedPkgName, nil
 	}
 
 	if err := os.MkdirAll(finalTmpDir, 0755); err != nil {
 		return arg, fmt.Errorf("failed to create temporary directory %s: %w", finalTmpDir, err)
 	}
+	source := versionedSource{
+		GitRoot: gitRoot,
+		Commit:  foundCommit,
+		RelPath: relPath,
+		Package: pkgName,
+		Version: foundVersion,
+		Name:    renamedPkgName,
+	}
+	if err := extractVersionedFiles(source, finalTmpDir, isVersionedMetadataFile); err != nil {
+		os.RemoveAll(finalTmpDir)
+		return arg, err
+	}
+	data, err := json.Marshal(source)
+	if err == nil {
+		err = os.WriteFile(filepath.Join(finalTmpDir, versionedPartialMarker), data, 0o644)
+	}
+	if err != nil {
+		os.RemoveAll(finalTmpDir)
+		return arg, fmt.Errorf("failed to record the historical source of %s: %w", renamedPkgName, err)
+	}
 
-	// 5. Extract all tracked files using git ls-tree and git show
-	// This avoids issues with .gitattributes export-ignore or archive settings.
-	lsCmd := exec.Command("git", "ls-tree", "-r", foundCommit+":"+relPath)
-	lsCmd.Dir = gitRoot
+	register()
+	return renamedPkgName, nil
+}
+
+// versionedSource is a recipe release found in Git history.
+type versionedSource struct {
+	GitRoot string `json:"git_root"`
+	Commit  string `json:"commit"`
+	RelPath string `json:"rel_path"`
+	Package string `json:"package"`
+	Version string `json:"version"`
+	Name    string `json:"name"`
+}
+
+// versionedPartialMarker is in a historical recipe directory holding only the
+// files planning reads; it records where the rest is.
+const versionedPartialMarker = ".hokuto-partial"
+
+var completeVersionedMu sync.Mutex
+
+// isVersionedMetadataFile reports whether planning reads a recipe file:
+// version, dependencies, options, split outputs, metadata, and the build
+// script and source list, which some checks look at. Patches and other
+// recipe files, Git LFS objects among them, wait for a build.
+func isVersionedMetadataFile(name string) bool {
+	switch name {
+	case "version", "depends", "options", "metadata.json", "build", "sources":
+		return true
+	}
+	if strings.HasPrefix(name, "depends.") || strings.HasPrefix(name, "options.") {
+		return true
+	}
+	parts := strings.Split(name, "/")
+	return len(parts) == 3 && parts[0] == "split" && parts[2] == "depends"
+}
+
+// completeVersionedPackageDir extracts the rest of a historical recipe that
+// prepareVersionedPackage extracted for planning only, before it is built.
+// Other directories are left alone. quiet keeps it off the terminal.
+func completeVersionedPackageDir(pkgDir string, quiet bool) error {
+	completeVersionedMu.Lock()
+	defer completeVersionedMu.Unlock()
+	markerPath := filepath.Join(pkgDir, versionedPartialMarker)
+	data, err := os.ReadFile(markerPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	var source versionedSource
+	if err := json.Unmarshal(data, &source); err != nil {
+		return fmt.Errorf("invalid %s: %w", markerPath, err)
+	}
+	if err := extractVersionedFiles(source, pkgDir, func(name string) bool { return !isVersionedMetadataFile(name) }); err != nil {
+		return err
+	}
+	if err := os.Remove(markerPath); err != nil {
+		return err
+	}
+	if quiet {
+		return nil
+	}
+	colArrow.Print("-> ")
+	colSuccess.Printf("Extracted %s@%s (as %s) from commit %s into temporary directory\n", source.Package, source.Version, source.Name, source.Commit[:8])
+	return nil
+}
+
+// extractVersionedFiles writes the files of a historical recipe that want
+// selects into dir, resolving Git LFS pointers and keeping executable bits.
+func extractVersionedFiles(source versionedSource, dir string, want func(name string) bool) error {
+	// Extract tracked files using git ls-tree and git show. This avoids
+	// issues with .gitattributes export-ignore or archive settings.
+	lsCmd := exec.Command("git", "ls-tree", "-r", source.Commit+":"+source.RelPath)
+	lsCmd.Dir = source.GitRoot
 	lsOut, err := lsCmd.Output()
 	if err != nil {
-		return arg, fmt.Errorf("failed to list files in git history for %s: %w", relPath, err)
+		return fmt.Errorf("failed to list files in git history for %s: %w", source.RelPath, err)
 	}
 
 	// Check if git-lfs is available for resolving LFS pointers
@@ -1406,32 +1504,33 @@ func prepareVersionedPackage(arg string) (string, error) {
 		}
 		modeStr := infoFields[0]
 		fileName := parts[1]
+		if !want(fileName) {
+			continue
+		}
 
-		targetFilePath := filepath.Join(finalTmpDir, fileName)
+		targetFilePath := filepath.Join(dir, fileName)
 		os.MkdirAll(filepath.Dir(targetFilePath), 0o755)
 
-		showCmd := exec.Command("git", "show", fmt.Sprintf("%s:%s/%s", foundCommit, relPath, fileName))
-		showCmd.Dir = gitRoot
+		showCmd := exec.Command("git", "show", fmt.Sprintf("%s:%s/%s", source.Commit, source.RelPath, fileName))
+		showCmd.Dir = source.GitRoot
 
 		outF, err := os.Create(targetFilePath)
 		if err != nil {
-			return arg, fmt.Errorf("failed to create file %s: %w", targetFilePath, err)
+			return fmt.Errorf("failed to create file %s: %w", targetFilePath, err)
 		}
 
 		showCmd.Stdout = outF
 		if err := showCmd.Run(); err != nil {
 			outF.Close()
-			return arg, fmt.Errorf("failed to extract file %s from git: %w", fileName, err)
+			return fmt.Errorf("failed to extract file %s from git: %w", fileName, err)
 		}
 		outF.Close()
 
 		// Check if the extracted file is a Git LFS pointer and resolve it
-		if hasGitLFS {
-			if isLFSPointer(targetFilePath) {
-				debugf("Resolving LFS pointer for %s\n", fileName)
-				if err := smudgeLFSFile(targetFilePath, gitRoot); err != nil {
-					colWarn.Printf("Warning: failed to resolve LFS file %s: %v\n", fileName, err)
-				}
+		if hasGitLFS && isLFSPointer(targetFilePath) {
+			debugf("Resolving LFS pointer for %s\n", fileName)
+			if err := smudgeLFSFile(targetFilePath, source.GitRoot); err != nil {
+				colWarn.Printf("Warning: failed to resolve LFS file %s: %v\n", fileName, err)
 			}
 		}
 
@@ -1445,16 +1544,9 @@ func prepareVersionedPackage(arg string) (string, error) {
 	}
 
 	if err := scanner.Err(); err != nil {
-		return arg, fmt.Errorf("error reading git ls-tree output: %w", err)
+		return fmt.Errorf("error reading git ls-tree output: %w", err)
 	}
-
-	versionedPkgDirs[renamedPkgName] = finalTmpDir
-	registerParallelPackageName(renamedPkgName, pkgName)
-	registerParallelPackageVersion(renamedPkgName, foundVersion)
-	colArrow.Print("-> ")
-	colSuccess.Printf("Extracted %s@%s (as %s) from commit %s into temporary directory\n", pkgName, foundVersion, renamedPkgName, foundCommit[:8])
-
-	return renamedPkgName, nil
+	return nil
 }
 
 // prepareVersionedPackageMajor reconstructs the newest source release whose

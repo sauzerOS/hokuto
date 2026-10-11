@@ -2292,6 +2292,9 @@ func runPkgBuild(pkgName string, cfg *Config, execCtx *Executor, opts BuildOptio
 	if err != nil {
 		return 0, fmt.Errorf("package %s not found in HOKUTO_PATH: %v", pkgName, err)
 	}
+	if err := completeVersionedPackageDir(pkgDir, opts.Quiet); err != nil {
+		return 0, fmt.Errorf("failed to extract the historical source of %s: %w", pkgName, err)
+	}
 
 	// NEW: Load build options (consolidated from 'options' file or individual files)
 	options := loadBuildOptions(pkgDir)
@@ -3473,6 +3476,9 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 	pkgDir, err := findPackageDir(pkgName)
 	if err != nil {
 		return fmt.Errorf("package %s not found in HOKUTO_PATH: %w", pkgName, err)
+	}
+	if err := completeVersionedPackageDir(pkgDir, false); err != nil {
+		return fmt.Errorf("failed to extract the historical source of %s: %w", pkgName, err)
 	}
 
 	// NEW: Load build options (consolidated from 'options' file or individual files)
@@ -5156,6 +5162,9 @@ func handleBuildCommand(args []string, cfg *Config) (err error) {
 				return nil
 			}
 			if err := prepareVersionedPlanSources(initialPlan.Order); err != nil {
+				return err
+			}
+			if err := completeVersionedPlanSources(initialPlan); err != nil {
 				return err
 			}
 
