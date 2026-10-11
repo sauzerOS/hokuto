@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 
 	"golang.org/x/term"
@@ -136,8 +137,39 @@ func WritePackageInfo(stagingDir, pkgName, pkgVer, pkgRev, arch, cflags string, 
 	return nil
 }
 
+// privateKeyCache holds the keys getPrivateKey read, by path: reading one
+// may take root, which an interrupt cancels, and a long upload signs its
+// index at the end (see handleUploadCommand).
+var privateKeyCache = struct {
+	sync.Mutex
+	keys map[string]ed25519.PrivateKey
+}{keys: make(map[string]ed25519.PrivateKey)}
+
 // getPrivateKey loads the Ed25519 private key based on activeKeyID.
 func getPrivateKey() (ed25519.PrivateKey, error) {
+	keyPath := privateKeyPath()
+	privateKeyCache.Lock()
+	defer privateKeyCache.Unlock()
+	if key, ok := privateKeyCache.keys[keyPath]; ok {
+		return key, nil
+	}
+	key, err := readPrivateKey(keyPath)
+	if err != nil {
+		return nil, err
+	}
+	privateKeyCache.keys[keyPath] = key
+	return key, nil
+}
+
+// forgetPrivateKeys drops the cached keys, after a key is written.
+func forgetPrivateKeys() {
+	privateKeyCache.Lock()
+	defer privateKeyCache.Unlock()
+	clear(privateKeyCache.keys)
+}
+
+// privateKeyPath is where the private key of activeKeyID is.
+func privateKeyPath() string {
 	keyPath := filepath.Join(DefaultKeyDir, activeKeyID+".key")
 	if root := os.Getenv("HOKUTO_ROOT"); root != "" {
 		keyPath = filepath.Join(root, "etc", "hokuto", "keys", activeKeyID+".key")
@@ -150,7 +182,11 @@ func getPrivateKey() (ed25519.PrivateKey, error) {
 			keyPath = filepath.Join(root, "etc", "hokuto", "keys", "hokuto.key")
 		}
 	}
+	return keyPath
+}
 
+// readPrivateKey reads the private key at keyPath, as root when needed.
+func readPrivateKey(keyPath string) (ed25519.PrivateKey, error) {
 	keyData, err := os.ReadFile(keyPath)
 	if err != nil {
 		// Try reading as root if permission denied
@@ -187,6 +223,7 @@ func getPrivateKey() (ed25519.PrivateKey, error) {
 
 // GenerateKeyPair generates a new Ed25519 key pair and saves it.
 func GenerateKeyPair(id string, execCtx *Executor) error {
+	defer forgetPrivateKeys()
 	pub, priv, err := ed25519.GenerateKey(nil)
 	if err != nil {
 		return fmt.Errorf("failed to generate key pair: %w", err)

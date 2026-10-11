@@ -240,6 +240,15 @@ func handleUploadCommand(args []string, cfg *Config) error {
 		return nil
 	}
 
+	// Every mode but syncdb and the copy writes the index, which is signed
+	// at the end, possibly after a long sync: read the key now, while root
+	// access works (an interrupt cancels it), and do not start without it.
+	if *sync || *prompt || *cleanup || *cleanupAll || *reindex || deletePkg.Seen {
+		if _, err := getPrivateKey(); err != nil {
+			return fmt.Errorf("cannot sign the repo index: %w", err)
+		}
+	}
+
 	// --- Migration Logic ---
 	if *migrate {
 		if cfg.Values["HOKUTO_MIRROR_NAME"] == "" || cfg.Values["HOKUTO_MIRROR_NAME"] == "cloudflare-r2" {
@@ -866,21 +875,20 @@ func handleUploadCommand(args []string, cfg *Config) error {
 		if err != nil {
 			return err
 		}
+		// 9. Sign, then upload the index and its signature: an index the
+		// signature does not match is refused by every client, so without a
+		// signature the published index stays as it is.
+		sigBytes, err := SignRepoIndex(indexBytes)
+		if err != nil {
+			return fmt.Errorf("%w; the remote index was not updated: run hokuto upload --reindex", err)
+		}
 		if err := r2.UploadFile(ctx, "repo-index.json", indexBytes); err != nil {
 			return fmt.Errorf("failed to upload index: %w", err)
 		}
-
-		// 9. Sign and upload index signature
-		sigBytes, err := SignRepoIndex(indexBytes)
-		if err != nil {
-			colWarn.Printf("Warning: failed to sign repo index: %v. Continuing without signature.\n", err)
-		} else {
-			if err := r2.UploadFile(ctx, "repo-index.json.sig", sigBytes); err != nil {
-				colWarn.Printf("Warning: failed to upload index signature: %v\n", err)
-			} else {
-				colSuccess.Println("Remote index signature updated.")
-			}
+		if err := r2.UploadFile(ctx, "repo-index.json.sig", sigBytes); err != nil {
+			return fmt.Errorf("failed to upload index signature: %w; run hokuto upload --reindex", err)
 		}
+		colSuccess.Println("Remote index signature updated.")
 
 		colSuccess.Printf("Sync complete. Updated index with %d new uploads.\n", uploadedCount)
 	} else {
