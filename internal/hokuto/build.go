@@ -5965,10 +5965,22 @@ func orderedBuildList(toBuild map[string]bool, requested []string) []string {
 func applyMoldLinker(ldflags string, options map[string]bool) string {
 	if !options["nomold"] && moldInstalled() {
 		ldflags = strings.ReplaceAll(ldflags, "-fuse-ld=bfd", "-fuse-ld=mold")
-		return strings.ReplaceAll(ldflags, "-fuse-ld=gold", "-fuse-ld=mold")
+		ldflags = strings.ReplaceAll(ldflags, "-fuse-ld=gold", "-fuse-ld=mold")
+		// mold warns about a version script naming symbols the link does
+		// not define, as ld.bfd does not; meson tests version scripts on
+		// an empty program with --fatal-warnings, and so dropped them:
+		// libblkid and libuuid lost their symbol versions.
+		if strings.Contains(ldflags, "-fuse-ld=mold") && !strings.Contains(ldflags, "undefined-version") {
+			ldflags += " " + moldUndefinedVersion
+		}
+		return ldflags
 	}
 	return strings.ReplaceAll(ldflags, "-fuse-ld=mold", "-fuse-ld=bfd")
 }
+
+// moldUndefinedVersion makes mold accept, as ld.bfd does, a version script
+// naming symbols the link does not define.
+const moldUndefinedVersion = "-Wl,--undefined-version"
 
 // moldInstalled reports whether the mold package is installed. A variable so
 // tests need not install it.
