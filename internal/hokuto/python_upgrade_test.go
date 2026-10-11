@@ -338,3 +338,39 @@ func TestPreparePythonUpgradeBuildOnlyForAConfirmedUpgrade(t *testing.T) {
 		t.Fatalf("without the new python installed the targets must stay, got %v", got)
 	}
 }
+
+func TestPythonToolInstallOrderPutsRuntimeDependenciesFirst(t *testing.T) {
+	_, repo := withTempDependencyRepo(t)
+	depends := map[string]string{
+		"python-build":           "python\npython-packaging\npython-pyproject-hooks\npython-build make\npython-flit-core make\npython-installer make\n",
+		"python-pyproject-hooks": "python\npython-build make\npython-flit-core make\npython-installer make\npython-wheel make\n",
+		"python-packaging":       "python\npython-build make\npython-flit-core make\npython-installer make\n",
+		"python-flit-core":       "python\npython-build make\npython-flit-core make\npython-installer make\n",
+		"python-installer":       "python\npython-build make\npython-flit-core make\npython-installer make\n",
+		"python-wheel":           "python\npython-packaging\npython-build make\npython-flit-core make\npython-installer make\n",
+	}
+	marked := make(map[string]string)
+	for name, deps := range depends {
+		writeTestPackage(t, repo, name, deps)
+		marked[name] = filepath.Join(repo, name)
+	}
+	tools := sortedKeys(keysOf(marked))
+
+	order := pythonToolInstallOrder(tools, marked)
+	pos := make(map[string]int)
+	for i, name := range order {
+		pos[name] = i
+	}
+	for _, pair := range [][2]string{
+		{"python-packaging", "python-build"},
+		{"python-pyproject-hooks", "python-build"},
+		{"python-packaging", "python-wheel"},
+	} {
+		if pos[pair[0]] > pos[pair[1]] {
+			t.Fatalf("%s must be installed before %s, which needs it at runtime: %v", pair[0], pair[1], order)
+		}
+	}
+	if len(order) != len(tools) {
+		t.Fatalf("every tool must be ordered: %v", order)
+	}
+}

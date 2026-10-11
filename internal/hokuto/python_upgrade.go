@@ -586,8 +586,7 @@ func pythonBootstrapBuild(marked map[string]string, current string, buildArgs []
 	// revision is not published yet: the previous one serves. Dependencies
 	// go first: installing a tool whose runtime dependency is missing would
 	// build that dependency's bumped revision, which needs the tools.
-	order := pythonBootstrapOrder(bootstrap, marked)
-	for _, name := range order {
+	for _, name := range pythonToolInstallOrder(bootstrap, marked) {
 		if isPackageInstalled(name) {
 			continue
 		}
@@ -601,6 +600,7 @@ func pythonBootstrapBuild(marked map[string]string, current string, buildArgs []
 			colWarn.Printf("Warning: failed to install the published %s: %v\n", name, err)
 		}
 	}
+	order := pythonBootstrapOrder(bootstrap, marked)
 	colArrow.Print("-> ")
 	colSuccess.Printf("Building the Python build tools first: %s\n", strings.Join(order, " "))
 	// One at a time, each installed before the next, with PYTHONPATH made
@@ -708,6 +708,19 @@ func setPythonBootstrapPath(pkgs []string, current string) func() {
 // among them it depends on (build-time dependencies included); ties, and
 // tools caught in a cycle, go in name order.
 func pythonBootstrapOrder(tools []string, marked map[string]string) []string {
+	return pythonToolOrder(tools, marked, false)
+}
+
+// pythonToolInstallOrder sorts the build tools so each comes after its
+// runtime dependencies among them, the order to install them in: a missing
+// runtime dependency is built from source, which needs the tools. Their
+// build dependencies form cycles (build and pyproject-hooks build each
+// other) that pythonBootstrapOrder breaks; their runtime ones do not.
+func pythonToolInstallOrder(tools []string, marked map[string]string) []string {
+	return pythonToolOrder(tools, marked, true)
+}
+
+func pythonToolOrder(tools []string, marked map[string]string, runtimeOnly bool) []string {
 	inSet := make(map[string]bool, len(tools))
 	for _, name := range tools {
 		inSet[name] = true
@@ -720,7 +733,7 @@ func pythonBootstrapOrder(tools []string, marked map[string]string) []string {
 			continue
 		}
 		for _, dep := range deps {
-			if dep.Cross || dep.CrossNative || dep.Suggest || dep.Optional {
+			if dep.Cross || dep.CrossNative || dep.Suggest || dep.Optional || (runtimeOnly && (dep.Make || dep.MakeOpt)) {
 				continue
 			}
 			names := dep.Alternatives
