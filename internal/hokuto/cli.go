@@ -1001,6 +1001,10 @@ func Main() {
 		for _, arg := range installPlan {
 			installPlanPending.Store(arg, true)
 		}
+		// A forced reinstall keeps an installed dependency a dependency:
+		// naming it to reinstall it does not make it a package the user
+		// chose, which would keep it after what needed it is gone.
+		keepAsDependency := forcedReinstallDependencies(userRequestedMap, *force)
 		for i, arg := range installPlan {
 			installPlanPending.Delete(arg)
 			var tarballPath, pkgName, resolvedVersion string
@@ -1368,7 +1372,7 @@ func Main() {
 
 			// --- Add to World File ---
 			// Only if the user explicitly requested this package (not auto-deps)
-			if explicitlyRequested || userRequestedMap[pkgName] {
+			if (explicitlyRequested || userRequestedMap[pkgName]) && !keepAsDependency[pkgName] {
 				if err := addToWorld(pkgName); err != nil {
 					finishInstallProgressLine()
 					fmt.Fprintf(os.Stderr, "Warning: failed to add %s to world file: %v\n", pkgName, err)

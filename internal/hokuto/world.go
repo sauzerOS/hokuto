@@ -136,6 +136,22 @@ func addToWorld(pkgName string) error {
 	return appendLineToFile(WorldFile, pkgName)
 }
 
+// forcedReinstallDependencies returns, of the packages an install --force
+// names, those installed as dependencies (not in world): reinstalling one
+// leaves it out of world.
+func forcedReinstallDependencies(requested map[string]bool, force bool) map[string]bool {
+	keep := make(map[string]bool)
+	if !force {
+		return keep
+	}
+	for pkgName := range requested {
+		if isPackageInstalled(pkgName) && !packageListedInWorld(WorldFile, pkgName) {
+			keep[pkgName] = true
+		}
+	}
+	return keep
+}
+
 // removeFromWorld removes a package from the world file.
 
 func removeFromWorld(pkgName string) error {
