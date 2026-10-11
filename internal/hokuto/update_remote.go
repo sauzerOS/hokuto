@@ -250,6 +250,17 @@ func checkForRemoteUpgrades(_ context.Context, cfg *Config, yes bool) error {
 	isCriticalAtomic.Store(1)
 	defer isCriticalAtomic.Store(0)
 
+	// A library one package drops is no reason to rebuild a package this
+	// update replaces later on (python 3.15 dropping libpython3.14.so asked
+	// about util-linux, whose new binary came next): that is decided once
+	// the update has run, as in a local update.
+	batch := make([]string, 0, len(steps))
+	for _, step := range steps {
+		batch = append(batch, remoteStepPackageName(step.name))
+	}
+	startUpdateBatch(batch)
+	defer reportBrokenUpdateBatch()
+
 	var progress *installProgress
 	if !Debug {
 		progress = newInstallProgress(len(steps))
@@ -264,6 +275,9 @@ func checkForRemoteUpgrades(_ context.Context, cfg *Config, yes bool) error {
 			progress.advance()
 			continue
 		}
+		// From here on a removed library that affects this package is its
+		// own problem again: its update is the one running now.
+		markUpdateBatchDone(remoteStepPackageName(step.name))
 		if fast {
 			progress.start(step.name)
 		} else {
@@ -318,6 +332,13 @@ func checkForRemoteUpgrades(_ context.Context, cfg *Config, yes bool) error {
 	colArrow.Print("\n-> ")
 	colSuccess.Printf("Remote update complete. Updated %d packages.\n", totalUpdated)
 	return nil
+}
+
+// remoteStepPackageName is the installed name of a remote update step: a
+// pinned release (glew@2.2.0-1) installs as its package.
+func remoteStepPackageName(name string) string {
+	name, _, _ = strings.Cut(name, "@")
+	return name
 }
 
 // remoteUpdateEntry is the index entry a remote update installs for
