@@ -536,6 +536,29 @@ func pythonRecheckRecipes(all map[string]string, failed []string) map[string]str
 // python, the Python build tools first (installed, so the rest can use
 // them), then the rest.
 func pythonRebuildBuildAll(marked map[string]string, current string, buildArgs []string, cfg *Config) {
+	colArrow.Print("-> ")
+	colSuccess.Printf("Rebuilding %d package(s) against python %s\n", len(marked), current)
+	buildArgs = append(append([]string{}, buildArgs...), "--no-install")
+	rest, restore := pythonBootstrapBuild(marked, current, buildArgs, cfg)
+	defer restore()
+
+	// What one of the rest needs from another is built and installed on the
+	// way; the rest is not installed.
+	if len(rest) > 0 {
+		colArrow.Print("-> ")
+		colSuccess.Printf("Building the remaining %d package(s)\n", len(rest))
+		if err := handleBuildCommand(append(buildArgs, rest...), cfg); err != nil {
+			debugf("python-rebuild: build: %v\n", err)
+		}
+	}
+}
+
+// pythonBootstrapBuild builds and installs, one at a time, the Python build
+// tools among marked against the new python current, and returns the other
+// recipes of marked. The returned function restores PYTHONPATH, which until
+// then holds the old copy of each tool that did not rebuild, so that its
+// failure is reported once rather than failing every package using it.
+func pythonBootstrapBuild(marked map[string]string, current string, buildArgs []string, cfg *Config) ([]string, func()) {
 	bootstrap := pythonBootstrapSet(marked)
 	var rest []string
 	for _, name := range sortedKeys(keysOf(marked)) {
@@ -543,9 +566,6 @@ func pythonRebuildBuildAll(marked map[string]string, current string, buildArgs [
 			rest = append(rest, name)
 		}
 	}
-	colArrow.Print("-> ")
-	colSuccess.Printf("Rebuilding %d package(s) against python %s\n", len(marked), current)
-
 	oldPath, hadPath := os.LookupEnv("PYTHONPATH")
 	restorePath := func() {
 		if hadPath {
@@ -554,58 +574,101 @@ func pythonRebuildBuildAll(marked map[string]string, current string, buildArgs [
 			os.Unsetenv("PYTHONPATH")
 		}
 	}
-	defer restorePath()
-
-	if len(bootstrap) > 0 {
-		// The new python sees none of the build tools: their packages are
-		// built for the old one, and a build container has them installed
-		// only while a build needs them. Install the published ones, so their
-		// pure-Python code runs on the new python from PYTHONPATH (see
-		// pythonBootstrapPath) while they are rebuilt.
-		for _, name := range bootstrap {
-			if !isPackageInstalled(name) {
-				if _, err := ensurePackageInstalled(name, cfg, false); err != nil {
-					colWarn.Printf("Warning: failed to install the published %s: %v\n", name, err)
-				}
-			}
-		}
-		order := pythonBootstrapOrder(bootstrap, marked)
-		colArrow.Print("-> ")
-		colSuccess.Printf("Building the Python build tools first: %s\n", strings.Join(order, " "))
-		// One at a time, each installed before the next, with PYTHONPATH made
-		// afresh from the old copies still installed: a tool once rebuilt
-		// replaced its old copy, and a link left to it would shadow the new
-		// one (a dangling setuptools .dist-info hid its entry points).
-		for _, name := range order {
-			cleanup := setPythonBootstrapPath(bootstrap, current)
-			args := append(append(append([]string{}, buildArgs...), "--no-install"), name)
-			if err := handleBuildCommand(args, cfg); err != nil {
-				debugf("python-rebuild: bootstrap build of %s: %v\n", name, err)
-			}
-			installBuiltRecipes([]string{name}, cfg)
-			cleanup()
-		}
-		for _, name := range bootstrap {
-			if !builtRecipePackage(BinDir, name, marked[name]) {
-				colWarn.Printf("Warning: %s did not rebuild; the rest uses its old copy\n", name)
-			}
-		}
+	if len(bootstrap) == 0 {
+		return rest, func() {}
 	}
 
-	// What one of the rest needs from another is built and installed on the
-	// way; the rest is not installed. A build tool that did not rebuild keeps
-	// its old copy on PYTHONPATH, so its failure is reported once rather than
-	// failing every package that uses it.
-	if len(rest) > 0 {
+	// The new python sees none of the build tools: their packages are built
+	// for the old one, and a build container has them installed only while
+	// a build needs them. Install the published ones, so their pure-Python
+	// code runs on the new python from PYTHONPATH (see pythonBootstrapPath)
+	// while they are rebuilt. Once the upgrade is confirmed, their bumped
+	// revision is not published yet: the previous one serves.
+	for _, name := range bootstrap {
+		if isPackageInstalled(name) {
+			continue
+		}
+		b, ok, err := locateBuildDependencyBinaryTarball(name, cfg, false)
+		if err == nil && ok {
+			err = installBuildDependencyPlan([]buildDepInstall{{name: name, cfg: cfg, tarball: b}}, false, true, func(string) {}, func(string, string) {})
+		} else if err == nil {
+			err = fmt.Errorf("no published package")
+		}
+		if err != nil {
+			colWarn.Printf("Warning: failed to install the published %s: %v\n", name, err)
+		}
+	}
+	order := pythonBootstrapOrder(bootstrap, marked)
+	colArrow.Print("-> ")
+	colSuccess.Printf("Building the Python build tools first: %s\n", strings.Join(order, " "))
+	// One at a time, each installed before the next, with PYTHONPATH made
+	// afresh from the old copies still installed: a tool once rebuilt
+	// replaced its old copy, and a link left to it would shadow the new one
+	// (a dangling setuptools .dist-info hid its entry points).
+	for _, name := range order {
 		cleanup := setPythonBootstrapPath(bootstrap, current)
-		defer cleanup()
-		colArrow.Print("-> ")
-		colSuccess.Printf("Building the remaining %d package(s)\n", len(rest))
-		args := append(append(append([]string{}, buildArgs...), "--no-install"), rest...)
-		if err := handleBuildCommand(args, cfg); err != nil {
-			debugf("python-rebuild: build: %v\n", err)
+		if err := handleBuildCommand(append(append([]string{}, buildArgs...), name), cfg); err != nil {
+			debugf("python-rebuild: bootstrap build of %s: %v\n", name, err)
+		}
+		installBuiltRecipes([]string{name}, cfg)
+		cleanup()
+	}
+	for _, name := range bootstrap {
+		if !builtRecipePackage(BinDir, name, marked[name]) {
+			colWarn.Printf("Warning: %s did not rebuild; the rest uses its old copy\n", name)
 		}
 	}
+	cleanup := setPythonBootstrapPath(bootstrap, current)
+	return rest, func() {
+		cleanup()
+		restorePath()
+	}
+}
+
+// preparePythonUpgradeBuild takes, from the targets of a publishing rebuild
+// (update --build-missing-binaries), what a confirmed python upgrade must
+// build first: python itself, installed, then the Python build tools, which
+// the new python cannot run in their published, old-python packages. It
+// returns the remaining targets and a function to call once they are built.
+func preparePythonUpgradeBuild(targets, buildArgs []string, cfg *Config) ([]string, func()) {
+	noop := func() {}
+	state, err := loadPythonUpgrade()
+	if err != nil || state == nil || state.Status != pythonUpgradeConfirmed {
+		return targets, noop
+	}
+	if slices.Contains(targets, pythonRecipe) {
+		colArrow.Print("-> ")
+		colSuccess.Printf("Building and installing python %s first\n", state.Release)
+		if err := handleBuildCommand(append(append([]string{}, buildArgs...), pythonRecipe), cfg); err != nil {
+			debugf("python upgrade: python build: %v\n", err)
+		}
+		installBuiltRecipes([]string{pythonRecipe}, cfg)
+		targets = slices.DeleteFunc(slices.Clone(targets), func(t string) bool { return t == pythonRecipe })
+	}
+	current, err := currentPythonMinor()
+	if err != nil || current != state.To {
+		if !slices.Contains(targets, pythonRecipe) {
+			colWarn.Printf("Warning: python %s is not installed (python3 is %s): the Python build tools are not bootstrapped\n", state.To, current)
+		}
+		return targets, noop
+	}
+	marked := make(map[string]string)
+	for _, name := range targets {
+		if pkgDir, err := findPackageMetadataDir(name); err == nil {
+			marked[name] = pkgDir
+		}
+	}
+	if len(pythonBootstrapSet(marked)) == 0 {
+		return targets, noop
+	}
+	rest, restore := pythonBootstrapBuild(marked, current, buildArgs, cfg)
+	var remaining []string
+	for _, name := range targets {
+		if _, recipe := marked[name]; !recipe || slices.Contains(rest, name) {
+			remaining = append(remaining, name)
+		}
+	}
+	return remaining, restore
 }
 
 // setPythonBootstrapPath points PYTHONPATH at the old-Python copies of the

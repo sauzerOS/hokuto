@@ -631,8 +631,14 @@ func buildMissingRepositoryBinaries(cfg *Config, buildArgs []string, yes bool) e
 		return fmt.Errorf("none of the selected packages can be built here (skipped: %s)", strings.Join(skipped, ", "))
 	}
 
-	buildArgs = append(buildArgs, targets...)
-	buildErr := handleBuildCommand(buildArgs, cfg)
+	// A confirmed python upgrade builds python and the Python build tools
+	// first.
+	targets, restorePython := preparePythonUpgradeBuild(targets, buildArgs, cfg)
+	var buildErr error
+	if len(targets) > 0 {
+		buildErr = handleBuildCommand(append(buildArgs, targets...), cfg)
+	}
+	restorePython()
 	// Unattended (-y, hokuto-builder's rounds): a package that failed is not
 	// tried again every run until its recipe changes.
 	if yes {

@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -302,5 +303,38 @@ func TestPythonRecheckRecipes(t *testing.T) {
 	want := []string{"pyqt-builder", "python-pyqt6", "python-setuptools", "python-sip", "python-wheel"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("recheck set = %v, want %v (the failed one, its rebuilt dependencies, the build tools)", got, want)
+	}
+}
+
+func TestPreparePythonUpgradeBuildOnlyForAConfirmedUpgrade(t *testing.T) {
+	cfg, repo := withPythonUpgradeEnv(t, "9.99.0 1")
+	writePythonUpgradeRecipe(t, repo, "python-build", "1.0 2", "python-rebuild\n")
+	targets := []string{"python-build", "foo"}
+
+	got, restore := preparePythonUpgradeBuild(targets, nil, cfg)
+	restore()
+	if !slices.Equal(got, targets) {
+		t.Fatalf("without a held upgrade the targets must stay, got %v", got)
+	}
+
+	// Confirmed, but the python installed is not the new one: nothing can be
+	// bootstrapped and nothing is built here.
+	state := &pythonUpgrade{From: "9.98", To: "9.99", Release: "9.99.0-1", Status: pythonUpgradePassed}
+	if err := savePythonUpgrade(state); err != nil {
+		t.Fatal(err)
+	}
+	got, restore = preparePythonUpgradeBuild(targets, nil, cfg)
+	restore()
+	if !slices.Equal(got, targets) {
+		t.Fatalf("an unconfirmed upgrade must not change the targets, got %v", got)
+	}
+	state.Status = pythonUpgradeConfirmed
+	if err := savePythonUpgrade(state); err != nil {
+		t.Fatal(err)
+	}
+	got, restore = preparePythonUpgradeBuild(targets, nil, cfg)
+	restore()
+	if !slices.Equal(got, targets) {
+		t.Fatalf("without the new python installed the targets must stay, got %v", got)
 	}
 }
