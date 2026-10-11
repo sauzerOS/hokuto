@@ -583,8 +583,11 @@ func pythonBootstrapBuild(marked map[string]string, current string, buildArgs []
 	// a build needs them. Install the published ones, so their pure-Python
 	// code runs on the new python from PYTHONPATH (see pythonBootstrapPath)
 	// while they are rebuilt. Once the upgrade is confirmed, their bumped
-	// revision is not published yet: the previous one serves.
-	for _, name := range bootstrap {
+	// revision is not published yet: the previous one serves. Dependencies
+	// go first: installing a tool whose runtime dependency is missing would
+	// build that dependency's bumped revision, which needs the tools.
+	order := pythonBootstrapOrder(bootstrap, marked)
+	for _, name := range order {
 		if isPackageInstalled(name) {
 			continue
 		}
@@ -598,7 +601,6 @@ func pythonBootstrapBuild(marked map[string]string, current string, buildArgs []
 			colWarn.Printf("Warning: failed to install the published %s: %v\n", name, err)
 		}
 	}
-	order := pythonBootstrapOrder(bootstrap, marked)
 	colArrow.Print("-> ")
 	colSuccess.Printf("Building the Python build tools first: %s\n", strings.Join(order, " "))
 	// One at a time, each installed before the next, with PYTHONPATH made
