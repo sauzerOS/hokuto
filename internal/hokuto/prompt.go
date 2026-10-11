@@ -57,6 +57,7 @@ func askForConfirmationWithDefault(p colorPrinter, defaultYes bool, format strin
 		// Use our existing cPrintf helper to print the prompt with the desired color.
 		// We print mainPrompt and the suffix separately to ensure the suffix keeps
 		// the color 'p' even if mainPrompt contains internal color resets (like colNote).
+		clearProgressForPrompt()
 		cPrintf(p, "%s", mainPrompt)
 		// The choices in yellow, as in every question, whatever the
 		// question's own color.

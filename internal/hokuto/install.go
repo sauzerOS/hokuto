@@ -1562,7 +1562,7 @@ func installPackageArchive(tarballPath, pkgName string, cfg *Config, execCtx *Ex
 			if err := copyFile(libPath, backupPath); err != nil {
 				fmt.Fprintf(os.Stderr, "warning: failed to backup library %s natively: %v\n", libPath, err)
 			} else {
-				fmt.Fprintf(logger, "%s", colInfo.Sprintf("Backed up affected library %s to %s\n", libPath, backupPath))
+				debugf("Backed up affected library %s to %s\n", libPath, backupPath)
 			}
 		} else {
 			mkdirCmd := exec.Command("mkdir", "-p", backupDir)
@@ -1575,7 +1575,7 @@ func installPackageArchive(tarballPath, pkgName string, cfg *Config, execCtx *Ex
 			if err := execCtx.Run(cpCmd); err != nil {
 				fmt.Fprintf(os.Stderr, "warning: failed to backup library %s: %v\n", libPath, err)
 			} else {
-				fmt.Fprintf(logger, "%s", colInfo.Sprintf("Backed up affected library %s to %s\n", libPath, backupPath))
+				debugf("Backed up affected library %s to %s\n", libPath, backupPath)
 			}
 		}
 	}
@@ -2438,6 +2438,7 @@ func printChoicePrompt(question, choices string) {
 }
 
 func printQuestion(question, coloredChoices string) {
+	clearProgressForPrompt()
 	colArrow.Print("-> ")
 	fmt.Print(question)
 	fmt.Printf(" %s: ", coloredChoices)

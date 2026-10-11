@@ -140,3 +140,15 @@ func (p *installProgress) finish(succeeded bool) {
 	p.endLine()
 	p.deactivate()
 }
+
+// clearProgressForPrompt makes room for a question asked while a progress bar
+// is shown: the install bar's line is cleared for it, so the question does
+// not follow the bar on its line, and the next package draws the bar again
+// below the answer. Other bars end their line.
+func clearProgressForPrompt() {
+	if p := currentInstallProgress(); p != nil {
+		p.suspend()
+		return
+	}
+	prepareDependencyProgressLogOutput()
+}

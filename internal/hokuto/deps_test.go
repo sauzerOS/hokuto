@@ -3715,3 +3715,61 @@ func TestVersionedPackageExtractsRecipeFilesOnlyForABuild(t *testing.T) {
 		t.Fatalf("a repository recipe must be left alone: %v", err)
 	}
 }
+
+func TestUpdateBatchCountsAPackagesOwnPrivateLibraries(t *testing.T) {
+	libraryRebuildFixture(t)
+	// samba links its private libraries from /usr/lib/samba, outside the
+	// linker's directories, through its runpath.
+	writeInstalledTestPackage(t, "samba")
+	private := filepath.Join(rootDir, "usr", "lib", "samba", "libsamba-python.cpython-315-x86-64-linux-gnu-private-samba.so")
+	if err := os.MkdirAll(filepath.Dir(private), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(private, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	manifest := "/usr/lib/samba/\n/usr/lib/samba/libsamba-python.cpython-315-x86-64-linux-gnu-private-samba.so  0123\n"
+	if err := os.WriteFile(filepath.Join(Installed, "samba", "manifest"), []byte(manifest), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	libdeps := "elf64:libsamba-python.cpython-315-x86-64-linux-gnu-private-samba.so\nelf64:libplist-2.0.so.5\n"
+	if err := os.WriteFile(filepath.Join(Installed, "samba", "libdeps"), []byte(libdeps), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Its update dropped the python 3.14 copies of those libraries.
+	startUpdateBatch([]string{"samba", "gone"})
+	deferUpdateBatchRebuilds(map[string][]string{
+		"samba": {"libsamba-python.cpython-314-x86-64-linux-gnu-private-samba.so"},
+		"gone":  {"libplist-2.0.so.4"},
+	})
+	if broken := finishUpdateBatch(); len(broken) != 0 {
+		t.Fatalf("samba's own libraries are installed and a removed package needs nothing, got %v", broken)
+	}
+
+	// One its split installs in the same directory (smbclient's) is there.
+	sibling := filepath.Join(rootDir, "usr", "lib", "samba", "libsmbclient-raw-private-samba.so")
+	if err := os.WriteFile(sibling, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	libdeps += "elf64:libsmbclient-raw-private-samba.so\n"
+	if err := os.WriteFile(filepath.Join(Installed, "samba", "libdeps"), []byte(libdeps), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	startUpdateBatch([]string{"samba"})
+	deferUpdateBatchRebuilds(map[string][]string{"samba": {"libsmbclient-raw-private-samba.so"}})
+	if broken := finishUpdateBatch(); len(broken) != 0 {
+		t.Fatalf("a library of its private directory is installed, got %v", broken)
+	}
+
+	// A private library nothing installs is still missing.
+	libdeps += "elf64:libgone-private-samba.so\n"
+	if err := os.WriteFile(filepath.Join(Installed, "samba", "libdeps"), []byte(libdeps), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	startUpdateBatch([]string{"samba"})
+	deferUpdateBatchRebuilds(map[string][]string{"samba": {"libgone-private-samba.so"}})
+	if broken := finishUpdateBatch(); len(broken["samba"]) == 0 {
+		t.Fatalf("a library no package installs must still be reported, got %v", broken)
+	}
+}

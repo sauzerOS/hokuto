@@ -21,13 +21,16 @@ import (
 // in the linker's directories counts as missing, so a package whose libraries
 // live somewhere unusual keeps the rebuild it was given rather than losing it.
 func libraryRebuildStillNeeded(pkgName string) bool {
+	if !isPackageInstalled(pkgName) {
+		return false // removed since: nothing left to rebuild
+	}
 	data, err := os.ReadFile(filepath.Join(Installed, pkgName, "libdeps"))
 	if err != nil {
 		if data, err = readFileAsRoot(filepath.Join(Installed, pkgName, "libdeps")); err != nil {
 			return true
 		}
 	}
-	dirs := linkerLibraryDirs()
+	dirs := append(linkerLibraryDirs(), ownLibraryDirs(pkgName)...)
 	for _, line := range strings.Split(string(data), "\n") {
 		dep, ok := parseLibDepRef(line)
 		if !ok {
@@ -39,6 +42,31 @@ func libraryRebuildStillNeeded(pkgName string) bool {
 		}
 	}
 	return false
+}
+
+// ownLibraryDirs lists the directories holding the shared libraries pkgName
+// installs. A package's private libraries (samba's /usr/lib/samba, shared
+// with its split smbclient) are outside the linker's directories, found
+// through its runpath.
+func ownLibraryDirs(pkgName string) []string {
+	entries, err := parseManifest(filepath.Join(Installed, pkgName, "manifest"))
+	if err != nil {
+		return nil
+	}
+	seen := make(map[string]bool)
+	var dirs []string
+	for path := range entries {
+		name := filepath.Base(path)
+		if !strings.HasSuffix(name, ".so") && !strings.Contains(name, ".so.") {
+			continue
+		}
+		if dir := filepath.Dir(path); !seen[dir] {
+			seen[dir] = true
+			dirs = append(dirs, dir)
+		}
+	}
+	sort.Strings(dirs)
+	return dirs
 }
 
 // libDepPresent reports whether a libdeps entry resolves to a file under the
