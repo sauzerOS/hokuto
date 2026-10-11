@@ -958,3 +958,48 @@ func canonicalizePath(rootDir, path string) string {
 	}
 	return strings.TrimPrefix(rel, "/")
 }
+
+// removeFiles removes paths, a missing one included, and returns those that
+// remain with why. Through sudo each rm took 35 ms on the Pi, and a python
+// minor upgrade made 3000 files obsolete: it takes many paths per rm, as
+// uninstall does, or removes them natively when running as root.
+func removeFiles(paths []string, execCtx *Executor) map[string]error {
+	failed := make(map[string]error)
+	if len(paths) == 0 {
+		return failed
+	}
+	if os.Geteuid() == 0 {
+		for _, path := range paths {
+			if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+				failed[path] = err
+			}
+		}
+		return failed
+	}
+	for start := 0; start < len(paths); {
+		end, argBytes := start, 0
+		for end < len(paths) && end-start < 256 {
+			n := len(paths[end]) + 1
+			if end > start && argBytes+n > 64*1024 {
+				break
+			}
+			argBytes += n
+			end++
+		}
+		batch := paths[start:end]
+		cmd := exec.Command("rm", "-f", "--")
+		cmd.Args = append(cmd.Args, batch...)
+		if err := execCtx.Run(cmd); err != nil {
+			// rm carries on past a path it cannot remove: find which remain.
+			for _, path := range batch {
+				if _, statErr := os.Lstat(path); statErr == nil {
+					failed[path] = err
+				} else if !os.IsNotExist(statErr) {
+					failed[path] = fmt.Errorf("%v; cannot inspect it: %v", err, statErr)
+				}
+			}
+		}
+		start = end
+	}
+	return failed
+}

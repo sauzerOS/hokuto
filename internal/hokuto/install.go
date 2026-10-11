@@ -1600,14 +1600,10 @@ func installPackageArchive(tarballPath, pkgName string, cfg *Config, execCtx *Ex
 	}
 
 	// 6. Remove files that were scheduled for deletion
-	for _, p := range filesToDelete {
-		rmCmd := exec.Command("rm", "-f", p)
-		if err := execCtx.Run(rmCmd); err != nil {
-			fmt.Fprintf(logger, "warning: failed to remove obsolete file %s: %v\n", p, err)
-		} else {
-			debugf("Removed obsolete file: %s\n", p)
-		}
+	for p, err := range removeFiles(filesToDelete, execCtx) {
+		fmt.Fprintf(logger, "warning: failed to remove obsolete file %s: %v\n", p, err)
 	}
+	debugf("Removed %d obsolete files\n", len(filesToDelete))
 
 	// 7. Run package post-install script
 	if logger == nil {
