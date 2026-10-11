@@ -68,3 +68,28 @@ func TestBuildLogDeletableOnlyAfterFailedStatus(t *testing.T) {
 		t.Fatal("a missing build tree must not be deletable")
 	}
 }
+
+func TestTUISelectLogKeepsTheShownLog(t *testing.T) {
+	now := time.Now()
+	logs := []logInfo{
+		{path: "/var/tmp/hokuto/a-01/log/build-log.txt", modTime: now.Add(-time.Minute)},
+		{path: "/var/tmp/hokuto/b-01/log/build-log.txt", modTime: now},
+		{path: "/var/tmp/hokuto/c-01/log/build-log.txt", modTime: now.Add(-time.Hour)},
+	}
+	if got := tuiSelectLog(logs, ""); got != 1 {
+		t.Fatalf("at start the log written last is shown, got %d", got)
+	}
+	// Another build writing more recently does not take over.
+	if got := tuiSelectLog(logs, logs[2].path); got != 2 {
+		t.Fatalf("the shown log must stay shown, got %d", got)
+	}
+	// A new build's log lands before it: the shown log is followed by path.
+	withNew := append([]logInfo{{path: "/var/tmp/hokuto/0-01/log/build-log.txt", modTime: now.Add(time.Second)}}, logs...)
+	if got := tuiSelectLog(withNew, logs[2].path); got != 3 {
+		t.Fatalf("the shown log must be followed to its new place, got %d", got)
+	}
+	// Its build tree removed, the log written last is shown.
+	if got := tuiSelectLog(logs[:2], logs[2].path); got != 1 {
+		t.Fatalf("a removed log gives way to the log written last, got %d", got)
+	}
+}

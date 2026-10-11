@@ -21,13 +21,14 @@ type logInfo struct {
 	buildDir     string // Extracted build directory path
 	canDelete    bool   // Whether this build directory can be deleted
 	deleteAction string // The delete command to show
+	modTime      time.Time
 }
 
 var (
 	tuiApp          *tview.Application
 	tuiLogs         []logInfo
 	tuiActiveIdx    int
-	tuiPrevIdx      int // Track previous index to detect tab switches
+	tuiPrevPath     string // The log shown at the last draw, to detect switches
 	tuiHeaderBox    *tview.TextView
 	tuiLogView      *tview.TextView
 	tuiFooterBox    *tview.TextView
@@ -48,7 +49,7 @@ func runTUI() int {
 	// Initialize channels and maps
 	tuiUpdateChan = make(chan []logInfo, 10)
 	tuiPrevContent = make(map[string]string)
-	tuiPrevIdx = -1
+	tuiPrevPath = ""
 	tuiSearchActive = false
 	tuiSearchQuery = ""
 	tuiSearchStatus = ""
@@ -266,19 +267,7 @@ func runTUI() int {
 					currentLogPath = tuiLogs[tuiActiveIdx].path
 				}
 				tuiLogs = logs
-				if currentLogPath != "" {
-					found := false
-					for i, log := range tuiLogs {
-						if log.path == currentLogPath {
-							tuiActiveIdx = i
-							found = true
-							break
-						}
-					}
-					if !found && tuiActiveIdx >= len(tuiLogs) && len(tuiLogs) > 0 {
-						tuiActiveIdx = len(tuiLogs) - 1
-					}
-				}
+				tuiActiveIdx = tuiSelectLog(tuiLogs, currentLogPath)
 				updateTUI()
 			})
 		}
@@ -290,11 +279,8 @@ func runTUI() int {
 	// Populate the first view on the application event loop. Writing through
 	// ANSIWriter before Run initialized the screen could leave the first rows
 	// unpainted until a later scroll forced another draw.
-	logs := readAllBuildLogs()
-	tuiLogs = logs
-	if len(tuiLogs) > 0 {
-		tuiActiveIdx = 0
-	}
+	tuiLogs = readAllBuildLogs()
+	tuiActiveIdx = tuiSelectLog(tuiLogs, "")
 	go tuiApp.QueueUpdateDraw(updateTUI)
 
 	// Run the application
@@ -334,10 +320,11 @@ func updateTUI() {
 		logPath := log.path
 		prevContent, hadPrevContent := tuiPrevContent[logPath]
 
-		// Detect if we switched tabs
-		switchedTabs := (tuiPrevIdx != tuiActiveIdx)
+		// Detect if we switched tabs: by the log, as its place in the list
+		// changes when another build starts or ends.
+		switchedTabs := tuiPrevPath != logPath
 		if switchedTabs {
-			tuiPrevIdx = tuiActiveIdx
+			tuiPrevPath = logPath
 		}
 
 		// Only update if content actually changed or we switched tabs
@@ -516,15 +503,9 @@ func readAllBuildLogs() []logInfo {
 		return []logInfo{{path: "No logs", content: "No build log yet. Run 'hokuto build <package>' to see logs here."}}
 	}
 
-	// Sort by modification time (newest first)
-	sort.Slice(allPaths, func(i, j int) bool {
-		ai, err1 := os.Stat(allPaths[i])
-		aj, err2 := os.Stat(allPaths[j])
-		if err1 != nil || err2 != nil {
-			return allPaths[i] > allPaths[j]
-		}
-		return ai.ModTime().After(aj.ModTime())
-	})
+	// A fixed order, by path: ordered by last write, the logs of parallel
+	// builds swapped places at every refresh.
+	sort.Strings(allPaths)
 
 	// Read all logs (read entire file for infinite scrollback)
 	logs := make([]logInfo, 0, len(allPaths))
@@ -538,6 +519,10 @@ func readAllBuildLogs() []logInfo {
 		// e.g., /var/tmpdir/hokuto/llvm/log/build-log.txt -> /var/tmpdir/hokuto/llvm/
 		buildDir := extractBuildDir(path)
 		canDelete, deleteAction := canDeleteBuildDir(buildDir, content)
+		var modTime time.Time
+		if info, err := os.Stat(path); err == nil {
+			modTime = info.ModTime()
+		}
 
 		logs = append(logs, logInfo{
 			path:         path,
@@ -545,10 +530,27 @@ func readAllBuildLogs() []logInfo {
 			buildDir:     buildDir,
 			canDelete:    canDelete,
 			deleteAction: deleteAction,
+			modTime:      modTime,
 		})
 	}
 
 	return logs
+}
+
+// tuiSelectLog returns the log to show after a refresh: the one shown before,
+// wherever it now is in the list, or, once its build tree is gone (the build
+// ended) and at start, the log written last.
+func tuiSelectLog(logs []logInfo, currentPath string) int {
+	newest := 0
+	for i, log := range logs {
+		if currentPath != "" && log.path == currentPath {
+			return i
+		}
+		if log.modTime.After(logs[newest].modTime) {
+			newest = i
+		}
+	}
+	return newest
 }
 
 // extractBuildDir extracts the build directory from a log file path
