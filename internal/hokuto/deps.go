@@ -1446,6 +1446,7 @@ func resolveAlternativeDep(dep DepSpec, yes bool, cfg *Config, requestingPkg ...
 		defer promptEndHook()
 	}
 
+	clearProgressForPrompt()
 	fmt.Println()
 	cPrintf(colArrow, "-> ")
 	parent := ""

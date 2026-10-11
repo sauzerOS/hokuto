@@ -443,6 +443,7 @@ func expandKmodRequests(args []string, assumeYes bool, in *bufio.Reader, out io.
 }
 
 func promptKernelChoice(pkg string, kernels []installedKernel, in *bufio.Reader, out io.Writer) ([]installedKernel, error) {
+	clearProgressForPrompt()
 	fmt.Fprintf(out, "%s is a kernel module package. Which kernel(s)?\n", pkg)
 	for i, k := range kernels {
 		fmt.Fprintf(out, "  %d) %s (%s)\n", i+1, k.Package, k.Release)

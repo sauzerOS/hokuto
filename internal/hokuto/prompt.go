@@ -99,6 +99,7 @@ func WithPrompt(fn func()) {
 	if promptEndHook != nil {
 		defer promptEndHook()
 	}
+	clearProgressForPrompt()
 
 	fn()
 }

@@ -233,6 +233,7 @@ func uninstallPackageLocked(pkgName string, cfg *Config, execCtx *Executor, forc
 
 	// 5. Confirm with user unless 'yes' is set
 	if !yes {
+		clearProgressForPrompt()
 		fcPrintf(logger, colArrow, "-> ")
 		fcPrintf(logger, color.Danger, "About to remove package %s and %d file(s). Continue?", pkgName, fileCount)
 		fmt.Fprint(logger, " "+colArrow.Sprint("[Y/n]")+": ")
@@ -364,6 +365,9 @@ func uninstallPackageLocked(pkgName string, cfg *Config, execCtx *Executor, forc
 
 		// Skip modification warning for files with 000000 checksum
 		if currentSum != meta.B3Sum && meta.B3Sum != "000000" {
+			if !yes {
+				clearProgressForPrompt()
+			}
 			fcPrintf(logger, colWarn, "\nWARNING: File %s has been modified (expected %s, found %s).\n", p, meta.B3Sum, currentSum)
 
 			// Prompt user unless 'yes' is set
