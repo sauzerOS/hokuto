@@ -1312,6 +1312,14 @@ func writeBuildLogHeader(path, pkgName, version, revision string, started time.T
 	return os.WriteFile(path, []byte(b.String()), 0o644)
 }
 
+// markBuildLogFailed ends a build log with the failed status, hokuto's
+// confirmation of a failed build (see buildLogFailed).
+func markBuildLogFailed(logPath, pkgName string, started time.Time, execCtx *Executor) {
+	if err := appendBuildLogStatus(logPath, pkgName, "failed", started, execCtx); err != nil {
+		debugf("Warning: failed to append build failure status: %v\n", err)
+	}
+}
+
 func appendBuildLogStatus(path, pkgName, status string, started time.Time, execCtx *Executor) error {
 	elapsed := time.Since(started).Truncate(time.Second)
 	line := fmt.Sprintf("\r\n%s%s%s%s%s%s%s%s\r\n",
@@ -3320,8 +3328,15 @@ func runPkgBuild(pkgName string, cfg *Config, execCtx *Executor, opts BuildOptio
 	elapsed := time.Since(startTime).Truncate(time.Second)
 	debugf("\n%s built successfully in %s, output in %s\n", pkgName, elapsed, outputDir)
 
-	if err := runSplitScript(pkgDir, outputDir, splitRoot, version, pkgName, buildExec, env, opts); err != nil {
+	// Packaging can still fail: mark the log failed as for the script, so
+	// hokuto log offers to delete the build tree.
+	packagingFailed := func(err error) (time.Duration, error) {
+		markBuildLogFailed(logPath, pkgName, startTime, buildExec)
+		keepFailedBuildLog(logPath, pkgName)
 		return 0, err
+	}
+	if err := runSplitScript(pkgDir, outputDir, splitRoot, version, pkgName, buildExec, env, opts); err != nil {
+		return packagingFailed(err)
 	}
 
 	// Determine output package name (rename if cross-system is enabled)
@@ -3370,7 +3385,7 @@ func runPkgBuild(pkgName string, cfg *Config, execCtx *Executor, opts BuildOptio
 		kmod:          kmod,
 		tarball:       &tarballPath,
 	}); err != nil {
-		return 0, err
+		return packagingFailed(err)
 	}
 
 	websiteOutputs := []WebsiteOutputSource{{Name: outputPkgName, OutputDir: outputDir, Tarball: tarballPath}}
@@ -3379,7 +3394,7 @@ func runPkgBuild(pkgName string, cfg *Config, execCtx *Executor, opts BuildOptio
 		recordSplit = func(out WebsiteOutputSource) { websiteOutputs = append(websiteOutputs, out) }
 	}
 	if err := packageSplitOutputs(pkgName, pkgDir, splitRoot, version, revision, targetArch, cflagsVal, isGeneric, shouldStrip, buildExec, cfg, opts, elapsed, recordSplit); err != nil {
-		return 0, err
+		return packagingFailed(err)
 	}
 
 	// Published once every package exists, so the site lists their sizes and
@@ -4134,6 +4149,7 @@ func pkgBuildRebuild(pkgName string, cfg *Config, execCtx *Executor, oldLibsDir 
 		crossSysroot:  crossSystemSysrootFor(cfg, defaults),
 		kmod:          kmod,
 	}); err != nil {
+		markBuildLogFailed(logPath, pkgName, startTime, buildExec)
 		return err
 	}
 

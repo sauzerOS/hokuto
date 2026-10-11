@@ -537,7 +537,7 @@ func readAllBuildLogs() []logInfo {
 		// Extract build directory from log path
 		// e.g., /var/tmpdir/hokuto/llvm/log/build-log.txt -> /var/tmpdir/hokuto/llvm/
 		buildDir := extractBuildDir(path)
-		canDelete, deleteAction := canDeleteBuildDir(buildDir)
+		canDelete, deleteAction := canDeleteBuildDir(buildDir, content)
 
 		logs = append(logs, logInfo{
 			path:         path,
@@ -560,40 +560,26 @@ func extractBuildDir(logPath string) string {
 	return dir
 }
 
-// canDeleteBuildDir checks if a build directory can be deleted
-// Returns (canDelete, deleteAction)
-// Can delete if the directory hasn't been modified in the last 5 minutes
-func canDeleteBuildDir(buildDir string) (bool, string) {
-	info, err := os.Stat(buildDir)
-	if err != nil {
+// canDeleteBuildDir reports whether a build tree may be deleted, and the
+// command shown for it: only once hokuto has marked its build failed. A
+// build that writes nothing for a while (a long link) is still running, and
+// a successful build removes its tree itself.
+func canDeleteBuildDir(buildDir, logContent string) (bool, string) {
+	if _, err := os.Stat(buildDir); err != nil {
 		return false, ""
 	}
-
-	// Check if directory hasn't been modified in the last 5 minutes
-	now := time.Now()
-	modTime := info.ModTime()
-	timeSinceMod := now.Sub(modTime)
-
-	// Also check all files in the directory to find the most recent modification
-	mostRecentMod := modTime
-	err = filepath.Walk(buildDir, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return nil // Skip errors
-		}
-		if info.ModTime().After(mostRecentMod) {
-			mostRecentMod = info.ModTime()
-		}
-		return nil
-	})
-	if err == nil {
-		timeSinceMod = now.Sub(mostRecentMod)
+	if !buildLogFailed(logContent) {
+		return false, ""
 	}
+	return true, fmt.Sprintf("rm -rf %s", buildDir)
+}
 
-	// Can delete if no modification in last 5 minutes
-	canDelete := timeSinceMod >= 5*time.Minute
-	deleteAction := fmt.Sprintf("rm -rf %s", buildDir)
-
-	return canDelete, deleteAction
+// buildLogFailed reports whether the last status line of a build log, which
+// hokuto appends when a build ends (appendBuildLogStatus), says it failed.
+func buildLogFailed(content string) bool {
+	text := strings.TrimRight(tuiANSISequence.ReplaceAllString(content, ""), " \t\r\n")
+	last := text[strings.LastIndexAny(text, "\r\n")+1:]
+	return strings.HasPrefix(last, ">>> ") && strings.Contains(last, ": Build failed at ")
 }
 
 // readFullFile reads the entire file for infinite scrollback support
