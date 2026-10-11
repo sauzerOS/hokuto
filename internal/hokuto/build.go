@@ -2936,6 +2936,10 @@ func runPkgBuild(pkgName string, cfg *Config, execCtx *Executor, opts BuildOptio
 
 				// Set PYTHONPATH to include target site-packages for build-time module detection
 				defaults["PYTHONPATH"] = filepath.Join(sysrootPrefix, "lib", targetPythonDirName(sysrootPrefix), "site-packages")
+				// Python extensions built here are named for the target.
+				if err := setCrossPythonEnv(defaults, pkgName, sysrootPrefix, normalizedArch, buildDir); err != nil {
+					return 0, fmt.Errorf("failed to set up python for the cross build: %w", err)
+				}
 			}
 
 			// Give recipes an escape hatch for meson `native: true` dependencies
