@@ -1188,10 +1188,11 @@ func installPackageArchive(tarballPath, pkgName string, cfg *Config, execCtx *Ex
 			}
 
 			// The fast installer keeps its progress bar on the current
-			// terminal line. Move below it before the diff and the prompt, so
-			// they do not get appended to the progress bar.
+			// terminal line. Clear it for the diff and the prompt: ending the
+			// line instead left a stale bar above them, and the bar comes
+			// back once, below the answer.
 			if fast {
-				prepareDependencyProgressLogOutput()
+				clearProgressForPrompt()
 			}
 			// Try to display diff, retry with root executor if permission
 			// denied. A file only root may read (/etc/shadow, /etc/gshadow,
