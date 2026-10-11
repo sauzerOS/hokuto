@@ -645,6 +645,11 @@ func getModifiedFiles(pkgName, rootDir string, execCtx *Executor) ([]string, err
 		if strings.HasPrefix(cleanSlash, "var/db/hokuto/") {
 			continue
 		}
+		// Python rewrites its bytecode caches itself: a changed one is not
+		// an edit to keep, and the package's copy replaces it.
+		if isPythonBytecodeCache(cleanSlash) {
+			continue
+		}
 
 		absPath := filepath.Join(rootDir, path)
 
@@ -740,6 +745,15 @@ func getModifiedFiles(pkgName, rootDir string, execCtx *Executor) ([]string, err
 	}
 
 	return modified, nil
+}
+
+// isPythonBytecodeCache reports whether path is a compiled Python module in
+// a __pycache__ directory.
+func isPythonBytecodeCache(path string) bool {
+	if !strings.HasSuffix(path, ".pyc") && !strings.HasSuffix(path, ".pyo") {
+		return false
+	}
+	return filepath.Base(filepath.Dir(filepath.FromSlash(path))) == "__pycache__"
 }
 
 func isRegisteredActiveAlternative(db *GlobalAlternativesDB, pkgName, path, expectedSum, currentSum string) bool {
