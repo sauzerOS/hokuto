@@ -645,11 +645,26 @@ func preparePythonUpgradeBuild(targets, buildArgs []string, cfg *Config) ([]stri
 		installBuiltRecipes([]string{pythonRecipe}, cfg)
 		targets = slices.DeleteFunc(slices.Clone(targets), func(t string) bool { return t == pythonRecipe })
 	}
+	// A build container has python installed only while a build needs it:
+	// the published release serves, as the builds would install it anyway.
+	if !isPackageInstalled(pythonRecipe) {
+		b, ok, err := locateBuildDependencyBinaryTarball(pythonRecipe, cfg, false)
+		if err == nil && ok {
+			colArrow.Print("-> ")
+			colSuccess.Printf("Installing python %s to build the Python build tools against\n", state.To)
+			err = installBuildDependencyPlan([]buildDepInstall{{name: pythonRecipe, cfg: cfg, tarball: b}}, false, true, func(string) {}, func(string, string) {})
+		}
+		if err != nil {
+			colWarn.Printf("Warning: failed to install python %s: %v\n", state.To, err)
+		}
+	}
 	current, err := currentPythonMinor()
 	if err != nil || current != state.To {
-		if !slices.Contains(targets, pythonRecipe) {
-			colWarn.Printf("Warning: python %s is not installed (python3 is %s): the Python build tools are not bootstrapped\n", state.To, current)
+		found := current
+		if err != nil {
+			found = err.Error()
 		}
+		colWarn.Printf("Warning: the python %s upgrade needs its Python build tools built first, but python3 is not %s (%s): they are not\n", state.To, state.To, found)
 		return targets, noop
 	}
 	marked := make(map[string]string)
