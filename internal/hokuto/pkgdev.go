@@ -1645,6 +1645,8 @@ func handleAutoBumpRepository(cfg *Config, autoBuild bool, assumeYes bool, repoU
 			pkgName = "zig-bin"
 		case "python-python-dateutil":
 			pkgName = "python-dateutil"
+		case "cosmic-term":
+			pkgName = "cosmic-terminal"
 		}
 
 		var newestVer string
