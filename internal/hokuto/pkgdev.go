@@ -1643,6 +1643,8 @@ func handleAutoBumpRepository(cfg *Config, autoBuild bool, assumeYes bool, repoU
 			pkgName = "discord"
 		case "zig":
 			pkgName = "zig-bin"
+		case "python-python-dateutil":
+			pkgName = "python-dateutil"
 		}
 
 		var newestVer string
