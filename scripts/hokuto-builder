@@ -539,6 +539,10 @@ nspawn_run() {
     printf '%s\n' '# hokuto-builder: prefer the host hokuto mounted at /usr/local/bin' \
         'case "$PATH" in /usr/local/bin:*) ;; *) PATH="/usr/local/bin:$PATH" ;; esac' \
         'export PATH' >"$ROOTFS/etc/profile.d/hokuto-builder.sh"
+   # Keep HOKUTO_BUILDER through sudo so OpenSnitch can recognise the processes.
+    install -d -m 0750 "$ROOTFS/etc/sudoers.d"
+    printf 'Defaults env_keep += "HOKUTO_BUILDER"\n' >"$ROOTFS/etc/sudoers.d/hokuto-builder-env"
+    chmod 0440 "$ROOTFS/etc/sudoers.d/hokuto-builder-env"
     local dir
     for dir in "${SHARED_DIRS[@]}"; do
         [ -d "$dir" ] || install -d -o "$BUILD_UID" -g "$BUILD_GID" "$dir"
